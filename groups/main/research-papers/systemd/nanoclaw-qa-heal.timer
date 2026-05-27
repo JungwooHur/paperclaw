@@ -1,0 +1,13 @@
+[Unit]
+Description=Run NanoClaw Q&A auto-healer every 5 minutes
+Documentation=https://github.com/JungwooHur/nanoclaw
+
+[Timer]
+# Fire 2 minutes after boot, then every 5 minutes thereafter.
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

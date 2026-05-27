@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.npm-cache/
+# Build output
+dist/
+
+# Local data & auth
+store/
+data/
+logs/
+
+# Groups - only track base structure and specific CLAUDE.md files
+groups/*
+!groups/main/
+!groups/global/
+groups/main/*
+groups/global/*
+!groups/main/CLAUDE.md
+!groups/global/CLAUDE.md
+!groups/main/research-papers/
+groups/main/research-papers/*
+!groups/main/research-papers/collect_papers.py
+!groups/main/research-papers/process_papers.py
+!groups/main/research-papers/save_qa_callout.py
+!groups/main/research-papers/auto_fix_qa.py
+!groups/main/research-papers/auto_save_qa.py
+!groups/main/research-papers/systemd/
+
+# Secrets
+*.keys.json
+.env
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Skills system (local per-installation state)
+.nanoclaw/
+
+agents-sdk-docs
