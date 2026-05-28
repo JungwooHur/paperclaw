@@ -22,7 +22,7 @@ systemctl --user status paperclaw-qa-heal.timer
 journalctl --user -u paperclaw-qa-heal.service -n 100
 ```
 
-The service reads `NOTION_TOKEN` and `NOTION_RESEARCH_DB` from `/home/jw/paperclaw/.env`.
+The service reads `NOTION_TOKEN` and `NOTION_RESEARCH_DB` from `~/paperclaw/.env` (resolved via systemd's `%h` specifier). If your PaperClaw checkout lives elsewhere, edit the `WorkingDirectory`/`EnvironmentFile`/`ExecStart` paths in `paperclaw-qa-heal.service` accordingly.
 
 ## Manual run
 

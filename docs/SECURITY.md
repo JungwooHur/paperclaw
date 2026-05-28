@@ -66,21 +66,22 @@ Messages and task operations are verified against group identity:
 
 ### 5. Credential Handling
 
-**Mounted Credentials:**
-- Claude auth tokens (filtered from `.env`, read-only)
+**Passed to Containers:**
+A subset of `.env` (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `NOTION_TOKEN`, `NOTION_RESEARCH_DB`, `OUTPUT_LANGUAGE`) is read by the host at spawn time and piped to the container over stdin. Secrets are never written to a mounted file and never set on the host `process.env`.
 
-**NOT Mounted:**
-- WhatsApp session (`store/auth/`) - host only
-- Mount allowlist - external, never mounted
-- Any credentials matching blocked patterns
+**Masked Inside the Project Root Mount (main only):**
+The main group's project-root bind mount hides two paths by overlaying an empty replacement. Without this overlay the agent could `cat` the file off disk and trivially bypass the Bash PreToolUse hook below.
+- `/workspace/project/.env` → empty file. Would otherwise leak `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`.
+- `/workspace/project/store/auth` → empty directory. Would otherwise leak Baileys WhatsApp session credentials — full account takeover on WhatsApp.
 
-**Credential Filtering:**
-Only these environment variables are exposed to containers:
-```typescript
-const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
-```
+**NOT Mounted at All:**
+- Mount allowlist (`~/.config/paperclaw/mount-allowlist.json`) — external, agent cannot modify mount policy.
+- Any path matching the blocked-pattern list (`.ssh`, `.aws`, `.netrc`, etc.).
 
-> **Note:** Anthropic credentials are mounted so that Claude Code can authenticate when the agent runs. However, this means the agent itself can discover these credentials via Bash or file operations. Ideally, Claude Code would authenticate without exposing credentials to the agent's execution environment, but I couldn't figure this out. **PRs welcome** if you have ideas for credential isolation.
+**Bash Subprocess Hardening:**
+A `PreToolUse` hook in the agent runner prepends `unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN` to every Bash invocation, so subprocesses the agent spawns cannot read Claude auth tokens from `printenv` even though the SDK itself needs them. Non-auth secrets (e.g. `NOTION_TOKEN`) stay visible — the agent calls Notion's API on the user's behalf.
+
+> **Residual risk:** the Claude Agent SDK still needs `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in its own process environment to authenticate, so an in-process exfil (e.g. an SDK extension that read `process.env` and posted it somewhere) would defeat the Bash hook. The mount masking + Bash hook combo only blocks the easy `cat .env` and `echo $ANTHROPIC_API_KEY` paths. **PRs welcome** for tighter in-process credential isolation.
 
 ## Privilege Comparison
 

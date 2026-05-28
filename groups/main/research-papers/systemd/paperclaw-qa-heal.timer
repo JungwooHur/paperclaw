@@ -1,6 +1,5 @@
 [Unit]
-Description=Run NanoClaw Q&A auto-healer every 5 minutes
-Documentation=https://github.com/JungwooHur/nanoclaw
+Description=Run PaperClaw Q&A auto-healer every 5 minutes
 
 [Timer]
 # Fire 2 minutes after boot, then every 5 minutes thereafter.

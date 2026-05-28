@@ -75,6 +75,43 @@ function buildVolumeMounts(
       readonly: true,
     });
 
+    // Mask sensitive paths inside the project root mount so the agent cannot
+    // exfiltrate credentials by reading them directly off disk. Docker
+    // applies bind mounts in order; a later mount over a sub-path of the
+    // project root hides the host file/dir from the container.
+    //
+    //   .env       — contains CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY.
+    //                Reading the file would bypass the PreToolUse Bash hook
+    //                that strips those vars from subprocess env.
+    //   store/auth — Baileys WhatsApp session credentials. The agent has no
+    //                legitimate reason to see these; if leaked they grant
+    //                full account takeover on WhatsApp.
+    //
+    // The empty masks live under DATA_DIR (gitignored, outside the project
+    // root mount), so an agent that escaped the .env mask still couldn't
+    // poison the mask file itself.
+    const masksDir = path.join(DATA_DIR, 'masks');
+    fs.mkdirSync(masksDir, { recursive: true });
+    const emptyFile = path.join(masksDir, 'empty-file');
+    const emptyDir = path.join(masksDir, 'empty-dir');
+    if (!fs.existsSync(emptyFile)) fs.writeFileSync(emptyFile, '');
+    fs.mkdirSync(emptyDir, { recursive: true });
+
+    if (fs.existsSync(path.join(projectRoot, '.env'))) {
+      mounts.push({
+        hostPath: emptyFile,
+        containerPath: '/workspace/project/.env',
+        readonly: true,
+      });
+    }
+    if (fs.existsSync(path.join(projectRoot, 'store', 'auth'))) {
+      mounts.push({
+        hostPath: emptyDir,
+        containerPath: '/workspace/project/store/auth',
+        readonly: true,
+      });
+    }
+
     // Main also gets its group folder as the working directory
     mounts.push({
       hostPath: groupDir,

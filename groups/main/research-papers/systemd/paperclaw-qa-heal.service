@@ -1,0 +1,12 @@
+[Unit]
+Description=PaperClaw Paper Q&A auto-healer
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/paperclaw/.env
+WorkingDirectory=%h/paperclaw
+ExecStart=/usr/bin/python3 %h/paperclaw/groups/main/research-papers/auto_fix_qa.py
+ExecStart=/usr/bin/python3 %h/paperclaw/groups/main/research-papers/auto_save_qa.py
+StandardOutput=journal
+StandardError=journal

@@ -17,10 +17,10 @@ You (WhatsApp)  →  PaperClaw  →  Claude Agent (container)  →  Notion
 ## What it does
 
 - **Nightly collection** (default: 11:30 PM in your timezone) — fetches the latest papers from 60+ researchers you follow on Semantic Scholar, classifies them by field/lab/venue, translates Abstract + Method to your language, and posts the day's summary to your WhatsApp.
-- **On-demand requests** — send a message like `정리해줘 https://arxiv.org/abs/2501.12345` and the agent dispatches a background subagent that creates the Notion page, extracts figures, and translates the paper.
+- **On-demand requests** — send a message like `add this paper: https://arxiv.org/abs/2501.12345` and the agent dispatches a background subagent that creates the Notion page, extracts figures, and translates the paper.
 - **Parallel processing** — send multiple papers in one message (or one after another). The agent processes up to 3 in parallel.
 - **Q&A** — ask follow-up questions about a paper; the answer is saved back to the paper's Notion page as a toggle callout so you can revisit later.
-- **Researcher discovery** — `"Marco Hutter 최근 논문 뭐 나왔어?"` triggers a Semantic Scholar lookup and offers to add the papers.
+- **Researcher discovery** — `"what papers has Professor Marco Hutter put out recently?"` triggers a Semantic Scholar lookup and offers to add the papers.
 
 ---
 
@@ -51,7 +51,7 @@ And on your machine:
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/<your-username>/paperclaw.git
+git clone https://github.com/JungwooHur/paperclaw.git
 cd paperclaw
 ./setup.sh         # installs Node deps, validates native modules, builds the container image
 ```
@@ -87,11 +87,11 @@ PaperClaw uses NotebookLM to process each paper section. The behavior depends on
 
 | `OUTPUT_LANGUAGE` | What happens to paper sections | Notion column names |
 |---|---|---|
-| `ko` *(default)* | Translated into Korean | `분야`, `연구실, 기관 소속` |
+| `ko` *(default)* | Translated into Korean | Korean — see `groups/main/CLAUDE.md` for the exact strings |
 | `en` | **No translation.** Reformatted into Notion-friendly English: headings, bullets, equations preserved as plain text, reference citations / page furniture stripped. Use this if you read papers natively in English. | `Field`, `Lab/Institution` |
 | `ja`, `zh-CN`, `de`, `fr`, `es`, ... | Translated into that language | `Field`, `Lab/Institution` |
 
-Set this in `.env` *before* you run the Notion bootstrap step below — the bootstrap script picks Korean vs English column names based on `OUTPUT_LANGUAGE`. (You can change later by renaming columns in Notion and updating the value in `.env`.)
+Set this in `.env` *before* you run the Notion bootstrap step below — the bootstrap script picks the column-name set based on `OUTPUT_LANGUAGE` (Korean for `ko`, English for everything else). You can change it later by renaming columns in Notion and updating the value in `.env`.
 
 ### 4. Set up Notion
 
@@ -138,7 +138,9 @@ Scan the printed QR with your phone (WhatsApp → Settings → Linked devices �
 npx tsx setup/index.ts --step groups       # lists available chats
 ```
 
-Pick the chat that should be your PaperClaw inbox (a 1-on-1 with yourself works fine). Copy its JID — for an individual it looks like `821012345678@s.whatsapp.net`; for a group, `120363xxxxxxxxx@g.us`. Paste into `CHAT_JID` in `.env`.
+Pick the chat that should be your PaperClaw inbox and paste its JID into `CHAT_JID` in `.env`. For an individual it looks like `821012345678@s.whatsapp.net`; for a group, `120363xxxxxxxxx@g.us`.
+
+> **Use a 1-on-1 self-chat for `CHAT_JID`.** The main group runs every incoming message through the agent without a trigger word, and the agent has `$NOTION_TOKEN` plus Bash + network access. Anyone who can send a message to the main chat can drive it — so a shared WhatsApp group is unsafe. Other people you trust can be added later as non-main groups (they require an `@AssistantName` trigger and have no admin privileges). See `docs/SECURITY.md` for the full trust model.
 
 Then register the group:
 
@@ -183,11 +185,11 @@ If you use `bootstrap-notion.ts`, this schema is created for you. If you create 
 | `Paper URL` | URL | arXiv / DOI link (used for dedup) |
 | `Authors` | Rich text | Comma-separated |
 | `Year` | Number | Publication year |
-| `분야` *(ko)* / `Field` *(other)* | Multi-select | Field tags (RL, VLA, Control, ...) |
-| `연구실, 기관 소속` *(ko)* / `Lab/Institution` *(other)* | Multi-select | Lab / institution |
+| `Field` | Multi-select | Field tags (RL, VLA, Control, ...) |
+| `Lab/Institution` | Multi-select | Lab / institution |
 | `Journal, Conference` | Select | TRO, ICRA, NeurIPS, ... (empty for arXiv-only) |
 
-The bootstrap script picks the column-name set based on `OUTPUT_LANGUAGE`. If you rename columns after creation, also update `groups/main/CLAUDE.md` (the schema reference) and `groups/main/research-papers/collect_papers.py` (the dedup queries) to match.
+The names above apply when `OUTPUT_LANGUAGE` is set to anything other than `ko`. With `OUTPUT_LANGUAGE=ko` (the default), the bootstrap script creates the two multi-select columns under Korean names instead — see `groups/main/CLAUDE.md` for the exact strings. If you rename columns after creation, also update `groups/main/CLAUDE.md` (the schema reference) and `groups/main/research-papers/collect_papers.py` (the dedup queries) to match.
 
 ---
 
@@ -223,7 +225,7 @@ PaperClaw ships with robotics defaults and Korean translation. If your situation
 
 1. **`groups/main/research-papers/config.json`** — replace `researchers`, `topics`, and `researcherLabMap` with your field's authors, queries, and labs.
 2. **`groups/main/CLAUDE.md`** — the "Classification Guidelines" section lists field tags and venue abbreviations. Swap robotics venues (TRO, ICRA, CoRL) for yours (ACL, EMNLP for NLP; Nature, Cell for bio; PRL for physics; etc.).
-3. **Notion DB tag values** — `Field` / `분야` is multi-select; just use your own tag values (you don't need to recreate the column).
+3. **Notion DB tag values** — the `Field` column is multi-select; just use your own tag values (you don't need to recreate the column).
 4. **Nightly task prompt** — `setup/create-research-task.ts` has a long prompt template with field examples. Adjust the example tags to your field.
 
 Nothing in `src/` or the container code is robotics- or language-specific. The domain knowledge lives entirely in `groups/main/CLAUDE.md` and `groups/main/research-papers/config.json`.
@@ -236,10 +238,10 @@ Send any of these to your registered WhatsApp chat:
 
 | You send | What happens |
 |---|---|
-| `정리해줘: https://arxiv.org/abs/2501.12345` | Single paper added to Notion with translation + figures |
+| `add this paper: https://arxiv.org/abs/2501.12345` | Single paper added to Notion with translation + figures |
 | 3 URLs in one message | All 3 processed in parallel (subagents) |
-| `Marco Hutter 최근 논문 뭐 나왔어?` | S2 search, prints list, asks if you want to add |
-| `[paper title]에서 reward 어떻게 설계했어?` | NotebookLM Q&A; answer saved as a toggle on the paper's Notion page |
+| `what papers has Professor Marco Hutter put out recently?` | S2 search, prints list, asks if you want to add |
+| `how did [paper title] design the reward?` | NotebookLM Q&A; answer saved as a toggle on the paper's Notion page |
 | A PDF attachment with a caption | Treated as a paper to add |
 
 The nightly job fires at 11:30 PM (your `TZ`) and posts a summary message with the day's haul broken down by field and lab.

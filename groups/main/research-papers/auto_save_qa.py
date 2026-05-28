@@ -29,8 +29,13 @@ import argparse, json, os, re, sqlite3, subprocess, sys, time
 import urllib.request, urllib.error
 
 API = "https://api.notion.com/v1"
-MSGS_DB = "/home/jw/paperclaw/store/messages.db"
-SAVE_SCRIPT = "/home/jw/paperclaw/groups/main/research-papers/save_qa_callout.py"
+
+# Resolve PaperClaw root relative to this script so the healer doesn't carry a
+# hardcoded user path. systemd's WorkingDirectory may differ, but this script
+# lives at <repo>/groups/main/research-papers/auto_save_qa.py.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+MSGS_DB = os.environ.get("PAPERCLAW_MSGS_DB", os.path.join(_REPO_ROOT, "store", "messages.db"))
+SAVE_SCRIPT = os.path.join(_REPO_ROOT, "groups", "main", "research-papers", "save_qa_callout.py")
 # See auto_fix_qa.py — Notion occasionally hangs mid-request; always use an
 # explicit timeout so a single bad call can't block the whole scan cycle.
 HTTP_TIMEOUT = 30
