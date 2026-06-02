@@ -135,10 +135,10 @@ def _normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", (title or "").strip().lower())
 
 
-def check_notion_exists(paper_url, title=None):
-    """Check if paper already exists in Notion database.
+def _find_existing_page(paper_url, title=None):
+    """Return the existing Notion page dict for this paper, or None.
 
-    Runs TWO independent checks and returns True if either hits:
+    Runs TWO independent checks and returns the first hit:
       (a) URL substring match on arxiv_id (tolerates abs/pdf/ar5iv/v1/v2),
           or exact URL match for non-arxiv papers.
       (b) Title contains-match (case-insensitive) — catches legacy
@@ -155,16 +155,23 @@ def check_notion_exists(paper_url, title=None):
         'Content-Type': 'application/json'
     }
 
-    # (a) URL match
+    # (a) URL match — ONLY when we actually have a URL/arxiv id to match on.
+    # A blank value here is catastrophic: Notion's `url equals ""` matches
+    # EVERY page (returns a full 100-row page), so `results[0]` would be an
+    # arbitrary false "duplicate". That is exactly the 2026-06-02 incident
+    # where a SocialNav add (whose paper_url had resolved to "") was reported
+    # as already-existing and returned an unrelated LongTraceRL page.
     arxiv_id = extract_arxiv_id(paper_url)
-    url_filter = (
-        {"property": "Paper URL", "url": {"contains": arxiv_id}} if arxiv_id
-        else {"property": "Paper URL", "url": {"equals": paper_url}}
-    )
-    req = urllib.request.Request(api_url, data=json.dumps({"filter": url_filter}).encode(), headers=headers)
-    with urllib.request.urlopen(req) as response:
-        if len(json.loads(response.read()).get('results', [])) > 0:
-            return True
+    if arxiv_id or paper_url:
+        url_filter = (
+            {"property": "Paper URL", "url": {"contains": arxiv_id}} if arxiv_id
+            else {"property": "Paper URL", "url": {"equals": paper_url}}
+        )
+        req = urllib.request.Request(api_url, data=json.dumps({"filter": url_filter}).encode(), headers=headers)
+        with urllib.request.urlopen(req) as response:
+            results = json.loads(response.read()).get('results', [])
+            if results:
+                return results[0]
 
     # (b) Title match — use a distinctive prefix/substring to stay within
     # Notion's `contains` semantics (case-insensitive, whitespace-tolerant).
@@ -186,8 +193,14 @@ def check_notion_exists(paper_url, title=None):
                                 "".join(r["plain_text"] for r in v["title"])
                             )
                             if existing == stem or stem in existing or existing in stem:
-                                return True
-    return False
+                                return p
+    return None
+
+
+def check_notion_exists(paper_url, title=None):
+    """Bool wrapper around _find_existing_page (back-compat for callers
+    that only need existence, e.g. the nightly fetch dedup)."""
+    return _find_existing_page(paper_url, title=title) is not None
 
 def classify_paper(title, abstract):
     """Classify paper into research areas."""
@@ -298,15 +311,25 @@ def add_to_notion(paper, areas, labs, venue_field):
     elif paper.get('externalIds', {}).get('DOI'):
         paper_url = f"https://doi.org/{paper['externalIds']['DOI']}"
     else:
-        paper_url = paper.get("paper_url", "")
+        # Accept the keys agents actually hand us via --add-paper: `paper_url`,
+        # `url`, or a bare `arxiv_id`. Missing all three previously left
+        # paper_url="" and silently broke dedup (see _find_existing_page note).
+        paper_url = paper.get("paper_url") or paper.get("url") or ""
+        if not paper_url and paper.get("arxiv_id"):
+            paper_url = f"https://arxiv.org/abs/{paper['arxiv_id']}"
 
     title = paper.get("title", "")
     key = _session_key(paper_url, title)
     if key and key in _ADDED_THIS_SESSION:
         return {"skipped": True, "reason": "session-cache", "key": key}
-    if check_notion_exists(paper_url, title=title):
+    existing = _find_existing_page(paper_url, title=title)
+    if existing is not None:
         if key: _ADDED_THIS_SESSION.add(key)
-        return {"skipped": True, "reason": "already-in-notion", "key": key}
+        # Return the existing page id so callers can PATCH into it directly
+        # instead of re-querying Notion (whose index lags ~10-30s after a
+        # write and has caused duplicate raw-curl re-creates).
+        return {"skipped": True, "reason": "already-in-notion", "key": key,
+                "id": existing.get("id")}
 
     # Format authors
     authors_list = paper.get('authors', [])
@@ -343,6 +366,145 @@ def add_to_notion(paper, areas, labs, venue_field):
         result = json.loads(response.read())
     if key: _ADDED_THIS_SESSION.add(key)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Duplicate healer (out-of-band, runs from the qa-heal systemd timer).
+#
+# The in-script dedup in add_to_notion only protects the sanctioned
+# --add-paper path. Agents have repeatedly fallen back to raw
+# `curl POST /v1/pages` when Notion's eventually-consistent query index hid a
+# page they had just created — and raw POST bypasses every in-script guard, so
+# no amount of prose ("never raw POST") reliably prevents the duplicate. This
+# sweep cleans up regardless of how a duplicate was created: it groups every
+# page by arxiv_id (or normalized title), keeps the richest page (most child
+# blocks), backfills a missing URL onto the keeper, and archives the rest.
+# Archived pages go to Notion trash (30-day recovery), so this is reversible.
+# ---------------------------------------------------------------------------
+_HTTP_TIMEOUT = 30  # Notion occasionally stalls mid-request; never block forever.
+
+
+def _notion_headers():
+    return {
+        'Authorization': f'Bearer {NOTION_TOKEN}',
+        'Notion-Version': '2022-06-28',
+        'Content-Type': 'application/json',
+    }
+
+
+def _query_all_pages():
+    """Return every page in the DB. The explicit `sorts` is REQUIRED: without
+    it Notion caps larger DBs at ~300 rows and still reports has_more=false."""
+    api_url = f"https://api.notion.com/v1/databases/{NOTION_DB}/query"
+    pages, cursor = [], None
+    while True:
+        body = {
+            "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
+            "page_size": 100,
+        }
+        if cursor:
+            body["start_cursor"] = cursor
+        req = urllib.request.Request(api_url, data=json.dumps(body).encode(), headers=_notion_headers())
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+            d = json.loads(r.read())
+        pages.extend(d.get("results", []))
+        if not d.get("has_more"):
+            break
+        cursor = d.get("next_cursor")
+    return pages
+
+
+def _page_title(page):
+    for v in page.get("properties", {}).values():
+        if v.get("type") == "title":
+            return "".join(r.get("plain_text", "") for r in v.get("title", []))
+    return ""
+
+
+def _page_url(page):
+    for v in page.get("properties", {}).values():
+        if v.get("type") == "url":
+            return v.get("url") or ""
+    return ""
+
+
+def _block_count(page_id):
+    """Number of top-level child blocks — a proxy for how much content a page
+    holds, used to pick which duplicate to keep."""
+    api = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+    total, cursor = 0, None
+    while True:
+        u = api + (f"&start_cursor={cursor}" if cursor else "")
+        req = urllib.request.Request(u, headers=_notion_headers())
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+            d = json.loads(r.read())
+        total += len(d.get("results", []))
+        if not d.get("has_more"):
+            break
+        cursor = d.get("next_cursor")
+    return total
+
+
+def _dedup_key(page):
+    """Group key: arxiv_id when available (most reliable), else normalized
+    title. Returns None for pages with neither (left untouched)."""
+    aid = extract_arxiv_id(_page_url(page))
+    if aid:
+        return f"arxiv:{aid}"
+    t = _normalize_title(_page_title(page))
+    return f"title:{t}" if len(t) >= 8 else None
+
+
+def _patch_page(page_id, payload):
+    api = f"https://api.notion.com/v1/pages/{page_id}"
+    req = urllib.request.Request(api, data=json.dumps(payload).encode(),
+                                 headers=_notion_headers(), method="PATCH")
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+        return json.loads(r.read())
+
+
+def dedupe_notion(dry_run=False):
+    """Find duplicate paper pages and archive all but the richest per group."""
+    if not NOTION_TOKEN or not NOTION_DB:
+        print("ERROR missing NOTION_TOKEN/NOTION_RESEARCH_DB", file=sys.stderr)
+        sys.exit(2)
+    pages = _query_all_pages()
+    groups = {}
+    for p in pages:
+        k = _dedup_key(p)
+        if k:
+            groups.setdefault(k, []).append(p)
+    dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
+    if not dup_groups:
+        print(f"OK no duplicates among {len(pages)} pages")
+        return
+    total_archived = 0
+    for k, grp in dup_groups.items():
+        # Keep the richest page (most blocks), tie-broken by most-recent edit.
+        ranked = sorted(
+            grp,
+            key=lambda p: (_block_count(p["id"]), p.get("last_edited_time", "")),
+            reverse=True,
+        )
+        keeper, losers = ranked[0], ranked[1:]
+        title = _page_title(keeper)[:60]
+        # Backfill a missing URL onto the keeper from a loser that has one.
+        if not _page_url(keeper):
+            for l in losers:
+                lu = _page_url(l)
+                if lu:
+                    print(f"BACKFILL-URL keep={keeper['id']} url={lu}")
+                    if not dry_run:
+                        _patch_page(keeper["id"], {"properties": {"Paper URL": {"url": lu}}})
+                    break
+        for l in losers:
+            print(f"{'WOULD-ARCHIVE' if dry_run else 'ARCHIVE'} dup={l['id']} "
+                  f"keep={keeper['id']} key={k} title={title!r}")
+            if not dry_run:
+                _patch_page(l["id"], {"archived": True})
+            total_archived += 1
+    print(f"{'DRY-RUN ' if dry_run else ''}done: {len(dup_groups)} duplicate "
+          f"group(s), {total_archived} page(s) {'would be ' if dry_run else ''}archived")
 
 
 def get_paper_url(paper):
@@ -583,7 +745,20 @@ def main():
                         help='Override labs (comma-separated) for --add-paper')
     parser.add_argument('--venue', type=str, default=None,
                         help='Override venue for --add-paper (e.g. TRO, CoRL)')
+    parser.add_argument('--dedupe', action='store_true',
+                        help='Archive duplicate paper pages (same arxiv_id or normalized '
+                             'title), keeping the richest in each group. Backfills a missing '
+                             'URL onto the keeper. Needs only NOTION_TOKEN/NOTION_RESEARCH_DB; '
+                             'does not read config.json, so it runs on the host.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='With --dedupe: report what would change without mutating Notion.')
     args = parser.parse_args()
+
+    # --dedupe runs out-of-band (host systemd timer) and must not require the
+    # container-only config.json, so handle it before load_config().
+    if args.dedupe:
+        dedupe_notion(dry_run=args.dry_run)
+        return
 
     print("Loading config...", file=sys.stderr)
     config = load_config()
@@ -617,7 +792,10 @@ def main():
             print(f"ERROR notion-call {e}")
             sys.exit(1)
         if isinstance(result, dict) and result.get("skipped"):
-            print(f"SKIPPED {result.get('reason','duplicate')}")
+            rid = result.get("id")
+            # Emit the existing page id when known so the caller can PATCH into
+            # it directly instead of re-querying Notion's lagging index.
+            print(f"SKIPPED {result.get('reason','duplicate')}" + (f" {rid}" if rid else ""))
             return
         pid = result.get("id") if isinstance(result, dict) else ""
         print(f"ADDED {pid}")

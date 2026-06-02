@@ -59,6 +59,26 @@ const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
+// Background-task nudge. The SDK buffers `task_notification` events for
+// background Tasks (run_in_background) and does not surface them while the
+// main agent is parked between turns waiting on streaming input. If nothing
+// re-triggers a turn, a completed subagent is never reported and the agent
+// sits idle until the host idle-timeout reaps the container. To recover, once
+// the agent has been parked with outstanding background work for NUDGE_IDLE_MS
+// we inject a synthetic reminder — that starts a fresh turn, which flushes the
+// buffered notification(s) and lets the agent send its completion report.
+const NUDGE_IDLE_MS = 60_000;
+const MAX_NUDGES = 20; // safety cap (~20 min) so a never-arriving notification can't nudge forever
+const BG_NUDGE_TEXT =
+  '<system-reminder>One or more background tasks you dispatched with ' +
+  'run_in_background may have finished while you were idle. For each ' +
+  'in_progress entry in papers_queue.json, call TaskOutput(task_id) now. If a ' +
+  'task returned a final result, update the queue and send the user the ' +
+  'completion report per the CLAUDE.md "Main Agent Loop" final-report step. If ' +
+  'tasks are still running, do NOT message the user — acknowledge internally ' +
+  'and keep waiting. Never re-dispatch or re-process a paper already marked ' +
+  'done.</system-reminder>';
+
 /**
  * Push-based async iterable for streaming user messages to the SDK.
  * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
@@ -368,6 +388,18 @@ async function runQuery(
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
+
+  // Background-task nudge state (see NUDGE_IDLE_MS above).
+  // pendingBgTasks: net count of dispatched-but-not-yet-reported background
+  //   Tasks, derived from the message stream (Task tool_use minus
+  //   task_notification).
+  // parked: true after a `result` (turn ended) — the agent is now idle waiting
+  //   on input, the only window where buffered notifications get stuck.
+  let pendingBgTasks = 0;
+  let parked = false;
+  let parkedAt = 0;
+  let totalNudges = 0;
+
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
@@ -381,7 +413,25 @@ async function runQuery(
     for (const text of messages) {
       log(`Piping IPC message into active query (${text.length} chars)`);
       stream.push(text);
+      parked = false; // real input starts its own turn; don't nudge on top of it
     }
+
+    // Agent parked with outstanding background work and no fresh input —
+    // inject a reminder to start a turn and flush buffered notifications.
+    if (
+      parked &&
+      pendingBgTasks > 0 &&
+      totalNudges < MAX_NUDGES &&
+      Date.now() - parkedAt >= NUDGE_IDLE_MS
+    ) {
+      totalNudges++;
+      log(
+        `Nudging agent (#${totalNudges}/${MAX_NUDGES}): ${pendingBgTasks} background task(s) pending while parked`,
+      );
+      stream.push(BG_NUDGE_TEXT);
+      parked = false; // a new turn will start; re-arm only after its result
+    }
+
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
@@ -462,8 +512,28 @@ async function runQuery(
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
+    // Any streamed message means the agent is actively in a turn; only a
+    // `result` (handled below) parks it again. Clearing here re-arms the
+    // nudge logic cleanly on every turn boundary.
+    parked = false;
+
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+    }
+
+    // Count background Task dispatches so we know whether to nudge later.
+    // Replays (on session resume) must not be re-counted.
+    if (message.type === 'assistant' && !(message as { isReplay?: boolean }).isReplay) {
+      const content = (message as { message?: { content?: unknown } }).message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          const b = block as { type?: string; name?: string; input?: { run_in_background?: boolean } };
+          if (b?.type === 'tool_use' && b.name === 'Task' && b.input?.run_in_background === true) {
+            pendingBgTasks++;
+            log(`Background Task dispatched; pendingBgTasks=${pendingBgTasks}`);
+          }
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -473,7 +543,9 @@ async function runQuery(
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
       const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+      if (pendingBgTasks > 0) pendingBgTasks--;
+      if (pendingBgTasks === 0) totalNudges = 0; // pending episode resolved; reset the cap
+      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}; pendingBgTasks=${pendingBgTasks}`);
     }
 
     if (message.type === 'result') {
@@ -485,6 +557,10 @@ async function runQuery(
         result: textResult || null,
         newSessionId
       });
+      // Turn ended. If background work is still outstanding the agent is now
+      // parked; arm the nudge timer (pollIpcDuringQuery checks the elapsed time).
+      parked = true;
+      parkedAt = Date.now();
     }
   }
 
