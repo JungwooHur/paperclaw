@@ -13,6 +13,7 @@ Known fixes accumulated so far:
 | NotebookLM unusable in container | `~/.notebooklm` mounted readonly → can't write conversation state | Mount writable (`readonly: false` in container-runner.ts) |
 | ar5iv silent failure | Returns HTTP 200 with ~6KB error page for failed conversions | Validate: `len(html) > 50000 and 'ltx_document' in html and 'Fatal error' not in html` |
 | Figure numbers one too low / reference numbers differ from the real paper | ar5iv is frozen at **v1** of a paper and serves v1 even when you request `.../html/IDv2` (HTTP 200, identical stale bytes for every version — verified on 2504.16680). A later revision that inserts a figure (e.g. a "Training diagram") shifts every subsequent figure number up by one and changes the bibliography, so any ar5iv-sourced translation systematically undercounts figure/reference numbers vs. the current paper the user reads. NOT a code/indexing bug — the source itself is stale | Source from **arxiv-native HTML** `https://arxiv.org/html/ARXIV_ID`, which always serves the latest version in the identical LaTeXML `<figure id="S3.F2">` format. Use ar5iv only as a fallback when native HTML 404s, and the PDF when neither HTML is usable. Image src is relative — resolve via the page's `<base href="/html/IDv3/">`. See Phase 1 step 3 + Phase 3 |
+| Inline citation numbers wrong / invented vs. the real paper | Separate from the ar5iv-version issue above. NotebookLM does not preserve a paper's citation markers when translating: it renumbers them **sequentially per section** (the same ref gets a different number in each section), and for **author-year papers (no numeric cites at all) it fabricates `[1],[2],…` that exist nowhere in the source** — verified 2026-06-04 on 2505.05787 (author-year, 143 invented tokens) vs. 2501.10100 (numeric, preserved correctly). Figures survive because Step 2-B tells NotebookLM to keep `Fig.`/`Eq.` refs; citations had no such rule | (1) **Prevent:** Step 2-B rule 5 now orders NotebookLM to keep citation markers verbatim (no renumber, no per-section restart, no invented numbers). (2) **Detect/repair:** `research-papers/verify_citations.py --page ID` classifies the paper's bib style from arxiv HTML and flags fabrication/resequencing; `--apply` strips fabricated numbers for author-year papers (eats one leading space so Korean particles reattach, skips `[0,1]`-style math intervals). Numeric resequencing needs a hand-built per-block remap (`fix_socialnav_cites.py`). See Step 2-D |
 | Figure extraction wrong bbox | PyMuPDF text blocks include figure labels → wrong `fig_top` | Use vector drawing + raster image bboxes instead of text blocks |
 | Figure left side clipped | Hardcoded `page_w/2 + 4` as crop x0 — clips when caption starts at exactly `page_w/2` | Use `cx0 - 6` (right col) / `cx1 + 6` (left col) anchored on caption bbox |
 | Caption cut off mid-sentence | Long captions split across multiple PDF text blocks | Walk forward from first caption block while text doesn't end with `.` and gap ≤ 25pt |
@@ -227,10 +228,11 @@ notebooklm ask "논문의 '{SECTION_NAME}' 섹션 전체를 한국어로 번역�
 2. 전문용어(예: motion matching, policy, reward, reinforcement learning 등)는 영어 그대로 유지
 3. 일반적인 단어는 문맥이 자연스럽도록 한국어로 번역
 4. 수식 참조(예: 식 (1), Eq. (3))와 Figure 참조(Fig. 2)는 원문 그대로 유지
-5. subsection 제목도 포함하되 '영어 원문 (한국어 번역)' 형식으로
-6. **수식은 LaTeX \$...\$ 혹은 \$\$...\$\$로 감싸지 말고 평문으로 출력해. 예: \$s = Enc(x)\$ ❌ → s = Enc(x) ✅. \$(x, y)\$ ❌ → (x, y) ✅**
-7. **문단 내부에서 임의로 줄바꿈(\\n)하지 마. 한 문단은 한 줄로 이어서 써. 문단 구분이 필요하면 빈 줄(\\n\\n) 하나로만 구분해**
-8. 번역 텍스트만 출력. 메타 코멘트 금지" --notebook <id>
+5. **본문의 인용 표시(citation marker)는 원문에 있는 형태 그대로 유지해. 원문이 [12]처럼 번호를 쓰면 그 번호를 그대로, Smith et al. [2023]처럼 저자-연도를 쓰면 그 형태 그대로 유지해. 절대 인용 번호를 새로 매기거나(renumber), 섹션마다 1부터 다시 세거나, 원문에 없는 번호를 만들어내지 마. 원문에 인용 표시가 없는 자리에 [번호]를 추가하지 마**
+6. subsection 제목도 포함하되 '영어 원문 (한국어 번역)' 형식으로
+7. **수식은 LaTeX \$...\$ 혹은 \$\$...\$\$로 감싸지 말고 평문으로 출력해. 예: \$s = Enc(x)\$ ❌ → s = Enc(x) ✅. \$(x, y)\$ ❌ → (x, y) ✅**
+8. **문단 내부에서 임의로 줄바꿈(\\n)하지 마. 한 문단은 한 줄로 이어서 써. 문단 구분이 필요하면 빈 줄(\\n\\n) 하나로만 구분해**
+9. 번역 텍스트만 출력. 메타 코멘트 금지" --notebook <id>
 ```
 
 **If `$OUTPUT_LANGUAGE=en`** (reformat, do NOT translate):
@@ -252,8 +254,9 @@ notebooklm ask "Translate the '{SECTION_NAME}' section of this paper into {LANG}
 2. Keep technical terms (e.g. policy, reward, reinforcement learning, motion matching) in their original English form; translate only the surrounding prose.
 3. Subsection headings appear as 'English original ({LANG} translation)'.
 4. Preserve equation references (Eq. (3), Fig. 2) unchanged. Render equations as plain text — never wrap in \$...\$.
-5. One paragraph per line; separate paragraphs with a single blank line.
-6. Output the translated text only. No meta commentary." --notebook <id>
+5. Preserve inline citation markers EXACTLY as in the source. If the source uses [12], keep [12]; if it uses 'Smith et al. [2023]', keep that form. Never renumber, never restart numbering per section, never invent a number the source does not have, never add [N] where the source has no citation.
+6. One paragraph per line; separate paragraphs with a single blank line.
+7. Output the translated text only. No meta commentary." --notebook <id>
 ```
 
 If a section's response is truncated, follow up with the same prompt skeleton but: *"The '{SECTION_NAME}' section was truncated. Continue from where you stopped, same rules. Output only the continuation, no meta commentary."* (in `$OUTPUT_LANGUAGE` for ko, in English for en/other).
@@ -281,6 +284,18 @@ HEADING_COUNT=$(curl -s "https://api.notion.com/v1/blocks/PAGE_ID/children?page_
   | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for b in d.get('results',[]) if b['type'] in ('heading_1','heading_2')))")
 echo "Sections: $SEC_COUNT, Notion headings: $HEADING_COUNT"
 ```
+
+**Step 2-D: Verify inline citation numbers against the real bibliography.** NotebookLM does not reliably keep a paper's citation markers even with Step 2-B rule 5 — it tends to renumber them sequentially per section, and for **author-year papers it fabricates numeric `[N]` markers that do not exist in the source at all**. Run the auditor after upload (arxiv papers only):
+
+```bash
+python3 research-papers/verify_citations.py --page PAGE_ID   # add --arxiv ID if Paper URL isn't set yet
+```
+
+- Exit 0 → citations consistent with the real bibliography. Done.
+- **author-year paper, FABRICATED** → the `[N]` numbers are invented; re-run with `--apply` to strip them (a missing number is correct; a wrong number is not — same policy as `en` reformatting). Do NOT try to "map" them — there is no numeric scheme to map to.
+- **numeric paper, OUT-OF-RANGE / RENUMBERED** → NotebookLM resequenced real numbers. This needs a per-block remap against the source inline anchors (`arxiv.org/html/ID` → `<a href="#bib.bibNN">N</a>`), context-anchored like `research-papers/fix_socialnav_cites.py`. NOT auto-fixable — build the per-block map by hand and verify before PATCHing.
+
+The classifier reads the paper's bibliography style from arxiv HTML (numeric `[1]..[N]` bib tags vs. `Author et al. [YEAR]` tags). Note native-latest HTML sometimes renders without the reference list (e.g. 2501.10100 latest omits it); the script falls back to ar5iv / `…v1` to recover a parseable bibliography.
 
 #### Phase 3: Figure Extraction (Build Figure Map)
 
