@@ -6,7 +6,11 @@ After=network-online.target
 Type=oneshot
 EnvironmentFile=%h/paperclaw/.env
 WorkingDirectory=%h/paperclaw
-ExecStart=/usr/bin/python3 %h/paperclaw/groups/main/research-papers/auto_fix_qa.py
-ExecStart=/usr/bin/python3 %h/paperclaw/groups/main/research-papers/auto_save_qa.py
+# The `-` prefix makes each step's failure non-fatal so a transient error in
+# one (e.g. a Notion HTTP 429) doesn't abort the rest — without it a failed
+# auto_fix_qa.py blocks the downstream healers (a real past incident).
+ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/auto_fix_qa.py
+ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/auto_save_qa.py
+ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/collect_papers.py --dedupe
 StandardOutput=journal
 StandardError=journal

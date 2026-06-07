@@ -10,9 +10,17 @@ when the URL parent isn't the page itself). This script enforces the safe path:
   3) After PATCH, top-level children are re-fetched to verify the new callout
      is a direct child of the page. If not, it is deleted and an error raised.
 
+It ALSO refuses to write to the wrong paper. `--expect-title` is required: the
+script fetches the target page's Title (and Paper URL) and aborts BEFORE writing
+unless the expected substring is present. This is the structural guard against
+the recurring bug where an agent reuses a stale page ID from an earlier task and
+silently files a Q&A under an unrelated paper. Prose rules alone never stopped
+it; this makes the wrong page a hard failure.
+
 Usage:
   python3 save_qa_callout.py \
       --page <page_id> \
+      --expect-title "Uncertainty-Aware"   # distinctive title fragment or arxiv id
       --question "Q: ..." \
       --answer-file /tmp/answer.md \
       --section "4.3"           # heading-text fragment; omit to append at end
@@ -58,6 +66,21 @@ def api_delete(block_id: str) -> None:
         f"{API}/blocks/{block_id}", method="DELETE", headers=headers()
     )
     urllib.request.urlopen(req).read()
+
+
+def fetch_page_identity(page_id: str) -> tuple[str, str]:
+    """Return (title, urls) for a page. `title` is the title-type property's
+    plain text; `urls` concatenates any url-type property values (e.g. the
+    arxiv 'Paper URL'). Used to verify --page is the paper we think it is."""
+    d = api_get(f"/pages/{page_id}")
+    props = d.get("properties", {})
+    title, urls = "", []
+    for v in props.values():
+        if v.get("type") == "title":
+            title = "".join(r["plain_text"] for r in v.get("title", []))
+        elif v.get("type") == "url" and v.get("url"):
+            urls.append(v["url"])
+    return title, " ".join(urls)
 
 
 def fetch_top_children(page_id: str) -> list[dict]:
@@ -323,6 +346,10 @@ def build_callout(question: str, answer_md: str) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--page", required=True, help="Notion page ID")
+    ap.add_argument("--expect-title", required=True,
+                    help="Distinctive substring of the paper's title (or its arxiv id). "
+                         "The script aborts if it is not found in the target page's "
+                         "Title/Paper URL — guards against writing to the wrong paper.")
     ap.add_argument("--question", required=True, help="Question text (single line)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--answer", help="Answer markdown")
@@ -332,6 +359,20 @@ def main() -> None:
     args = ap.parse_args()
 
     answer_md = args.answer if args.answer else open(args.answer_file, encoding="utf-8").read()
+
+    # Page-identity guard: refuse to write before confirming --page is the
+    # paper the caller claims. Catches stale/reused page IDs.
+    page_title, page_urls = fetch_page_identity(args.page)
+    needle = args.expect_title.strip().lower()
+    if needle not in f"{page_title} {page_urls}".lower():
+        sys.exit(
+            f"FAIL: --expect-title {args.expect_title!r} not found on target page.\n"
+            f"  page {args.page}\n"
+            f"  actual title: {page_title!r}\n"
+            f"  This is almost certainly the WRONG paper. Re-resolve the page ID from "
+            f"the paper title (query the Paper DB) before saving. Nothing was written."
+        )
+    print(f"page identity OK: {page_title[:80]!r}", file=sys.stderr)
 
     top = fetch_top_children(args.page)
     after_id = None

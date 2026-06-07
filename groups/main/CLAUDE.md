@@ -12,6 +12,8 @@ Known fixes accumulated so far:
 |------|-----------|-----|
 | NotebookLM unusable in container | `~/.notebooklm` mounted readonly → can't write conversation state | Mount writable (`readonly: false` in container-runner.ts) |
 | ar5iv silent failure | Returns HTTP 200 with ~6KB error page for failed conversions | Validate: `len(html) > 50000 and 'ltx_document' in html and 'Fatal error' not in html` |
+| Figure numbers one too low / reference numbers differ from the real paper | ar5iv is frozen at **v1** of a paper and serves v1 even when you request `.../html/IDv2` (HTTP 200, identical stale bytes for every version — verified on 2504.16680). A later revision that inserts a figure (e.g. a "Training diagram") shifts every subsequent figure number up by one and changes the bibliography, so any ar5iv-sourced translation systematically undercounts figure/reference numbers vs. the current paper the user reads. NOT a code/indexing bug — the source itself is stale | Source from **arxiv-native HTML** `https://arxiv.org/html/ARXIV_ID`, which always serves the latest version in the identical LaTeXML `<figure id="S3.F2">` format. Use ar5iv only as a fallback when native HTML 404s, and the PDF when neither HTML is usable. Image src is relative — resolve via the page's `<base href="/html/IDv3/">`. See Phase 1 step 3 + Phase 3 |
+| Inline citation numbers wrong / invented vs. the real paper | Separate from the ar5iv-version issue above. NotebookLM does not preserve a paper's citation markers when translating: it renumbers them **sequentially per section** (the same ref gets a different number in each section), and for **author-year papers (no numeric cites at all) it fabricates `[1],[2],…` that exist nowhere in the source** — verified 2026-06-04 on 2505.05787 (author-year, 143 invented tokens) vs. 2501.10100 (numeric, preserved correctly). Figures survive because Step 2-B tells NotebookLM to keep `Fig.`/`Eq.` refs; citations had no such rule | (1) **Prevent:** Step 2-B rule 5 now orders NotebookLM to keep citation markers verbatim (no renumber, no per-section restart, no invented numbers). (2) **Detect/repair:** `research-papers/verify_citations.py --page ID` classifies the paper's bib style from arxiv HTML and flags fabrication/resequencing; `--apply` strips fabricated numbers for author-year papers (eats one leading space so Korean particles reattach, skips `[0,1]`-style math intervals). Numeric resequencing needs a hand-built per-block remap (`fix_socialnav_cites.py`). See Step 2-D |
 | Figure extraction wrong bbox | PyMuPDF text blocks include figure labels → wrong `fig_top` | Use vector drawing + raster image bboxes instead of text blocks |
 | Figure left side clipped | Hardcoded `page_w/2 + 4` as crop x0 — clips when caption starts at exactly `page_w/2` | Use `cx0 - 6` (right col) / `cx1 + 6` (left col) anchored on caption bbox |
 | Caption cut off mid-sentence | Long captions split across multiple PDF text blocks | Walk forward from first caption block while text doesn't end with `.` and gap ≤ 25pt |
@@ -29,7 +31,9 @@ Known fixes accumulated so far:
 | qa-heal systemd service hung indefinitely on a single Notion API call | `auto_fix_qa.py` used `urllib.urlopen()` with no timeout. Notion occasionally returns 502 then keeps the TCP connection open but stops responding. On 2026-04-22 a systemd run was stuck 5+ min on one request, blocking the downstream `auto_save_qa.py` ExecStart so the LeWorldModel Q&A never got saved until the hang was killed manually | Explicit `HTTP_TIMEOUT = 30s` on every `urlopen()` call in both `auto_fix_qa.py` and `auto_save_qa.py`. A 30s cap is well past any healthy Notion latency and still gives the script time to fail fast on stuck connections so the next cycle picks up clean |
 | Q&A callout saved with broken formatting (code fences flattened to one line, ASCII art squashed, `**bold**` literal) | `save_qa_callout.py`'s `build_answer_blocks()` only recognized `### `, `- `, `N. ` prefixes. Triple-backtick code fences fell into the `else: paragraph` branch, where `sanitize()` collapses single `\n` to space — destroying pseudo-code / visualization / Python blocks. `**bold**` markdown, `#`/`##` headings, and markdown tables were likewise untouched | Rewrote `build_answer_blocks()` to (a) split on ```` ``` ```` fences first and emit Notion `code` blocks with newlines preserved and language detection, (b) match `#{1,6}` as heading_1/2/3 (clamped), (c) convert `**bold**` inline to rich_text with `annotations.bold`, (d) detect markdown tables (`|…|` + `|---|` header) and render them as `language="markdown"` code blocks so alignment is preserved without building Notion table schema, (e) `sanitize()` now only runs on prose — never on code-block content. Fenced regex: `r"```([^\n\`]*)\n(.*?)```"` with `re.DOTALL` |
 | `auto_save_qa.py` attributed a Q&A to the wrong paper when current-pair had only generic English kw overlap | The old priority put "history has `[kw] 논문`" as Tier 1 — a stray "Methods paper" in a prior task-completion bot msg trivially matched any title containing "Methods". Then Tier 3 scoring was a flat distinct-kw count, so papers with 2 generic matched kws ("world" + "planning", "Adversarial" + "Good") tied with or beat papers whose match included a title-unique compound name like "LeWorldModel" | Rework the resolver: (a) current-pair `_has_paper_reference` with ≥2 distinct kws is Tier 1; (b) current-pair distinct ≥2 ranked by IDF-weighted score is Tier 2 — kws that appear in few paper titles count more, so one hit on "LeWorldModel" (df=1, weight=1.0) beats two hits on "world"+"planning" (weight=0.12); (c) history-based attribution demoted to Tier 3 with a consistency check requiring the current pair to share ≥1 kw with the historical paper; (d) COMMON_WORDS list expanded with generic ML primitives (control, action, space, reward, policy, state, task, goal, loss, etc.) that were false-positive magnets; (e) `extract_title_keywords` now dedupes case-insensitively so "...Space...Action Space" doesn't double-count; (f) cross-page dedup: before saving, also check other candidate paper pages (any paper sharing ≥1 kw with pair) so Q&As saved on the correct paper before a resolver improvement don't get duplicated on the newly-resolved wrong paper |
+| Interactive agent saved a paper Q&A to the WRONG paper page (`save_qa_callout.py --page <stale id>`) | On 2026-05-30 the in-container reviewer answered two MBPO follow-up questions about "Uncertainty-Aware Robotic World Model" (2504.16680) but passed `--page` for "Robotic World Model: A Neural Network Simulator" (2501.10100) — a stale page ID left in context from a paper it had processed earlier in the session. Root cause is *paper identification*: the agent reused in-context state instead of working out which paper the current turn is about, and `save_qa_callout.py` wrote to whatever `--page` it got (it only verified top-level placement, never paper identity). Prose "re-resolve first" rules never held — needed structure. The user pushed for handling ALL input shapes: named paper, pasted 번역본, pasted 원본, bare follow-up | Two layers. **(1) Identification — `resolve_paper.py`:** reads the whole user message and resolves the paper by concrete evidence, in order: arxiv id/URL (exact, via `Paper URL contains`) → distinctive title keywords (clear winner only, IDF-weighted, reuses `auto_save_qa.py`) → pasted-excerpt body-grep (fetches ≤8 title-narrowed candidate bodies and substring-matches 48-char windows; this is the only thing that finds a pasted translated passage — **Notion `/v1/search` matches titles, not body text**, verified empirically). Inconclusive → prints `ASK_USER` + exits 2 so the agent asks instead of guessing (also the correct answer for a bare follow-up). Body-grep discriminates even the two near-identical-title RWM papers. **(2) Write guard — `save_qa_callout.py --expect-title` (required):** before writing, `GET /pages/{id}` and abort unless the expected title fragment/arxiv id is in the page Title+Paper URL — catches any residual page/paper mismatch. `auto_save_qa.py` passes its resolved `paper["title"]`. CLAUDE.md Step 1/Step 4 mandate the resolver + guard. (auto_fix_qa.py unaffected — re-PATCHes inline on the same page, never calls the script.) |
 | Same paper added 2-5× to Notion DB in the nightly job | Nightly prompt used raw `curl -X POST /v1/pages` to add papers. Notion's DB query index is eventually consistent (~10-30s lag), so a paper POSTed at T+0 doesn't show up in a duplicate-check query at T+5 → next candidate re-posts it. Found 20 duplicate groups incl. 5× OccWorld and 3× AMP. Prose-only "check first" rules failed because the index is the actual race condition | `collect_papers.py add_to_notion()` made idempotent: (a) in-process `_ADDED_THIS_SESSION` set keyed by arxiv_id/title-prefix catches same-session re-adds regardless of index state, (b) `check_notion_exists(url, title=...)` now checks BOTH arxiv_id substring AND normalized-title equality, (c) new `--add-paper` CLI (stdin JSON + `--areas/--labs/--venue` flags) exposes this to the agent atomically. Nightly prompt (setup/create-research-task.ts step 4b) forbids raw curl POST for paper adds. Existing 20 duplicate groups cleaned up by `/tmp/dedupe_notion_papers.py` (kept the page with most children, backfilled URL from losers, archived the rest) |
+| Same paper double-created on an on-demand request (not just the nightly job) | On 2026-05-28 a subagent processing "Robotic World Model" (2501.10100) ran `collect_papers.py --add-paper` **in the background** and never read its `ADDED <page_id>` output. It then tried to *find* the just-created page by querying Notion — but the query index hadn't caught up (eventual consistency, ~10-30s), so the lookup returned empty. Concluding "the page wasn't created," it fell back to **raw `curl POST /v1/pages`**, producing a second page. The `--add-paper` idempotency was fine; the agent simply went around it. Raw POST bypasses every in-script guard, so prose ("never raw POST") can't prevent this | Two-part fix. (1) **Structural healer:** `collect_papers.py --dedupe` groups all pages by arxiv_id / normalized title, keeps the richest (most child blocks), backfills a missing URL onto the keeper, archives the rest. Wired as a third `ExecStart` in `paperclaw-qa-heal.service` (every 5 min); all three ExecStarts now carry a `-` prefix so one healer's failure no longer blocks the others. Catches duplicates regardless of how they were created. (2) **Prompt + tooling:** `--add-paper` now prints `SKIPPED already-in-notion <page_id>` (id included) and `add_to_notion` returns the existing id, so the agent never needs a post-create lookup. Subagent step 3 rewritten: run `--add-paper` in the foreground, capture the `<page_id>` from stdout, never query-to-find a just-created page, never raw POST |
 | Agent stops uploading to Notion mid-session, claims "토큰 만료" / "Notion API 토큰 문제" — token is actually fine | Notion's PATCH `/blocks/{id}/children` occasionally returns `401 "API token is invalid"` for non-auth reasons (large/oddly-formatted payloads, transient edge issues). On 2026-05-05 a 43KB DreamToFly batch hit this; the same token had just succeeded on a `POST /pages` call and a `GET /pages/{id}` call moments later, and the same PATCH succeeded once split into 4 × ~10KB batches. The agent correctly recovered for that one paper, but **locked the wrong "token expired" mental model** into context. ~1100 turns later, asked to upload RAM paper and LoRA blog, it skipped Notion entirely and only saved translations to `/tmp/` (lost when container exits), telling the user "Notion 토큰 문제로 즉시 업로드 불가" — pure misdiagnosis | (1) **Never conclude "token expired" from a single 401.** If `GET /pages/{id}` with the same `$NOTION_TOKEN` returns 200, the token is valid — full stop. (2) On PATCH 401, **first action is split the children array in half and retry** before suspecting auth. Keep halving until either it succeeds or you get a 401 on a single-block payload (only then is the token actually suspect). (3) Once you've decided to translate something, **always create the Notion page and PATCH blocks** — `/tmp/` files are ephemeral and wasted work. If you genuinely cannot upload, raise the failing curl command + full response to the user instead of silently saving to `/tmp/` |
 
 ## Language Policy (Token Optimization)
@@ -161,19 +165,24 @@ The output **MUST** be a section-by-section verbatim treatment (one `notebooklm 
    notebooklm create "Paper: ARXIV_ID_OR_SLUG" --json
    ```
 3. **Pick the source URL based on paper type:**
-   - **Arxiv paper** → check ar5iv availability first (ar5iv returns HTTP 200 even for failed conversions — validate content):
+   - **Arxiv paper** → ⚠️ **use arxiv-native HTML (`arxiv.org/html/...`), NOT ar5iv.** ar5iv is frozen at **v1** of a paper and silently serves v1 even when you request `.../html/IDv3` (HTTP 200, stale content — same bytes for every version). For any paper revised after first submission, v1 has fewer/renumbered figures and a different bibliography than the current version. **This is the root cause of "figure numbers one too low" and "reference numbers differ":** a revision that inserts one figure shifts every later number up by one, and ar5iv never sees it. `arxiv.org/html/ARXIV_ID` always serves the **latest** version in the identical LaTeXML format. Pick the source in this priority order:
      ```bash
      python3 -c "
      import urllib.request, sys
-     url = 'https://ar5iv.labs.arxiv.org/html/ARXIV_ID'
-     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-     html = urllib.request.urlopen(req, timeout=15).read().decode('utf-8', errors='ignore')
-     ok = len(html) > 50000 and 'ltx_document' in html and 'Fatal error' not in html
-     print('OK' if ok else 'FAIL')
+     def fetch(u):
+         req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+         return urllib.request.urlopen(req, timeout=15).read().decode('utf-8', errors='ignore')
+     ok = lambda h: len(h) > 50000 and 'ltx_document' in h and 'Fatal error' not in h
+     for u in ('https://arxiv.org/html/ARXIV_ID',            # latest version — PREFERRED
+               'https://ar5iv.labs.arxiv.org/html/ARXIV_ID'):  # fallback (often stale v1)
+         try:
+             if ok(fetch(u)): print(u); sys.exit(0)
+         except Exception: pass
+     print('PDF')   # no usable HTML — use the PDF (always the latest version too)
      "
      ```
-     - If **OK**: `notebooklm source add "https://ar5iv.labs.arxiv.org/html/ARXIV_ID" --notebook <id>`
-     - If **FAIL**: `notebooklm source add "https://arxiv.org/pdf/ARXIV_ID" --notebook <id>`
+     - Prints a **URL** → `notebooklm source add "<that url>" --notebook <id>`, and **use that same URL in Phase 3**.
+     - Prints **PDF** → `notebooklm source add "https://arxiv.org/pdf/ARXIV_ID" --notebook <id>`, and use the Phase 3b PDF fallback.
    - **Non-arxiv paper** (e.g. LeCun AMI on OpenReview, ICLR/NeurIPS-only papers): download the PDF locally, **verify it is the full paper (not a slide deck or talk)**, then add to notebook. Use slug (not arxiv_id) as notebooks.json key:
      ```bash
      # OpenReview blocks default curl — use a full browser UA + Referer.
@@ -219,10 +228,11 @@ notebooklm ask "논문의 '{SECTION_NAME}' 섹션 전체를 한국어로 번역�
 2. 전문용어(예: motion matching, policy, reward, reinforcement learning 등)는 영어 그대로 유지
 3. 일반적인 단어는 문맥이 자연스럽도록 한국어로 번역
 4. 수식 참조(예: 식 (1), Eq. (3))와 Figure 참조(Fig. 2)는 원문 그대로 유지
-5. subsection 제목도 포함하되 '영어 원문 (한국어 번역)' 형식으로
-6. **수식은 LaTeX \$...\$ 혹은 \$\$...\$\$로 감싸지 말고 평문으로 출력해. 예: \$s = Enc(x)\$ ❌ → s = Enc(x) ✅. \$(x, y)\$ ❌ → (x, y) ✅**
-7. **문단 내부에서 임의로 줄바꿈(\\n)하지 마. 한 문단은 한 줄로 이어서 써. 문단 구분이 필요하면 빈 줄(\\n\\n) 하나로만 구분해**
-8. 번역 텍스트만 출력. 메타 코멘트 금지" --notebook <id>
+5. **본문의 인용 표시(citation marker)는 원문에 있는 형태 그대로 유지해. 원문이 [12]처럼 번호를 쓰면 그 번호를 그대로, Smith et al. [2023]처럼 저자-연도를 쓰면 그 형태 그대로 유지해. 절대 인용 번호를 새로 매기거나(renumber), 섹션마다 1부터 다시 세거나, 원문에 없는 번호를 만들어내지 마. 원문에 인용 표시가 없는 자리에 [번호]를 추가하지 마**
+6. subsection 제목도 포함하되 '영어 원문 (한국어 번역)' 형식으로
+7. **수식은 LaTeX \$...\$ 혹은 \$\$...\$\$로 감싸지 말고 평문으로 출력해. 예: \$s = Enc(x)\$ ❌ → s = Enc(x) ✅. \$(x, y)\$ ❌ → (x, y) ✅**
+8. **문단 내부에서 임의로 줄바꿈(\\n)하지 마. 한 문단은 한 줄로 이어서 써. 문단 구분이 필요하면 빈 줄(\\n\\n) 하나로만 구분해**
+9. 번역 텍스트만 출력. 메타 코멘트 금지" --notebook <id>
 ```
 
 **If `$OUTPUT_LANGUAGE=en`** (reformat, do NOT translate):
@@ -244,8 +254,9 @@ notebooklm ask "Translate the '{SECTION_NAME}' section of this paper into {LANG}
 2. Keep technical terms (e.g. policy, reward, reinforcement learning, motion matching) in their original English form; translate only the surrounding prose.
 3. Subsection headings appear as 'English original ({LANG} translation)'.
 4. Preserve equation references (Eq. (3), Fig. 2) unchanged. Render equations as plain text — never wrap in \$...\$.
-5. One paragraph per line; separate paragraphs with a single blank line.
-6. Output the translated text only. No meta commentary." --notebook <id>
+5. Preserve inline citation markers EXACTLY as in the source. If the source uses [12], keep [12]; if it uses 'Smith et al. [2023]', keep that form. Never renumber, never restart numbering per section, never invent a number the source does not have, never add [N] where the source has no citation.
+6. One paragraph per line; separate paragraphs with a single blank line.
+7. Output the translated text only. No meta commentary." --notebook <id>
 ```
 
 If a section's response is truncated, follow up with the same prompt skeleton but: *"The '{SECTION_NAME}' section was truncated. Continue from where you stopped, same rules. Output only the continuation, no meta commentary."* (in `$OUTPUT_LANGUAGE` for ko, in English for en/other).
@@ -274,30 +285,52 @@ HEADING_COUNT=$(curl -s "https://api.notion.com/v1/blocks/PAGE_ID/children?page_
 echo "Sections: $SEC_COUNT, Notion headings: $HEADING_COUNT"
 ```
 
+**Step 2-D: Verify inline citation numbers against the real bibliography.** NotebookLM does not reliably keep a paper's citation markers even with Step 2-B rule 5 — it tends to renumber them sequentially per section, and for **author-year papers it fabricates numeric `[N]` markers that do not exist in the source at all**. Run the auditor after upload (arxiv papers only):
+
+```bash
+python3 research-papers/verify_citations.py --page PAGE_ID   # add --arxiv ID if Paper URL isn't set yet
+```
+
+- Exit 0 → citations consistent with the real bibliography. Done.
+- **author-year paper, FABRICATED** → the `[N]` numbers are invented; re-run with `--apply` to strip them (a missing number is correct; a wrong number is not — same policy as `en` reformatting). Do NOT try to "map" them — there is no numeric scheme to map to.
+- **numeric paper, OUT-OF-RANGE / RENUMBERED** → NotebookLM resequenced real numbers. This needs a per-block remap against the source inline anchors (`arxiv.org/html/ID` → `<a href="#bib.bibNN">N</a>`), context-anchored like `research-papers/fix_socialnav_cites.py`. NOT auto-fixable — build the per-block map by hand and verify before PATCHing.
+
+The classifier reads the paper's bibliography style from arxiv HTML (numeric `[1]..[N]` bib tags vs. `Author et al. [YEAR]` tags). Note native-latest HTML sometimes renders without the reference list (e.g. 2501.10100 latest omits it); the script falls back to ar5iv / `…v1` to recover a parseable bibliography.
+
 #### Phase 3: Figure Extraction (Build Figure Map)
 
-Run this Python script to parse ar5iv HTML and build `/tmp/figure_map.json`. ar5iv assigns `<figure id="S3.F2">` where `S3` = section 3, `F2` = figure 2 — this gives the section mapping directly.
+Run this Python script to parse the LaTeXML HTML and build `/tmp/figure_map.json`. Both arxiv-native HTML and ar5iv assign `<figure id="S3.F2">` where `S3` = section 3, `F2` = figure 2 — this gives the section mapping directly. **Prefer arxiv-native HTML (latest version); fall back to ar5iv only if native HTML is unavailable** — see the Phase 1 root-cause note about ar5iv being frozen at v1.
 
 ```bash
 python3 << 'PYEOF'
 import urllib.request, re, json, sys
+from urllib.parse import urljoin
 
 ARXIV_ID = "REPLACE_WITH_ARXIV_ID"
-url = f"https://ar5iv.labs.arxiv.org/html/{ARXIV_ID}"
-base = "https://ar5iv.labs.arxiv.org/"
+# arxiv-native first (always latest version), ar5iv second (often stale v1).
+candidates = [f"https://arxiv.org/html/{ARXIV_ID}",
+              f"https://ar5iv.labs.arxiv.org/html/{ARXIV_ID}"]
+html = src_url = None
+for url in candidates:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        h = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", errors="ignore")
+    except Exception:
+        continue
+    # 200 is returned even for failed conversions (tiny error page) — validate.
+    if len(h) > 50000 and "ltx_document" in h and "Fatal error" not in h:
+        html, src_url = h, url
+        break
 
-try:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", errors="ignore")
-except Exception as e:
-    print(json.dumps({"error": str(e)}), file=sys.stderr)
-    sys.exit(1)
-
-# Validate ar5iv content — it returns 200 even for failed conversions (tiny error page)
-if len(html) < 50000 or "ltx_document" not in html or "Fatal error" in html:
-    print(json.dumps({"error": "ar5iv conversion failed — no figures available"}), file=sys.stderr)
+if html is None:
+    print(json.dumps({"error": "no usable HTML — use the PDF fallback"}), file=sys.stderr)
     print(json.dumps({}))
     sys.exit(0)
+
+# Resolve relative image src. arxiv-native embeds the version in the path via
+# <base href="/html/IDv3/">; ar5iv serves from its own host root.
+bm = re.search(r'<base[^>]+href="([^"]+)"', html, re.IGNORECASE)
+base = urljoin(src_url, bm.group(1)) if bm else src_url.rsplit("/", 1)[0] + "/"
 
 figures = {}
 pattern = re.compile(r'<figure[^>]+id="([^"]*)"[^>]*>(.*?)</figure>', re.DOTALL | re.IGNORECASE)
@@ -308,9 +341,7 @@ for m in pattern.finditer(html):
     img_m = re.search(r'<img[^>]+src="([^"]+)"', body, re.IGNORECASE)
     if not img_m:
         continue
-    src = img_m.group(1)
-    if not src.startswith("http"):
-        src = base + src.lstrip("./")
+    src = urljoin(base, img_m.group(1))
 
     cap_m = re.search(r'<figcaption[^>]*>(.*?)</figcaption>', body, re.DOTALL | re.IGNORECASE)
     caption = ""
@@ -331,7 +362,7 @@ Save the output: `python3 << 'PYEOF' ... PYEOF > /tmp/figure_map.json`
 - `F1` → introduction or early section (no section prefix = first major section)
 - `A1.F5` → appendix section A1
 
-**If ar5iv fails** (script outputs `{}`), use the **PDF figure extraction fallback** below — do NOT skip figures or block translation.
+**If no HTML is available** (script outputs `{}`), use the **PDF figure extraction fallback** below — do NOT skip figures or block translation.
 
 #### Phase 3b: PDF Figure Extraction Fallback (when ar5iv fails)
 
@@ -528,6 +559,23 @@ If NotebookLM fails (auth expired, rate limited, errors), fall back to reading a
 **CRITICAL: When a user asks about a paper, you MUST (1) answer the question AND (2) save the Q&A to the paper's Notion page. Both steps are MANDATORY.**
 
 #### Step 1: Identify the paper and get Notion PAGE_ID
+
+> **🚨 ALWAYS identify the paper from the message in front of you. NEVER reuse a page ID left over from an earlier paper in this session/task.** The recurring bug (MBPO Q&A landing on "Robotic World Model: A Neural Network Simulator" instead of "Uncertainty-Aware Robotic World Model", 2026-05-30) was a stale in-context page ID.
+
+Run the resolver — it reads the user's whole message and figures out the paper from concrete evidence (arxiv id/URL → distinctive title words → a pasted 번역본/원본 excerpt matched against page bodies), and refuses to guess when it can't tell:
+
+```bash
+python3 /workspace/group/research-papers/resolve_paper.py --text "FULL_USER_MESSAGE_INCLUDING_ANY_PASTED_TEXT"
+# -> CONFIDENT\t<page_id>\t<title>\t<how>      (use this page_id + a title fragment for --expect-title)
+# -> ASK_USER (exit 2) + candidate list        (ASK the user which paper — do NOT pick one yourself)
+```
+
+- **CONFIDENT** → use the printed `<page_id>` in Step 4, and pass a distinctive fragment of the printed `<title>` (or the arxiv id) to `--expect-title`.
+- **ASK_USER** → the evidence was inconclusive (e.g. a bare follow-up like "그럼 online이야?" or a paste with no title/link/body match). **Ask the user which paper before saving.** Guessing is exactly what caused the bug. This is also why a pure follow-up question needs the paper named or the resolver run against the *combined* recent context.
+
+Why this exists: Notion's search API matches titles, not body text, so a pasted translated passage can't be found by server-side search — `resolve_paper.py` fetches a small set of title-narrowed candidate bodies and substring-matches the paste locally. The old fallback (query DB by title `contains`) only worked when the user *named* the paper.
+
+Direct title query (only when you already know the exact keyword, e.g. user named the paper):
 ```bash
 curl -s -X POST "https://api.notion.com/v1/databases/$NOTION_RESEARCH_DB/query" \
   -H "Authorization: Bearer $NOTION_TOKEN" \
@@ -564,6 +612,7 @@ The callout layout the script produces is the Parkour-style **collapsible Q&A**:
 ```bash
 python3 /workspace/group/research-papers/save_qa_callout.py \
   --page  PAGE_ID \
+  --expect-title "Uncertainty-Aware"   # distinctive fragment of the paper title (or its arxiv id) \
   --question "Q: ..." \
   --answer-file /tmp/answer.md \
   --section "4.3"          # heading-text fragment; omit to append at end
@@ -571,6 +620,7 @@ python3 /workspace/group/research-papers/save_qa_callout.py \
 
 What the script guarantees:
 
+- **`--expect-title` is REQUIRED.** Before writing anything, the script fetches the target page's Title (and Paper URL) and aborts if your expected substring isn't there. Pass a distinctive fragment of the title you got in Step 1 (e.g. `"Uncertainty-Aware"`) or the arxiv id (e.g. `"2504.16680"`). This is the hard guard against filing a Q&A under the wrong paper — if it fails, you reused the wrong page ID; go back to Step 1 and re-resolve. Do NOT pass a generic word that matches many papers.
 - The PATCH URL is **always** `/blocks/PAGE_ID/children` (page as parent). Never any other block as parent — that was the recurring footgun.
 - `--section` is matched against top-level heading text (case-insensitive substring), and the callout is placed after the **last top-level block** of that section (i.e., immediately before the next equal-or-shallower heading). If no heading matches, the script exits with an error rather than guessing.
 - After the PATCH, the script re-fetches top-level children and confirms the new callout ID is in the list. If it landed nested somewhere wrong, the script deletes it and exits non-zero.
@@ -701,9 +751,12 @@ Steps (in this order, no exceptions):
 
 2. Figure extraction (ar5iv first, PyMuPDF fallback — Phase 3).
 
-3. **Notion page creation via `collect_papers.py --add-paper`** (NOT raw `curl POST /v1/pages`). The script does a second-layer dedup with session cache and prints `ADDED <page_id>` on success or `SKIPPED already-in-notion` on dedup hit. Raw POST is forbidden because it bypasses dedup and has caused duplicate-page incidents.
+3. **Notion page creation via `collect_papers.py --add-paper`** (NOT raw `curl POST /v1/pages`). The script does a second-layer dedup with session cache and prints exactly one line: `ADDED <page_id>` on create, `SKIPPED already-in-notion <page_id>` on dedup hit, or `ERROR <msg>`. **Capture that page_id from the command's stdout** — it is the page you PATCH into in step 4.
+   - **Run it in the FOREGROUND and read its output.** Never run `--add-paper` with `run_in_background` and walk away — you must see the `ADDED/SKIPPED <page_id>` line.
+   - **Never query Notion to "find" the page you just created.** Notion's query index lags ~10-30s behind a write, so a post-create lookup often returns empty and tricks you into thinking the page wasn't made. The `<page_id>` is already in the `--add-paper` output; use it directly.
+   - **Never fall back to raw `curl POST /v1/pages`.** It bypasses all dedup and is the exact cause of the 2026-05-28 "Robotic World Model" double-create. If `--add-paper` prints `ERROR`, surface that error — do not hand-roll a POST.
 
-4. PATCH translated sections + figures into the page returned by step 3. Verify with `GET /v1/pages/<id>` that the page belongs to THIS paper (Title property matches) before patching — guards against page-id mix-ups across parallel subagents.
+4. PATCH translated sections + figures into the page id from step 3. Verify with `GET /v1/pages/<id>` that the page belongs to THIS paper (Title property matches) before patching — guards against page-id mix-ups across parallel subagents.
 
 5. Save initial Q&A callouts if appropriate.
 
@@ -737,7 +790,7 @@ Earlier versions of this doc had a fast-path for single papers (main agent proce
 - "이 논문 추가해: https://arxiv.org/abs/2401.12345" → Resolve, append to queue, dispatch 1 background subagent
 - (Mid-batch) "아 이것도 추가해줘: <url4>" → Append to queue; if `in_progress_count < 3`, dispatch immediately, else it waits as `pending`
 - "Sergey Levine 교수님 최근 논문 뭐 나왔어?" → Search S2, list papers, ask if user wants to add them
-- "Learning Agile 논문에서 reward 어떻게 설계했어?" → NotebookLM ask, answer in detail, then `save_qa_callout.py --section Method` (Parkour-style toggle Q&A)
+- "Learning Agile 논문에서 reward 어떻게 설계했어?" → NotebookLM ask, answer in detail, then `save_qa_callout.py --expect-title "Learning Agile" --section Method` (Parkour-style toggle Q&A; `--expect-title` is required and must match the resolved page)
 - "이 논문 방법론 설명해줘" → NotebookLM ask, explain step-by-step, save Q&A near Method section
 - "RL에서 DAgger가 뭐야?" → Claude 직접 답변 (일반 개념), 논문 관련이면 해당 섹션에 Q&A 저장
 

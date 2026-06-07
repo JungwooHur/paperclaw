@@ -480,7 +480,7 @@ def strip_bot_prefix(content: str) -> str:
 # ---- Save -----------------------------------------------------------------
 
 def save_callout(page_id: str, question: str, answer_md: str,
-                 dry_run: bool) -> bool:
+                 expect_title: str, dry_run: bool) -> bool:
     if dry_run:
         print(f"    DRY: would save Q='{question[:60]}' to page={page_id[-12:]}",
               file=sys.stderr)
@@ -493,6 +493,7 @@ def save_callout(page_id: str, question: str, answer_md: str,
         r = subprocess.run(
             ["python3", SAVE_SCRIPT,
              "--page", page_id,
+             "--expect-title", expect_title,
              "--question", question[:2000],
              "--answer-file", answer_path],
             capture_output=True, text=True,
@@ -596,7 +597,8 @@ def main() -> None:
             print(f"[{chat_jid[:20]:20}] {m['timestamp']}: missing Q&A for "
                   f"paper='{paper['title'][:50]}'", file=sys.stderr)
             print(f"    Q: {user_msg['content'][:80]}", file=sys.stderr)
-            ok = save_callout(paper["id"], question, answer_md, args.dry_run)
+            ok = save_callout(paper["id"], question, answer_md,
+                              paper["title"], args.dry_run)
             if ok:
                 saved_count += 1
                 # Add to cache so subsequent messages don't re-create
