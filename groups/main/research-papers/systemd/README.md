@@ -3,7 +3,7 @@
 `auto_fix_qa.py` runs every 5 minutes via a systemd user timer. It scans every page in `$NOTION_RESEARCH_DB` and repairs Q&A callouts that are either:
 
 - nested under a paragraph/heading instead of top-level (placement bug), OR
-- in the pre-Parkour format (default color, question-in-callout rich_text) instead of the gray-background `💡 callout → toggle(question) → answer` layout.
+- in the legacy format (default color, question-in-callout rich_text) instead of the gray-background `💡 callout → toggle(question) → answer` layout.
 
 The script is **structural prevention**, not a style rule — the agent has repeatedly ignored written instructions to use `save_qa_callout.py`, so this self-heals the state out of band.
 

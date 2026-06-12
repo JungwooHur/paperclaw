@@ -20,7 +20,7 @@ it; this makes the wrong page a hard failure.
 Usage:
   python3 save_qa_callout.py \
       --page <page_id> \
-      --expect-title "Uncertainty-Aware"   # distinctive title fragment or arxiv id
+      --expect-title "Distinctive-Fragment" # distinctive title fragment or arxiv id
       --question "Q: ..." \
       --answer-file /tmp/answer.md \
       --section "4.3"           # heading-text fragment; omit to append at end
@@ -315,7 +315,7 @@ def build_answer_blocks(answer_md: str) -> list[dict]:
 def build_callout(question: str, answer_md: str) -> dict:
     """Build the standard Paper-DB Q&A block.
 
-    Layout (matches Perceptive Humanoid Parkour and other reference pages):
+    Layout (matches the toggle-style reference pages):
 
         callout (icon: 💡, gray_background, empty rich_text)
         └── toggle (rich_text: "Q: ...question...")

@@ -24,11 +24,25 @@ groups/main/research-papers/*
 !groups/main/research-papers/save_qa_callout.py
 !groups/main/research-papers/auto_fix_qa.py
 !groups/main/research-papers/auto_save_qa.py
+!groups/main/research-papers/verify_citations.py
 !groups/main/research-papers/systemd/
 
-# Secrets
+# Secrets & personal data (public repo — see scripts/check-sensitive.sh)
 *.keys.json
 .env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.pdf
+**/attachments/
+**/conversations/
+**/sessions/
+notebooks.json
+papers_queue.json
+.claude/settings.local.json
 
 # OS
 .DS_Store

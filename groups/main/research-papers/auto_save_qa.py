@@ -47,9 +47,9 @@ HTTP_TIMEOUT = 30
 # in unrelated chat text (e.g. a task-completion report, a code block, a
 # general ML question), it's a false-positive magnet for Tier 3 distinct-kw
 # scoring. Keep it here. Overly aggressive filtering is safer than leaking
-# generic words: the LeWorldModel vs. "Variable Impedance Control in ...
-# Action Space" misdetection in April 2026 was caused by "Control", "Space",
-# and "Action" matching scattered mentions of those ML primitives.
+# generic words: an April 2026 misdetection between two papers was caused by
+# "Control", "Space", and "Action" matching scattered mentions of those ML
+# primitives.
 COMMON_WORDS = {
     "the", "and", "for", "with", "from", "via", "using", "based", "towards",
     "learning", "model", "models", "training", "system", "method", "methods",
@@ -163,7 +163,7 @@ def _block_text(b: dict) -> str:
 
 
 def fetch_top_callouts(page_id: str) -> list[dict]:
-    """Return [{'question': str, 'body': str}] for each top-level Parkour
+    """Return [{'question': str, 'body': str}] for each top-level toggle-style
     toggle callout on the page — used for already-saved detection by
     comparing either the question text or the answer body."""
     cur, out = None, []
@@ -182,7 +182,7 @@ def fetch_top_callouts(page_id: str) -> list[dict]:
         question = ""
         body_parts: list[str] = []
         if k and k[0]["type"] == "toggle":
-            # Parkour-style: toggle label is the question, toggle children are body
+            # toggle-style: toggle label is the question, toggle children are body
             question = "".join(r["plain_text"]
                                for r in k[0]["toggle"].get("rich_text", []))
             tpath = f"/blocks/{k[0]['id']}/children?page_size=100"
@@ -245,7 +245,7 @@ def _distinct_kw(text: str, kws: list[str]) -> int:
 # Populated lazily by load_paper_pages() — keyword → number of paper titles
 # that contain that keyword (case-insensitive). Used to break ties when
 # several papers have the same distinct-kw count against the chat text:
-# a paper whose matched kws are mostly title-unique (like "LeWorldModel")
+# a paper whose matched kws are mostly title-unique compound names
 # beats one whose matched kws are widely shared generic English (like
 # "world" + "planning"). Inverse document frequency — classic trick.
 _KW_DF: dict[str, int] = {}
@@ -261,8 +261,8 @@ def _weighted_kw(text: str, kws: list[str]) -> float:
             df = _KW_DF.get(kw.lower(), 1)
             # idf(x) = 1 / df — rare kws weigh more. Use 1/df rather than
             # log(N/df) so the difference between df=1 and df=20 is very
-            # pronounced (matters most for compound paper names like
-            # "LeWorldModel" that should dominate any generic kw).
+            # pronounced (matters most for title-unique compound paper
+            # names that should dominate any generic kw).
             score += 1.0 / df
     return score
 
@@ -316,7 +316,7 @@ def active_paper_at(window: list[dict], papers: list[dict],
     # Tier 2 — distinct keywords in current pair (no "paper" mention
     # needed). Base filter: ≥2 distinct kws AND IDF-weighted score ≥ 0.5
     # (i.e. at least one matched kw must be reasonably rare — a title-
-    # unique name like "LeWorldModel" scores 1.0, so this passes any
+    # unique compound name scores 1.0, so this passes any
     # paper with at least one distinctive kw hit). The weight threshold
     # suppresses bogus matches where the only signal is 2 generic English
     # words shared by 20+ paper titles (e.g. "world" + "planning").
@@ -562,7 +562,7 @@ def main() -> None:
 
             # Dedup check across ALL plausible paper pages, not just the
             # resolved one. Historical incident: the resolver used to pick
-            # the wrong paper for JEPA contrastive-loss / GAN Q&As, and
+            # the wrong paper for two concept Q&As, and
             # the per-page-only dedup would have happily created bogus
             # duplicates on the wrong paper's page. By checking any paper
             # page that shares ≥1 distinct kw with the current pair, we
