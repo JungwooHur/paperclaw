@@ -65,9 +65,12 @@ scan_text() {  # $1 = label of what is being scanned, stdin = text
   [ -z "$text" ] && return 0
 
   check() {  # $2 = pattern, $3 = exclusion ('' = none), $4 = message
+    # Case-insensitive on purpose: uppercase variants (FOO@KAIST.AC.KR, A-F hex
+    # UUIDs) must not bypass the scan. Over-matching is the safe direction —
+    # the override env var exists for genuine false positives.
     local hits
-    hits=$(printf '%s\n' "$text" | grep -nIE "$2" || true)
-    [ -n "$3" ] && hits=$(printf '%s\n' "$hits" | grep -vE "$3" || true)
+    hits=$(printf '%s\n' "$text" | grep -niIE "$2" || true)
+    [ -n "$3" ] && hits=$(printf '%s\n' "$hits" | grep -viE "$3" || true)
     if [ -n "$hits" ]; then
       say ""
       say "✗ [$1] $4"
@@ -110,9 +113,12 @@ case "$MODE" in
         continue
       fi
       printf '%s' "$f" | grep -qE "$SELF_EXCLUDE_RE" && continue
-      # scan only ADDED lines of this file's staged diff
+      # scan only ADDED lines of this file's staged diff. Drop everything
+      # before the first hunk header (@@) instead of grepping out '^+++' —
+      # an added line like '++i;' renders as '+++i;' in the diff and would
+      # be silently skipped by a '^+++' filter.
       git diff --cached -U0 --no-color -- "$f" \
-        | grep -E '^\+' | grep -vE '^\+\+\+' | cut -c2- \
+        | sed -n '/^@@/,$p' | grep -E '^\+' | cut -c2- \
         | scan_text "$f" || FAIL=1
     done <<< "$STAGED"
     ;;
