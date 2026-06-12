@@ -59,9 +59,24 @@ systemctl --user restart paperclaw
 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
 
+## Public Repo Hygiene (MANDATORY before every commit/push/PR)
+
+This is a **public repository**. The owner's personal data and research activity must never reach tracked files, commit messages, or PR titles/bodies.
+
+**Never include, anywhere git-tracked or GitHub-visible:**
+- Secrets/tokens of any kind (`.env` values, Notion/Claude/X tokens, cookies)
+- Personal identifiers: emails, phone numbers, real WhatsApp JIDs, Notion page/DB UUIDs
+- **Specific papers the owner processed**: arxiv IDs, paper titles, author names tied to actual usage. When documenting an incident, genericize: "paper A / paper B", `<arxiv-id>`, "an author-year paper". Famous papers are fine ONLY as illustrative examples (like the README's), never as incident records.
+- Runtime artifacts: `store/`, `data/`, `logs/`, `attachments/`, `conversations/`, `notebooks.json`, `papers_queue.json`, `research-papers/config.json`, any `.db`/`.pdf`
+
+**Enforcement (structural, not just prose):**
+- `.husky/pre-commit` + `.husky/commit-msg` run `scripts/check-sensitive.sh`, which blocks forbidden paths (even `git add -f`) and scans added lines / commit messages for secrets, emails, phones, JIDs, arxiv IDs, and UUIDs.
+- False positive? Fix the wording first; only as a last resort `PAPERCLAW_ALLOW_SENSITIVE=1 git commit ...`.
+- PR bodies aren't covered by git hooks — apply the same rules manually when writing them.
+
 ## Living Documentation Policy
 
-**Every debugging session that finds a root cause must update the relevant CLAUDE.md and push.**
+**Every debugging session that finds a root cause must update the relevant CLAUDE.md and push.** Documentation written under this policy is still subject to Public Repo Hygiene above — record the *lesson*, never the *specific paper*.
 
 This codebase improves through accumulated operational knowledge. When a bug is found and fixed in a terminal session:
 

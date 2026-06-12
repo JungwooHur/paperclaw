@@ -159,8 +159,8 @@ def _find_existing_page(paper_url, title=None):
     # A blank value here is catastrophic: Notion's `url equals ""` matches
     # EVERY page (returns a full 100-row page), so `results[0]` would be an
     # arbitrary false "duplicate". That is exactly the 2026-06-02 incident
-    # where a SocialNav add (whose paper_url had resolved to "") was reported
-    # as already-existing and returned an unrelated LongTraceRL page.
+    # where adding a paper whose paper_url had resolved to "" was reported
+    # as already-existing and returned an unrelated paper's page.
     arxiv_id = extract_arxiv_id(paper_url)
     if arxiv_id or paper_url:
         url_filter = (
@@ -293,8 +293,8 @@ def add_to_notion(paper, areas, labs, venue_field):
 
     Runs check_notion_exists() first; if duplicate, returns the existing
     page dict. Also keeps a session cache to survive Notion's
-    eventually-consistent query index (observed: Pessimistic Bootstrapping
-    + AMP + OccWorld all added 3-5x within a single minute, because a
+    eventually-consistent query index (observed: several papers each added
+    3-5x within a single minute, because a
     query right after POST didn't yet see the new page).
     """
     url = "https://api.notion.com/v1/pages"

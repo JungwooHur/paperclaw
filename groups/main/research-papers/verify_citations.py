@@ -25,7 +25,7 @@ What this does:
      same policy en-mode reformatting already uses (a wrong number is worse than
      no number). Numeric-paper anomalies are reported but NOT auto-rewritten:
      remapping a renumbered numeric paper needs the source context per block
-     (see fix_socialnav_cites.py for a hand-verified example) and is unsafe to
+     (needs a hand-verified per-block remap, built per paper) and is unsafe to
      guess.
 
 Exit code: 0 = clean, 1 = anomalies found (so the agent/healer can react).
@@ -43,8 +43,8 @@ import auto_save_qa as aq
 
 # Native-latest first (matches the figures the reader sees), then ar5iv and
 # explicit v1 as fallbacks — native-latest sometimes renders WITHOUT the
-# bibliography (e.g. 2501.10100 latest is 215KB w/ no refs; v1 is 437KB w/ all
-# 50). For citation auditing we need an HTML that actually carries the ref list.
+# bibliography (observed: latest render with no refs at all; v1 carried the
+# full list). For citation auditing we need an HTML that actually carries the ref list.
 ARXIV_CANDIDATES = ("https://arxiv.org/html/{id}",
                     "https://ar5iv.labs.arxiv.org/html/{id}",
                     "https://arxiv.org/html/{id}v1")
@@ -226,7 +226,7 @@ def main():
             anomalies = True
             print(f"  RENUMBERED: {resets} per-section restarts and highest used "
                   f"[{distinct_max}] << real [{max_n}] — looks resequenced. "
-                  f"Needs per-block remap (see fix_socialnav_cites.py); not "
+                  f"Needs a hand-built per-block remap; not "
                   f"auto-fixable.")
         if not anomalies:
             print(f"  OK: numbers within 1..{max_n}, no resequencing signature.")

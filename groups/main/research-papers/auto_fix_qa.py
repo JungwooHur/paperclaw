@@ -3,7 +3,7 @@
 
 Recurring problem: the agent keeps hand-rolling `PATCH /blocks/{paragraph}/children`
 for Q&A saves instead of calling `save_qa_callout.py`, which leaves callouts
-nested under random paragraphs and/or in the pre-Parkour default-color layout.
+nested under random paragraphs and/or in the legacy default-color layout.
 Four rounds of increasingly strict CLAUDE.md rules have not broken this habit,
 so this script runs out-of-band (systemd timer) to self-heal the state.
 
@@ -14,7 +14,7 @@ For every paper page in $NOTION_RESEARCH_DB:
        - color is not gray_background
        - rich_text is non-empty (legacy question-in-callout format)
        - first child is not a toggle
-  3. Extract question + answer children, rebuild as the Parkour layout
+  3. Extract question + answer children, rebuild as the toggle layout
      (gray 💡 callout → toggle(question) → answer blocks), place at the
      correct top-level position, delete the broken original.
   4. Section placement: look for a "<num>.<num>" prefix in the question;

@@ -1,1 +1,2 @@
+bash scripts/check-sensitive.sh --staged
 npm run format:fix
