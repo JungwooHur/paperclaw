@@ -35,6 +35,7 @@ Known fixes accumulated so far:
 | Same paper added 2-5× to Notion DB in the nightly job | Nightly prompt used raw `curl -X POST /v1/pages` to add papers. Notion's DB query index is eventually consistent (~10-30s lag), so a paper POSTed at T+0 doesn't show up in a duplicate-check query at T+5 → next candidate re-posts it. Found 20 duplicate groups (worst case the same paper added 5×). Prose-only "check first" rules failed because the index is the actual race condition | `collect_papers.py add_to_notion()` made idempotent: (a) in-process `_ADDED_THIS_SESSION` set keyed by arxiv_id/title-prefix catches same-session re-adds regardless of index state, (b) `check_notion_exists(url, title=...)` now checks BOTH arxiv_id substring AND normalized-title equality, (c) new `--add-paper` CLI (stdin JSON + `--areas/--labs/--venue` flags) exposes this to the agent atomically. Nightly prompt (setup/create-research-task.ts step 4b) forbids raw curl POST for paper adds. Existing 20 duplicate groups cleaned up by `/tmp/dedupe_notion_papers.py` (kept the page with most children, backfilled URL from losers, archived the rest) |
 | Same paper double-created on an on-demand request (not just the nightly job) | On 2026-05-28 a subagent processing a paper ran `collect_papers.py --add-paper` **in the background** and never read its `ADDED <page_id>` output. It then tried to *find* the just-created page by querying Notion — but the query index hadn't caught up (eventual consistency, ~10-30s), so the lookup returned empty. Concluding "the page wasn't created," it fell back to **raw `curl POST /v1/pages`**, producing a second page. The `--add-paper` idempotency was fine; the agent simply went around it. Raw POST bypasses every in-script guard, so prose ("never raw POST") can't prevent this | Two-part fix. (1) **Structural healer:** `collect_papers.py --dedupe` groups all pages by arxiv_id / normalized title, keeps the richest (most child blocks), backfills a missing URL onto the keeper, archives the rest. Wired as a third `ExecStart` in `paperclaw-qa-heal.service` (every 5 min); all three ExecStarts now carry a `-` prefix so one healer's failure no longer blocks the others. Catches duplicates regardless of how they were created. (2) **Prompt + tooling:** `--add-paper` now prints `SKIPPED already-in-notion <page_id>` (id included) and `add_to_notion` returns the existing id, so the agent never needs a post-create lookup. Subagent step 3 rewritten: run `--add-paper` in the foreground, capture the `<page_id>` from stdout, never query-to-find a just-created page, never raw POST |
 | Agent stops uploading to Notion mid-session, claims "토큰 만료" / "Notion API 토큰 문제" — token is actually fine | Notion's PATCH `/blocks/{id}/children` occasionally returns `401 "API token is invalid"` for non-auth reasons (large/oddly-formatted payloads, transient edge issues). On 2026-05-05 a 43KB block batch hit this; the same token had just succeeded on a `POST /pages` call and a `GET /pages/{id}` call moments later, and the same PATCH succeeded once split into 4 × ~10KB batches. The agent correctly recovered for that one paper, but **locked the wrong "token expired" mental model** into context. ~1100 turns later, asked to upload two new documents, it skipped Notion entirely and only saved translations to `/tmp/` (lost when container exits), telling the user "Notion 토큰 문제로 즉시 업로드 불가" — pure misdiagnosis | (1) **Never conclude "token expired" from a single 401.** If `GET /pages/{id}` with the same `$NOTION_TOKEN` returns 200, the token is valid — full stop. (2) On PATCH 401, **first action is split the children array in half and retry** before suspecting auth. Keep halving until either it succeeds or you get a 401 on a single-block payload (only then is the token actually suspect). (3) Once you've decided to translate something, **always create the Notion page and PATCH blocks** — `/tmp/` files are ephemeral and wasted work. If you genuinely cannot upload, raise the failing curl command + full response to the user instead of silently saving to `/tmp/` |
+| Translated page had duplicated sections, a one-sentence stub section, and summarized subsections | Three independent failure modes in one processing run: (1) the subagent batched all of a section's subsections into ONE `notebooklm ask`, and NotebookLM compressed them to fit its output limit (~700 chars each vs 5-15k source chars — a summary, not a translation); (2) a slow per-section ask was dispatched as a *background* task, polled, timed out, and the section was re-asked with a trimmed prompt → one-sentence stub; (3) hand-rolled multi-batch PATCH assembly lost track of what was uploaded and re-appended two whole sections → duplicates. Step 2-C's heading-count check passed anyway (duplicates inflate the count) | `research-papers/verify_sections.py` — structural auditor run as a MANDATORY gate (new Step 2-C + subagent template step 5): flags DUPLICATE (with the extra heading ids to archive), CONTENT_LOSS (< 400 chars), SUMMARIZED (translated/source ratio < 0.35; faithful ko translations measure 0.55-0.7), MISSING (vs Step 2-A list). Source spans are measured by locating each `number + title` heading (last occurrence, so ToC hits are skipped) and cutting the tail at References. Plus three new anti-pattern rules: never batch subsections into one ask, never background an ask, never re-append after partial upload without auditing the page |
 
 ## Language Policy (Token Optimization)
 
@@ -152,6 +153,9 @@ When adding a paper, process **ALL sections** through NotebookLM (translate for 
 **⚠️ ANTI-PATTERNS — NEVER do these when the user asks to 정리/리뷰 (organize/review) a paper:**
 - ❌ Writing a summary or review from 2-3 NotebookLM questions (e.g. "핵심 모듈 설명해", "X가 뭐야"). This produces a review, not the full section-by-section output expected.
 - ❌ Asking NotebookLM for "X문장으로 요약" / "summarize in N sentences" / "key takeaways" in any query — summaries lock you into summary mode.
+- ❌ **Batching multiple subsections into ONE `notebooklm ask`** ("Section N 전체(N.1-N.4 포함) 번역해"). NotebookLM compresses to fit its output limit, so every batched subsection comes back **summarized ~5-15× thinner** than a section translated in its own call — even when the prompt says "전문 번역". One call per section/subsection, no matter how slow it feels.
+- ❌ **Running `notebooklm ask` as a background task** and polling its output file. The observed failure chain: poll → timeout → give up → re-ask a trimmed prompt → the section lands as a one-sentence stub. Run asks in the foreground and wait; a slow ask (60-120s) is normal.
+- ❌ **Re-appending sections after a partial multi-batch upload without checking the page.** Hand-rolled PATCH assembly that loses track of what's uploaded produces duplicated sections. After assembly, the Step 2-C auditor is the source of truth — not your memory of which batches went through.
 - ❌ Skipping Step 2-A (section list) and jumping to topic-based questions.
 - ❌ Fewer Notion heading_1/heading_2 blocks than sections returned by Step 2-A.
 
@@ -274,16 +278,21 @@ text = text.strip()
 ```
 Apply this sanitizer to every paragraph's text immediately before the Notion PATCH. Do not upload raw NotebookLM output.
 
-**Step 2-C: Verify completeness before finishing.** After all sections are uploaded to Notion, fetch the page blocks and confirm every section in `/tmp/sections.txt` has a matching heading_1 or heading_2. If any section is missing, translate and append it — do NOT finish with a partial upload.
+**Step 2-C: Run the structural auditor (MANDATORY before declaring done).** A bare heading count cannot see duplicated sections, one-sentence stubs, or batched-call summaries — all observed in real runs. Run `verify_sections.py`, which checks all four structural failure modes against the source paper:
 
 ```bash
-# Count sections in Step 2-A list vs Notion headings
-SEC_COUNT=$(grep -c '^\s*[IVXLC0-9]' /tmp/sections.txt)
-HEADING_COUNT=$(curl -s "https://api.notion.com/v1/blocks/PAGE_ID/children?page_size=100" \
-  -H "Authorization: Bearer $NOTION_TOKEN" -H "Notion-Version: 2022-06-28" \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for b in d.get('results',[]) if b['type'] in ('heading_1','heading_2')))")
-echo "Sections: $SEC_COUNT, Notion headings: $HEADING_COUNT"
+python3 /workspace/group/research-papers/verify_sections.py \
+  --page PAGE_ID \
+  --source /tmp/paper.pdf        # local PDF path or PDF url; for arxiv papers use --arxiv ID instead \
+  --sections /tmp/sections.txt   # optional: catches MISSING sections from the Step 2-A list
 ```
+
+- **exit 0** → page is structurally sound. Proceed to Step 2-D.
+- **DUPLICATE** → archive the listed extra heading ids AND their body blocks (PATCH `archived: true`).
+- **CONTENT_LOSS** (stub section) / **SUMMARIZED** (translated/source ratio below threshold) → re-translate **that section in its OWN `notebooklm ask`**, delete the old body blocks under its heading, insert the new paragraphs after the heading.
+- **MISSING** → translate and append it.
+
+Fix and re-run until exit 0 — do NOT finish with findings outstanding. The thresholds (`--min-ratio 0.35`, `--min-chars 400`, `--min-source 800`) are calibrated on real pages: faithful full ko translations land at ~0.55-0.7 of source chars; batched-call summaries land at ≤0.2.
 
 **Step 2-D: Verify inline citation numbers against the real bibliography.** NotebookLM does not reliably keep a paper's citation markers even with Step 2-B rule 5 — it tends to renumber them sequentially per section, and for **author-year papers it fabricates numeric `[N]` markers that do not exist in the source at all**. Run the auditor after upload (arxiv papers only):
 
@@ -758,7 +767,9 @@ Steps (in this order, no exceptions):
 
 4. PATCH translated sections + figures into the page id from step 3. Verify with `GET /v1/pages/<id>` that the page belongs to THIS paper (Title property matches) before patching — guards against page-id mix-ups across parallel subagents.
 
-5. Save initial Q&A callouts if appropriate.
+5. **Structural gate (Step 2-C): `python3 /workspace/group/research-papers/verify_sections.py --page <id> --source <pdf-or-url-or---arxiv ID> --sections /tmp/sections.txt` MUST exit 0 before you return done.** Findings mean the page is duplicated/stubbed/summarized/missing — fix per Step 2-C and re-run. If you cannot get to exit 0, return `{"status":"failed","error":"verify_sections: <findings summary>"}` instead of claiming success.
+
+6. Save initial Q&A callouts if appropriate.
 
 Rules:
 - DO NOT call `mcp__paperclaw__send_message` — the main agent consolidates user output.
