@@ -50,6 +50,8 @@ import json
 import os
 import re
 import sys
+import tempfile
+from html import unescape
 import urllib.request
 
 import auto_save_qa as aq  # shared Notion helpers: api_get, _block_text, headers
@@ -149,8 +151,7 @@ def _strip_html(html: str) -> str:
     html = re.sub(r"(?i)</(p|h[1-6]|section|div|li|figure|figcaption)>|<br\s*/?>",
                   "\n", html)
     html = re.sub(r"(?s)<[^>]+>", " ", html)
-    html = (html.replace("&amp;", "&").replace("&lt;", "<")
-                .replace("&gt;", ">").replace("&nbsp;", " "))
+    html = unescape(html)
     html = re.sub(r"[ \t]+", " ", html)
     return re.sub(r"\n\s*\n+", "\n", html)
 
@@ -160,7 +161,8 @@ def source_text_from_arxiv(arxiv_id: str):
         url = tmpl.format(id=arxiv_id)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "ignore")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                html = resp.read().decode("utf-8", "ignore")
         except Exception:
             continue
         if len(html) > 50000 and "ltx_document" in html and "Fatal error" not in html:
@@ -174,9 +176,13 @@ def source_text_from_pdf(path_or_url: str):
     except ImportError:
         sys.stderr.write("PyMuPDF not installed; cannot read PDF source.\n")
         return None
-    local = path_or_url
+    local, is_temp = path_or_url, False
     if re.match(r"^https?://", path_or_url):
-        local = "/tmp/_verify_sections_src.pdf"
+        # Unique temp path: parallel subagents share /tmp, so a fixed name
+        # would let concurrent gates overwrite each other's source PDF.
+        fd, local = tempfile.mkstemp(suffix=".pdf", prefix="verify_sections_")
+        os.close(fd)
+        is_temp = True
         try:
             req = urllib.request.Request(
                 path_or_url,
@@ -185,17 +191,22 @@ def source_text_from_pdf(path_or_url: str):
                 f.write(r.read())
         except Exception as e:
             sys.stderr.write(f"could not download source pdf: {e}\n")
+            os.unlink(local)
             return None
-    if not os.path.exists(local):
-        sys.stderr.write(f"source not found: {local}\n")
-        return None
     try:
-        doc = fitz.open(local)
-    except Exception as e:
-        sys.stderr.write(f"could not open pdf: {e}\n")
-        return None
-    # Keep newlines — the References tail-cut anchors on a heading line.
-    text = "\n".join(doc[i].get_text() for i in range(doc.page_count))
+        if not os.path.exists(local):
+            sys.stderr.write(f"source not found: {local}\n")
+            return None
+        try:
+            doc = fitz.open(local)
+            # Keep newlines — the References tail-cut anchors on a heading line.
+            text = "\n".join(doc[i].get_text() for i in range(doc.page_count))
+        except Exception as e:
+            sys.stderr.write(f"could not open pdf: {e}\n")
+            return None
+    finally:
+        if is_temp and os.path.exists(local):
+            os.unlink(local)
     return re.sub(r"[ \t]+", " ", text)
 
 
@@ -209,7 +220,8 @@ def load_source_text(source: str | None, arxiv: str | None):
     if re.match(r"^https?://", source):  # landing page -> try as html
         try:
             req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
-            html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "ignore")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                html = resp.read().decode("utf-8", "ignore")
             return _strip_html(html)
         except Exception:
             return None
@@ -258,10 +270,11 @@ def load_manifest(path: str | None) -> list:
     if not path or not os.path.exists(path):
         return []
     keys = []
-    for line in open(path, encoding="utf-8"):
-        k = section_key(line)
-        if k:
-            keys.append(k)
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            k = section_key(line)
+            if k:
+                keys.append(k)
     return keys
 
 
