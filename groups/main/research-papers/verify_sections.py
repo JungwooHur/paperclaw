@@ -390,15 +390,19 @@ def main() -> int:
         for key, s in first.items():
             sc = src_chars.get(key)
             tc = s["chars"]
-            is_parent = any(k != key and k.startswith(key + ".") for k in keys)
-            # A located source span below the floor means the section is
-            # intrinsically tiny (e.g. a parent heading whose intro is one
-            # sentence before its first subsection) — nothing to lose.
-            if sc is not None and sc < args.min_source:
+            # A parent section whose subsections are their own page sections
+            # legitimately holds only an intro; ratio-checking it against the
+            # whole section's source (which spans all subsections) is a false
+            # positive. Children use either dotted (2.1) or IEEE hyphen (III-A)
+            # labels, so check both.
+            is_parent = any(k != key and (k.startswith(key + ".")
+                                          or k.startswith(key + "-"))
+                            for k in keys)
+            if is_parent:
                 continue
-            # Unlocatable source + parent heading: a parent with all content
-            # under its children legitimately holds 0 own chars.
-            if sc is None and is_parent:
+            # A located source span below the floor means the section is
+            # intrinsically tiny — nothing to lose.
+            if sc is not None and sc < args.min_source:
                 continue
             if tc < args.min_chars:
                 findings.append({
