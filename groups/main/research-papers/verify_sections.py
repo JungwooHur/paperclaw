@@ -60,8 +60,28 @@ HEADING_TYPES = ("heading_1", "heading_2", "heading_3")
 # Body-bearing block types whose text counts toward a section's length.
 BODY_TYPES = ("paragraph", "bulleted_list_item", "numbered_list_item",
               "quote", "callout", "toggle", "code")
-# Leading section label: arabic "2", "2.1", "3.4.1" or roman "I", "IV".
-_KEY_RE = re.compile(r"^\s*((?:\d+(?:\.\d+)*)|(?:[IVXLC]+))(?=[\s.:)]|$)")
+# Leading section label. Handles the forms papers actually use:
+#   roman "I" / "IV", roman+letter "III-A" / "IV-D" (IEEE subsections),
+#   arabic "2" / "2.1" / "3.4.1", and appendix letters "A" / "B" / "C".
+# The trailing lookahead keeps it from biting the first word of an unlabeled
+# heading ("Score (...)" -> no key, not "S").
+_KEY_RE = re.compile(
+    r"^\s*("
+    r"[IVXLC]+(?:-[A-Z])?"      # I, IV, III-A
+    r"|\d+(?:\.\d+)*(?:-[A-Z])?"  # 2, 2.1, 3-A
+    r"|[A-Z]"                    # appendix A, B, ...
+    r")(?=[\s.:)\-]|$)")
+# CLI / formatting furniture that must never reach a Notion paper body. The
+# notebooklm CLI prints these conversation status lines to stdout interleaved
+# with the answer; uploading raw stdout embeds them. `**` is unconverted
+# markdown bold; ⬇ is a listing glyph from source HTML.
+_ARTIFACT_PATS = [
+    ("cli-conversation",
+     re.compile(r"(Continuing|Resumed|New) conversation[: ]|Conversation:\s*[0-9a-f-]{8,}", re.I)),
+    ("cli-answer-label", re.compile(r"\bAnswer:\s", re.I)),
+    ("markdown-bold", re.compile(r"\*\*")),
+    ("listing-glyph", re.compile(r"⬇")),
+]
 # Where a source paper's body ends — don't let "References" inflate the last
 # section's measured length.
 _TAIL_RE = re.compile(r"\n\s*(references|bibliography|acknowledg(e)?ments)\b",
@@ -320,6 +340,39 @@ def main() -> int:
                           f"duplicate heading(s) + their body blocks",
             })
 
+    # 1b. ARTIFACT blocks (no source needed): CLI furniture / unconverted
+    # markdown / listing glyphs that leaked into the body. The CLI "Answer:"
+    # label is only counted when a conversation token co-occurs in the same
+    # block, so a legitimate "Answer:" in prose isn't flagged.
+    artifact_blocks = []
+    for b in blocks:
+        t = b["type"]
+        if t not in ("paragraph",) + HEADING_TYPES + ("callout", "quote",
+                                                       "bulleted_list_item",
+                                                       "numbered_list_item"):
+            continue
+        text = aq._block_text(b)
+        hit = []
+        for name, pat in _ARTIFACT_PATS:
+            if not pat.search(text):
+                continue
+            if name == "cli-answer-label" and not _ARTIFACT_PATS[0][1].search(text):
+                continue
+            hit.append(name)
+        if hit:
+            artifact_blocks.append((b["id"], hit, text[:60]))
+    if artifact_blocks:
+        kinds = sorted({k for _, hits, _ in artifact_blocks for k in hits})
+        findings.append({
+            "type": "ARTIFACT", "section": None,
+            "block_count": len(artifact_blocks),
+            "kinds": kinds,
+            "block_ids": [bid for bid, _, _ in artifact_blocks][:50],
+            "detail": f"{len(artifact_blocks)} block(s) contain non-content "
+                      f"artifacts ({', '.join(kinds)}); strip them in place — raw "
+                      f"`notebooklm ask` stdout was uploaded without sanitizing",
+        })
+
     # 2 + 3. COMPLETENESS / SUMMARIZATION (needs source). Measure only the FIRST
     # occurrence of each key so duplicates don't mask a short copy.
     src_text = load_source_text(args.source, args.arxiv)
@@ -403,12 +456,14 @@ def main() -> int:
             print(f"  {k:>6}  {v['chars']:>6} chars{sc}  {v['title'][:42]}")
         print("-" * 68)
         if not findings:
-            print("OK — no duplicate, short, summarized, or missing sections.")
+            print("OK — no duplicate, artifact, short, summarized, or missing sections.")
         else:
             for f in findings:
                 print(f"[{f['type']}] {f['detail']}")
                 if f.get("delete_heading_ids"):
                     print(f"         delete heading ids: {f['delete_heading_ids']}")
+                if f.get("block_ids"):
+                    print(f"         artifact block ids: {f['block_ids']}")
 
     return 0 if not findings else 2
 

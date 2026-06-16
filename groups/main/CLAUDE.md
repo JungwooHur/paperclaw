@@ -22,6 +22,7 @@ Known fixes accumulated so far:
 | Non-arxiv paper translated from slide deck | First Google hit was a 10-page talk PDF (ends "THANK YOU") — agent uploaded that to NotebookLM as if it were the full paper | For non-arxiv papers, fetch from OpenReview/conference site with browser UA + Referer; then run a `fitz` page-count + last-page text check to reject slide decks before adding the source |
 | OpenReview PDF returns HTTP 403 | Default curl UA is blocked | Use `curl -L -A "Mozilla/5.0..." -H "Referer: https://openreview.net/forum?id=..." "https://openreview.net/pdf?id=..."` |
 | Wrap `\n` mid-paragraph on Notion | NotebookLM replies are ~80-char soft-wrapped; uploading raw text makes Notion render breaks inside sentences | Step 2-B prompt forbids mid-paragraph `\n`; sanitizer collapses single `\n` to space while preserving `\n\n` paragraph breaks (see Step 2-B-post) |
+| `notebooklm` CLI status lines embedded as sentences in the paper body (`Continuing conversation <id>... Answer:`, `Resumed conversation: <id>`, repeated dozens of times) | The CLI auto-resumes the notebook's last conversation and prints status lines (`cli/chat.py` `console.print`) interleaved with the answer on stdout; when piped (non-TTY) the color is dropped but the text remains. The subagent captured raw `notebooklm ask` stdout and uploaded it. Step 2-B-post only stripped `$`/`\n`, not this furniture | (1) **Prevent:** Step 2-B now mandates `notebooklm ask … --json` + read `.answer` (the CLI guards every status print behind `if not json_output`). (2) **Defense-in-depth:** Step 2-B-post sanitizer now also strips conversation furniture, `Answer:`, `**`, `⬇`. (3) **Detect:** `verify_sections.py` ARTIFACT check (source-free) flags any block still carrying it. Also widened the auditor's section-key regex to catch IEEE `III-A` / appendix `A.` labels so duplicated subsections are no longer invisible |
 | Math wrapped in `$...$` on Notion | NotebookLM emits LaTeX-style `$s=Enc(x)$` but Notion paragraphs don't render LaTeX — `$` shows as literal | Step 2-B prompt forbids `$` wrapping; sanitizer strips all `$` chars before PATCH (see Step 2-B-post) |
 | Q&A callout saved to wrong section | Hand-rolled PATCH used `/blocks/{paragraph-id}/children` (paragraph as parent), so the callout became a child of that paragraph and rendered inside whatever section the paragraph lived in. Recurred 4× even after written rules were strengthened — text instructions weren't enough | Use `groups/main/research-papers/save_qa_callout.py` for ALL paper Q&A. Script enforces `/blocks/PAGE_ID/children` parent + `after`-by-section + post-PATCH top-level verification + auto-rollback. Hand-rolled curl PATCHes for Q&A are forbidden |
 | Q&A callout recurring misplacement / wrong format even after `save_qa_callout.py` existed | The agent kept hand-rolling curl PATCHes anyway — prose rules in this file weren't load-bearing. Structural prevention needed instead | `auto_fix_qa.py` + systemd user timer (`groups/main/research-papers/systemd/`) run every 5 min and auto-repair any broken Q&A callout: moves nested callouts back to top level, converts legacy (default-color + question-in-rich_text) format to toggle-style (gray callout → toggle(question) → answer). Already-top-level callouts keep their position; only nested callouts are re-placed by heuristic |
@@ -155,6 +156,7 @@ When adding a paper, process **ALL sections** through NotebookLM (translate for 
 - ❌ Asking NotebookLM for "X문장으로 요약" / "summarize in N sentences" / "key takeaways" in any query — summaries lock you into summary mode.
 - ❌ **Batching multiple subsections into ONE `notebooklm ask`** ("Section N 전체(N.1-N.4 포함) 번역해"). NotebookLM compresses to fit its output limit, so every batched subsection comes back **summarized ~5-15× thinner** than a section translated in its own call — even when the prompt says "전문 번역". One call per section/subsection, no matter how slow it feels.
 - ❌ **Running `notebooklm ask` as a background task** and polling its output file. The observed failure chain: poll → timeout → give up → re-ask a trimmed prompt → the section lands as a one-sentence stub. Run asks in the foreground and wait; a slow ask (60-120s) is normal.
+- ❌ **Piping bare `notebooklm ask` stdout into a section file.** Non-JSON mode interleaves `Continuing conversation <id>...` / `Answer:` / `Resumed conversation: <id>` status lines with the answer; they end up as sentences in the paper body. Always `--json` and read `.answer` (see Step 2-B).
 - ❌ **Re-appending sections after a partial multi-batch upload without checking the page.** Hand-rolled PATCH assembly that loses track of what's uploaded produces duplicated sections. After assembly, the Step 2-C auditor is the source of truth — not your memory of which batches went through.
 - ❌ Skipping Step 2-A (section list) and jumping to topic-based questions.
 - ❌ Fewer Notion heading_1/heading_2 blocks than sections returned by Step 2-A.
@@ -224,6 +226,13 @@ Save the resulting section list to `/tmp/sections.txt` and use it as the transla
 
 **Step 2-B: Process each section in order.** Pick the prompt that matches `$OUTPUT_LANGUAGE`:
 
+> **🚨 ALWAYS call `notebooklm ask … --json` and read only the `.answer` field.** In its default (non-JSON) mode the CLI interleaves conversation *status* lines with the answer on stdout — `Continuing conversation <id>...`, `Answer:`, `Resumed conversation: <id>` — because it auto-resumes the notebook's last conversation. Capturing raw stdout embeds those status lines into the paper body (observed: dozens of leaked `Continuing conversation …` paragraphs). `--json` suppresses them and returns the answer cleanly:
+> ```bash
+> notebooklm ask "<the prompt below>" --notebook <id> --json \
+>   | python3 -c "import sys,json; print(json.load(sys.stdin)['answer'])" > /tmp/section.txt
+> ```
+> Never pipe bare `notebooklm ask` stdout into a section file.
+
 **If `$OUTPUT_LANGUAGE=ko`** (default — translate to Korean):
 ```bash
 notebooklm ask "논문의 '{SECTION_NAME}' 섹션 전체를 한국어로 번역해.
@@ -268,6 +277,13 @@ If a section's response is truncated, follow up with the same prompt skeleton bu
 **Step 2-B-post: Post-process before uploading to Notion.** Even with rules 6-7 in the prompt, NotebookLM occasionally inserts `$` around math or wraps long paragraphs with `\n`. Always run this sanitizer on each section file before building Notion blocks:
 ```python
 import re
+# Defense-in-depth: strip notebooklm CLI status furniture even though --json
+# should already exclude it (belt and suspenders — a non-json call elsewhere
+# must not poison the page).
+text = re.sub(r"(Continuing|Resumed|New) conversation[^\n]*\n?", "", text, flags=re.I)
+text = re.sub(r"Conversation:\s*[0-9a-f-]{8,}[^\n]*\n?", "", text, flags=re.I)
+text = re.sub(r"^\s*Answer:\s*", "", text)    # CLI answer label
+text = text.replace("**", "").replace("⬇", "")  # unconverted markdown / listing glyph
 MARK = "\x00PARA\x00"
 text = text.replace("\n\n", MARK)            # protect real paragraph breaks
 text = text.replace("\n", " ")                # collapse wrap line breaks
@@ -288,7 +304,8 @@ python3 /workspace/group/research-papers/verify_sections.py \
 ```
 
 - **exit 0** → page is structurally sound. Proceed to Step 2-D.
-- **DUPLICATE** → archive the listed extra heading ids AND their body blocks (PATCH `archived: true`).
+- **DUPLICATE** → archive the listed extra heading ids AND their body blocks (PATCH `archived: true`). The auditor recognizes IEEE-style subsection labels (`III-A`, `IV-D`) and appendix letters (`A`, `B`) as well as roman/arabic, so duplicated subsections are caught too. **Confirm which copy is fuller before deleting** — if the later copy has more content, archive the earlier one instead.
+- **ARTIFACT** → blocks contain leaked CLI furniture (`Continuing/Resumed conversation`, `Answer:`), unconverted `**bold**`, or the `⬇` glyph. Strip them in place (rewrite the block's `rich_text`); this means a section was uploaded from raw `notebooklm ask` stdout — re-check Step 2-B used `--json`.
 - **CONTENT_LOSS** (stub section) / **SUMMARIZED** (translated/source ratio below threshold) → re-translate **that section in its OWN `notebooklm ask`**, delete the old body blocks under its heading, insert the new paragraphs after the heading.
 - **MISSING** → translate and append it.
 
