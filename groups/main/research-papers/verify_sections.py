@@ -67,9 +67,12 @@ BODY_TYPES = ("paragraph", "bulleted_list_item", "numbered_list_item",
 # heading ("Score (...)" -> no key, not "S").
 _KEY_RE = re.compile(
     r"^\s*("
-    r"[IVXLC]+(?:-[A-Z])?"      # I, IV, III-A
+    r"[IVXLC]+(?:-[A-Z])?"        # I, IV, III-A
     r"|\d+(?:\.\d+)*(?:-[A-Z])?"  # 2, 2.1, 3-A
-    r"|[A-Z]"                    # appendix A, B, ...
+    r"|[A-Z](?:[.-]\d+)+"         # appendix subsection A.1, B-2 (unique key each)
+    r"|[A-Z](?=[.:)\-])"          # appendix letter A./B. — must be followed by
+                                  #   punctuation, NOT a space, so an unlabeled
+                                  #   heading like "A New Approach" isn't keyed
     r")(?=[\s.:)\-]|$)")
 # CLI / formatting furniture that must never reach a Notion paper body. The
 # notebooklm CLI prints these conversation status lines to stdout interleaved
