@@ -91,6 +91,19 @@ _TAIL_RE = re.compile(r"\n\s*(references|bibliography|acknowledg(e)?ments)\b",
                       re.IGNORECASE)
 
 
+def _echo_norm(s: str) -> str:
+    """Normalize a heading/paragraph for echo comparison: drop a TRAILING
+    '(translation)', the leading section label, and all non-alphanumerics.
+    '1. Introduction (서론)' and '1 Introduction (서론)' both -> 'introduction'.
+
+    The parenthetical is stripped only at the END — splitting at the first '('
+    would reduce an equation like 'Score(T,G) = min...(1)' to just 'score' and
+    falsely match a heading 'Score (점수)'."""
+    s = re.sub(r"\s*\([^()]*\)\s*$", "", s or "")
+    s = _KEY_RE.sub("", s, count=1)
+    return re.sub(r"[^0-9a-z가-힣]", "", s.lower())
+
+
 def section_key(heading_text: str):
     """'2.1 The Robot-Native Regime (2.1 ...)' -> '2.1'. None if no label."""
     m = _KEY_RE.match(heading_text or "")
@@ -376,6 +389,29 @@ def main() -> int:
                       f"`notebooklm ask` stdout was uploaded without sanitizing",
         })
 
+    # 1c. HEADING_ECHO (no source needed): a paragraph that merely restates its
+    # section heading, so the title shows twice (a heading block + an echo
+    # paragraph). NotebookLM emits the section title as the first body line; the
+    # assembler created a heading block AND kept that line as a paragraph.
+    echo_ids = []
+    last_head = None
+    for b in blocks:
+        t = b["type"]
+        if t in HEADING_TYPES:
+            last_head = aq._block_text(b)
+        elif t == "paragraph" and last_head:
+            s = aq._block_text(b)
+            n = _echo_norm(s)
+            if n and len(s) < 120 and n == _echo_norm(last_head):
+                echo_ids.append(b["id"])
+    if echo_ids:
+        findings.append({
+            "type": "HEADING_ECHO", "section": None,
+            "block_count": len(echo_ids), "block_ids": echo_ids,
+            "detail": f"{len(echo_ids)} paragraph(s) merely repeat their section "
+                      f"heading (title shown twice) — archive the echo paragraph",
+        })
+
     # 2 + 3. COMPLETENESS / SUMMARIZATION (needs source). Measure only the FIRST
     # occurrence of each key so duplicates don't mask a short copy.
     src_text = load_source_text(args.source, args.arxiv)
@@ -463,7 +499,7 @@ def main() -> int:
             print(f"  {k:>6}  {v['chars']:>6} chars{sc}  {v['title'][:42]}")
         print("-" * 68)
         if not findings:
-            print("OK — no duplicate, artifact, short, summarized, or missing sections.")
+            print("OK — no duplicate, echo, artifact, short, summarized, or missing sections.")
         else:
             for f in findings:
                 print(f"[{f['type']}] {f['detail']}")
