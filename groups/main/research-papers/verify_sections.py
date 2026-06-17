@@ -99,7 +99,7 @@ def _echo_norm(s: str) -> str:
     The parenthetical is stripped only at the END — splitting at the first '('
     would reduce an equation like 'Score(T,G) = min...(1)' to just 'score' and
     falsely match a heading 'Score (점수)'."""
-    s = re.sub(r"\s*\([^()]*\)\s*$", "", s or "")
+    s = re.sub(r"\s*\([^()]*\)[^0-9a-z가-힣]*$", "", s or "")
     s = _KEY_RE.sub("", s, count=1)
     return re.sub(r"[^0-9a-z가-힣]", "", s.lower())
 
@@ -404,6 +404,10 @@ def main() -> int:
             n = _echo_norm(s)
             if n and len(s) < 120 and n == _echo_norm(last_head):
                 echo_ids.append(b["id"])
+            # The echo is always the FIRST paragraph of a section; stop after
+            # it so a later short paragraph that happens to equal the title
+            # (e.g. a body line "Conclusion") isn't falsely flagged.
+            last_head = None
     if echo_ids:
         findings.append({
             "type": "HEADING_ECHO", "section": None,
