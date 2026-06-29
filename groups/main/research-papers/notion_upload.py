@@ -43,7 +43,8 @@ def _api(method, path, body=None, tries=10):
             req = urllib.request.Request(
                 API + path, data=json.dumps(body).encode() if body else None,
                 method=method, headers=h)
-            return json.load(urllib.request.urlopen(req, timeout=60))
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp)
         except urllib.error.HTTPError as e:
             last = e
             if e.code == 429:

@@ -35,10 +35,17 @@ def extract_figures(zip_path, workdir=None):
     os.makedirs(work, exist_ok=True)
     cache = os.path.join(work, "figmap.json")
     if os.path.exists(cache):
-        return json.load(open(cache))
+        with open(cache, encoding="utf-8") as f:
+            return json.load(f)
 
-    exdir = os.path.join(work, "pdfs")
+    exdir = os.path.abspath(os.path.join(work, "pdfs"))
     with zipfile.ZipFile(zip_path) as z:
+        # Zip Slip guard: these zips come from user uploads — reject any member
+        # that would write outside exdir (../ traversal, absolute paths).
+        for m in z.infolist():
+            dest = os.path.abspath(os.path.join(exdir, m.filename))
+            if dest != exdir and not dest.startswith(exdir + os.sep):
+                raise ValueError(f"unsafe zip member: {m.filename}")
         z.extractall(exdir)
     pdfs = sorted(p for p in _walk(exdir) if p.lower().endswith(".pdf"))
 
@@ -78,8 +85,8 @@ def extract_figures(zip_path, workdir=None):
                 with open(out, "wb") as f:
                     f.write(ext["image"])
                 figmap[label] = out
-    with open(cache, "w") as f:
-        json.dump(figmap, f)
+    with open(cache, "w", encoding="utf-8") as f:
+        json.dump(figmap, f, ensure_ascii=False)
     return figmap
 
 

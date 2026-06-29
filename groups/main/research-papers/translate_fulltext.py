@@ -63,7 +63,8 @@ def notion(method, path, body=None, tries=12):
                 headers={"Authorization": f"Bearer {tok}",
                          "Notion-Version": "2022-06-28",
                          "Content-Type": "application/json"})
-            return json.load(urllib.request.urlopen(req, timeout=60))
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp)
         except urllib.error.HTTPError as e:
             last = e
             if e.code == 429:
@@ -82,7 +83,10 @@ def list_sources(notebook):
     r = nb("source", "list", "--notebook", notebook, "--json", timeout=60)
     if r.returncode != 0:
         sys.exit(f"`notebooklm source list` failed for {notebook}: {r.stderr[:300]}")
-    d = json.loads(r.stdout)
+    try:
+        d = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"`notebooklm source list` returned non-JSON: {r.stdout[:300]}")
     return d.get("sources", d) if isinstance(d, dict) else d
 
 
