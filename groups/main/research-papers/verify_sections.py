@@ -449,6 +449,33 @@ def main() -> int:
                       f"heading (title shown twice) — archive the echo paragraph",
         })
 
+    # 1d. PARA_DUP (no source needed): the same substantial paragraph appearing
+    # more than once on the page. This is the symptom of section-translation
+    # boundary overlap (adjacent NotebookLM section answers repeat each other)
+    # that the heading-only DUPLICATE check can't see. Only count paragraphs
+    # long enough to be real content (>= 80 chars normalized), so short stock
+    # lines ("Summary", a shared formula) don't false-trigger.
+    seen, dup_para_ids = {}, []
+    for b in blocks:
+        if b["type"] not in ("paragraph", "bulleted_list_item",
+                              "numbered_list_item", "quote"):
+            continue
+        norm = re.sub(r"\s+", "", aq._block_text(b))
+        if len(norm) < 80:
+            continue
+        if norm in seen:
+            dup_para_ids.append(b["id"])
+        else:
+            seen[norm] = b["id"]
+    if dup_para_ids:
+        findings.append({
+            "type": "PARA_DUP", "section": None,
+            "block_count": len(dup_para_ids), "block_ids": dup_para_ids[:50],
+            "detail": f"{len(dup_para_ids)} paragraph(s) duplicate an earlier "
+                      f"paragraph verbatim — likely section-translation boundary "
+                      f"overlap; archive the repeats",
+        })
+
     # 2 + 3. COMPLETENESS / SUMMARIZATION (needs source). Measure only the FIRST
     # occurrence of each key so duplicates don't mask a short copy.
     src_text = load_source_text(args.source, args.arxiv)
@@ -536,7 +563,7 @@ def main() -> int:
             print(f"  {k:>6}  {v['chars']:>6} chars{sc}  {v['title'][:42]}")
         print("-" * 68)
         if not findings:
-            print("OK — no duplicate, echo, artifact, short, summarized, or missing sections.")
+            print("OK — no duplicate, echo, para-dup, artifact, short, summarized, or missing sections.")
         else:
             for f in findings:
                 print(f"[{f['type']}] {f['detail']}")
