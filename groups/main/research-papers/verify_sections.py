@@ -455,18 +455,20 @@ def main() -> int:
     # that the heading-only DUPLICATE check can't see. Only count paragraphs
     # long enough to be real content (>= 80 chars normalized), so short stock
     # lines ("Summary", a shared formula) don't false-trigger.
-    seen, dup_para_ids = {}, []
+    seen, dup_para_ids = set(), []
     for b in blocks:
         if b["type"] not in ("paragraph", "bulleted_list_item",
                               "numbered_list_item", "quote"):
             continue
-        norm = re.sub(r"\s+", "", aq._block_text(b))
+        # lowercased so two copies differing only in embedded-English casing
+        # (sentence-boundary capitalization) still match.
+        norm = re.sub(r"\s+", "", aq._block_text(b).lower())
         if len(norm) < 80:
             continue
         if norm in seen:
             dup_para_ids.append(b["id"])
         else:
-            seen[norm] = b["id"]
+            seen.add(norm)
     if dup_para_ids:
         findings.append({
             "type": "PARA_DUP", "section": None,
