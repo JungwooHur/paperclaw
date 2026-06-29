@@ -151,6 +151,53 @@ def clean_title(title):
     return re.split(r"\s+_\s+", title)[0].strip()
 
 
+_FIGREF = re.compile(r"Figure\s*([0-9]+[-.][0-9]+)", re.I)
+
+
+def _block_text(b):
+    o = b.get(b["type"], {})
+    return "".join(x.get("text", {}).get("content", "") for x in o.get("rich_text", []))
+
+
+def inject_figures(blocks, figures_zip, workdir):
+    """Insert each book figure (uploaded privately into Notion) right after the
+    FIRST block that references its 'Figure N-M' label. Figures with no textual
+    reference are appended at the end so nothing is silently dropped."""
+    import extract_book_figures as ef
+    import notion_upload as nu
+    figmap = ef.extract_figures(figures_zip, workdir)   # {label: local_png}
+    if not figmap:
+        return blocks
+    uploaded = {}   # label -> file_upload id (uploaded lazily, attached same run)
+
+    def img_for(label):
+        if label not in uploaded:
+            fid = nu.upload_image(figmap[label]) if label in figmap else None
+            uploaded[label] = fid
+        return uploaded[label]
+
+    out, placed = [], set()
+    for b in blocks:
+        out.append(b)
+        for label in dict.fromkeys(m.group(1).replace(".", "-")
+                                   for m in _FIGREF.finditer(_block_text(b))):
+            if label in placed or label not in figmap:
+                continue
+            fid = img_for(label)
+            if fid:
+                out.append(nu.image_block(fid))
+                placed.add(label)
+    # any figures never referenced in text -> append at end
+    for label in figmap:
+        if label not in placed:
+            fid = img_for(label)
+            if fid:
+                out.append(nu.image_block(fid))
+                placed.add(label)
+    print(f"  injected {len(placed)}/{len(figmap)} figures", flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--notebook", required=True)
@@ -158,6 +205,10 @@ def main():
     ap.add_argument("--chunk", type=int, default=4000)
     ap.add_argument("--lang", default=os.environ.get("OUTPUT_LANGUAGE", "ko"))
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--figures-zip", default=None,
+                    help="book source zip (chapter PDFs); inject its figures "
+                         "next to their 'Figure N-M' references, uploaded "
+                         "PRIVATELY into Notion (never a public host)")
     ap.add_argument("--apply", action="store_true",
                     help="rebuild the Notion page after translating")
     args = ap.parse_args()
@@ -204,6 +255,10 @@ def main():
     md = "\n\n".join(parts)
     blocks = sq.build_answer_blocks(md)
     print(f"assembled {len(md)} chars -> {len(blocks)} blocks", flush=True)
+
+    if args.apply and args.figures_zip:
+        blocks = inject_figures(blocks, args.figures_zip, f"{work}/figs")
+        print(f"with figures -> {len(blocks)} blocks", flush=True)
 
     if not args.apply:
         print("translation done (--apply to rebuild the page)", flush=True)
