@@ -74,15 +74,21 @@ _KEY_RE = re.compile(
                                   #   punctuation, NOT a space, so an unlabeled
                                   #   heading like "A New Approach" isn't keyed
     r")(?=[\s.:)\-]|$)")
-# CLI / formatting furniture that must never reach a Notion paper body. The
-# notebooklm CLI prints these conversation status lines to stdout interleaved
-# with the answer; uploading raw stdout embeds them. `**` is unconverted
-# markdown bold; ⬇ is a listing glyph from source HTML.
+# Non-content artifacts that must never reach a Notion paper body:
+#  - CLI furniture: the notebooklm CLI prints conversation status lines to
+#    stdout interleaved with the answer; uploading raw stdout embeds them.
+#  - RAW MARKDOWN: NotebookLM emits markdown (### headings, **bold**, -/*
+#    bullets, --- rules). If the assembler builds paragraph blocks from the raw
+#    text instead of converting it (save_qa_callout.build_answer_blocks), these
+#    render as literal text. `⬇` is a listing glyph from source HTML.
 _ARTIFACT_PATS = [
     ("cli-conversation",
      re.compile(r"(Continuing|Resumed|New) conversation[: ]|Conversation:\s*[0-9a-f-]{8,}", re.I)),
     ("cli-answer-label", re.compile(r"\bAnswer:\s", re.I)),
     ("markdown-bold", re.compile(r"\*\*")),
+    ("markdown-heading", re.compile(r"(?:^|\n)#{1,6}\s")),
+    ("markdown-rule", re.compile(r"(?:^|\n)(?:---+|\*\*\*+|___+)\s*(?:\n|$)")),
+    ("markdown-bullet", re.compile(r"(?:^|\n)\s*[\*\-]\s+\S")),
     ("listing-glyph", re.compile(r"⬇")),
 ]
 # Where a source paper's body ends — don't let "References" inflate the last
@@ -339,12 +345,29 @@ def main() -> int:
 
     findings = []
 
-    # 1. DUPLICATE sections (occurrence > 1).
+    # 1. DUPLICATE sections (occurrence > 1), keyed HIERARCHICALLY by the
+    # enclosing-heading chain. A paper commonly reuses bare subsection letters
+    # (II has A/B/C/D, III has A/B, IV has A/B/C/D); those are different
+    # subsections under different parents, NOT duplicates. Scoping by the parent
+    # chain ("II>A" vs "III>A") avoids that false positive, while two real
+    # copies of the same section under the same parent still collide.
     dup_keys = {}
+    stack = []  # (level, scope_token)
     for s in sections:
+        lvl = s["level"]
+        while stack and stack[-1][0] >= lvl:
+            stack.pop()
+        parent = stack[-1][1] if stack else ""
         if s["key"]:
-            dup_keys.setdefault(s["key"], []).append(s)
-    for key, occ in dup_keys.items():
+            scope = f"{parent}>{s['key']}"
+            s["_dupkey"] = scope
+            dup_keys.setdefault(scope, []).append(s)
+        else:
+            # Unlabeled heading: scope children by its title, never dup-checked.
+            scope = f"{parent}>~{_echo_norm(s['heading'])[:16]}"
+        stack.append((lvl, scope))
+    for scope, occ in dup_keys.items():
+        key = occ[0]["key"]
         if len(occ) > 1:
             extra_ids = [o["heading_id"] for o in occ[1:]]
             findings.append({
@@ -385,8 +408,10 @@ def main() -> int:
             "kinds": kinds,
             "block_ids": [bid for bid, _, _ in artifact_blocks][:50],
             "detail": f"{len(artifact_blocks)} block(s) contain non-content "
-                      f"artifacts ({', '.join(kinds)}); strip them in place — raw "
-                      f"`notebooklm ask` stdout was uploaded without sanitizing",
+                      f"artifacts ({', '.join(kinds)}); cli-* = raw `notebooklm ask` "
+                      f"stdout uploaded unsanitized, markdown-* = NotebookLM markdown "
+                      f"not run through build_answer_blocks. Rebuild the body via the "
+                      f"converter (see Phase 4 step 2)",
         })
 
     # 1c. HEADING_ECHO (no source needed): a paragraph that merely restates its
