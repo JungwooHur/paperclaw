@@ -542,7 +542,15 @@ Headers: Authorization: Bearer $NOTION_TOKEN, Notion-Version: 2022-06-28
 
 Build the block list section by section. For each section:
 1. Add `heading_1` for the section title
-2. Add translated text as `paragraph` blocks (split at 2000 chars). **Drop a leading paragraph that just restates the section title** — NotebookLM emits the section title as the first line of its answer (e.g. `1 Introduction (서론)`), and keeping it produces a paragraph that duplicates the `heading_1` you just made (title shown twice). Compare the first paragraph to the heading text you're creating (ignoring the `N.`/parenthetical-translation differences) and skip it if they match. `verify_sections.py` flags any that slip through as HEADING_ECHO.
+2. Convert the translated text to Notion blocks with the **shared markdown converter — do NOT dump raw text into paragraph blocks**:
+   ```python
+   import sys; sys.path.insert(0, "/workspace/group/research-papers")
+   from save_qa_callout import build_answer_blocks
+   blocks = build_answer_blocks(section_markdown)   # handles ###/## headings, **bold**,
+                                                    # -/* bullets (+ wrapped lines), N. lists,
+                                                    # ``` code, | tables |, --- dividers
+   ```
+   NotebookLM emits markdown (`### Subsection`, `**bold**`, `*` bullets, `---`, code fences). If you build `paragraph` blocks from the raw text yourself, all of that renders as **literal `###` / `**` / `---` text** and the layout is broken (verify_sections flags it as RAW_MARKDOWN). `build_answer_blocks` also splits long paragraphs on whitespace boundaries — **never hard-split at a fixed char count**, which cuts through words (`self-atten`|`tion`). **Drop a leading paragraph that just restates the section title** — NotebookLM repeats the section title as the first line; keeping it duplicates the `heading_1` you just made (verify_sections flags HEADING_ECHO). Compare the first line to the heading (ignoring `N.`/parenthetical-translation) and skip it if they match.
 3. **After the first paragraph of each section**, insert all figures whose ID starts with `S{section_number}.` from `/tmp/figure_map.json` as `image` blocks
 
 Example for section III (section number 3):

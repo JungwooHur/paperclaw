@@ -232,6 +232,25 @@ def _is_md_table(para: str) -> bool:
     return bool(re.match(r"^\s*\|?\s*:?-+", lines[1]))
 
 
+def _group_list_items(para: str, marker_re: str) -> list[str]:
+    """Split a list paragraph into item texts, merging continuation lines.
+
+    A list item's wrapped/indented continuation line does NOT start with the
+    marker; it belongs to the item above. The previous version dropped such
+    lines, losing content (e.g. '* CoT:\\n    explanation...' kept only 'CoT:').
+    """
+    items: list[str] = []
+    for line in para.split("\n"):
+        m = re.match(marker_re, line)
+        if m:
+            t = sanitize(m.group(1))
+            if t:
+                items.append(t)
+        elif line.strip() and items:
+            items[-1] = (items[-1] + " " + sanitize(line)).strip()
+    return items
+
+
 def _prose_blocks(prose_md: str) -> list[dict]:
     """Convert prose markdown (no fenced code blocks) into Notion blocks."""
     blocks: list[dict] = []
@@ -244,6 +263,11 @@ def _prose_blocks(prose_md: str) -> list[dict]:
             # alignment is preserved without building Notion table schema.
             blocks.append(_code_block(para, "markdown"))
             continue
+        if re.fullmatch(r"(?:---+|\*\*\*+|___+)", para):
+            # Markdown horizontal rule -> Notion divider (else it renders as a
+            # literal "---" paragraph).
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+            continue
         first = para.split("\n", 1)[0]
         m_head = re.match(r"^(#{1,6})\s+(.*)", first)
         if m_head:
@@ -254,22 +278,14 @@ def _prose_blocks(prose_md: str) -> list[dict]:
                 blocks.extend(_paragraph_blocks(sanitize(rest)))
             continue
         if first.lstrip().startswith(("- ", "* ")):
-            for line in para.split("\n"):
-                m = re.match(r"^\s*[\-*]\s+(.*)", line)
-                if m:
-                    txt = sanitize(m.group(1))
-                    if txt:
-                        blocks.append({"object": "block", "type": "bulleted_list_item",
-                                       "bulleted_list_item": {"rich_text": _inline_rich_text(txt[:2000])}})
+            for txt in _group_list_items(para, r"^\s*[\-*]\s+(.*)"):
+                blocks.append({"object": "block", "type": "bulleted_list_item",
+                               "bulleted_list_item": {"rich_text": _inline_rich_text(txt[:2000])}})
             continue
         if re.match(r"^\s*\d+\.\s", first):
-            for line in para.split("\n"):
-                m = re.match(r"^\s*\d+\.\s+(.*)", line)
-                if m:
-                    txt = sanitize(m.group(1))
-                    if txt:
-                        blocks.append({"object": "block", "type": "numbered_list_item",
-                                       "numbered_list_item": {"rich_text": _inline_rich_text(txt[:2000])}})
+            for txt in _group_list_items(para, r"^\s*\d+\.\s+(.*)"):
+                blocks.append({"object": "block", "type": "numbered_list_item",
+                               "numbered_list_item": {"rich_text": _inline_rich_text(txt[:2000])}})
             continue
         if first.lstrip().startswith("> "):
             quote = "\n".join(re.sub(r"^\s*>\s?", "", ln) for ln in para.split("\n"))
