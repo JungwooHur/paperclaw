@@ -85,7 +85,11 @@ _ARTIFACT_PATS = [
     ("cli-conversation",
      re.compile(r"(Continuing|Resumed|New) conversation[: ]|Conversation:\s*[0-9a-f-]{8,}", re.I)),
     ("cli-answer-label", re.compile(r"\bAnswer:\s", re.I)),
-    ("markdown-bold", re.compile(r"\*\*")),
+    # Paired **bold** only — a lone ** is Python kwargs unpacking
+    # (e.g. tools[name](**arguments)), legitimate prose/code content, not
+    # unconverted markdown. Inner excludes parens/asterisks so f(**a) g(**b)
+    # doesn't match across two unpackings.
+    ("markdown-bold", re.compile(r"\*\*(?=\S)[^*\n()]{1,100}?(?<=\S)\*\*")),
     ("markdown-heading", re.compile(r"(?:^|\n)#{1,6}\s")),
     ("markdown-rule", re.compile(r"(?:^|\n)(?:---+|\*\*\*+|___+)\s*(?:\n|$)")),
     ("markdown-bullet", re.compile(r"(?:^|\n)\s*[\*\-]\s+\S")),
