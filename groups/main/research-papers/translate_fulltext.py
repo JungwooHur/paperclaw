@@ -51,7 +51,9 @@ API = "https://api.notion.com/v1"
 
 
 def notion(method, path, body=None, tries=12):
-    tok = os.environ["NOTION_TOKEN"]
+    tok = os.environ.get("NOTION_TOKEN")
+    if not tok:
+        sys.exit("NOTION_TOKEN environment variable must be set")
     last = None
     for a in range(tries):
         try:
@@ -78,13 +80,16 @@ def nb(*args, timeout=300):
 
 def list_sources(notebook):
     r = nb("source", "list", "--notebook", notebook, "--json", timeout=60)
+    if r.returncode != 0:
+        sys.exit(f"`notebooklm source list` failed for {notebook}: {r.stderr[:300]}")
     d = json.loads(r.stdout)
     return d.get("sources", d) if isinstance(d, dict) else d
 
 
 def source_fulltext(notebook, sid, out_path):
     nb("source", "fulltext", sid, "--notebook", notebook, "-o", out_path, timeout=120)
-    t = open(out_path, encoding="utf-8").read()
+    with open(out_path, encoding="utf-8") as f:
+        t = f.read()
     i = t.find("Content:")
     return t[i + 8:].strip() if i >= 0 else t
 
@@ -112,7 +117,7 @@ def chunk_text(t, cap):
 LANG_NAME = {"ko": "한국어", "ja": "일본어", "zh-CN": "중국어", "en": "English"}
 
 
-def translate_chunk(chunk, lang):
+def translate_chunk(chunk, lang, nb_id):
     name = LANG_NAME.get(lang, lang)
     if lang == "en":
         prompt = ("Reformat the following text cleanly. Keep ALL content, do "
@@ -125,9 +130,14 @@ def translate_chunk(chunk, lang):
     out = ""
     for attempt in range(4):
         try:
-            r = nb("ask", prompt, "--notebook", NB_ID, "--json")
+            r = nb("ask", prompt, "--notebook", nb_id, "--json")
             out = json.loads(r.stdout).get("answer", "").strip() if r.returncode == 0 else ""
-        except Exception:
+        except Exception as e:
+            # Broad on purpose: this runs unattended for hours, so retry on ANY
+            # failure (timeout, JSON, subprocess, network) rather than abort the
+            # whole queue — but log it so failures aren't silent.
+            print(f"    chunk attempt {attempt} failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
             out = ""
         if len(out) >= 0.30 * len(chunk):   # complete enough
             return out
@@ -151,8 +161,6 @@ def main():
     ap.add_argument("--apply", action="store_true",
                     help="rebuild the Notion page after translating")
     args = ap.parse_args()
-    global NB_ID
-    NB_ID = args.notebook
     work = args.workdir or f"/tmp/ft_{args.page[:8]}"
     os.makedirs(work, exist_ok=True)
 
@@ -165,15 +173,18 @@ def main():
         sid, title = s.get("id"), s.get("title", f"source {si}")
         raw_path = f"{work}/src_{si:02}.txt"
         if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 50):
-            open(raw_path, "w").write(source_fulltext(args.notebook, sid, raw_path + ".dl"))
-        chunks = chunk_text(normalize(open(raw_path).read()), args.chunk)
+            with open(raw_path, "w", encoding="utf-8") as f:
+                f.write(source_fulltext(args.notebook, sid, raw_path + ".dl"))
+        with open(raw_path, encoding="utf-8") as f:
+            chunks = chunk_text(normalize(f.read()), args.chunk)
         paths = []
         for ci, c in enumerate(chunks):
             p = f"{work}/tr_{si:02}_{ci:03}.txt"
             if not (os.path.exists(p) and os.path.getsize(p) > 10):
                 t0 = time.time()
-                a = translate_chunk(c, args.lang)
-                open(p, "w").write(a)
+                a = translate_chunk(c, args.lang, args.notebook)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(a)
                 flag = "" if len(a) >= 0.30 * len(c) else " SHORT!"
                 print(f"  s{si:02}c{ci:03}: src={len(c)} out={len(a)} "
                       f"({time.time()-t0:.0f}s){flag}", flush=True)
@@ -186,7 +197,8 @@ def main():
     for title, paths in seg_files:
         parts.append(f"# {title}")
         for p in paths:
-            body = open(p).read().strip()
+            with open(p, encoding="utf-8") as f:
+                body = f.read().strip()
             if body:
                 parts.append(body)
     md = "\n\n".join(parts)
