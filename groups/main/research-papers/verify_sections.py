@@ -85,7 +85,15 @@ _ARTIFACT_PATS = [
     ("cli-conversation",
      re.compile(r"(Continuing|Resumed|New) conversation[: ]|Conversation:\s*[0-9a-f-]{8,}", re.I)),
     ("cli-answer-label", re.compile(r"\bAnswer:\s", re.I)),
-    ("markdown-bold", re.compile(r"\*\*")),
+    # Paired **bold** only — a lone ** is Python kwargs unpacking
+    # (e.g. tools[name](**arguments)), legitimate prose/code content. The inner
+    # may contain a balanced "(...)" (so bilingual bold like **Introduction
+    # (서론)** is still caught) but must NOT contain a ")" that precedes a "("
+    # — that ")...(" shape is the signature of matching across two unpackings
+    # (f(**a) and g(**b)). Not anchored on a trailing word boundary, so Korean
+    # particles glued to bold (**중요**입니다) are still caught.
+    ("markdown-bold",
+     re.compile(r"\*\*(?=\S)(?![^*\n]*\)[^*\n]*\()[^*\n]{1,100}?(?<=\S)\*\*")),
     ("markdown-heading", re.compile(r"(?:^|\n)#{1,6}\s")),
     ("markdown-rule", re.compile(r"(?:^|\n)(?:---+|\*\*\*+|___+)\s*(?:\n|$)")),
     ("markdown-bullet", re.compile(r"(?:^|\n)\s*[\*\-]\s+\S")),
