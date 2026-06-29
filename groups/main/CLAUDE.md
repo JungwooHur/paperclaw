@@ -19,6 +19,7 @@ Known fixes accumulated so far:
 | Caption cut off mid-sentence | Long captions split across multiple PDF text blocks | Walk forward from first caption block while text doesn't end with `.` and gap ≤ 25pt |
 | Notion PATCH image 400 error | Including `"type"` field in image update | Use `{"image": {"external": {"url": "..."}}}` — no `type` field |
 | Q&A callout blank line | `"rich_text": []` in a `default`-color callout renders as a blank line | Use `"color": "gray_background"` on the callout — its tinted band visually anchors the empty rich_text and the toggle child sits flush inside (toggle-style layout, see save_qa_callout.py) |
+| Long documents / books came out heavily summarized (pages at 1–24% of source length) with duplicated paragraph runs | The per-section "translate section X.Y" NotebookLM loop does not preserve a long document: adjacent section answers OVERLAP (same paragraph twice) and the spans BETWEEN them are DROPPED (whole paragraphs vanish). The heading-count and heading-DUPLICATE checks passed these pages. Recurred across 6 books | Translate long docs with `research-papers/translate_fulltext.py`: pulls each source's raw indexed text (`notebooklm source fulltext`), tiling sentence-bounded chunks (no gap/overlap), one bounded `notebooklm ask --json` per chunk (bounded "translate THIS" doesn't summarize), length-checked, assembled via build_answer_blocks, rate-safe rebuild. Plus `verify_sections.py` PARA_DUP detects verbatim paragraph duplication the heading check missed. See "Long documents / books" |
 | Non-arxiv paper translated from slide deck | First Google hit was a 10-page talk PDF (ends "THANK YOU") — agent uploaded that to NotebookLM as if it were the full paper | For non-arxiv papers, fetch from OpenReview/conference site with browser UA + Referer; then run a `fitz` page-count + last-page text check to reject slide decks before adding the source |
 | OpenReview PDF returns HTTP 403 | Default curl UA is blocked | Use `curl -L -A "Mozilla/5.0..." -H "Referer: https://openreview.net/forum?id=..." "https://openreview.net/pdf?id=..."` |
 | Wrap `\n` mid-paragraph on Notion | NotebookLM replies are ~80-char soft-wrapped; uploading raw text makes Notion render breaks inside sentences | Step 2-B prompt forbids mid-paragraph `\n`; sanitizer collapses single `\n` to space while preserving `\n\n` paragraph breaks (see Step 2-B-post) |
@@ -148,7 +149,41 @@ Headers: Authorization: Bearer $NOTION_TOKEN, Notion-Version: 2022-06-28
 - **Journal/Conference**: Use abbreviations — TRO, RAL, IJRR, ICRA, IROS, CoRL, RSS, NeurIPS, Science Robotics, etc.
 - **연구실/기관 소속**: Check `researcherLabMap` in config.json first, infer from affiliations if not found
 
-### Full Paper Processing (via NotebookLM)
+### Long documents / books → `translate_fulltext.py` (MANDATORY, do NOT use Phase 2 section-asks)
+
+> **A book or any long multi-source document MUST be translated with
+> `research-papers/translate_fulltext.py`, never with the Phase 2
+> "translate section X.Y" loop.** Per-section NotebookLM asks do NOT preserve a
+> long document: adjacent section answers *overlap* (the same paragraph lands on
+> the page twice) and the spans *between* them are *dropped* (whole paragraphs
+> vanish). On real books this produced pages at **1–24 % of the source length**
+> with duplicated runs — and the heading-count / heading-DUPLICATE checks passed
+> them anyway. This recurred across 6 books before it was caught.
+
+```bash
+# notebook already has the uploaded PDF/zip sources (one per chapter is fine)
+python3 /workspace/group/research-papers/translate_fulltext.py \
+  --notebook <notebook_id> --page <notion_page_id> --apply
+# then ALWAYS gate it:
+python3 /workspace/group/research-papers/verify_sections.py --page <notion_page_id>
+```
+
+It pulls each source's raw indexed text (`notebooklm source fulltext` — the
+complete text, not a summary), splits it into **tiling, sentence-bounded chunks**
+(every chunk a contiguous span; chunks cover the whole text with no gap/overlap →
+omission and duplication are impossible by construction), translates each chunk on
+its own via `notebooklm ask --json` (a bounded "translate THIS text" request does
+NOT summarize, unlike "translate section X"), with an empty/short retry + length
+check, assembles via `build_answer_blocks`, and rate-safely rebuilds the page.
+Resumable (chunk cache under `--workdir`). **Verify completeness**: translated
+Korean should be ~0.4–0.7× the source `Characters:` total; a ratio < 0.3 means it
+summarized — investigate before declaring done.
+
+The section-by-section workflow below is **only** for short arxiv papers (where
+each section is small and figures must be placed by `S{n}.F{m}` id). For books,
+use the tool above.
+
+### Full Paper Processing (via NotebookLM) — short arxiv papers
 
 When adding a paper, process **ALL sections** through NotebookLM (translate for `ko`/other, reformat for `en` — see [Output Language Mode](#output-language-mode)) and place **ALL figures** in their correct positions. Use NotebookLM rather than reading the paper HTML yourself — saves Claude tokens.
 
