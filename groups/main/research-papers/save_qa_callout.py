@@ -243,12 +243,12 @@ def _group_list_items(para: str, marker_re: str) -> list[str]:
     for line in para.split("\n"):
         m = re.match(marker_re, line)
         if m:
-            t = sanitize(m.group(1))
-            if t:
-                items.append(t)
+            # Append even when empty (e.g. "* " with text on the next line), so
+            # continuation lines merge into THIS item, not the previous one.
+            items.append(sanitize(m.group(1)))
         elif line.strip() and items:
             items[-1] = (items[-1] + " " + sanitize(line)).strip()
-    return items
+    return [it for it in items if it]
 
 
 def _prose_blocks(prose_md: str) -> list[dict]:
