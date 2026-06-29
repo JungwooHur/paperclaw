@@ -71,6 +71,12 @@ def notion(method, path, body=None, tries=12):
                 time.sleep(float(e.headers.get("Retry-After", 5)) + 2 * a)
                 continue
             raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # transient network/read timeout — retry (a mid-rebuild crash here
+            # would leave the page half-archived). Backoff and try again.
+            last = e
+            time.sleep(2 + 2 * a)
+            continue
     raise last
 
 
@@ -216,7 +222,9 @@ def main():
     ap.add_argument("--apply", action="store_true",
                     help="rebuild the Notion page after translating")
     args = ap.parse_args()
-    work = args.workdir or f"/tmp/ft_{args.page[:8]}"
+    # FULL page id — a prefix collides (pages created together share a prefix),
+    # which would make two books read each other's chunk/figure cache.
+    work = args.workdir or f"/tmp/ft_{args.page}"
     os.makedirs(work, exist_ok=True)
 
     sources = list_sources(args.notebook)
@@ -224,6 +232,7 @@ def main():
 
     # Phase 1: fulltext + chunked translation (resumable).
     seg_files = []  # (title, [chunk translation paths in order])
+    consec_empty = 0
     for si, s in enumerate(sources):
         sid, title = s.get("id"), s.get("title", f"source {si}")
         raw_path = f"{work}/src_{si:02}.txt"
@@ -238,14 +247,32 @@ def main():
             if not (os.path.exists(p) and os.path.getsize(p) > 10):
                 t0 = time.time()
                 a = translate_chunk(c, args.lang, args.notebook)
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(a)
+                # Only cache a usable result. Caching an empty answer would make
+                # the resume-skip treat a FAILED chunk as done, silently dropping
+                # that span from the book.
+                if a:
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.write(a)
                 flag = "" if len(a) >= 0.30 * len(c) else " SHORT!"
                 print(f"  s{si:02}c{ci:03}: src={len(c)} out={len(a)} "
                       f"({time.time()-t0:.0f}s){flag}", flush=True)
+                consec_empty = consec_empty + 1 if not a else 0
+                if consec_empty >= 5:
+                    sys.exit("ABORT: 5 consecutive empty NotebookLM responses — "
+                             "the service is down/rate-limited. Stopping before "
+                             "an incomplete page is built; re-run later to resume.")
                 time.sleep(1)
             paths.append(p)
         seg_files.append((clean_title(title), paths))
+
+    # Completeness guard: every chunk must have a cached translation. If any is
+    # missing (failed/empty), refuse to assemble or touch the page — a partial
+    # rebuild would drop content or, worse, archive the old page and crash.
+    missing = [p for _, ps in seg_files for p in ps
+               if not (os.path.exists(p) and os.path.getsize(p) > 10)]
+    if missing:
+        sys.exit(f"ABORT: {len(missing)} chunk(s) not translated (e.g. {missing[0]}). "
+                 f"Re-run to resume; NOT assembling/rebuilding with gaps.")
 
     # Build markdown: per source -> heading + chunk bodies.
     parts = []
