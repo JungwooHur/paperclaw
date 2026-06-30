@@ -63,13 +63,20 @@ def notion(method, path, body=None, tries=12):
                 headers={"Authorization": f"Bearer {tok}",
                          "Notion-Version": "2022-06-28",
                          "Content-Type": "application/json"})
-            return json.load(urllib.request.urlopen(req, timeout=60))
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.load(resp)
         except urllib.error.HTTPError as e:
             last = e
             if e.code == 429:
                 time.sleep(float(e.headers.get("Retry-After", 5)) + 2 * a)
                 continue
             raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # transient network/read timeout — retry (a mid-rebuild crash here
+            # would leave the page half-archived). Backoff and try again.
+            last = e
+            time.sleep(2 + 2 * a)
+            continue
     raise last
 
 
@@ -82,7 +89,10 @@ def list_sources(notebook):
     r = nb("source", "list", "--notebook", notebook, "--json", timeout=60)
     if r.returncode != 0:
         sys.exit(f"`notebooklm source list` failed for {notebook}: {r.stderr[:300]}")
-    d = json.loads(r.stdout)
+    try:
+        d = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        sys.exit(f"`notebooklm source list` returned non-JSON: {r.stdout[:300]}")
     return d.get("sources", d) if isinstance(d, dict) else d
 
 
@@ -151,6 +161,53 @@ def clean_title(title):
     return re.split(r"\s+_\s+", title)[0].strip()
 
 
+_FIGREF = re.compile(r"Figure\s*([0-9]+[-.][0-9]+)", re.I)
+
+
+def _block_text(b):
+    o = b.get(b["type"], {})
+    return "".join(x.get("text", {}).get("content", "") for x in o.get("rich_text", []))
+
+
+def inject_figures(blocks, figures_zip, workdir):
+    """Insert each book figure (uploaded privately into Notion) right after the
+    FIRST block that references its 'Figure N-M' label. Figures with no textual
+    reference are appended at the end so nothing is silently dropped."""
+    import extract_book_figures as ef
+    import notion_upload as nu
+    figmap = ef.extract_figures(figures_zip, workdir)   # {label: local_png}
+    if not figmap:
+        return blocks
+    uploaded = {}   # label -> file_upload id (uploaded lazily, attached same run)
+
+    def img_for(label):
+        if label not in uploaded:
+            fid = nu.upload_image(figmap[label]) if label in figmap else None
+            uploaded[label] = fid
+        return uploaded[label]
+
+    out, placed = [], set()
+    for b in blocks:
+        out.append(b)
+        for label in dict.fromkeys(m.group(1).replace(".", "-")
+                                   for m in _FIGREF.finditer(_block_text(b))):
+            if label in placed or label not in figmap:
+                continue
+            fid = img_for(label)
+            if fid:
+                out.append(nu.image_block(fid))
+                placed.add(label)
+    # any figures never referenced in text -> append at end
+    for label in figmap:
+        if label not in placed:
+            fid = img_for(label)
+            if fid:
+                out.append(nu.image_block(fid))
+                placed.add(label)
+    print(f"  injected {len(placed)}/{len(figmap)} figures", flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--notebook", required=True)
@@ -158,10 +215,16 @@ def main():
     ap.add_argument("--chunk", type=int, default=4000)
     ap.add_argument("--lang", default=os.environ.get("OUTPUT_LANGUAGE", "ko"))
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--figures-zip", default=None,
+                    help="book source zip (chapter PDFs); inject its figures "
+                         "next to their 'Figure N-M' references, uploaded "
+                         "PRIVATELY into Notion (never a public host)")
     ap.add_argument("--apply", action="store_true",
                     help="rebuild the Notion page after translating")
     args = ap.parse_args()
-    work = args.workdir or f"/tmp/ft_{args.page[:8]}"
+    # FULL page id — a prefix collides (pages created together share a prefix),
+    # which would make two books read each other's chunk/figure cache.
+    work = args.workdir or f"/tmp/ft_{args.page}"
     os.makedirs(work, exist_ok=True)
 
     sources = list_sources(args.notebook)
@@ -169,6 +232,7 @@ def main():
 
     # Phase 1: fulltext + chunked translation (resumable).
     seg_files = []  # (title, [chunk translation paths in order])
+    consec_empty = 0
     for si, s in enumerate(sources):
         sid, title = s.get("id"), s.get("title", f"source {si}")
         raw_path = f"{work}/src_{si:02}.txt"
@@ -183,14 +247,32 @@ def main():
             if not (os.path.exists(p) and os.path.getsize(p) > 10):
                 t0 = time.time()
                 a = translate_chunk(c, args.lang, args.notebook)
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(a)
+                # Only cache a usable result. Caching an empty answer would make
+                # the resume-skip treat a FAILED chunk as done, silently dropping
+                # that span from the book.
+                if a:
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.write(a)
                 flag = "" if len(a) >= 0.30 * len(c) else " SHORT!"
                 print(f"  s{si:02}c{ci:03}: src={len(c)} out={len(a)} "
                       f"({time.time()-t0:.0f}s){flag}", flush=True)
-                time.sleep(1)
+                consec_empty = consec_empty + 1 if not a else 0
+                if consec_empty >= 5:
+                    sys.exit("ABORT: 5 consecutive empty NotebookLM responses — "
+                             "the service is down/rate-limited. Stopping before "
+                             "an incomplete page is built; re-run later to resume.")
+                time.sleep(3)  # gentle pacing — avoid re-triggering NotebookLM rate limits
             paths.append(p)
         seg_files.append((clean_title(title), paths))
+
+    # Completeness guard: every chunk must have a cached translation. If any is
+    # missing (failed/empty), refuse to assemble or touch the page — a partial
+    # rebuild would drop content or, worse, archive the old page and crash.
+    missing = [p for _, ps in seg_files for p in ps
+               if not (os.path.exists(p) and os.path.getsize(p) > 10)]
+    if missing:
+        sys.exit(f"ABORT: {len(missing)} chunk(s) not translated (e.g. {missing[0]}). "
+                 f"Re-run to resume; NOT assembling/rebuilding with gaps.")
 
     # Build markdown: per source -> heading + chunk bodies.
     parts = []
@@ -204,6 +286,10 @@ def main():
     md = "\n\n".join(parts)
     blocks = sq.build_answer_blocks(md)
     print(f"assembled {len(md)} chars -> {len(blocks)} blocks", flush=True)
+
+    if args.apply and args.figures_zip:
+        blocks = inject_figures(blocks, args.figures_zip, f"{work}/figs")
+        print(f"with figures -> {len(blocks)} blocks", flush=True)
 
     if not args.apply:
         print("translation done (--apply to rebuild the page)", flush=True)

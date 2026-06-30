@@ -539,18 +539,11 @@ for fig_num, pn in sorted(fig_pages.items()):
     out_path = f"{OUT_DIR}/fig{fig_num}.png"
     page.get_pixmap(matrix=fitz.Matrix(250/72, 250/72), clip=crop, alpha=False).save(out_path)
 
-    # Upload to catbox.moe
-    result = subprocess.run(
-        ["curl", "-s", "-F", "reqtype=fileupload", "-F", f"fileToUpload=@{out_path}",
-         "https://catbox.moe/user/api.php"],
-        capture_output=True, text=True
-    )
-    url = result.stdout.strip()
-    if url.startswith("https://"):
-        results[fig_num] = {"url": url, "page": pn + 1}
-        print(f"Figure {fig_num} (page {pn+1}): {url}", file=sys.stderr)
-    else:
-        print(f"Figure {fig_num}: upload failed — {url}", file=sys.stderr)
+    # Upload PRIVATELY into Notion (NOT a public host) — see image hosting below.
+    from notion_upload import upload_image
+    fid = upload_image(out_path)
+    if fid:
+        results[fig_num] = {"file_upload": fid, "page": pn + 1}
 
 print(json.dumps(results, indent=2))
 PYEOF
@@ -565,7 +558,13 @@ notebooklm ask "각 Figure가 어느 섹션에 속하는지 알려줘. Figure �
 
 Then use the section mapping to insert image blocks via Notion `after` parameter (insert after the first paragraph of each figure's section).
 
-**Image hosting priority:** catbox.moe (`https://catbox.moe/user/api.php`) → if that fails, try `https://litterbox.catbox.moe/resources/internals/api.php` (with `userhash=` empty, `time=1h`).
+**Image hosting (MANDATORY): upload figures PRIVATELY into Notion — never a public host.** Use `research-papers/notion_upload.py`:
+```python
+from notion_upload import upload_image, image_block
+fid = upload_image("/tmp/fig.png")          # Notion File Upload API; returns a file_upload id
+block = image_block(fid)                     # {"image": {"type":"file_upload","file_upload":{"id":fid}}}
+```
+The figure is stored inside the owner's Notion workspace, not on `catbox.moe`/`litterbox` (a public, anyone-with-link host). Public hosting is forbidden — source figures are copyrighted/personal, and public links rot. A created upload expires (~1h) until attached to a block, so upload and PATCH in the same run. (Legacy pages still on catbox are migrated by `notion_upload.py --page <id> --apply`.)
 
 #### Phase 4: Assemble on Notion Page
 
