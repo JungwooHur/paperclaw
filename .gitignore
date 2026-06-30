@@ -26,6 +26,7 @@ groups/main/research-papers/*
 !groups/main/research-papers/auto_save_qa.py
 !groups/main/research-papers/verify_citations.py
 !groups/main/research-papers/verify_sections.py
+!groups/main/research-papers/translate_fulltext.py
 !groups/main/research-papers/systemd/
 
 # Secrets & personal data (public repo — see scripts/check-sensitive.sh)
