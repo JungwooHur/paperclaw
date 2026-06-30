@@ -261,7 +261,7 @@ def main():
                     sys.exit("ABORT: 5 consecutive empty NotebookLM responses — "
                              "the service is down/rate-limited. Stopping before "
                              "an incomplete page is built; re-run later to resume.")
-                time.sleep(1)
+                time.sleep(3)  # gentle pacing — avoid re-triggering NotebookLM rate limits
             paths.append(p)
         seg_files.append((clean_title(title), paths))
 
