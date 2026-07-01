@@ -183,6 +183,59 @@ The section-by-section workflow below is **only** for short arxiv papers (where
 each section is small and figures must be placed by `S{n}.F{m}` id). For books,
 use the tool above.
 
+#### Known fulltext-translation pitfalls (both auto-handled now; remediate old pages)
+
+- **Leaked source-image URLs in the body.** `notebooklm source fulltext` indexes
+  each source PDF's embedded images and emits their internal URLs
+  (`https://lh3.googleusercontent.com/notebooklm/<token>=w..-h..-v0`) — each
+  followed by an image UUID, often beside a bare PDF page-number line — *inside the
+  text*. A faithful "do not summarize" translation echoes all of it as paragraph
+  text (seen as standalone `https://lh3…` paragraphs and `… 14 15 https://lh3…`
+  tails). It is NOT content. `translate_fulltext.strip_source_urls()` now strips it
+  from both the source (before chunking) and the cached chunk bodies (at assembly),
+  so fresh runs are clean. To fix a page already built before this:
+  `python3 research-papers/clean_source_urls.py --page <id> --apply` (dry-run
+  without `--apply`) — it edits/archives only text blocks; injected image blocks are
+  untouched. The *image blocks* themselves were always correct (private file_upload);
+  only the echoed URL *text* was the problem.
+- **`injected 0/N figures` = stale figmap cache, not a missing-reference bug.**
+  `extract_book_figures` caches `figmap.json` with **absolute** PNG paths. If those
+  files were cleaned up (classically: a figmap.json carried over from the old
+  short-prefix `/tmp/ft_<page[:8]>` workdir, whose PNGs are long gone), every upload
+  fails and injection silently yields 0 — even though the fallback "append unreferenced
+  figures at the end" should have placed them. There is now a stale-cache guard
+  (re-extract if any cached path is missing), so deleting the cache is no longer
+  required, but if you ever see `0/N`, check that the figmap paths exist on disk.
+
+#### NotebookLM daily rate limit (plan long batches around it)
+
+`notebooklm ask` is a **web-UI chat query**, not an API call: the CLI is
+`notebooklm-py` (an unofficial browser-session wrapper that drives
+notebooklm.google.com as the logged-in Google account, auth via a Playwright
+cookie store — that's why `notebooklm login` needs Chromium). So **every ask
+counts against that account's daily chat-query quota**, shared with any human
+chatting in the same account's web UI. Documented per-tier caps (2026): Free 50,
+Plus 200, Pro 500, Ultra 2,500–5,000 chats/day.
+
+A full book is ~150–200 tiling chunks = ~150–200 asks (a chunk that comes back
+SHORT retries up to 4× → up to 4 asks), so **2–3 books can drain a ~500/day
+window** — which is exactly how a multi-book queue stalls midway in runs of empty
+answers. Planning:
+
+- The quota is a **rolling ~24h window from first use**, NOT a fixed midnight
+  reset (verified: a batch spending ~470 asks across local midnight still tripped
+  mid-run). When it trips, `ask` returns empty; `translate_fulltext.py` aborts
+  after 5 consecutive empties with the chunk cache intact — it's **resumable**, so
+  just re-run after the window reopens.
+- **Budget ~450–470 chunks/day** and split large backlogs across days rather than
+  re-tripping the limit mid-run.
+- Recovery: wait ~24h from when the empties first appeared; retrying early just
+  returns more empties. If empties persist after a clean 24h wait, the session
+  cookie may be stale — re-run `notebooklm login`.
+- Heavy bursts can also trip a *separate* batchexecute throttle (surfaced as the
+  library's `RateLimitError`), distinct from the daily cap — the tool already
+  paces 3s/chunk to avoid it.
+
 ### Full Paper Processing (via NotebookLM) — short arxiv papers
 
 When adding a paper, process **ALL sections** through NotebookLM (translate for `ko`/other, reformat for `en` — see [Output Language Mode](#output-language-mode)) and place **ALL figures** in their correct positions. Use NotebookLM rather than reading the paper HTML yourself — saves Claude tokens.
