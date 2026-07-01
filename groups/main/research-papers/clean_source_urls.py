@@ -50,8 +50,10 @@ def _clean_runs(rich_text):
             continue                              # whole run was URL noise
         nr = json.loads(json.dumps(r))            # deep copy, keep annotations
         nr["text"]["content"] = cleaned
-        if nr["text"].get("link") is None and "plain_text" in nr:
-            nr["plain_text"] = cleaned
+        # drop read-only fields: they're now stale vs the cleaned content and
+        # Notion recomputes them on write (sending stale ones can 400).
+        nr.pop("plain_text", None)
+        nr.pop("href", None)
         out.append(nr)
     return out, changed
 

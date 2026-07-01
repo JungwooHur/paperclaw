@@ -41,7 +41,9 @@ def extract_figures(zip_path, workdir=None):
         # those files were cleaned up (e.g. an old short-prefix /tmp workdir whose
         # figmap.json was carried over), every upload fails and figure injection
         # silently yields 0 — re-extract instead of trusting dead paths.
-        if cached and all(os.path.exists(p) for p in cached.values()):
+        # isinstance (not truthiness): a figureless book caches {}, which is
+        # falsy — `if cached` would re-parse every chapter PDF on every run.
+        if isinstance(cached, dict) and all(os.path.exists(p) for p in cached.values()):
             return cached
 
     exdir = os.path.abspath(os.path.join(work, "pdfs"))
