@@ -36,7 +36,13 @@ def extract_figures(zip_path, workdir=None):
     cache = os.path.join(work, "figmap.json")
     if os.path.exists(cache):
         with open(cache, encoding="utf-8") as f:
-            return json.load(f)
+            cached = json.load(f)
+        # Stale-cache guard: the cache holds absolute paths to extracted PNGs. If
+        # those files were cleaned up (e.g. an old short-prefix /tmp workdir whose
+        # figmap.json was carried over), every upload fails and figure injection
+        # silently yields 0 — re-extract instead of trusting dead paths.
+        if cached and all(os.path.exists(p) for p in cached.values()):
+            return cached
 
     exdir = os.path.abspath(os.path.join(work, "pdfs"))
     with zipfile.ZipFile(zip_path) as z:

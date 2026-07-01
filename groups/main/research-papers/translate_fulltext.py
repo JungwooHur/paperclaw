@@ -109,6 +109,34 @@ def normalize(t):
     return re.sub(r"\s+", " ", t).strip()
 
 
+# NotebookLM's `source fulltext` indexes each source PDF's embedded images and
+# emits their internal URLs (lh3.googleusercontent.com/notebooklm/<token>=w..-h..-v0)
+# each followed by the image's UUID, often beside a bare PDF page-number line.
+# A faithful "do not summarize" translation echoes all of that as body text. It
+# is NOT document content, so strip it from both the source (before translating)
+# and the translated output (before assembling the page).
+_SRC_IMG = re.compile(
+    r"https?://lh3\.googleusercontent\.com/\S+"               # image URL
+    r"(?:\s+[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})*",  # trailing uuid(s)
+    re.I)
+_NUM_LINE = re.compile(r"\s*\d+(?:\s+\d+)*\s*")
+
+
+def strip_source_urls(text):
+    """Remove leaked NotebookLM source-image artifacts (lh3 image URLs, their
+    trailing image UUIDs, and the bare page-number marker lines left beside
+    them). No-op unless such a URL is present, so inline numbers and 'Figure
+    N-M' references in clean text are never touched."""
+    if "lh3.googleusercontent.com" not in text:
+        return text
+    text = _SRC_IMG.sub("", text)
+    # rstrip kills the residue space the URL removal leaves; drop bare page-number
+    # markers but keep truly-empty lines so paragraph breaks survive.
+    lines = [ln for ln in (x.rstrip() for x in text.split("\n"))
+             if not _NUM_LINE.fullmatch(ln)]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
 def chunk_text(t, cap):
     """Tiling chunks <= cap chars, split only at sentence boundaries."""
     sents = re.split(r"(?<=[.!?])\s+", t)
@@ -149,6 +177,7 @@ def translate_chunk(chunk, lang, nb_id):
             print(f"    chunk attempt {attempt} failed: {type(e).__name__}: {e}",
                   file=sys.stderr)
             out = ""
+        out = strip_source_urls(out)         # drop leaked lh3 image URLs/markers
         if len(out) >= 0.30 * len(chunk):   # complete enough
             return out
         time.sleep(3)                        # empty/short -> retry
@@ -240,7 +269,7 @@ def main():
             with open(raw_path, "w", encoding="utf-8") as f:
                 f.write(source_fulltext(args.notebook, sid, raw_path + ".dl"))
         with open(raw_path, encoding="utf-8") as f:
-            chunks = chunk_text(normalize(f.read()), args.chunk)
+            chunks = chunk_text(normalize(strip_source_urls(f.read())), args.chunk)
         paths = []
         for ci, c in enumerate(chunks):
             p = f"{work}/tr_{si:02}_{ci:03}.txt"
@@ -280,7 +309,7 @@ def main():
         parts.append(f"# {title}")
         for p in paths:
             with open(p, encoding="utf-8") as f:
-                body = f.read().strip()
+                body = strip_source_urls(f.read()).strip()  # clean older cached chunks
             if body:
                 parts.append(body)
     md = "\n\n".join(parts)

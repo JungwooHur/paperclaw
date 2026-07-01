@@ -29,6 +29,7 @@ groups/main/research-papers/*
 !groups/main/research-papers/translate_fulltext.py
 !groups/main/research-papers/extract_book_figures.py
 !groups/main/research-papers/notion_upload.py
+!groups/main/research-papers/clean_source_urls.py
 !groups/main/research-papers/systemd/
 
 # Secrets & personal data (public repo — see scripts/check-sensitive.sh)
