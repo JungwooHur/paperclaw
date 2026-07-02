@@ -184,6 +184,41 @@ def translate_chunk(chunk, lang, nb_id):
     return out                               # best effort (caller logs SHORT)
 
 
+def translate_chunk_robust(chunk, lang, nb_id, _depth=0):
+    """translate_chunk, plus a split-on-failure fallback. Some chunks come back
+    empty no matter how many times we retry — not from rate-limiting but because
+    the span is too big/dense for one answer (a book *index* with no sentence
+    breaks tiles into 6-7k-char blobs; dense code listings do the same). Halving
+    such a chunk and translating each part succeeds where the whole fails.
+
+    A split result is accepted ONLY when BOTH halves come back complete (each
+    clears the same 0.30 length bar against its own sub-chunk). If either half
+    fails we return "" — never the surviving half: caching a partial would
+    silently drop the rest of the span, the omission this tool exists to prevent
+    (the caller writes any non-empty result to the chunk cache and the
+    completeness guard then waves it through as done). Failing the FIRST half
+    also short-circuits before we translate the second, so a real outage stays
+    cheap and returns empty, letting the caller's 5-consecutive-empty abort fire
+    instead of accumulating half-chunks."""
+    out = translate_chunk(chunk, lang, nb_id)
+    if len(out) >= 0.30 * len(chunk):
+        return out
+    if _depth < 3 and len(chunk) > 1500:
+        mid = chunk.rfind(" ", len(chunk) // 3, 2 * len(chunk) // 3)
+        mid = mid if mid > 0 else len(chunk) // 2
+        lchunk, rchunk = chunk[:mid].strip(), chunk[mid:].strip()
+        left = translate_chunk_robust(lchunk, lang, nb_id, _depth + 1)
+        if len(left) < 0.30 * len(lchunk):   # first half failed -> give up now
+            return ""                        #  (don't fan out; don't keep a partial)
+        right = translate_chunk_robust(rchunk, lang, nb_id, _depth + 1)
+        if len(right) < 0.30 * len(rchunk):  # second half failed -> don't keep a partial
+            return ""
+        print(f"    split-translated a {len(chunk)}-char chunk NotebookLM "
+              f"returned empty on (depth {_depth})", flush=True)
+        return (left + "\n\n" + right).strip()
+    return out                               # best effort (caller logs SHORT)
+
+
 def clean_title(title):
     # "3. <chapter> _ <book title>.pdf" -> "3. <chapter>"
     title = re.sub(r"\.(pdf|txt|md|html?)$", "", title, flags=re.I)
@@ -275,7 +310,7 @@ def main():
             p = f"{work}/tr_{si:02}_{ci:03}.txt"
             if not (os.path.exists(p) and os.path.getsize(p) > 10):
                 t0 = time.time()
-                a = translate_chunk(c, args.lang, args.notebook)
+                a = translate_chunk_robust(c, args.lang, args.notebook)
                 # Only cache a usable result. Caching an empty answer would make
                 # the resume-skip treat a FAILED chunk as done, silently dropping
                 # that span from the book.

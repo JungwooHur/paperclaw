@@ -206,6 +206,29 @@ use the tool above.
   figures at the end" should have placed them. There is now a stale-cache guard
   (re-extract if any cached path is missing), so deleting the cache is no longer
   required, but if you ever see `0/N`, check that the figmap paths exist on disk.
+- **A chunk that always comes back empty is usually too big/dense, not rate-limited.**
+  A book *index* (alphabetical term lists with no sentence punctuation) tiles into
+  6–7k-char blobs, and dense code listings do the same; NotebookLM returns an empty
+  answer for the whole span no matter how many retries, yet translating each *half*
+  works. `translate_chunk_robust` handles it: on a persistent empty it splits the
+  chunk, translates each part (recursing down), and accepts the result **only when
+  BOTH halves come back complete** — otherwise it returns empty rather than caching
+  the surviving half, which would silently drop the rest of the span (the caller
+  writes any non-empty result to the chunk cache and the completeness guard then
+  treats it as done). If the FIRST half already fails, it stops there without
+  translating the second, so a real outage stays cheap and returns empty — letting
+  the 5-consecutive-empty abort fire instead of fanning out into a deep retry tree.
+  (Distinguish from rate-limiting: rate-limiting hits *many consecutive* chunks; a
+  size problem hits the *same specific* oversized chunks every run.)
+- **`[ARTIFACT] markdown-heading/bullet` after a clean rebuild** — occasionally a
+  block lands as a *paragraph whose text begins with* `##`/`*`. `build_answer_blocks`
+  DOES convert a clean `## X` line to a heading and a `* a. * b.` line to a bullet
+  (verified), so this is **NotebookLM output-shape variance** (it emits a heading or
+  bullet run glued to its body in a shape the converter doesn't split), **not a
+  converter bug — don't "fix" the converter.** Remediate on the page: strip the
+  leading `#{1,6} ` marker (→ plain paragraph) or split a flattened `* … * …` run
+  into real `bulleted_list_item`s. No text is lost; only the block boundary/type is
+  wrong.
 
 #### NotebookLM daily rate limit (plan long batches around it)
 
