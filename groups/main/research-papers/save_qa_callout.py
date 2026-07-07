@@ -151,11 +151,15 @@ def chunks(text: str, limit: int = 1900) -> list[str]:
 
 
 def sanitize(t: str) -> str:
-    """Prose sanitizer: collapse single \\n, strip $. NEVER apply to code blocks —
-    newlines inside triple-backtick fences must be preserved verbatim."""
+    """Prose sanitizer: collapse single \\n. NEVER apply to code blocks — newlines
+    inside triple-backtick fences must be preserved verbatim.
+
+    Does NOT strip '$': LaTeX math delimiters must survive to _inline_rich_text,
+    which turns $...$ / $$...$$ into Notion equation objects and only then drops
+    any leftover stray '$' from real prose. (The old strip deleted every '$',
+    leaving bare LaTeX as plain text so every formula needed a manual Ctrl+Shift+E.)"""
     MARK = "\x00PARA\x00"
     t = t.replace("\n\n", MARK).replace("\n", " ").replace(MARK, "\n\n")
-    t = t.replace("$", "")
     t = re.sub(r"[ \t]+", " ", t)
     return t.strip()
 
@@ -178,20 +182,49 @@ def _normalize_lang(lang: str) -> str:
     return lang if lang in NOTION_CODE_LANGS else "plain text"
 
 
+# LaTeX math -> Notion inline equation objects. NotebookLM emits math wrapped in
+# $...$ / $$...$$ (also \(...\) / \[...\]). The '$' inline forms require a
+# non-space char right inside each delimiter, so prose money ("$5 and $10") is not
+# mistaken for math. Order matters: $$..$$ / \[..\] are tried before $..$.
+_MATH = re.compile(
+    r"\$\$(?P<disp>.+?)\$\$"                        # $$ ... $$
+    r"|\\\[(?P<dispb>.+?)\\\]"                       # \[ ... \]
+    r"|\$(?![\s$])(?P<inl>[^$\n]+?)(?<![\s$])\$"     # $ ... $
+    r"|\\\((?P<inlb>.+?)\\\)",                       # \( ... \)
+    re.DOTALL)
+
+
+def _math_and_text(text: str, bold: bool) -> list[dict]:
+    """Split one (optionally bold) run into inline equation objects + text, dropping
+    stray unbalanced '$'. The bold annotation carries onto equations too, so a bold
+    run that contains math stays fully bold."""
+    ann = {"annotations": {"bold": True}} if bold else {}
+    out: list[dict] = []
+    pos = 0
+    for m in _MATH.finditer(text):
+        pre = text[pos:m.start()].replace("$", "")
+        if pre:
+            out.append({"type": "text", "text": {"content": pre[:2000]}, **ann})
+        expr = next(g for g in m.groups() if g is not None).strip()
+        if expr:
+            out.append({"type": "equation", "equation": {"expression": expr[:1000]}, **ann})
+        pos = m.end()
+    tail = text[pos:].replace("$", "")
+    if tail:
+        out.append({"type": "text", "text": {"content": tail[:2000]}, **ann})
+    return out
+
+
 def _inline_rich_text(text: str) -> list[dict]:
-    """Split inline text on **bold** markers, emitting rich_text spans with
-    annotations. Non-bold spans are plain. Empty text yields an empty span."""
-    out = []
-    for part in re.split(r"(\*\*[^*\n]+?\*\*)", text):
-        if not part:
+    """Rich_text spans for inline text: **bold** -> annotations, $...$ / \\(...\\)
+    LaTeX -> Notion inline equation objects, everything else plain. Bold is parsed
+    first so a bold run containing math stays fully bold. Empty text -> empty span."""
+    out: list[dict] = []
+    for seg in re.split(r"(\*\*[^*\n]+?\*\*)", text):
+        if not seg:
             continue
-        if len(part) >= 4 and part.startswith("**") and part.endswith("**"):
-            body = part[2:-2]
-            if body:
-                out.append({"type": "text", "text": {"content": body[:2000]},
-                            "annotations": {"bold": True}})
-        else:
-            out.append({"type": "text", "text": {"content": part[:2000]}})
+        bold = len(seg) >= 4 and seg.startswith("**") and seg.endswith("**")
+        out.extend(_math_and_text(seg[2:-2] if bold else seg, bold))
     return out or [{"type": "text", "text": {"content": ""}}]
 
 
@@ -199,6 +232,33 @@ def _paragraph_blocks(text: str) -> list[dict]:
     return [{"object": "block", "type": "paragraph",
              "paragraph": {"rich_text": _inline_rich_text(ch)}}
             for ch in chunks(text)]
+
+
+_DISPLAY_MATH = re.compile(r"\$\$(.+?)\$\$|\\\[(.+?)\\\]", re.DOTALL)
+
+
+def _prose_paragraphs(text: str) -> list[dict]:
+    """Sanitize prose into paragraph blocks, but pull any DISPLAY equation
+    ($$...$$ or \\[...\\]) out into its own Notion equation block — even mid-
+    paragraph, where sanitize has by then folded its standalone line into the
+    surrounding prose. Inline $...$ / \\(...\\) stay in their paragraph (handled
+    by _inline_rich_text)."""
+    text = sanitize(text)
+    out: list[dict] = []
+    pos = 0
+    for m in _DISPLAY_MATH.finditer(text):
+        pre = text[pos:m.start()].strip()
+        if pre:
+            out.extend(_paragraph_blocks(pre))
+        expr = (m.group(1) or m.group(2) or "").strip()
+        if expr:
+            out.append({"object": "block", "type": "equation",
+                        "equation": {"expression": expr[:1000]}})
+        pos = m.end()
+    tail = text[pos:].strip()
+    if tail:
+        out.extend(_paragraph_blocks(tail))
+    return out
 
 
 def _heading_block(level: int, text: str) -> dict:
@@ -275,7 +335,7 @@ def _prose_blocks(prose_md: str) -> list[dict]:
             blocks.append(_heading_block(level, sanitize(m_head.group(2))))
             rest = para[len(first):].strip()
             if rest:
-                blocks.extend(_paragraph_blocks(sanitize(rest)))
+                blocks.extend(_prose_paragraphs(rest))
             continue
         if first.lstrip().startswith(("- ", "* ")):
             for txt in _group_list_items(para, r"^\s*[\-*]\s+(.*)"):
@@ -292,7 +352,7 @@ def _prose_blocks(prose_md: str) -> list[dict]:
             blocks.append({"object": "block", "type": "quote",
                            "quote": {"rich_text": _inline_rich_text(sanitize(quote)[:2000])}})
             continue
-        blocks.extend(_paragraph_blocks(sanitize(para)))
+        blocks.extend(_prose_paragraphs(para))
     return blocks
 
 
