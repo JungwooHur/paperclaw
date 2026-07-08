@@ -229,6 +229,26 @@ use the tool above.
   leading `#{1,6} ` marker (→ plain paragraph) or split a flattened `* … * …` run
   into real `bulleted_list_item`s. No text is lost; only the block boundary/type is
   wrong.
+- **Math renders as raw LaTeX (had to Ctrl+Shift+E every formula by hand).** Source
+  docs / NotebookLM emit math as LaTeX — sometimes with `$…$`, but often as BARE
+  LaTeX with NO delimiters at all (hand-written `.md` handbooks especially: equations
+  sit on their own line, `\mathbf{x} = …`). The converter then dropped it in as plain
+  text. **Two-part fix, both needed:** (1) `translate_chunk`'s prompt now orders
+  NotebookLM to wrap every formula — inline in `$…$`, display in `$$…$$`. It complies
+  and, crucially, gets the *boundaries* right (`\(N(0,\sigma^2 I)\)` — the `N(0,`
+  prefix a regex can't recover); it actually emits `\(…\)` / `\[…\]`. (2)
+  `save_qa_callout` turns `$…$` / `\(…\)` into inline Notion **equation** objects and
+  `$$…$$` / `\[…\]` into equation **blocks** (even mid-paragraph, via
+  `_prose_paragraphs`); `sanitize` no longer strips `$`. **Do NOT try to detect bare
+  LaTeX with a converter heuristic** — inline math boundaries are unrecoverable
+  without the model's understanding; re-translate with the delimiter prompt instead.
+  (Verified: a bare-LaTeX handbook → 58 equation blocks + 390 inline equations, 0
+  bare LaTeX left.)
+- **Never run two `--apply` rebuilds against the SAME page concurrently.** A rebuild
+  archives all old blocks then appends the new — two overlapping runs race on
+  archive/append and corrupt the page (duplicated/half-archived, HTTP 400). If you
+  kill a rebuild, CONFIRM it actually died (`ps`) before relaunching, and give each
+  run its own log file (a shared `>` log interleaves and hides the second process).
 
 #### NotebookLM daily rate limit (plan long batches around it)
 

@@ -159,11 +159,15 @@ def translate_chunk(chunk, lang, nb_id):
     name = LANG_NAME.get(lang, lang)
     if lang == "en":
         prompt = ("Reformat the following text cleanly. Keep ALL content, do "
-                  "NOT summarize. Output only the reformatted text:\n\n" + chunk)
+                  "NOT summarize. Wrap every math expression in LaTeX delimiters: "
+                  "inline math in $...$, standalone/display math in $$...$$. "
+                  "Output only the reformatted text:\n\n" + chunk)
     else:
         prompt = (f"다음 영어 텍스트를 {name}로 한 문장도 빠짐없이 전문 번역해. 절대 요약하지 마. "
                   f"전문용어(LLM, agent, reasoning, tool, token 등)는 영어 그대로 유지. "
                   f"원문에 소제목(예: '3.1 Title')이 있으면 그 줄을 '## 제목' 형식으로. "
+                  f"모든 수학 수식은 LaTeX로 출력하되, 문장 안에 들어가는 수식은 $...$로, "
+                  f"별도 줄에 있는 수식은 $$...$$로 반드시 감싸라 (예: $\\alpha_t$, $$x = a + b$$). "
                   f"번역문만 출력:\n\n" + chunk)
     out = ""
     for attempt in range(4):
