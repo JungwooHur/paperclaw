@@ -29,11 +29,35 @@ import argparse
 import datetime
 import os
 import sys
+import time
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from auto_fix_qa import query_paper_pages, api_post
 from strip_backmatter import strip_backmatter
 from clean_source_urls import clean_page
+
+
+def _post_retry(path, body, tries=5):
+    """api_post with retry — this runs unattended on a 5-minute timer, so a
+    transient Notion 429/5xx during the DB query must not abort the whole run."""
+    last = None
+    for a in range(tries):
+        try:
+            return api_post(path, body)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (429, 500, 502, 503, 504) and a < tries - 1:
+                time.sleep(float(e.headers.get("Retry-After", 2)) if e.code == 429 else 2 + 2 * a)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = e
+            if a < tries - 1:
+                time.sleep(2 + 2 * a)
+                continue
+            raise
+    raise last
 
 
 def query_recent_pages(hours):
@@ -50,7 +74,7 @@ def query_recent_pages(hours):
                 "sorts": [{"timestamp": "last_edited_time", "direction": "descending"}]}
         if cur:
             body["start_cursor"] = cur
-        d = api_post(f"/databases/{db}/query", body)
+        d = _post_retry(f"/databases/{db}/query", body)
         out.extend(p["id"] for p in d["results"])
         if d.get("has_more"):
             cur = d["next_cursor"]
