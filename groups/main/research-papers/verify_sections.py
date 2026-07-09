@@ -478,6 +478,26 @@ def main() -> int:
                       f"overlap; archive the repeats",
         })
 
+    # BACKMATTER: a References / Bibliography / Acknowledgements section translated
+    # into the body. The translated page should be Abstract..Conclusion only; a
+    # bibliography run through translation is mangled (author names pick up a Korean
+    # "그리고", citation numbers renumber per chunk, entries fragment across blocks).
+    _backmatter = re.compile(
+        r"^\s*\d*\.?\s*(references|bibliography|참고\s*문헌|"
+        r"acknowledge?ments?|disclosure of funding)\b", re.I)
+    bm = next((i for i, b in enumerate(blocks)
+               if b["type"].startswith("heading")
+               and _backmatter.match(aq._block_text(b).strip())), None)
+    if bm is not None and len(blocks) - bm > 1:
+        tail = [b["id"] for b in blocks[bm:]]
+        findings.append({
+            "type": "BACKMATTER", "section": None,
+            "block_count": len(tail), "block_ids": tail[:50],
+            "detail": f"a back-matter section ('{aq._block_text(blocks[bm]).strip()[:40]}') was "
+                      f"translated into the body — References/Acknowledgements must NOT be "
+                      f"translated. Remove it: strip_backmatter.py --page <id> --apply",
+        })
+
     # 2 + 3. COMPLETENESS / SUMMARIZATION (needs source). Measure only the FIRST
     # occurrence of each key so duplicates don't mask a short copy.
     src_text = load_source_text(args.source, args.arxiv)
