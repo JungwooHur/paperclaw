@@ -373,6 +373,8 @@ notebooklm ask "이 논문의 모든 섹션과 subsection 목록을 순서대로
 ```
 Save the resulting section list to `/tmp/sections.txt` and use it as the translation checklist. Papers may have Abstract, Introduction, Background, Preliminaries, Related Work, Method, System Design, Experiments, Evaluation, Discussion, Conclusion, Appendix, etc. in any combination.
 
+**Drop the back-matter — never translate `References` / `Bibliography` / `참고문헌` / `Acknowledgements` / `Disclosure of Funding`.** The translated page is the BODY only (Abstract..Conclusion). A bibliography run through translation comes out mangled — author names pick up a Korean "그리고", citation numbers renumber per chunk (`[1],[2],[12],[1]…`), and entries fragment across blocks. If a back-matter section slips in anyway, `verify_sections.py` now flags it as `BACKMATTER`; remove it with `python3 research-papers/strip_backmatter.py --page <id> --apply` (archives the first back-matter heading and everything after it).
+
 **Step 2-B: Process each section in order.** Pick the prompt that matches `$OUTPUT_LANGUAGE`:
 
 > **🚨 ALWAYS call `notebooklm ask … --json` and read only the `.answer` field.** In its default (non-JSON) mode the CLI interleaves conversation *status* lines with the answer on stdout — `Continuing conversation <id>...`, `Answer:`, `Resumed conversation: <id>` — because it auto-resumes the notebook's last conversation. Capturing raw stdout embeds those status lines into the paper body (observed: dozens of leaked `Continuing conversation …` paragraphs). `--json` suppresses them and returns the answer cleanly:
