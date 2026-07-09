@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import re
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -36,7 +35,8 @@ _BACKMATTER = re.compile(
 def _headers():
     tok = os.environ.get("NOTION_TOKEN")
     if not tok:
-        sys.exit("NOTION_TOKEN must be set")
+        # raise (don't sys.exit) so this stays importable by a healer/workflow
+        raise ValueError("NOTION_TOKEN environment variable must be set")
     return {"Authorization": f"Bearer {tok}", "Notion-Version": "2022-06-28",
             "Content-Type": "application/json"}
 
@@ -54,6 +54,9 @@ def _api(method, path, body=None, tries=8):
             last = e
             if e.code == 429:
                 time.sleep(float(e.headers.get("Retry-After", 5)) + 2 * a)
+                continue
+            if e.code in (500, 502, 503, 504):  # transient server error — retry
+                time.sleep(2 + 2 * a)
                 continue
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -75,7 +78,8 @@ def fetch_blocks(page_id):
 
 def _text(b):
     o = b.get(b["type"], {})
-    return "".join(x.get("text", {}).get("content", "") for x in o.get("rich_text", []))
+    # plain_text is present on every rich_text type (text/mention/equation)
+    return "".join(x.get("plain_text", "") for x in o.get("rich_text", []))
 
 
 def strip_backmatter(page_id, apply=False):

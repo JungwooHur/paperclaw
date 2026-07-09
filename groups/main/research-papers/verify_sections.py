@@ -488,7 +488,7 @@ def main() -> int:
     bm = next((i for i, b in enumerate(blocks)
                if b["type"].startswith("heading")
                and _backmatter.match(aq._block_text(b).strip())), None)
-    if bm is not None and len(blocks) - bm > 1:
+    if bm is not None:  # a back-matter heading at all — even a lone one — is wrong
         tail = [b["id"] for b in blocks[bm:]]
         findings.append({
             "type": "BACKMATTER", "section": None,
