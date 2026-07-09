@@ -283,7 +283,24 @@ answers. Planning:
 
 When adding a paper, process **ALL sections** through NotebookLM (translate for `ko`/other, reformat for `en` — see [Output Language Mode](#output-language-mode)) and place **ALL figures** in their correct positions. Use NotebookLM rather than reading the paper HTML yourself — saves Claude tokens.
 
+**⚠️ Phase 0 — Resolve the arxiv id FIRST (never guess it).** When the user names a
+paper by TITLE (no URL/id), do NOT build an arxiv id from memory — an LLM
+confabulates a plausible-but-wrong id, and a single-digit-off id fetches a
+DIFFERENT paper that then gets fully translated and saved under the requested title
+(real incident: a title-only request produced a guessed id one digit off, which was
+a *different* paper; the wrong translation shipped and was only caught when the user
+later sent the real URL). Instead:
+```bash
+python3 /workspace/group/research-papers/resolve_arxiv.py "<the user's request: url, id, or title>"
+```
+It queries the authoritative arxiv API and prints `{"arxiv_id","title","url"}`, or
+`ASK_USER` + exit 2 when it can't confidently match one paper. **Use ONLY the id/url
+it returns; on ASK_USER, ask the user — never proceed on a guess. Echo the returned
+`title` back** ("정리 시작: <title> (<arxiv_id>)") so a wrong match is caught before a
+full translation is wasted.
+
 **⚠️ ANTI-PATTERNS — NEVER do these when the user asks to 정리/리뷰 (organize/review) a paper:**
+- ❌ **Guessing/constructing an arxiv id (or the paper's identity) from a title or from memory.** Always resolve via `resolve_arxiv.py` (Phase 0) or the user's URL; a wrong id silently translates the WRONG paper and saves it under the right title.
 - ❌ Writing a summary or review from 2-3 NotebookLM questions (e.g. "핵심 모듈 설명해", "X가 뭐야"). This produces a review, not the full section-by-section output expected.
 - ❌ Asking NotebookLM for "X문장으로 요약" / "summarize in N sentences" / "key takeaways" in any query — summaries lock you into summary mode.
 - ❌ **Batching multiple subsections into ONE `notebooklm ask`** ("Section N 전체(N.1-N.4 포함) 번역해"). NotebookLM compresses to fit its output limit, so every batched subsection comes back **summarized ~5-15× thinner** than a section translated in its own call — even when the prompt says "전문 번역". One call per section/subsection, no matter how slow it feels.

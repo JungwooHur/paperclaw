@@ -30,6 +30,7 @@ groups/main/research-papers/*
 !groups/main/research-papers/extract_book_figures.py
 !groups/main/research-papers/notion_upload.py
 !groups/main/research-papers/clean_source_urls.py
+!groups/main/research-papers/resolve_arxiv.py
 !groups/main/research-papers/strip_backmatter.py
 !groups/main/research-papers/systemd/
 
