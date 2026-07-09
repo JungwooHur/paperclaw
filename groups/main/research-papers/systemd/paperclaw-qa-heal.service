@@ -12,5 +12,10 @@ WorkingDirectory=%h/paperclaw
 ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/auto_fix_qa.py
 ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/auto_save_qa.py
 ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/collect_papers.py --dedupe
+# Structurally enforce the paper-body cleanup the agent doesn't reliably do:
+# strip translated back-matter (References/Acknowledgements) + leaked source URLs
+# (NotebookLM image URLs, ar5iv citation URLs). Recently-edited pages only, so the
+# 5-minute cadence stays cheap.
+ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/heal_paper_pages.py
 StandardOutput=journal
 StandardError=journal
