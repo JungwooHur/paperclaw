@@ -52,7 +52,8 @@ _ARXIVURL = re.compile(r"\s*https?://[^\s]*(?:ar5iv|arxiv\.org)[^\s]*", re.I)
 def strip_citation_urls(text):
     """Remove leaked arxiv/ar5iv inline-citation URLs (bibliography groups) and any
     stray arxiv/ar5iv reference URL, keeping the 'Figure N'/'Table N' text."""
-    if "ar5iv" not in text and "arxiv.org" not in text and "#bib.bib" not in text:
+    low = text.lower()   # _ARXIVURL is re.I; keep this guard case-insensitive too
+    if "ar5iv" not in low and "arxiv.org" not in low and "#bib.bib" not in low:
         return text
     text = _BIBCITE.sub(" ", text)
     text = _ARXIVURL.sub("", text)
@@ -67,7 +68,8 @@ def _clean_text(content):
 
 
 def _has_junk(content):
-    return any(m in content for m in _MARKERS)
+    low = content.lower()   # markers are lowercase; match arXiv.org etc. too
+    return any(m in low for m in _MARKERS)
 
 
 def _clean_runs(rich_text):
