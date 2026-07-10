@@ -47,10 +47,11 @@ _DELIMITED = re.compile(
     r"|\\\(.+?\\\)",
     re.DOTALL)
 
-# Brace group with one level of nesting, so a subscript whose content itself has
-# a superscript — `_{t^{\prime}}`, `^{V(1+P)}` — is ONE token. Without the nested
-# alternative the inner `{` truncates the token and `$` lands mid-expression.
-_BRACE = r"\{(?:[^{}\n]|\{[^{}\n]*\})*\}"
+# Brace group with up to THREE levels of nesting, so a subscript whose content
+# itself has nested braces — `_{t^{\prime}}`, `_{x_{t_{i}}}` — is ONE token.
+# Without the nested alternatives the inner `{` truncates the token and `$` lands
+# mid-expression. (Insert-only keeps even a deeper miss safe — just cosmetic.)
+_BRACE = r"\{(?:[^{}\n]|\{(?:[^{}\n]|\{(?:[^{}\n]|\{[^{}\n]*\})*\})*\})*\}"
 
 # A maximal run of bare-math tokens on a single line (no whitespace, no newline).
 # Ordered longest-token-first so multi-char tokens win over the single-char fallback.
@@ -126,23 +127,45 @@ _TEXT_TYPES = ("paragraph", "heading_1", "heading_2", "heading_3", "quote",
 
 def _text_span_latex(b: dict) -> bool:
     t = b["type"]
-    spans = b.get(t, {}).get("rich_text", [])
+    spans = (b.get(t) or {}).get("rich_text", [])
     text_only = "".join(s.get("plain_text", "") for s in spans
                         if s.get("type") != "equation")
     return bool(_LATEX_DETECT.search(text_only))
 
 
+def _unsafe_annotations(b: dict) -> bool:
+    """True if any span carries formatting the reconstruct round-trip can't
+    preserve — a link (href), italic/underline/strikethrough/code, or a non-
+    default color. Bold IS preserved (re-emitted as **), so it doesn't count.
+    Such blocks are skipped rather than have their formatting silently dropped."""
+    t = b["type"]
+    for s in (b.get(t) or {}).get("rich_text", []):
+        if s.get("href"):
+            return True
+        a = s.get("annotations") or {}
+        if a.get("italic") or a.get("underline") or a.get("strikethrough") or a.get("code"):
+            return True
+        if a.get("color", "default") != "default":
+            return True
+    return False
+
+
 def _reconstruct(b: dict) -> str:
-    """Source text for the block: text spans verbatim; existing equation spans
-    re-emitted as $expr$ so _inline_rich_text preserves them on the round-trip."""
+    """Source text for the block: existing equation spans re-emitted as $expr$ and
+    bold spans as **...** so _inline_rich_text reproduces both on the round-trip.
+    (Blocks with formatting that CAN'T round-trip are skipped upstream — see
+    _unsafe_annotations.)"""
     t = b["type"]
     parts = []
-    for s in b.get(t, {}).get("rich_text", []):
+    for s in (b.get(t) or {}).get("rich_text", []):
         if s.get("type") == "equation":
-            expr = s.get("equation", {}).get("expression", "").strip()
+            expr = (s.get("equation") or {}).get("expression", "").strip()
             parts.append(f"${expr}$" if expr else "")
         else:
-            parts.append(s.get("plain_text", ""))
+            txt = s.get("plain_text", "")
+            if txt and (s.get("annotations") or {}).get("bold"):
+                txt = f"**{txt}**"
+            parts.append(txt)
     return "".join(parts)
 
 
@@ -160,6 +183,8 @@ def wrap_math_page(page_id: str, apply: bool = False) -> dict:
             continue
         if not _text_span_latex(b):                   # only act on real bare LaTeX
             continue
+        if _unsafe_annotations(b):                    # don't drop formatting we
+            continue                                  # can't round-trip (links/italic/…)
         src = _reconstruct(b)
         wrapped = wrap_math_text(src)
         if wrapped == src:
