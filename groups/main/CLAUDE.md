@@ -25,7 +25,7 @@ Known fixes accumulated so far:
 | Wrap `\n` mid-paragraph on Notion | NotebookLM replies are ~80-char soft-wrapped; uploading raw text makes Notion render breaks inside sentences | Step 2-B prompt forbids mid-paragraph `\n`; sanitizer collapses single `\n` to space while preserving `\n\n` paragraph breaks (see Step 2-B-post) |
 | Section title shown twice — a `heading_1` block plus a body paragraph that restates the same title (e.g. heading `1. Introduction (서론)` followed by paragraph `1 Introduction (서론)`) | NotebookLM emits the section title as the first line of its answer; the assembler created a heading block from the section name AND kept that first line as a paragraph. Differs from the heading only by the `N.`/Korean-parenthetical, so a naive equality check misses it | (1) **Prevent:** Phase 4 step 2 drops a leading paragraph whose normalized text (label + `(translation)` stripped) equals the heading being created. (2) **Detect:** `verify_sections.py` HEADING_ECHO check (source-free) flags any echo paragraph with its block id to archive |
 | `notebooklm` CLI status lines embedded as sentences in the paper body (`Continuing conversation <id>... Answer:`, `Resumed conversation: <id>`, repeated dozens of times) | The CLI auto-resumes the notebook's last conversation and prints status lines (`cli/chat.py` `console.print`) interleaved with the answer on stdout; when piped (non-TTY) the color is dropped but the text remains. The subagent captured raw `notebooklm ask` stdout and uploaded it. Step 2-B-post only stripped `$`/`\n`, not this furniture | (1) **Prevent:** Step 2-B now mandates `notebooklm ask … --json` + read `.answer` (the CLI guards every status print behind `if not json_output`). (2) **Defense-in-depth:** Step 2-B-post sanitizer now also strips conversation furniture, `Answer:`, `**`, `⬇`. (3) **Detect:** `verify_sections.py` ARTIFACT check (source-free) flags any block still carrying it. Also widened the auditor's section-key regex to catch IEEE `III-A` / appendix `A.` labels so duplicated subsections are no longer invisible |
-| Math wrapped in `$...$` on Notion | NotebookLM emits LaTeX-style `$s=Enc(x)$` but Notion paragraphs don't render LaTeX — `$` shows as literal | Step 2-B prompt forbids `$` wrapping; sanitizer strips all `$` chars before PATCH (see Step 2-B-post) |
+| Math renders as raw LaTeX on Notion | NotebookLM emits LaTeX (`$s=Enc(x)$` or bare `\mathbf{x}`); Notion paragraphs don't render it inline | **Superseded — `$` is now KEPT, not stripped.** `build_answer_blocks` converts `$…$`/`\(…\)`/`$$…$$`/`\[…\]` into Notion equation objects, and `wrap_math.py` wraps bare LaTeX so it converts too. See the "Math renders as raw LaTeX" bullet under Known Issues for the Prevent/Repair/Detect layers |
 | Q&A callout saved to wrong section | Hand-rolled PATCH used `/blocks/{paragraph-id}/children` (paragraph as parent), so the callout became a child of that paragraph and rendered inside whatever section the paragraph lived in. Recurred 4× even after written rules were strengthened — text instructions weren't enough | Use `groups/main/research-papers/save_qa_callout.py` for ALL paper Q&A. Script enforces `/blocks/PAGE_ID/children` parent + `after`-by-section + post-PATCH top-level verification + auto-rollback. Hand-rolled curl PATCHes for Q&A are forbidden |
 | Q&A callout recurring misplacement / wrong format even after `save_qa_callout.py` existed | The agent kept hand-rolling curl PATCHes anyway — prose rules in this file weren't load-bearing. Structural prevention needed instead | `auto_fix_qa.py` + systemd user timer (`groups/main/research-papers/systemd/`) run every 5 min and auto-repair any broken Q&A callout: moves nested callouts back to top level, converts legacy (default-color + question-in-rich_text) format to toggle-style (gray callout → toggle(question) → answer). Already-top-level callouts keep their position; only nested callouts are re-placed by heuristic |
 | `auto_fix_qa.py` silently skipped some paper pages on full-DB scan | Notion `/databases/{id}/query` without a `sorts` field returns only ~300 pages for larger DBs and reports `has_more=false` anyway — verified empirically. The healer's `query_paper_pages()` missed one paper page for ~1h, leaving its 4 Q&A callouts broken | Always pass `"sorts": [{"timestamp": "created_time", "direction": "ascending"}]` when paginating a DB query. With an explicit sort the same DB returns every page and pagination is stable |
@@ -240,20 +240,36 @@ use the tool above.
   into real `bulleted_list_item`s. No text is lost; only the block boundary/type is
   wrong.
 - **Math renders as raw LaTeX (had to Ctrl+Shift+E every formula by hand).** Source
-  docs / NotebookLM emit math as LaTeX — sometimes with `$…$`, but often as BARE
-  LaTeX with NO delimiters at all (hand-written `.md` handbooks especially: equations
-  sit on their own line, `\mathbf{x} = …`). The converter then dropped it in as plain
-  text. **Two-part fix, both needed:** (1) `translate_chunk`'s prompt now orders
-  NotebookLM to wrap every formula — inline in `$…$`, display in `$$…$$`. It complies
-  and, crucially, gets the *boundaries* right (`\(N(0,\sigma^2 I)\)` — the `N(0,`
-  prefix a regex can't recover); it actually emits `\(…\)` / `\[…\]`. (2)
-  `save_qa_callout` turns `$…$` / `\(…\)` into inline Notion **equation** objects and
-  `$$…$$` / `\[…\]` into equation **blocks** (even mid-paragraph, via
-  `_prose_paragraphs`); `sanitize` no longer strips `$`. **Do NOT try to detect bare
-  LaTeX with a converter heuristic** — inline math boundaries are unrecoverable
-  without the model's understanding; re-translate with the delimiter prompt instead.
-  (Verified: a bare-LaTeX handbook → 58 equation blocks + 390 inline equations, 0
-  bare LaTeX left.)
+  docs / NotebookLM emit math as LaTeX — sometimes with `$…$`, but **often as BARE
+  LaTeX with NO delimiters** (`\mathbf{x} = …`). `build_answer_blocks` only converts
+  *delimited* math (`$…$` / `\(…\)` → inline equation objects, `$$…$$` / `\[…\]` →
+  equation **blocks** even mid-paragraph via `_prose_paragraphs`; `sanitize` no longer
+  strips `$`), so bare spans land as plain text. **Prompting NotebookLM to wrap is NOT
+  reliable** — across a paper's many section answers it wraps some spans and emits the
+  rest bare (verified: a full re-translation with the delimiter prompt still left ~40
+  bare-LaTeX blocks). So the fix is structural, Prevent/Repair/Detect
+  (`research-papers/wrap_math.py`):
+  * **Core** `wrap_math_text(text)` — a CONSERVATIVE **insert-only** regex
+    (`wrap_math_text(t).replace('$','') == t.replace('$','')`, so it can never corrupt
+    prose; worst case is a cosmetically over/under-wrapped span). Wraps a run in `$…$`
+    only when it carries a strong LaTeX signal (a `\command` or a sub/superscript) —
+    **nesting-aware** (`_{t^{\prime}}` is one token; getting this wrong splits `$` into
+    the middle of an expression). Bare lone letters / bare numbers it leaves alone (a
+    regex genuinely can't tell those from prose — the residual the old "boundaries
+    unrecoverable" worry still applies to, and it's visually minor). Idempotent:
+    existing `$…$` / `\(…\)` / `\[…\]` is preserved.
+  * **Prevent** — `save_qa_callout._inline_rich_text` calls it, so anything built
+    through the converter (books via `translate_fulltext`, papers routed through it)
+    gets math wrapped up front.
+  * **Repair** — `wrap_math_page(page_id)` sweeps a *built* page regardless of how the
+    agent assembled it; wired into `heal_paper_pages.py` (the 5-min qa-heal timer).
+  * **Detect** — `verify_sections.py` `BARE_MATH` flags any block with un-delimited
+    LaTeX left in a **text span**. Scan text spans ONLY: an equation span's
+    `plain_text` IS its expression, so an all-spans scan false-flags correct equations
+    (this cost a wrong "40 blocks still broken" reading before it was caught).
+  Step 2-B still asks NotebookLM to wrap (a cheap first line of defense) but the
+  structural layer is what makes it hold. (Verified on a paper NotebookLM left bare:
+  45/45 blocks insert-only safe, 0 bare-LaTeX residual, math renders automatically.)
 - **Never run two `--apply` rebuilds against the SAME page concurrently.** A rebuild
   archives all old blocks then appends the new — two overlapping runs race on
   archive/append and corrupt the page (duplicated/half-archived, HTTP 400). If you

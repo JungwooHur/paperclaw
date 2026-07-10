@@ -422,6 +422,34 @@ def main() -> int:
                       f"converter (see Phase 4 step 2)",
         })
 
+    # 1b2. BARE_MATH (no source needed): un-delimited LaTeX left in a TEXT span
+    # renders as raw source and needs manual Ctrl+Shift+E. NotebookLM emits math
+    # undelimited ~half the time and build_answer_blocks only converts delimited
+    # math. Scan TEXT spans ONLY — an equation span's plain_text IS its expression,
+    # so an all-spans scan would false-flag correctly-rendered equations.
+    _BARE_MATH = re.compile(r"\\[A-Za-z]{2,}|[_^]\{|\\[{}]")
+    bare_ids = []
+    for b in blocks:
+        t = b["type"]
+        if t not in ("paragraph",) + HEADING_TYPES + ("quote",
+                                                      "bulleted_list_item",
+                                                      "numbered_list_item"):
+            continue
+        payload = b.get(t, {})
+        spans = payload.get("rich_text", []) if isinstance(payload, dict) else []
+        text_only = "".join(s.get("plain_text", "") for s in spans
+                            if s.get("type") != "equation")
+        if _BARE_MATH.search(text_only):
+            bare_ids.append(b["id"])
+    if bare_ids:
+        findings.append({
+            "type": "BARE_MATH", "section": None,
+            "block_count": len(bare_ids), "block_ids": bare_ids[:50],
+            "detail": f"{len(bare_ids)} block(s) carry un-delimited LaTeX in text "
+                      f"(renders as raw source, needs manual Ctrl+Shift+E). Run "
+                      f"wrap_math.py --page <id>, or let heal_paper_pages sweep it",
+        })
+
     # 1c. HEADING_ECHO (no source needed): a paragraph that merely restates its
     # section heading, so the title shows twice (a heading block + an echo
     # paragraph). NotebookLM emits the section title as the first body line; the

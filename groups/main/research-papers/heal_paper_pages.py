@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Auto-heal every paper page in $NOTION_RESEARCH_DB: remove translated back-matter
+r"""Auto-heal every paper page in $NOTION_RESEARCH_DB: remove translated back-matter
 and leaked source URLs. Runs from paperclaw-qa-heal.service (systemd timer).
 
 Why this exists
@@ -15,6 +15,9 @@ for one-off remediation across the whole DB, on the healer's 5-minute cadence:
     Acknowledgements/Disclosure-of-Funding heading and everything after it.
   * clean_source_urls — strip leaked NotebookLM image URLs and ar5iv citation /
     figure-reference URLs from body text.
+  * wrap_math — wrap bare LaTeX (`\mathbf{c}_{v}`, `L_{s}<m_{1}`) left in text
+    spans in $...$ so it renders as Notion equations (NotebookLM emits math
+    undelimited ~half the time; build_answer_blocks only converts delimited math).
 
 Both are idempotent and no-ops on an already-clean page. Applies by default;
 --dry-run reports without writing.
@@ -36,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from auto_fix_qa import query_paper_pages, api_post
 from strip_backmatter import strip_backmatter
 from clean_source_urls import clean_page
+from wrap_math import wrap_math_page
 
 
 def _post_retry(path, body, tries=5):
@@ -88,14 +92,17 @@ def heal(pages, apply):
         try:
             bm = strip_backmatter(pid, apply=apply)
             cu = clean_page(pid, apply=apply)
+            wm = wrap_math_page(pid, apply=apply)
         except Exception as e:
             print(f"  {pid}: error {type(e).__name__}: {e}", file=sys.stderr)
             continue
         n_bm = bm.get("archived") or bm.get("would_archive") or 0
         n_url = (cu.get("edited") or 0) + (cu.get("archived") or 0)
-        if n_bm or n_url:
+        n_math = wm.get("edited") or 0
+        if n_bm or n_url or n_math:
             healed += 1
-            print(f"  {pid}: back-matter blocks={n_bm} url-cleaned blocks={n_url}")
+            print(f"  {pid}: back-matter blocks={n_bm} url-cleaned blocks={n_url} "
+                  f"math-wrapped blocks={n_math}")
     print(f"healed {healed}/{len(pages)} paper page(s)"
           f"{' (dry-run)' if not apply else ''}")
 
