@@ -35,9 +35,12 @@ _TEXT_TYPES = ("paragraph", "heading_1", "heading_2", "heading_3", "quote",
 
 # Two leak types this cleans, both from the paper/book source leaking into body:
 #   1. lh3.googleusercontent.com — NotebookLM source-image URLs (books).
-#   2. ar5iv citation links — papers sourced off ar5iv HTML flatten each inline
-#      [N] link to "N https://ar5iv…#bib.bibN" text.
-_MARKERS = ("lh3.googleusercontent.com", "ar5iv", "#bib.bib")
+#   2. arxiv citation/reference links — a paper's inline [N] and Fig./Table links
+#      flatten to "N https://…#bib.bibN" / "Table 2 https://…#S5.T2" text. This
+#      happens off BOTH ar5iv.labs.arxiv.org AND arxiv.org native HTML, so both
+#      hosts must trigger the cleaner (arxiv.org was the gap that let a
+#      native-sourced paper's figure/table URLs survive).
+_MARKERS = ("lh3.googleusercontent.com", "ar5iv", "arxiv.org", "#bib.bib")
 
 # Bibliography citation groups "[ N url , N url ]" -> remove entirely (per the
 # workflow's strip-inline-citations rule). A leftover Figure/Table/Eq reference
@@ -47,9 +50,9 @@ _ARXIVURL = re.compile(r"\s*https?://[^\s]*(?:ar5iv|arxiv\.org)[^\s]*", re.I)
 
 
 def strip_citation_urls(text):
-    """Remove leaked ar5iv inline-citation URLs (bibliography groups) and any
+    """Remove leaked arxiv/ar5iv inline-citation URLs (bibliography groups) and any
     stray arxiv/ar5iv reference URL, keeping the 'Figure N'/'Table N' text."""
-    if "ar5iv" not in text and "#bib.bib" not in text:
+    if "ar5iv" not in text and "arxiv.org" not in text and "#bib.bib" not in text:
         return text
     text = _BIBCITE.sub(" ", text)
     text = _ARXIVURL.sub("", text)
