@@ -107,27 +107,41 @@ _CONTENT_JS = """e => {
 # once (not once per table id).
 _GROUP_JS = """e => { if (!e.hasAttribute('data-wmid')) e.setAttribute('data-wmid','g'+(window.__wmc=(window.__wmc||0)+1)); return e.getAttribute('data-wmid'); }"""
 
-# Union of the container's actual table/panel/caption boxes, in PAGE coordinates.
-# Clipping to this (not to the wrapper's own box) captures the full table without
-# a width reset (no over-expansion) and merges a table's sub-parts into ONE image
-# instead of fragmenting them; headings are excluded (not in the selector).
+# Un-clip ONLY this container's subtree (a global overflow reset disrupts the whole
+# page layout and makes neighbouring figures overlap the table). Enough to reveal a
+# table overflowing a fixed-width minipage.
+_RESET_JS = """e => { for (const n of [e, ...e.querySelectorAll('*')]) { if (n.style) n.style.overflow='visible'; } }"""
+
+# Clip rect in PAGE coordinates. HORIZONTAL extent comes from the real table/panel
+# boxes only — a centered figcaption can be wider than the table and would pull
+# adjacent-column text into the clip. The caption contributes VERTICAL extent only
+# (so it shows above the table) at the table's own width. Headings are excluded.
 _UNION_JS = """e => {
-  const els = e.querySelectorAll('table,.ltx_figure_panel,.ltx_tabular,figcaption');
+  const tb = e.querySelectorAll('table,.ltx_figure_panel,.ltx_tabular');
   let l=1e9,t=1e9,r=-1e9,b=-1e9;
-  for (const n of els){ const c=n.getBoundingClientRect();
+  for (const n of tb){ const c=n.getBoundingClientRect();
     if (c.width<10||c.height<10) continue;
     l=Math.min(l,c.left); t=Math.min(t,c.top); r=Math.max(r,c.right); b=Math.max(b,c.bottom); }
   if (r<0) return null;
+  for (const n of e.querySelectorAll('figcaption')){ const c=n.getBoundingClientRect();
+    if (c.height<5) continue; t=Math.min(t,c.top); b=Math.max(b,c.bottom); }
   return {x:l+window.scrollX, y:t+window.scrollY, w:r-l, h:b-t};
 }"""
 
 
 def render_tables(arxiv_id: str, tables: list, outdir: str) -> list:
-    """Screenshot each table container once. Returns [{num, caption, path}] — one
-    image per container, placed at the container's lowest table number."""
+    """Return [{num, caption, path}], one crisp image per table number.
+
+    Pass 1 (preferred): element.screenshot() the substantial <table>/panel element
+    — it paints ONLY that element, so no adjacent-column text or over-wide caption
+    bleeds in, and tiny helper <table>s (fragmentation) are filtered by size.
+    Pass 2 (fallback): for any number left without an image — e.g. a transform-
+    scaled panel whose box collapses — clip-screenshot the union of the nearest
+    ancestor that actually holds table content."""
     from playwright.sync_api import sync_playwright
     cap = {t["num"]: t["caption"] for t in tables}
-    out = []
+    out = {}
+    idx = 0
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch(channel="chrome")
@@ -140,8 +154,6 @@ def render_tables(arxiv_id: str, tables: list, outdir: str) -> list:
                     timeout=60000)
         except Exception:
             pg.goto(f"https://arxiv.org/html/{arxiv_id}", timeout=60000)
-        pg.evaluate("for (const n of document.querySelectorAll('*')) "
-                    "{ n.style.overflow='visible'; n.style.maxWidth='none'; }")
         pg.wait_for_timeout(150)
         group_el, group_nums = {}, {}
         for t in sorted(tables, key=lambda x: x["num"]):
@@ -152,11 +164,45 @@ def render_tables(arxiv_id: str, tables: list, outdir: str) -> list:
             wmid = c.evaluate(_GROUP_JS)
             group_el.setdefault(wmid, c)
             group_nums.setdefault(wmid, []).append(t["num"])
-        idx = 0
+        # pass 1: crisp element screenshots
         for wmid, c in group_el.items():
-            num = sorted(group_nums[wmid])[0]
-            u = c.evaluate(_UNION_JS)
-            if not u or u["w"] < 40 or u["h"] < 20:
+            nums = sorted(group_nums[wmid])
+            c.evaluate(_RESET_JS)
+            pg.wait_for_timeout(50)
+            raw = (c.query_selector_all("table")
+                   or c.query_selector_all(".ltx_figure_panel") or [])
+            subs = []
+            for tg in raw:
+                box = tg.bounding_box()
+                if box and box["width"] >= 120 and box["height"] >= 50:
+                    subs.append((box["width"] * box["height"], tg))
+            subs.sort(key=lambda x: -x[0])
+            for i, (_, tg) in enumerate(subs):
+                path = os.path.join(outdir, f"table_{idx}.png")
+                idx += 1
+                try:
+                    tg.screenshot(path=path)
+                except Exception:
+                    continue
+                if not os.path.exists(path) or os.path.getsize(path) < 300:
+                    continue
+                out.setdefault(nums[i] if i < len(nums) else nums[-1], path)
+        # pass 2: page-clip fallback for any number still missing
+        for t in tables:
+            if t["num"] in out:
+                continue
+            node = pg.query_selector(f'[id="{t["id"]}"]')
+            u = None
+            for _ in range(5):
+                if not node:
+                    break
+                node.evaluate(_RESET_JS)
+                pg.wait_for_timeout(40)
+                u = node.evaluate(_UNION_JS)
+                if u and u["w"] >= 40 and u["h"] >= 40:
+                    break
+                node = node.evaluate_handle("e => e.parentElement").as_element()
+            if not u or u["w"] < 40 or u["h"] < 40:
                 continue
             pad = 12
             clip = {"x": max(0, u["x"] - pad), "y": max(0, u["y"] - pad),
@@ -167,11 +213,11 @@ def render_tables(arxiv_id: str, tables: list, outdir: str) -> list:
                 pg.screenshot(path=path, clip=clip, full_page=True)
             except Exception:
                 continue
-            if not os.path.exists(path) or os.path.getsize(path) < 300:
-                continue
-            out.append({"num": num, "caption": cap.get(num, ""), "path": path})
+            if os.path.exists(path) and os.path.getsize(path) >= 300:
+                out[t["num"]] = path
         browser.close()
-    return out
+    return [{"num": n, "caption": cap.get(n, ""), "path": pth}
+            for n, pth in sorted(out.items())]
 
 
 def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,

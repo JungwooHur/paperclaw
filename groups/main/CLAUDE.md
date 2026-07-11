@@ -308,13 +308,17 @@ use the tool above.
   `element.screenshot()` on the `id` element clips or misses: (a) plain `ltx_table` works;
   (b) a fixed-width `ltx_minipage` narrower than its table → clips both sides; (c) a
   CSS-`transform: scale()`d panel whose `id` is on a *caption-only* `<figure>` with the
-  table in a SIBLING → captures only the caption. The robust fix (all three): climb from
-  the id element to the nearest ancestor that actually contains a rendered table/panel
-  (height ≥ 40px, no heading), then `page.screenshot(clip=…, full_page=True)` the UNION of
-  that container's `table`/`.ltx_figure_panel`/`figcaption` boxes — clipping to real content
-  boxes (not the wrapper's box) needs no width reset (which over-expands normal tables) and
-  merges a table's sub-parts into one image instead of fragmenting them. Tables sharing one
-  flex container are captured once at the lowest number. **Safe removal (default):** the flattened data is entangled with
+  table in a SIBLING → captures only the caption. Robust fix, two passes after climbing the
+  id element to the nearest ancestor that actually holds a rendered table/panel (no heading):
+  **Pass 1** — `element.screenshot()` each SUBSTANTIAL `<table>`/`.ltx_figure_panel` (width ≥
+  120, height ≥ 50). element.screenshot paints only that element, so no adjacent-column text
+  or over-wide caption bleeds in (a page-level `clip` does bleed), and the size filter drops
+  the tiny helper `<table>`s that otherwise fragment one table into many images. **Pass 2**
+  (fallback for a number still missing — e.g. a transform-scaled panel whose box collapses):
+  climb up re-unioning the container's table/panel boxes and `page.screenshot(clip, full_page)`.
+  Never do a GLOBAL `overflow:visible`/`maxWidth:none` reset — it disrupts page layout so a
+  neighbouring figure overlaps the table; reset only the target's own subtree. The caption is
+  dropped from the image (Notion image block carries it as its caption instead). **Safe removal (default):** the flattened data is entangled with
   prose (one block can hold a table's data tail AND the next real paragraph), so it
   archives only PURE-table blocks — ≥12 floats, <18% Korean, no leaked heading, no
   prose-sentence tail — never a mixed block, so no prose is ever lost (a little numeric
