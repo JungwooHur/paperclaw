@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Auto-heal every paper page in $NOTION_RESEARCH_DB: remove translated back-matter
+r"""Auto-heal every paper page in $NOTION_RESEARCH_DB: remove translated back-matter
 and leaked source URLs. Runs from paperclaw-qa-heal.service (systemd timer).
 
 Why this exists
@@ -15,6 +15,18 @@ for one-off remediation across the whole DB, on the healer's 5-minute cadence:
     Acknowledgements/Disclosure-of-Funding heading and everything after it.
   * clean_source_urls — strip leaked NotebookLM image URLs and ar5iv citation /
     figure-reference URLs from body text.
+  * wrap_math — wrap bare LaTeX (`\mathbf{c}_{v}`, `L_{s}<m_{1}`) left in text
+    spans in $...$ so it renders as Notion equations (NotebookLM emits math
+    undelimited ~half the time; build_answer_blocks only converts delimited math).
+  * strip_furniture — archive leaked arxiv HTML page chrome (nav/TOC/report-issue
+    widget/license line/`javascript:` links) that whole-fulltext translation drags in.
+  * heal_figures — inject the paper's arxiv figures if the page has none (resolves
+    the arxiv id from the page's Paper URL). Figure extraction is otherwise
+    agent-driven and routinely skipped, leaving papers with 0 figures.
+  * heal_tables — render the paper's arxiv tables (headless Chromium screenshot)
+    and inject them if the page has none, archiving only PURE-table flattened text
+    (never prose). Tables translated from HTML fulltext otherwise land as an
+    unreadable run of numbers.
 
 Both are idempotent and no-ops on an already-clean page. Applies by default;
 --dry-run reports without writing.
@@ -36,6 +48,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from auto_fix_qa import query_paper_pages, api_post
 from strip_backmatter import strip_backmatter
 from clean_source_urls import clean_page
+from wrap_math import wrap_math_page
+from strip_furniture import strip_furniture
+from extract_paper_figures import heal_figures
+from extract_paper_tables import heal_tables
 
 
 def _post_retry(path, body, tries=5):
@@ -88,14 +104,32 @@ def heal(pages, apply):
         try:
             bm = strip_backmatter(pid, apply=apply)
             cu = clean_page(pid, apply=apply)
+            wm = wrap_math_page(pid, apply=apply)
+            fu = strip_furniture(pid, apply=apply)
         except Exception as e:
-            print(f"  {pid}: error {type(e).__name__}: {e}", file=sys.stderr)
+            print(f"  {pid}: text-heal error {type(e).__name__}: {e}", file=sys.stderr)
             continue
         n_bm = bm.get("archived") or bm.get("would_archive") or 0
         n_url = (cu.get("edited") or 0) + (cu.get("archived") or 0)
-        if n_bm or n_url:
+        n_math = wm.get("edited") or 0
+        n_fur = fu.get("archived") or fu.get("would_archive") or 0
+        # Visual heals hit the network / headless Chromium — isolate each so a
+        # transient failure (arxiv down, playwright hiccup) never blocks the text
+        # heals or the other visual heal. Both short-circuit fast when the page is
+        # already done (existing images), so clean pages pay nothing.
+        n_fig = n_tbl = 0
+        try:
+            n_fig = heal_figures(pid, apply=apply).get("placed") or 0
+        except Exception as e:
+            print(f"  {pid}: figure-heal error {type(e).__name__}: {e}", file=sys.stderr)
+        try:
+            n_tbl = heal_tables(pid, apply=apply).get("placed") or 0
+        except Exception as e:
+            print(f"  {pid}: table-heal error {type(e).__name__}: {e}", file=sys.stderr)
+        if n_bm or n_url or n_math or n_fur or n_fig or n_tbl:
             healed += 1
-            print(f"  {pid}: back-matter blocks={n_bm} url-cleaned blocks={n_url}")
+            print(f"  {pid}: back-matter={n_bm} url={n_url} math={n_math} "
+                  f"furniture={n_fur} figures={n_fig} tables={n_tbl}")
     print(f"healed {healed}/{len(pages)} paper page(s)"
           f"{' (dry-run)' if not apply else ''}")
 

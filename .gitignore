@@ -33,6 +33,10 @@ groups/main/research-papers/*
 !groups/main/research-papers/resolve_arxiv.py
 !groups/main/research-papers/strip_backmatter.py
 !groups/main/research-papers/heal_paper_pages.py
+!groups/main/research-papers/wrap_math.py
+!groups/main/research-papers/strip_furniture.py
+!groups/main/research-papers/extract_paper_figures.py
+!groups/main/research-papers/extract_paper_tables.py
 !groups/main/research-papers/systemd/
 
 # Secrets & personal data (public repo — see scripts/check-sensitive.sh)

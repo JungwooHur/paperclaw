@@ -31,6 +31,8 @@ chars per paragraph rich_text block.
 from __future__ import annotations
 import argparse, json, os, re, sys, time, urllib.request, urllib.error
 
+from wrap_math import wrap_math_text  # Prevent: auto-wrap bare LaTeX -> equations
+
 API = "https://api.notion.com/v1"
 
 
@@ -219,6 +221,7 @@ def _inline_rich_text(text: str) -> list[dict]:
     """Rich_text spans for inline text: **bold** -> annotations, $...$ / \\(...\\)
     LaTeX -> Notion inline equation objects, everything else plain. Bold is parsed
     first so a bold run containing math stays fully bold. Empty text -> empty span."""
+    text = wrap_math_text(text)   # bare LaTeX -> $...$ so it becomes equations
     out: list[dict] = []
     for seg in re.split(r"(\*\*[^*\n]+?\*\*)", text):
         if not seg:

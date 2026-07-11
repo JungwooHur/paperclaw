@@ -422,6 +422,94 @@ def main() -> int:
                       f"converter (see Phase 4 step 2)",
         })
 
+    # 1b2. BARE_MATH (no source needed): un-delimited LaTeX left in a TEXT span
+    # renders as raw source and needs manual Ctrl+Shift+E. NotebookLM emits math
+    # undelimited ~half the time and build_answer_blocks only converts delimited
+    # math. Scan TEXT spans ONLY — an equation span's plain_text IS its expression,
+    # so an all-spans scan would false-flag correctly-rendered equations.
+    _BARE_MATH = re.compile(r"\\[A-Za-z]{2,}|[_^]\{|\\[{}]")
+    bare_ids = []
+    for b in blocks:
+        t = b["type"]
+        if t not in ("paragraph",) + HEADING_TYPES + ("quote",
+                                                      "bulleted_list_item",
+                                                      "numbered_list_item"):
+            continue
+        payload = b.get(t, {})
+        spans = payload.get("rich_text", []) if isinstance(payload, dict) else []
+        text_only = "".join(s.get("plain_text", "") for s in spans
+                            if s.get("type") != "equation")
+        if _BARE_MATH.search(text_only):
+            bare_ids.append(b["id"])
+    if bare_ids:
+        findings.append({
+            "type": "BARE_MATH", "section": None,
+            "block_count": len(bare_ids), "block_ids": bare_ids[:50],
+            "detail": f"{len(bare_ids)} block(s) carry un-delimited LaTeX in text "
+                      f"(renders as raw source, needs manual Ctrl+Shift+E). Run "
+                      f"wrap_math.py --page <id>, or let heal_paper_pages sweep it",
+        })
+
+    # 1b3. FURNITURE (no source needed): leaked arxiv HTML page chrome (nav / TOC /
+    # report-issue widget / license line / javascript: links) that whole-fulltext
+    # translation of an arxiv source drags into the body. Reuses strip_furniture's
+    # high-precision marker set.
+    try:
+        from strip_furniture import FURNITURE
+        fur_ids = [b["id"] for b in blocks
+                   if b["type"] in ("paragraph",) + HEADING_TYPES + ("quote",
+                       "bulleted_list_item", "numbered_list_item", "callout")
+                   and FURNITURE.search(aq._block_text(b))]
+    except Exception:
+        fur_ids = []
+    if fur_ids:
+        findings.append({
+            "type": "FURNITURE", "section": None,
+            "block_count": len(fur_ids), "block_ids": fur_ids[:50],
+            "detail": f"{len(fur_ids)} block(s) contain leaked arxiv HTML page chrome "
+                      f"(nav/TOC/report-issue/license). Run strip_furniture.py --page "
+                      f"<id>, or let heal_paper_pages sweep it",
+        })
+
+    # 1b4. FIGURES_MISSING (no source needed): the body references figures
+    # (그림 N / Figure N / Fig. N) but the page has zero image blocks — figure
+    # extraction (Phase 3) was skipped.
+    fig_ref = re.compile(r"(?:그림|Figure|Fig\.?)\s*\d+")
+    has_ref = any(b["type"] in ("paragraph",) + HEADING_TYPES
+                  and fig_ref.search(aq._block_text(b)) for b in blocks)
+    if has_ref and not any(b["type"] == "image" for b in blocks):
+        findings.append({
+            "type": "FIGURES_MISSING", "section": None,
+            "block_count": 0, "block_ids": [],
+            "detail": "body references figures but the page has 0 image blocks — run "
+                      "extract_paper_figures.py --page <id> --arxiv <id> (or let "
+                      "heal_paper_pages inject them)",
+        })
+
+    # 1b5. TABLE_FLATTENED (no source needed): dense flattened-table text blocks
+    # while the page has no table images — a paper translated from arxiv HTML
+    # fulltext whose <table>s landed as unreadable runs of numbers.
+    try:
+        from extract_paper_tables import _is_pure_table
+        flat_ids = [b["id"] for b in blocks
+                    if b["type"] in ("paragraph",) + HEADING_TYPES
+                    and _is_pure_table(aq._block_text(b))]
+    except Exception:
+        flat_ids = []
+    has_table_img = any(
+        b["type"] == "image" and any(
+            (c.get("plain_text", "") or "").lower().startswith("table")
+            for c in (b.get("image", {}).get("caption") or []))
+        for b in blocks)
+    if flat_ids and not has_table_img:
+        findings.append({
+            "type": "TABLE_FLATTENED", "section": None,
+            "block_count": len(flat_ids), "block_ids": flat_ids[:50],
+            "detail": f"{len(flat_ids)} block(s) look like flattened table data and the "
+                      f"page has no table images — run extract_paper_tables.py --page "
+                      f"<id> --arxiv <id> (or let heal_paper_pages inject them)",
+        })
+
     # 1c. HEADING_ECHO (no source needed): a paragraph that merely restates its
     # section heading, so the title shows twice (a heading block + an echo
     # paragraph). NotebookLM emits the section title as the first body line; the
