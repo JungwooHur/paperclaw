@@ -300,11 +300,21 @@ use the tool above.
   ($\downarrow$ 12.3) …`). Unlike figures, arxiv tables are HTML `<figure
   class="ltx_table" id="SnTm">` elements (not images), so they must be RENDERED:
   `research-papers/extract_paper_tables.py --page <id> --arxiv <id>` loads the live arxiv
-  page in headless Chromium (playwright) and screenshots each table element (exact
-  layout + color highlights + caption), uploads PRIVATELY via notion_upload, and inserts
-  the image after the first `표 N` / `Table N` mention (parse table ids directly, NOT via
-  `<figure>…</figure>` boundaries — nested table-figures truncate a non-greedy match and
-  silently drop tables). **Safe removal (default):** the flattened data is entangled with
+  page in headless Chromium (playwright) and screenshots the table (exact layout + color
+  highlights + caption), uploads PRIVATELY via notion_upload, and inserts the image after
+  the first `표 N` / `Table N` mention (parse table ids directly, NOT via `<figure>…</figure>`
+  boundaries — nested table-figures truncate a non-greedy match and silently drop tables).
+  **Rendering is the hard part — LaTeXML wraps tables three ways** and a naive
+  `element.screenshot()` on the `id` element clips or misses: (a) plain `ltx_table` works;
+  (b) a fixed-width `ltx_minipage` narrower than its table → clips both sides; (c) a
+  CSS-`transform: scale()`d panel whose `id` is on a *caption-only* `<figure>` with the
+  table in a SIBLING → captures only the caption. The robust fix (all three): climb from
+  the id element to the nearest ancestor that actually contains a rendered table/panel
+  (height ≥ 40px, no heading), then `page.screenshot(clip=…, full_page=True)` the UNION of
+  that container's `table`/`.ltx_figure_panel`/`figcaption` boxes — clipping to real content
+  boxes (not the wrapper's box) needs no width reset (which over-expands normal tables) and
+  merges a table's sub-parts into one image instead of fragmenting them. Tables sharing one
+  flex container are captured once at the lowest number. **Safe removal (default):** the flattened data is entangled with
   prose (one block can hold a table's data tail AND the next real paragraph), so it
   archives only PURE-table blocks — ≥12 floats, <18% Korean, no leaked heading, no
   prose-sentence tail — never a mixed block, so no prose is ever lost (a little numeric

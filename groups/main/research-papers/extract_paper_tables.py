@@ -91,35 +91,87 @@ def _is_pure_table(text: str) -> bool:
     return True
 
 
-def render_tables(arxiv_id: str, ids: list, outdir: str) -> dict:
-    """Screenshot each table element from the live arxiv HTML. {id: png_path}."""
+# Resolve the element that actually holds a table's content. A table id can sit
+# on a caption-only <figure> whose <table>/panel is a SIBLING (LaTeXML flex
+# layout), so climb to the nearest ancestor that holds table content but no
+# heading. Then screenshot the inner <table> / .ltx_figure_panel element DIRECTLY
+# — it sizes to its content, so it is never clipped by a narrow minipage wrapper
+# and never over-expanded by a width reset (the two clipping bugs).
+_CONTENT_JS = """e => {
+  const big = x => { for (const n of x.querySelectorAll('table,.ltx_figure_panel,.ltx_tabular')) { const c=n.getBoundingClientRect(); if (c.height>=40 && c.width>=40) return true; } return false; };
+  let n = e, s = 0;
+  while (n && s < 5) { if (big(n) && !n.querySelector('h1,h2,h3,h4,.ltx_title')) return n; n = n.parentElement; s++; }
+  return e.parentElement || e;
+}"""
+# Stable per-container group id so tables sharing a flex container are captured
+# once (not once per table id).
+_GROUP_JS = """e => { if (!e.hasAttribute('data-wmid')) e.setAttribute('data-wmid','g'+(window.__wmc=(window.__wmc||0)+1)); return e.getAttribute('data-wmid'); }"""
+
+# Union of the container's actual table/panel/caption boxes, in PAGE coordinates.
+# Clipping to this (not to the wrapper's own box) captures the full table without
+# a width reset (no over-expansion) and merges a table's sub-parts into ONE image
+# instead of fragmenting them; headings are excluded (not in the selector).
+_UNION_JS = """e => {
+  const els = e.querySelectorAll('table,.ltx_figure_panel,.ltx_tabular,figcaption');
+  let l=1e9,t=1e9,r=-1e9,b=-1e9;
+  for (const n of els){ const c=n.getBoundingClientRect();
+    if (c.width<10||c.height<10) continue;
+    l=Math.min(l,c.left); t=Math.min(t,c.top); r=Math.max(r,c.right); b=Math.max(b,c.bottom); }
+  if (r<0) return null;
+  return {x:l+window.scrollX, y:t+window.scrollY, w:r-l, h:b-t};
+}"""
+
+
+def render_tables(arxiv_id: str, tables: list, outdir: str) -> list:
+    """Screenshot each table container once. Returns [{num, caption, path}] — one
+    image per container, placed at the container's lowest table number."""
     from playwright.sync_api import sync_playwright
-    paths = {}
+    cap = {t["num"]: t["caption"] for t in tables}
+    out = []
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch(channel="chrome")
         except Exception:
             browser = p.chromium.launch()
-        pg = browser.new_page(viewport={"width": 1500, "height": 2400},
+        pg = browser.new_page(viewport={"width": 2400, "height": 3200},
                               device_scale_factor=2)
         try:
             pg.goto(f"https://arxiv.org/html/{arxiv_id}", wait_until="networkidle",
                     timeout=60000)
         except Exception:
             pg.goto(f"https://arxiv.org/html/{arxiv_id}", timeout=60000)
-        for tid in ids:
-            el = pg.query_selector(f'[id="{tid}"]')
-            if not el:
+        pg.evaluate("for (const n of document.querySelectorAll('*')) "
+                    "{ n.style.overflow='visible'; n.style.maxWidth='none'; }")
+        pg.wait_for_timeout(150)
+        group_el, group_nums = {}, {}
+        for t in sorted(tables, key=lambda x: x["num"]):
+            idel = pg.query_selector(f'[id="{t["id"]}"]')
+            if not idel:
                 continue
-            path = os.path.join(outdir, f"table_{tid.replace('.', '_')}.png")
+            c = idel.evaluate_handle(_CONTENT_JS).as_element()
+            wmid = c.evaluate(_GROUP_JS)
+            group_el.setdefault(wmid, c)
+            group_nums.setdefault(wmid, []).append(t["num"])
+        idx = 0
+        for wmid, c in group_el.items():
+            num = sorted(group_nums[wmid])[0]
+            u = c.evaluate(_UNION_JS)
+            if not u or u["w"] < 40 or u["h"] < 20:
+                continue
+            pad = 12
+            clip = {"x": max(0, u["x"] - pad), "y": max(0, u["y"] - pad),
+                    "width": u["w"] + 2 * pad, "height": u["h"] + 2 * pad}
+            path = os.path.join(outdir, f"table_{idx}.png")
+            idx += 1
             try:
-                el.screenshot(path=path)
-                if os.path.getsize(path) > 300:
-                    paths[tid] = path
+                pg.screenshot(path=path, clip=clip, full_page=True)
             except Exception:
-                pass
+                continue
+            if not os.path.exists(path) or os.path.getsize(path) < 300:
+                continue
+            out.append({"num": num, "caption": cap.get(num, ""), "path": path})
         browser.close()
-    return paths
+    return out
 
 
 def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
@@ -159,23 +211,22 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         return rep
 
     outdir = tempfile.mkdtemp(prefix="paper_tables_")
-    paths = render_tables(arxiv_id, [t["id"] for t in tables], outdir)
+    images = render_tables(arxiv_id, tables, outdir)   # [{num, caption, path}]
+    rep["rendered"] = len(images)
 
-    # place images grouped by anchor, in document order
+    # place images grouped by anchor (first `표 N` mention), in document order
     groups, order = {}, []
-    for t in tables:
-        if t["id"] not in paths:
-            continue
-        anchor = _table_anchor(t["num"], blocks) or "__end__"
-        groups.setdefault(anchor, []).append((t, paths[t["id"]]))
+    for im in images:
+        anchor = _table_anchor(im["num"], blocks) or "__end__"
+        groups.setdefault(anchor, []).append(im)
         if anchor not in order:
             order.append(anchor)
     for key in order:
         children = []
-        for t, path in groups[key]:
-            fid = upload_image(path)
+        for im in groups[key]:
+            fid = upload_image(im["path"])
             if fid:
-                children.append(ef._image_block(fid, t["caption"]))
+                children.append(ef._image_block(fid, im["caption"]))
                 time.sleep(0.2)
         if not children:
             continue
