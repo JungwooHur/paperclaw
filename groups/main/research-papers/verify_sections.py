@@ -486,6 +486,30 @@ def main() -> int:
                       "heal_paper_pages inject them)",
         })
 
+    # 1b5. TABLE_FLATTENED (no source needed): dense flattened-table text blocks
+    # while the page has no table images — a paper translated from arxiv HTML
+    # fulltext whose <table>s landed as unreadable runs of numbers.
+    try:
+        from extract_paper_tables import _is_pure_table
+        flat_ids = [b["id"] for b in blocks
+                    if b["type"] in ("paragraph",) + HEADING_TYPES
+                    and _is_pure_table(aq._block_text(b))]
+    except Exception:
+        flat_ids = []
+    has_table_img = any(
+        b["type"] == "image" and any(
+            (c.get("plain_text", "") or "").lower().startswith("table")
+            for c in (b.get("image", {}).get("caption") or []))
+        for b in blocks)
+    if flat_ids and not has_table_img:
+        findings.append({
+            "type": "TABLE_FLATTENED", "section": None,
+            "block_count": len(flat_ids), "block_ids": flat_ids[:50],
+            "detail": f"{len(flat_ids)} block(s) look like flattened table data and the "
+                      f"page has no table images — run extract_paper_tables.py --page "
+                      f"<id> --arxiv <id> (or let heal_paper_pages inject them)",
+        })
+
     # 1c. HEADING_ECHO (no source needed): a paragraph that merely restates its
     # section heading, so the title shows twice (a heading block + an echo
     # paragraph). NotebookLM emits the section title as the first body line; the

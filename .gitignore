@@ -36,6 +36,7 @@ groups/main/research-papers/*
 !groups/main/research-papers/wrap_math.py
 !groups/main/research-papers/strip_furniture.py
 !groups/main/research-papers/extract_paper_figures.py
+!groups/main/research-papers/extract_paper_tables.py
 !groups/main/research-papers/systemd/
 
 # Secrets & personal data (public repo — see scripts/check-sensitive.sh)

@@ -295,6 +295,25 @@ use the tool above.
   translation of an arxiv source. **Repair:** `research-papers/strip_furniture.py --page
   <id>` archives any block carrying a chrome-exclusive marker (high precision — real body
   is never touched); wired into heal_paper_pages. **Detect:** `verify_sections` FURNITURE.
+- **Tables came out as an unreadable run of numbers.** Translating a paper from its arxiv
+  HTML fulltext flattens every `<table>` into prose (`VLAs $\pi_{0.5}$3.3B 96.9 84.6
+  ($\downarrow$ 12.3) …`). Unlike figures, arxiv tables are HTML `<figure
+  class="ltx_table" id="SnTm">` elements (not images), so they must be RENDERED:
+  `research-papers/extract_paper_tables.py --page <id> --arxiv <id>` loads the live arxiv
+  page in headless Chromium (playwright) and screenshots each table element (exact
+  layout + color highlights + caption), uploads PRIVATELY via notion_upload, and inserts
+  the image after the first `표 N` / `Table N` mention (parse table ids directly, NOT via
+  `<figure>…</figure>` boundaries — nested table-figures truncate a non-greedy match and
+  silently drop tables). **Safe removal (default):** the flattened data is entangled with
+  prose (one block can hold a table's data tail AND the next real paragraph), so it
+  archives only PURE-table blocks — ≥12 floats, <18% Korean, no leaked heading, no
+  prose-sentence tail — never a mixed block, so no prose is ever lost (a little numeric
+  residue can remain; `--keep-text` disables removal). **Repair:** `heal_tables` in
+  heal_paper_pages, in an ISOLATED try so a playwright failure can't block the text heals;
+  it short-circuits when table images already exist, so clean pages never launch Chromium.
+  **Detect:** `verify_sections` TABLE_FLATTENED. No Prevent in translate_fulltext — the
+  fulltext NotebookLM returns is already flattened text, so tables can't be identified
+  there; post-hoc render is the reliable fix.
 - **Never run two `--apply` rebuilds against the SAME page concurrently.** A rebuild
   archives all old blocks then appends the new — two overlapping runs race on
   archive/append and corrupt the page (duplicated/half-archived, HTTP 400). If you
