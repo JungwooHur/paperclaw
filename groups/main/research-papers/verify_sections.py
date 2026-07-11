@@ -450,6 +450,42 @@ def main() -> int:
                       f"wrap_math.py --page <id>, or let heal_paper_pages sweep it",
         })
 
+    # 1b3. FURNITURE (no source needed): leaked arxiv HTML page chrome (nav / TOC /
+    # report-issue widget / license line / javascript: links) that whole-fulltext
+    # translation of an arxiv source drags into the body. Reuses strip_furniture's
+    # high-precision marker set.
+    try:
+        from strip_furniture import FURNITURE
+        fur_ids = [b["id"] for b in blocks
+                   if b["type"] in ("paragraph",) + HEADING_TYPES + ("quote",
+                       "bulleted_list_item", "numbered_list_item", "callout")
+                   and FURNITURE.search(aq._block_text(b))]
+    except Exception:
+        fur_ids = []
+    if fur_ids:
+        findings.append({
+            "type": "FURNITURE", "section": None,
+            "block_count": len(fur_ids), "block_ids": fur_ids[:50],
+            "detail": f"{len(fur_ids)} block(s) contain leaked arxiv HTML page chrome "
+                      f"(nav/TOC/report-issue/license). Run strip_furniture.py --page "
+                      f"<id>, or let heal_paper_pages sweep it",
+        })
+
+    # 1b4. FIGURES_MISSING (no source needed): the body references figures
+    # (그림 N / Figure N / Fig. N) but the page has zero image blocks — figure
+    # extraction (Phase 3) was skipped.
+    fig_ref = re.compile(r"(?:그림|Figure|Fig\.?)\s*\d+")
+    has_ref = any(b["type"] in ("paragraph",) + HEADING_TYPES
+                  and fig_ref.search(aq._block_text(b)) for b in blocks)
+    if has_ref and not any(b["type"] == "image" for b in blocks):
+        findings.append({
+            "type": "FIGURES_MISSING", "section": None,
+            "block_count": 0, "block_ids": [],
+            "detail": "body references figures but the page has 0 image blocks — run "
+                      "extract_paper_figures.py --page <id> --arxiv <id> (or let "
+                      "heal_paper_pages inject them)",
+        })
+
     # 1c. HEADING_ECHO (no source needed): a paragraph that merely restates its
     # section heading, so the title shows twice (a heading block + an echo
     # paragraph). NotebookLM emits the section title as the first body line; the

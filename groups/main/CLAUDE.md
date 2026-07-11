@@ -270,6 +270,31 @@ use the tool above.
   Step 2-B still asks NotebookLM to wrap (a cheap first line of defense) but the
   structural layer is what makes it hold. (Verified on a paper NotebookLM left bare:
   45/45 blocks insert-only safe, 0 bare-LaTeX residual, math renders automatically.)
+- **Papers came out with 0 figures (Phase 3 skipped).** Figure extraction/injection was
+  the one workflow step with no structural backstop — Phase 3 was pasted prose the agent
+  copy-ran and skipped, so most recently-processed papers had 0 figures even though the
+  arxiv HTML has them. Now a committed script + healer + verify check like everything
+  else: `research-papers/extract_paper_figures.py --page <id> --arxiv <id>` parses
+  arxiv-native HTML `<figure id="SnFm">` (the `F<m>` is the figure number), uploads each
+  PRIVATELY via `notion_upload`, and inserts the image right after the paragraph that
+  first mentions its number (`그림 N` / `Figure N` / `Fig. N` — NotebookLM keeps figure
+  refs), falling back to the numbered section heading, then page end. Deterministic — no
+  NotebookLM section-mapping round-trip. Idempotent (skips if the page already has
+  images). **Repair:** `heal_figures` in heal_paper_pages resolves the arxiv id from the
+  page's Paper URL and injects if the page has none (5-min timer, recently-edited pages).
+  **Detect:** `verify_sections` FIGURES_MISSING flags a page that references figures but
+  has 0 image blocks. (The older "injected 0/N = stale figmap cache" note above is a
+  separate BOOK-figure issue in extract_book_figures.)
+- **Leaked arxiv HTML page chrome in the body** (nav / TOC / "Report an issue" widget /
+  "Download PDF" / literal `javascript:toggleNavTOC()` / `License: CC BY … arXiv:…vN
+  [cs.RO]`). Root cause: translating a paper from its arxiv HTML *fulltext*
+  (`translate_fulltext` pulls `notebooklm source fulltext`) drags the page's chrome —
+  which sits before the real content — into the translation; the literal `javascript:…`
+  string sitting in Korean prose is the tell. The per-section paper path never hits this
+  (bounded per-section asks return only section text); it is specific to whole-fulltext
+  translation of an arxiv source. **Repair:** `research-papers/strip_furniture.py --page
+  <id>` archives any block carrying a chrome-exclusive marker (high precision — real body
+  is never touched); wired into heal_paper_pages. **Detect:** `verify_sections` FURNITURE.
 - **Never run two `--apply` rebuilds against the SAME page concurrently.** A rebuild
   archives all old blocks then appends the new — two overlapping runs race on
   archive/append and corrupt the page (duplicated/half-archived, HTTP 400). If you
