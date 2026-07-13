@@ -37,7 +37,7 @@ RUN npm install -g agent-browser @anthropic-ai/claude-code
 # Install notebooklm-py (paper analysis via Google NotebookLM)
 COPY vendor/notebooklm-py /tmp/notebooklm-py
 RUN pip install --break-system-packages /tmp/notebooklm-py && rm -rf /tmp/notebooklm-py \
- && mv "$(which notebooklm)" /usr/local/lib/notebooklm-real
+ && mv "$(command -v notebooklm)" /usr/local/lib/notebooklm-real
 # Serialize concurrent `notebooklm` calls (single shared ~/.notebooklm browser
 # profile can't be driven by two processes at once). Wrapper flocks then execs the
 # real CLI, so parallel paper subagents queue their asks instead of colliding.

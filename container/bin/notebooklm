@@ -11,6 +11,8 @@
 # (figure/table extraction, Notion upload) still runs in parallel.
 #
 # This is the structural reason the user never has to serialize requests by hand.
-exec 9>/tmp/notebooklm.lock
+# Lock next to the ~/.notebooklm profile it guards (same container user -> same
+# HOME -> same lock, still serialized); avoids a /tmp file owned by another user.
+exec 9>"${HOME:-/tmp}/notebooklm.lock"
 flock 9
 exec /usr/local/lib/notebooklm-real "$@"
