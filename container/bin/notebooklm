@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Serialize EVERY NotebookLM CLI call across parallel paper subagents.
+#
+# There is a single shared browser profile at ~/.notebooklm, and Chrome/Playwright
+# cannot drive one profile from two processes at once (SingletonLock). So when the
+# dispatcher runs several paper subagents in parallel and they each call
+# `notebooklm ask`, the sessions collide — the documented failure mode of
+# summarized / stub / duplicated sections. flock makes concurrent invocations QUEUE
+# instead of conflict: the lock is held for the whole command, so a 60-120s `ask`
+# blocks other asks until it finishes, while the rest of each paper's pipeline
+# (figure/table extraction, Notion upload) still runs in parallel.
+#
+# This is the structural reason the user never has to serialize requests by hand.
+# Lock next to the ~/.notebooklm profile it guards (same container user -> same
+# HOME -> same lock, still serialized); avoids a /tmp file owned by another user.
+exec 9>"${HOME:-/tmp}/notebooklm.lock"
+flock 9
+exec /usr/local/lib/notebooklm-real "$@"

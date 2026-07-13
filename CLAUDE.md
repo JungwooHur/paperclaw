@@ -67,6 +67,10 @@ The paper-page healers (back-matter, source-URL, math, furniture, figure, table 
 
 **Fix / prevention:** the installed units are now **symlinks** to the repo files (content can't drift), and `/update` re-links + `daemon-reload`s them. If healers "aren't applying," first check the installed unit actually contains every `ExecStart` from the repo unit and run `systemctl --user daemon-reload`. Note: `heal_figures`/`heal_tables` are HTML-based (arxiv `arxiv.org/html/<id>`) — a **PDF-only paper (HTML 404)** can't be auto-healed for figures/tables.
 
+## Concurrent paper requests (NotebookLM serialization)
+
+Multiple paper requests are meant to run as **parallel background subagents** (the dispatcher pattern in `groups/main/CLAUDE.md`) — the user sends N papers and must **never** have to serialize them by hand. The catch: every subagent drives ONE shared NotebookLM browser profile (`~/.notebooklm`), and Chrome can't be driven by two processes at once — concurrent `notebooklm ask` calls collide and yield summarized/stub/duplicated sections (this, not the container timeout which resets on activity, is what broke a parallel batch). So **`container/bin/notebooklm` is a `flock` wrapper** installed over the real CLI in the Dockerfile: it serializes every NotebookLM call system-wide, so parallel subagents QUEUE their asks instead of conflicting, while the rest of each paper's pipeline (figures, tables, Notion upload) still runs in parallel. **Do NOT advise sending papers one at a time — serialization is the wrapper's job.** Requires a container rebuild to take effect.
+
 ## Public Repo Hygiene (MANDATORY before every commit/push/PR)
 
 This is a **public repository**. The owner's personal data and research activity must never reach tracked files, commit messages, or PR titles/bodies.
