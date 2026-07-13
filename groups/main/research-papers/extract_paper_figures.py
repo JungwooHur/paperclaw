@@ -73,7 +73,7 @@ def parse_figures(html_text: str, source_url: str) -> list:
     # arxiv HTML pages set `<base href="/html/<id>vN/">` and give srcs relative to
     # it (`images/x.jpg`); urljoin against the page URL alone would drop the version
     # dir and 404. Others have no <base> and srcs already include the version dir.
-    bm = re.search(r'<base[^>]+href="([^"]+)"', html_text, re.I)
+    bm = re.search(r'<base[^>]+href=["\']?([^"\'>\s]+)', html_text, re.I)
     base = urljoin(source_url, _html.unescape(bm.group(1))) if bm else source_url
     out, seen = [], set()
     for fid, body in _FIG.findall(html_text):
@@ -137,7 +137,7 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
         if b["type"] != "image":
             return False
         cap = "".join(c.get("plain_text", "") for c in
-                      (b.get("image", {}).get("caption") or [])).strip().lower()
+                      ((b.get("image") or {}).get("caption") or [])).strip().lower()
         return not cap.startswith("table")
     have_imgs = sum(1 for b in blocks if _is_fig_img(b))
     rep = {"page": page_id, "existing_images": have_imgs,

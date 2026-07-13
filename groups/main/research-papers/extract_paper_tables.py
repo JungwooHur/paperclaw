@@ -238,7 +238,7 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     for b in blocks:
         if b["type"] == "image":
             cap = "".join(c.get("plain_text", "") for c in
-                          (b.get("image", {}).get("caption") or []))
+                          ((b.get("image") or {}).get("caption") or []))
             m = re.match(r"\s*table\s*(\d+)", cap, re.I)
             if m:
                 existing.add(int(m.group(1)))
