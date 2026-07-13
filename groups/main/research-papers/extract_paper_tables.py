@@ -231,24 +231,28 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     rep = {"page": page_id, "found": 0, "placed": 0, "archived": 0,
            "skipped_existing": False}
 
-    def _has_table_images():
-        for b in blocks:
-            if b["type"] == "image":
-                for c in (b.get("image", {}).get("caption") or []):
-                    if c.get("plain_text", "").strip().lower().startswith("table"):
-                        return True
-        return False
-
-    if _has_table_images() and not force:
-        rep["skipped_existing"] = True
-        return rep
+    # Per-NUMBER idempotency: an agent (or an earlier run) may have imaged SOME
+    # tables and left the rest as text. Skip only the numbers already imaged (by
+    # their "Table N" caption), inject the missing ones — not all-or-nothing.
+    existing = set()
+    for b in blocks:
+        if b["type"] == "image":
+            cap = "".join(c.get("plain_text", "") for c in
+                          ((b.get("image") or {}).get("caption") or []))
+            m = re.match(r"\s*table\s*(\d+)", cap, re.I)
+            if m:
+                existing.add(int(m.group(1)))
 
     html_text, _ = ef.fetch_html(arxiv_id)
     if not html_text:
         rep["error"] = "no HTML source"
         return rep
-    tables = parse_tables(html_text)
-    rep["found"] = len(tables)
+    all_tables = parse_tables(html_text)
+    tables = [t for t in all_tables if force or t["num"] not in existing]
+    rep["found"] = len(all_tables)
+    if not tables:
+        rep["skipped_existing"] = True
+        return rep
     if not apply:
         rep["would_place"] = [t["num"] for t in tables]
         rep["would_archive"] = sum(1 for b in blocks
@@ -272,7 +276,13 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         for im in groups[key]:
             fid = upload_image(im["path"])
             if fid:
-                children.append(ef._image_block(fid, im["caption"]))
+                # ALWAYS caption "Table N…" — the per-number idempotency keys off it,
+                # and some papers' <figcaption> parses empty (which would otherwise
+                # make the image un-tracked and re-injected as a duplicate next run).
+                cap = im["caption"]
+                if not cap.strip().lower().startswith("table"):
+                    cap = f"Table {im['num']}" + (f": {cap}" if cap.strip() else "")
+                children.append(ef._image_block(fid, cap))
                 time.sleep(0.2)
         if not children:
             continue

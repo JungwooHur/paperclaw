@@ -7,13 +7,34 @@
 
 The script is **structural prevention**, not a style rule — the agent has repeatedly ignored written instructions to use `save_qa_callout.py`, so this self-heals the state out of band.
 
+The service also runs `auto_save_qa.py`, `collect_papers.py --dedupe`, and
+**`heal_paper_pages.py`** (back-matter / source-URL / math / furniture / figure /
+table healing) — see the `ExecStart` lines in the unit.
+
 ## Install
 
+**SYMLINK the units — do NOT `cp`.** A copied unit goes stale the moment the repo
+unit gains a step: `cp` was used originally, then `heal_paper_pages.py` was added
+to the repo unit but the installed copy was never refreshed, so for weeks the
+healer's ExecStart never ran and *none* of the structural fixes reached new papers
+(the journal showed only the old 3 steps). A symlink can't drift — a `git pull`
+updates the target and a `daemon-reload` picks it up.
+
 ```bash
-cp groups/main/research-papers/systemd/paperclaw-qa-heal.service ~/.config/systemd/user/
-cp groups/main/research-papers/systemd/paperclaw-qa-heal.timer   ~/.config/systemd/user/
+cd ~/paperclaw
+ln -sf "$PWD/groups/main/research-papers/systemd/paperclaw-qa-heal.service" ~/.config/systemd/user/
+ln -sf "$PWD/groups/main/research-papers/systemd/paperclaw-qa-heal.timer"   ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now paperclaw-qa-heal.timer
+```
+
+After ANY change to the unit files (including a `git pull` that touches them), run
+`systemctl --user daemon-reload`. Drift check (should print nothing):
+
+```bash
+diff <(readlink -f ~/.config/systemd/user/paperclaw-qa-heal.service) \
+     "$PWD/groups/main/research-papers/systemd/paperclaw-qa-heal.service" >/dev/null \
+  && echo "in sync" || echo "STALE — re-link + daemon-reload"
 ```
 
 Verify:

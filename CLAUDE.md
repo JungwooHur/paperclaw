@@ -59,6 +59,14 @@ systemctl --user restart paperclaw
 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
 
+## systemd unit staleness (paper healer)
+
+The paper-page healers (back-matter, source-URL, math, furniture, figure, table cleanup) run **on the host** from `paperclaw-qa-heal.service` — NOT in the container. The installed unit lives at `~/.config/systemd/user/paperclaw-qa-heal.service`; the source of truth is `groups/main/research-papers/systemd/paperclaw-qa-heal.service`.
+
+**Failure mode (real incident):** the unit was originally `cp`-installed, then `heal_paper_pages.py` was added as a new `ExecStart` in the repo unit — but the installed copy was never refreshed. So the whole `heal_paper_pages` step (all figure/table/math/furniture/back-matter healing) **silently never ran**, and every newly-processed paper kept its un-healed state even though the code was merged. The journal is the tell: `journalctl --user -u paperclaw-qa-heal.service` showed only the old 3 steps, with zero `healed N/M` output.
+
+**Fix / prevention:** the installed units are now **symlinks** to the repo files (content can't drift), and `/update` re-links + `daemon-reload`s them. If healers "aren't applying," first check the installed unit actually contains every `ExecStart` from the repo unit and run `systemctl --user daemon-reload`. Note: `heal_figures`/`heal_tables` are HTML-based (arxiv `arxiv.org/html/<id>`) — a **PDF-only paper (HTML 404)** can't be auto-healed for figures/tables.
+
 ## Public Repo Hygiene (MANDATORY before every commit/push/PR)
 
 This is a **public repository**. The owner's personal data and research activity must never reach tracked files, commit messages, or PR titles/bodies.

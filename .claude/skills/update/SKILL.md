@@ -127,6 +127,22 @@ Parse the JSON output. It contains: `migrationsRun` (count), `results` (array of
 
 **If no migrations found:** This is normal (most updates won't have migrations). Continue silently.
 
+## 7b. Re-sync systemd units
+
+If the pull touched `groups/main/research-papers/systemd/*.service` or `*.timer`
+(or the units aren't symlinked yet), re-link and reload — otherwise a stale
+installed unit silently keeps running the OLD ExecStart steps, so new healer
+steps never run (a real past incident: `heal_paper_pages.py` was added to the
+repo unit but the installed copy was never refreshed).
+
+```bash
+for u in paperclaw-qa-heal.service paperclaw-qa-heal.timer; do
+  ln -sf "$PWD/groups/main/research-papers/systemd/$u" ~/.config/systemd/user/$u
+done
+systemctl --user daemon-reload
+systemctl --user is-active paperclaw-qa-heal.timer   # should print "active"
+```
+
 ## 8. Verify
 
 Run build and tests:

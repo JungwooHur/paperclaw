@@ -69,12 +69,18 @@ def fetch_html(arxiv_id: str):
 def parse_figures(html_text: str, source_url: str) -> list:
     """Ordered list of {id, num, img_url, caption}, one per figure image,
     deduped by image URL (composite figures expose one img per subfigure)."""
+    # Resolve relative img srcs against the page's <base href> if present. Some
+    # arxiv HTML pages set `<base href="/html/<id>vN/">` and give srcs relative to
+    # it (`images/x.jpg`); urljoin against the page URL alone would drop the version
+    # dir and 404. Others have no <base> and srcs already include the version dir.
+    bm = re.search(r'<base[^>]+href=["\']?([^"\'>\s]+)', html_text, re.I)
+    base = urljoin(source_url, _html.unescape(bm.group(1))) if bm else source_url
     out, seen = [], set()
     for fid, body in _FIG.findall(html_text):
         img = _IMG.search(body)
         if not img:
             continue
-        url = urljoin(source_url, _html.unescape(img.group(1)))
+        url = urljoin(base, _html.unescape(img.group(1)))
         if url in seen:
             continue
         seen.add(url)
@@ -125,7 +131,15 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     from notion_upload import upload_image
 
     blocks = vs.fetch_blocks(page_id)
-    have_imgs = sum(1 for b in blocks if b["type"] == "image")
+    # Count only NON-table images: table images (caption "Table N", injected by
+    # extract_paper_tables) must not make the figure healer think figures exist.
+    def _is_fig_img(b):
+        if b["type"] != "image":
+            return False
+        cap = "".join(c.get("plain_text", "") for c in
+                      ((b.get("image") or {}).get("caption") or [])).strip().lower()
+        return not cap.startswith("table")
+    have_imgs = sum(1 for b in blocks if _is_fig_img(b))
     rep = {"page": page_id, "existing_images": have_imgs,
            "found": 0, "placed": 0, "skipped_existing": False}
     if have_imgs and not force:
