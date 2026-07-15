@@ -27,6 +27,10 @@ for one-off remediation across the whole DB, on the healer's 5-minute cadence:
     and inject them if the page has none, archiving only PURE-table flattened text
     (never prose). Tables translated from HTML fulltext otherwise land as an
     unreadable run of numbers.
+  * heal_verify — run the verify_sections structural audit (the MANDATORY Step 2-C
+    gate the agent skips): auto-dedup duplicate sections and LOUDLY flag dropped /
+    short / summarized sections so a page the agent's hand-rolled Notion assembly
+    broke never ships silently.
 
 Both are idempotent and no-ops on an already-clean page. Applies by default;
 --dry-run reports without writing.
@@ -52,6 +56,7 @@ from wrap_math import wrap_math_page
 from strip_furniture import strip_furniture
 from extract_paper_figures import heal_figures
 from extract_paper_tables import heal_tables
+from heal_verify import heal_verify
 
 
 def _post_retry(path, body, tries=5):
@@ -126,10 +131,22 @@ def heal(pages, apply):
             n_tbl = heal_tables(pid, apply=apply).get("placed") or 0
         except Exception as e:
             print(f"  {pid}: table-heal error {type(e).__name__}: {e}", file=sys.stderr)
-        if n_bm or n_url or n_math or n_fur or n_fig or n_tbl:
+        # Structural audit (verify_sections): auto-dedup duplicate sections and,
+        # crucially, LOUDLY flag dropped/short/summarized sections that the agent's
+        # hand-rolled Notion assembly leaves behind — so a broken page never ships
+        # silently again. Content the agent never uploaded can't be auto-restored.
+        n_dedup = 0
+        try:
+            hv = heal_verify(pid, apply=apply)
+            n_dedup = hv.get("deduped_blocks") or 0
+            for flag in hv.get("flags", []):
+                print(f"  {pid}: AUDIT {flag}", file=sys.stderr)
+        except Exception as e:
+            print(f"  {pid}: verify-heal error {type(e).__name__}: {e}", file=sys.stderr)
+        if n_bm or n_url or n_math or n_fur or n_fig or n_tbl or n_dedup:
             healed += 1
             print(f"  {pid}: back-matter={n_bm} url={n_url} math={n_math} "
-                  f"furniture={n_fur} figures={n_fig} tables={n_tbl}")
+                  f"furniture={n_fur} figures={n_fig} tables={n_tbl} dedup={n_dedup}")
     print(f"healed {healed}/{len(pages)} paper page(s)"
           f"{' (dry-run)' if not apply else ''}")
 
