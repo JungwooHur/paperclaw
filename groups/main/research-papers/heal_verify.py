@@ -38,16 +38,21 @@ _HEAD = ("heading_1", "heading_2", "heading_3")
 
 
 def audit(page_id: str, arxiv: str = None) -> dict:
-    """Run verify_sections --json and return its report dict ({findings: [...]})."""
+    """Run verify_sections --json and return its report dict ({findings: [...]}).
+    RAISES on a real failure (crash / no JSON) so the healer logs it loudly rather
+    than silently treating a broken page as clean. `--json` prints the findings
+    regardless of exit code, so a non-zero exit (findings present) is NOT an error —
+    only missing/invalid JSON is."""
     cmd = [sys.executable, os.path.join(_HERE, "verify_sections.py"),
            "--page", page_id, "--json"]
     if arxiv:
         cmd += ["--arxiv", arxiv]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        return json.loads(r.stdout or "{}")
-    except Exception as e:
-        return {"findings": [], "error": f"{type(e).__name__}: {e}"}
+        return json.loads(r.stdout)
+    except (ValueError, TypeError):
+        raise RuntimeError(f"verify_sections failed (exit {r.returncode}): "
+                           f"{(r.stderr or r.stdout or '')[:200]}")
 
 
 def _lvl(b):
@@ -86,20 +91,29 @@ def dedupe_duplicates(page_id, blocks, apply):
             scope = f"{parent}>~{s['heading'][:12]}"
         stack.append((s["level"], scope))
     ranges = _section_ranges(blocks)
-    to_archive = []
+    seen, to_archive = set(), []
     for occ in scoped.values():
         if len(occ) < 2:
             continue
         occ.sort(key=lambda s: s["chars"], reverse=True)   # keep the richest
         for d in occ[1:]:
-            to_archive += ranges.get(d["heading_id"], [])
+            for bid in ranges.get(d["heading_id"], []):
+                if bid not in seen:            # overlapping parent/child dup ranges
+                    seen.add(bid)              # must not double-PATCH a block
+                    to_archive.append(bid)
     # safety cap: never archive most of the page (a mis-scope shouldn't nuke it)
     if len(to_archive) > len(blocks) // 2:
         return 0
     if apply:
+        failures = []
         for bid in to_archive:
-            notion("PATCH", f"/blocks/{bid}", {"archived": True})
+            try:
+                notion("PATCH", f"/blocks/{bid}", {"archived": True})
+            except Exception as e:               # archive all we can, report failures
+                failures.append((bid, str(e)))
             time.sleep(0.34)
+        if failures:
+            raise RuntimeError(f"dedup failed on {len(failures)} block(s): {failures[:3]}")
     return len(to_archive)
 
 
