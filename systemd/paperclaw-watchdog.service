@@ -1,0 +1,9 @@
+[Unit]
+Description=PaperClaw WhatsApp connection watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/paperclaw/scripts/paperclaw-watchdog.sh
+StandardOutput=journal
+StandardError=journal
