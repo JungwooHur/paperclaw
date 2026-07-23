@@ -79,6 +79,16 @@ export class WhatsAppChannel implements Channel {
       printQRInTerminal: false,
       logger,
       browser: Browsers.macOS('Chrome'),
+      // Disable WhatsApp history sync. With the default (shouldSyncHistoryMessage
+      // => true, syncFullHistory => true), every (re)connect enters baileys'
+      // AwaitingInitialSync state, buffers events, waits 20s for a history
+      // notification, then flushes the buffer — and that flush DEADLOCKS the event
+      // loop (process at 0% CPU, no logs) so WhatsApp stops answering until the
+      // watchdog restarts it ~an hour later. The bot only handles NEW messages, so
+      // returning false takes baileys' "History sync is disabled by config,
+      // transitioning to Online" fast path and skips the deadlock entirely.
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
     });
 
     this.sock.ev.on('connection.update', (update) => {
