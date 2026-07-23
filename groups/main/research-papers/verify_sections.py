@@ -450,6 +450,37 @@ def main() -> int:
                       f"wrap_math.py --page <id>, or let heal_paper_pages sweep it",
         })
 
+    # 1b2b. INVALID_EQ (no source needed): an EQUATION span whose expression KaTeX
+    # would reject — most commonly a lone trailing `\` from inline math built with
+    # bare-paren `(...)` semantics instead of `\(...\)` (`\(100\)` -> eq `100\`), which
+    # renders as a red error on every such equation. Scan equation spans ONLY.
+    try:
+        from heal_equations import katex_invalid
+        inv_ids, inv_reasons = [], {}
+        for b in blocks:
+            t = b["type"]
+            payload = b.get(t, {})
+            spans = payload.get("rich_text", []) if isinstance(payload, dict) else []
+            bad = [katex_invalid((s.get("equation") or {}).get("expression", ""))
+                   for s in spans if s.get("type") == "equation"]
+            bad = [r for r in bad if r]
+            if bad:
+                inv_ids.append(b["id"])
+                for r in bad:
+                    inv_reasons[r] = inv_reasons.get(r, 0) + 1
+    except Exception:
+        inv_ids, inv_reasons = [], {}
+    if inv_ids:
+        findings.append({
+            "type": "INVALID_EQ", "section": None,
+            "block_count": len(inv_ids), "block_ids": inv_ids[:50],
+            "detail": f"{sum(inv_reasons.values())} equation span(s) are KaTeX-invalid "
+                      f"({', '.join(f'{k}={v}' for k, v in inv_reasons.items())}) across "
+                      f"{len(inv_ids)} block(s) — render as red errors. Run heal_equations.py "
+                      f"--page <id> (fixes the trailing-backslash case), or let "
+                      f"heal_paper_pages sweep it",
+        })
+
     # 1b3. FURNITURE (no source needed): leaked arxiv HTML page chrome (nav / TOC /
     # report-issue widget / license line / javascript: links) that whole-fulltext
     # translation of an arxiv source drags into the body. Reuses strip_furniture's
