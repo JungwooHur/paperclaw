@@ -523,6 +523,25 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Liveness heartbeat. The watchdog (scripts/paperclaw-watchdog.sh) decides a hung
+  // process by how long logs/paperclaw.log has been frozen. But paperclaw legitimately
+  // logs nothing for ~1h when idle, and also while a long paper batch's subagent
+  // containers grind through NotebookLM — so without a heartbeat the watchdog mistook a
+  // healthy service for a hang and restarted it ~hourly, each restart detaching the
+  // batch's containers and orphaning papers_queue.json (a 27-paper batch stalled this
+  // way with 12 papers never dispatched). Emitting an unconditional heartbeat every
+  // HEARTBEAT_MS keeps the log fresh whenever the event loop is alive, so a frozen log
+  // now reliably means an actually-hung process. The WA status makes the line double as
+  // a socket-liveness signal the watchdog can read (a dead-but-not-reconnecting socket
+  // shows `whatsapp=down` across heartbeats while the log itself stays fresh).
+  const HEARTBEAT_MS = 10 * 60 * 1000;
+  setInterval(() => {
+    logger.info(
+      `heartbeat whatsapp=${whatsapp?.isConnected() ? 'up' : 'down'}`,
+    );
+  }, HEARTBEAT_MS).unref();
+
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);
