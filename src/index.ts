@@ -537,7 +537,9 @@ async function main(): Promise<void> {
   // shows `whatsapp=down` across heartbeats while the log itself stays fresh).
   const HEARTBEAT_MS = 10 * 60 * 1000;
   setInterval(() => {
-    logger.info(`heartbeat whatsapp=${whatsapp?.isConnected() ? 'up' : 'down'}`);
+    logger.info(
+      `heartbeat whatsapp=${whatsapp?.isConnected() ? 'up' : 'down'}`,
+    );
   }, HEARTBEAT_MS).unref();
 
   startMessageLoop().catch((err) => {
