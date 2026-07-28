@@ -1051,6 +1051,14 @@ OR
 
 When a scheduled task fires and finds `papers_queue.json` with `pending` entries, enter the Main Agent Loop at step 3 (do not re-ingest; the queue is already built).
 
+> **🚨 In a SCHEDULED run, never end your turn while subagents are in flight — poll them to completion.**
+>
+> The dispatch-then-wait loop (step 5) only works in INTERACTIVE mode, where an incoming WhatsApp message re-invokes you. A scheduled task is a **one-shot container**: `task-scheduler.ts` closes its stdin, so you get exactly ONE turn, and **when your turn ends the container exits and every background subagent dies with it.**
+>
+> Real incident: a scheduled resume dispatched 3 subagents, said "now I'll wait for `task_notification`", and ended its turn 147 s in. The container exited, the 3 subagents were killed mid-translation (one paper had 100 blocks uploaded and was never marked done, two never reached Notion), and the batch sat frozen — 3 stuck `in_progress`, 10 never dispatched — for **two days**. Nothing was wrong with the queue or the papers; the runtime simply killed the waiter.
+>
+> So in a scheduled run: after dispatching, **actively poll `TaskOutput(task_id)`** for each in-flight task instead of returning. As each finishes, record it, dispatch the next `pending`, and keep polling. Only end your turn once `pending == 0 && in_progress == 0` (or you must stop early — in which case leave the queue in a correct `pending` state and say how many remain). A batch left correctly `pending` is safe: `sweep_batch_queue.py` (on the 5-min healer) detects a stranded queue — untouched for ≥20 min with no agent container alive — reconciles dead `in_progress` back to `pending`, and schedules a fresh resume. That is the backstop, not the plan.
+
 #### Why No "Single Paper Exception"
 
 Earlier versions of this doc had a fast-path for single papers (main agent processes directly). It was removed because it broke incremental requests — if the user sent paper A then paper B two minutes later, the main agent was busy in tool calls for A and couldn't dispatch B until A finished. Always-dispatch keeps the main agent's loop responsive to IPC for the entire processing duration. Subagent setup overhead is ~30s vs. ~5min total processing — acceptable.

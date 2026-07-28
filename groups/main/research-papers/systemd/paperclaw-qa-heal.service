@@ -17,5 +17,11 @@ ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/collect_pap
 # (NotebookLM image URLs, ar5iv citation URLs). Recently-edited pages only, so the
 # 5-minute cadence stays cheap.
 ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/heal_paper_pages.py
+# Recover a STRANDED paper batch. papers_queue.json is driven by an agent inside a
+# container; when that container dies mid-batch (a scheduled one-shot ending its turn
+# while background subagents are in flight, a crash, a deploy) nothing re-enters the
+# loop and the batch silently stops — observed frozen for two days with 3 papers stuck
+# `in_progress` and 10 never dispatched. This reconciles and re-dispatches it.
+ExecStart=-/usr/bin/python3 %h/paperclaw/groups/main/research-papers/sweep_batch_queue.py
 StandardOutput=journal
 StandardError=journal
