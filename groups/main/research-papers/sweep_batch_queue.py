@@ -43,6 +43,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -86,12 +87,47 @@ groups/main/CLAUDE.md의 "Paper Processing (Background Subagent Dispatcher)"를 
 4. 위 턴 유지 규칙대로 폴링하며 끝까지 진행한다.
 5. 전부 끝나면 결과 요약을 send_message로 보내고 큐 파일을 삭제한다.
 
+🚨 환경성 실패는 논문 실패가 아니다 — 즉시 중단해라
+NotebookLM 인증 만료("authentication expired", "run notebooklm login")나 rate limit을
+만나면, 그건 그 논문의 문제가 아니라 **환경 문제**라서 남은 논문도 100% 똑같이 실패한다.
+이때:
+- 해당 논문을 failed로 기록하지 마라. **pending 그대로 두고 배치를 즉시 중단**해라.
+  (실제로 인증이 만료된 상태에서 재개가 돌아 5편이 2분 만에 failed로 묻힌 적이 있다.)
+- 남은 pending도 dispatch하지 말고, 사용자에게 "NotebookLM 인증 만료 — 호스트에서
+  `notebooklm login` 필요"라고 알린 뒤 종료해라. 인증이 복구되면 자동으로 재개된다.
+
 주의
 - status가 "failed"인 항목은 건드리지 마라. 이미 Notion 페이지가 있어 dedup에 걸리며
   별도 재처리 대상이다.
 - 토큰/시간이 부족해 남은 것을 이번에 못 끝내겠으면, 큐를 pending 상태로 정확히
   남겨두고 사용자에게 몇 편이 남았는지 알려라. 큐만 올바르면 자동 재개가 이어받는다.
 """
+
+
+# An ENVIRONMENTAL failure — the shared NotebookLM session died or is throttled, so
+# EVERY paper fails instantly and identically. Such a paper isn't broken and must not
+# be buried as permanently `failed`; it's retryable the moment the environment is fixed.
+_ENV_FAIL = re.compile(
+    r"auth\w*\s+(expired|invalid)|re-?authenticate|notebooklm login"
+    r"|rate.?limit|quota", re.I)
+
+
+def notebooklm_auth_ok():
+    """True/False if we can tell whether the NotebookLM session is alive, None if not.
+
+    Probed ONLY when we're about to schedule a resume (rare), because it drives a real
+    browser session and isn't free. An expired session is the difference between a
+    resume that works and one that marches through the queue marking every paper
+    `failed` in a couple of minutes."""
+    try:
+        p = subprocess.run(["notebooklm", "list", "--json"],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None                                   # can't tell — don't block recovery
+    blob = (p.stdout or "") + (p.stderr or "")
+    if _ENV_FAIL.search(blob):
+        return False
+    return True if p.returncode == 0 else None
 
 
 def load_queue():
@@ -148,8 +184,13 @@ def main() -> int:
     papers = q.get("papers", [])
     pending = [p for p in papers if p.get("status") == "pending"]
     running = [p for p in papers if p.get("status") == "in_progress"]
-    if not pending and not running:
-        return 0                                    # drained (only done/failed left)
+    # Papers buried by an environmental failure (dead NotebookLM session, rate limit)
+    # are retryable, not broken — count them as work so a queue that a bad session
+    # marked "all failed" is still recovered once the environment is healthy again.
+    retryable = [p for p in papers
+                 if p.get("status") == "failed" and _ENV_FAIL.search(str(p.get("error") or ""))]
+    if not pending and not running and not retryable:
+        return 0                                    # drained (only real done/failed left)
 
     age_min = (datetime.datetime.now().timestamp() - os.path.getmtime(QUEUE)) / 60
     if age_min < a.stale_min:
@@ -178,14 +219,33 @@ def main() -> int:
         chat_jid = row[0]
 
         print(f"sweep: STRANDED batch — {len(pending)} pending, {len(running)} in_progress, "
-              f"queue idle {age_min:.0f}m, no agent container"
+              f"{len(retryable)} env-failed, queue idle {age_min:.0f}m, no agent container"
               f"{' (dry-run)' if a.dry_run else ''}")
+
+        # Don't resume into a broken environment. With a dead NotebookLM session every
+        # paper fails within seconds, so an unguarded resume doesn't stall — it marches
+        # through the queue burning each remaining paper into `failed` (observed: 5
+        # papers buried in ~2 minutes). Better to stay stranded and say why.
+        auth = notebooklm_auth_ok()
+        if auth is False:
+            print("sweep: NotebookLM session is EXPIRED — refusing to resume (a resume "
+                  "now would mark every remaining paper failed). Run `notebooklm login` "
+                  "on the host; the batch resumes automatically after that.",
+                  file=sys.stderr)
+            return 0
+
         if a.dry_run:
             return 0
 
         # Their containers are gone, so in_progress can never complete — hand them back
         # to pending. The subagent's own dedup check keeps already-finished work cheap.
         for p in running:
+            p["status"] = "pending"
+            p["task_id"] = None
+            p["error"] = None
+        # Same for papers a dead session / rate limit buried: the environment is healthy
+        # again (checked just above), so give them another go instead of losing them.
+        for p in retryable:
             p["status"] = "pending"
             p["task_id"] = None
             p["error"] = None
@@ -204,8 +264,9 @@ def main() -> int:
             (tid, "main", chat_jid, RESUME_PROMPT, "once", "", "isolated",
              now.isoformat(), "active", now.isoformat()))
         conn.commit()
-        print(f"sweep: reconciled {len(running)} in_progress -> pending, "
-              f"scheduled {tid} ({len(pending) + len(running)} papers to resume)")
+        print(f"sweep: reconciled {len(running)} in_progress + {len(retryable)} env-failed "
+              f"-> pending, scheduled {tid} "
+              f"({len(pending) + len(running) + len(retryable)} papers to resume)")
         return 0
     finally:
         conn.close()
