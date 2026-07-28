@@ -5,7 +5,16 @@ flagged by CodeQL (py/incomplete-url-substring-sanitization).
 """
 
 import re
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+# The NotebookLM marketing/landing host (note: no ``.com``). A request to the
+# app host ``notebooklm.google.com`` is redirected here — typically
+# ``notebooklm.google/?location=unsupported`` — when Google's region /
+# anti-abuse risk-control declines the request's *environment* (VPN/proxy or
+# datacenter IP, IP/timezone/language mismatch, non-browser access pattern).
+# This is distinct from the ``accounts.google.com`` login redirect (expired or
+# invalid auth) and from a genuine page-structure change.
+_NOTEBOOKLM_MARKETING_HOST = "notebooklm.google"
 
 
 def is_youtube_url(url: str) -> bool:
@@ -64,3 +73,57 @@ def contains_google_auth_redirect(text: str) -> bool:
     url_pattern = r'https?://[^\s"\'<>]+'
     urls = re.findall(url_pattern, text)
     return any(is_google_auth_redirect(url) for url in urls)
+
+
+def is_notebooklm_unavailable_redirect(url: str) -> bool:
+    """Check if a URL is the NotebookLM marketing/landing host (an access gate).
+
+    A request to the app (``notebooklm.google.com``) redirected to the bare
+    ``notebooklm.google`` host means Google's region / anti-abuse risk-control
+    declined the request's environment — *not* expired auth (that goes to
+    ``accounts.google.com``) and *not* a page-structure change. The bare host is
+    distinguished from the app host purely by the absent ``.com`` suffix, so an
+    exact / subdomain match on ``notebooklm.google`` never matches
+    ``notebooklm.google.com``.
+
+    Args:
+        url: URL to check (typically ``response.url`` after redirects).
+
+    Returns:
+        True if the URL is the ``notebooklm.google`` landing host.
+    """
+    try:
+        hostname = (urlparse(url).hostname or "").lower()
+        return hostname == _NOTEBOOKLM_MARKETING_HOST or hostname.endswith(
+            "." + _NOTEBOOKLM_MARKETING_HOST
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def notebooklm_unavailable_location(url: str) -> str | None:
+    """Return the ``location`` query value from a NotebookLM access-gate URL.
+
+    Surfaces the diagnostic Google attaches to the marketing redirect (e.g.
+    ``"unsupported"`` from ``notebooklm.google/?location=unsupported``) so the
+    cause is visible even though the URL scrubber drops the rest of the query.
+    Returns ``None`` when absent or unparseable.
+
+    Args:
+        url: URL to inspect (typically ``response.url`` after redirects).
+    """
+    try:
+        values = parse_qs(urlparse(url).query).get("location")
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not values:
+        return None
+    # Sequence unpacking (not ``values[0]``) — the parse-qs list isn't an RPC row,
+    # but the positional-indexing guardrail can't tell; the guard above keeps the
+    # unpack safe.
+    first, *_ = values
+    # The value lands in a user-facing error string, so keep only a bounded,
+    # sane diagnostic token (e.g. ``unsupported``) — never echo arbitrary,
+    # newline-bearing, or URL-shaped query content.
+    sanitized = re.sub(r"[^A-Za-z0-9_-]", "", first)[:64]
+    return sanitized or None
