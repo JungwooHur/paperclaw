@@ -71,6 +71,21 @@ The paper-page healers (back-matter, source-URL, math, furniture, figure, table 
 
 Multiple paper requests are meant to run as **parallel background subagents** (the dispatcher pattern in `groups/main/CLAUDE.md`) — the user sends N papers and must **never** have to serialize them by hand. The catch: every subagent drives ONE shared NotebookLM browser profile (`~/.notebooklm`), and Chrome can't be driven by two processes at once — concurrent `notebooklm ask` calls would collide and yield summarized/stub sections. So **`container/bin/notebooklm` is a `flock` wrapper** installed over the real CLI in the Dockerfile: it serializes every NotebookLM call system-wide, so parallel subagents QUEUE their asks instead of conflicting, while the rest of each paper's pipeline (figures, tables, Notion upload) still runs in parallel. **Do NOT advise sending papers one at a time — serialization is the wrapper's job.** Requires a container rebuild to take effect. (This is a real risk but was NOT the cause of the mid-July broken batch — that was the assembly bug below; don't conflate the two.)
 
+## A stale vendored notebooklm-py lies about auth (keep it current)
+
+`notebooklm-py` is an **unofficial CLI that drives the NotebookLM web app** with a Playwright cookie session, so it breaks whenever Google changes the app. The container installs it from the tracked copy in `vendor/notebooklm-py`, which had sat at **0.3.4 since the initial commit while upstream moved to 0.7.3** (8 releases).
+
+**Failure mode (real incident, cost days):** the stale CLI reported a perfectly valid session as `Authentication expired or invalid … Run 'notebooklm login' to re-authenticate`. Every paper in a batch therefore failed within seconds, and each was recorded as permanently `failed`. The error message is confidently wrong and sends you down an auth rabbit hole — three interactive `notebooklm login` rounds later, the cookies were still the *same untouched ones from a month earlier*, because they were never the problem.
+
+**The decisive test — do this before ever blaming auth:** run the SAME `~/.notebooklm/storage_state.json` against a current CLI in a throwaway venv:
+```bash
+python3 -m venv /tmp/nlm && /tmp/nlm/bin/pip install -q notebooklm-py
+/tmp/nlm/bin/notebooklm list --json     # works here + fails on the installed one = the CLI is stale, not the session
+```
+Also note **`notebooklm doctor` is not trustworthy for this** — it only checks that an SID cookie exists in the file and happily prints `Auth ✓ pass` while every real request redirects to the Google sign-in page. `notebooklm list --json` is the only honest check.
+
+**Upgrading:** replace `vendor/notebooklm-py` with the new sdist (drop `tests/`, `examples/`, `PKG-INFO` — the old vendored tree tracked neither), `pip install --user --break-system-packages --upgrade ./vendor/notebooklm-py` on the host so host-side probes agree with the container, then prune the builder and rebuild (see Container Build Cache). Verify the CLI both *inside* the image and on the host with `list --json`. The image's ENTRYPOINT speaks the agent JSON protocol, so probe it with `--entrypoint`.
+
 ## Silently-broken paper assembly (verify enforcement)
 
 The agent uploads translated sections with **hand-rolled multi-batch Notion PATCH**. Notion returns `401 "API token is invalid"` on a large `children` payload — a SIZE issue, not auth (the `ntn_` integration token never expires; a `GET /pages/{id}` with the same token returns 200). The agent splits/retries and **loses track of what it uploaded**, so whole sections get DROPPED (a paper shipped with only its appendix, main body gone) or DUPLICATED/reordered. Block/heading/image counts still look fine — **do NOT judge a page healthy from counts; check section content coverage.** The mandatory guard `verify_sections.py` (Step 2-C) exists, but the agent runs it by PROSE rule and skips it, so broken pages ship silently. Structural fix: **`heal_verify` runs the audit on the 5-minute healer** regardless of the agent — auto-dedups duplicate sections (keep-richest, capped) and LOUDLY flags MISSING/CONTENT_LOSS/SUMMARIZED in the journal (`AUDIT …`). It can't recreate content the agent never uploaded (needs re-processing), but a broken page is never silent again.
