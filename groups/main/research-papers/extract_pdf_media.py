@@ -26,7 +26,7 @@ a real 47-page report, then fixed here):
      this.
   2. HORIZONTAL clipping. It inferred the figure's column from the CAPTION's
      x-extent (`is_fullwidth = cx0 < 0.3W and cx1 > 0.7W`). A short centered
-     caption ("Figure 1: Kimi K3 main results.") fails that test, so a
+     caption ("Figure 1: Main results.") fails that test, so a
      full-width figure on a SINGLE-column paper was treated as a left-column
      figure and cropped to `cx1 + 6` — chopping off its right half.
 
@@ -46,8 +46,16 @@ column, with no caption-shape guessing.
 Tables use the identical machinery, growing DOWNWARD (LaTeX puts a table's
 caption above its body) instead of upward.
 
+  # eyeball the crops first — renders to disk, touches nothing:
+  extract_pdf_media.py --pdf <path-or-url> --out <dir>
+
   extract_pdf_media.py --page <id> [--arxiv <id> | --pdf <path-or-url>]
-                       [--dry-run] [--force] [--figures-only|--tables-only]
+                       [--dry-run] [--figures-only|--tables-only]
+                       [--force] [--keep-text]
+
+`--force` REPLACES: it archives the page's existing figure/table images before
+injecting, so a page built by the old broken path can be repaired in place
+without ending up with two of every figure.
 """
 import argparse
 import json
@@ -163,7 +171,7 @@ def _page_lines(page):
 def learn_furniture(doc) -> tuple:
     """Find the document's running head and foot, as normalised text.
 
-    A paper's running head ("KIMI K3: OPEN FRONTIER INTELLIGENCE") and its page
+    A paper's running head (its title, repeated at the top) and its page
     number are drawn from the page's own content stream, so they look exactly
     like figure content to a geometric walk — and they sit at the very top of the
     page, which is how the old snippet ended up cropping whole pages. They are
@@ -471,7 +479,7 @@ def fetch_pdf(source: str) -> str:
 
 
 def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
-           kinds=("figure", "table")) -> dict:
+           kinds=("figure", "table"), keep_text: bool = False) -> dict:
     """Render from the PDF and insert each image after its first mention."""
     import time
 
@@ -486,14 +494,16 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
         return "".join(c.get("plain_text", "") for c in
                        ((b.get("image") or {}).get("caption") or [])).strip().lower()
 
+    def _img_kind(b):
+        return "table" if _img_caption(b).startswith("table") else "figure"
+
     have = {"figure": 0, "table": 0}
     for b in blocks:
-        if b["type"] != "image":
-            continue
-        have["table" if _img_caption(b).startswith("table") else "figure"] += 1
+        if b["type"] == "image":
+            have[_img_kind(b)] += 1
     todo = tuple(k for k in kinds if force or not have[k])
     rep = {"page": page_id, "existing": have, "kinds": list(todo),
-           "found": 0, "placed": 0}
+           "found": 0, "placed": 0, "replaced": 0, "text_archived": 0}
     if not todo:
         rep["skipped_existing"] = True
         return rep
@@ -502,6 +512,21 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     out_dir = tempfile.mkdtemp(prefix="pdfmedia_")
     media = render_media(pdf, out_dir, kinds=todo)
     rep["found"] = len(media)
+    if not media:
+        return rep
+
+    # --force means REPLACE, not "add a second copy". A page built by the old
+    # whole-page-screenshot path already has an image per figure, so injecting
+    # without clearing first doubles every figure and makes the page worse than
+    # it was. Old images go only after the new ones rendered successfully.
+    stale = [b for b in blocks if b["type"] == "image" and _img_kind(b) in todo]
+    if force and stale:
+        rep["replaced"] = len(stale)
+        if apply:
+            for b in stale:
+                notion("PATCH", f"/blocks/{b['id']}", {"archived": True})
+                time.sleep(0.2)
+            blocks = vs.fetch_blocks(page_id)
 
     groups, order = {}, []
     for (kind, num) in sorted(media, key=lambda k: (k[0], k[1])):
@@ -532,7 +557,40 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
                 body["after"] = key
             notion("PATCH", f"/blocks/{page_id}/children", body)
             time.sleep(0.34)
+
+    if "table" in todo and not keep_text:
+        rep["text_archived"] = _archive_flattened_tables(page_id, blocks, apply)
     return rep
+
+
+def _archive_flattened_tables(page_id: str, blocks: list, apply: bool) -> int:
+    """Drop the table text a real table image now replaces.
+
+    Only unambiguous whole-block cases: a `code` block that IS a markdown table
+    (what build_answer_blocks emits for one), and a paragraph `_is_pure_table`
+    already vouches for. A block mixing table data with the next real sentence is
+    left alone — same policy as extract_paper_tables, so no prose is ever lost.
+    """
+    import verify_sections as vs
+    from extract_paper_tables import _is_pure_table
+    from translate_fulltext import notion
+
+    def _text(b):
+        return "".join(x.get("plain_text", "")
+                       for x in (b.get(b["type"]) or {}).get("rich_text", []))
+
+    doomed = []
+    for b in blocks:
+        if b["type"] == "code" and vs._MD_TABLE_RE.search(_text(b)):
+            doomed.append(b["id"])
+        elif b["type"] == "paragraph" and _is_pure_table(_text(b)):
+            doomed.append(b["id"])
+    if apply:
+        import time
+        for bid in doomed:
+            notion("PATCH", f"/blocks/{bid}", {"archived": True})
+            time.sleep(0.2)
+    return len(doomed)
 
 
 def _anchor_for(kind: str, num: int, blocks: list):
@@ -573,7 +631,9 @@ def main() -> int:
     ap.add_argument("--out", help="render to this directory and exit (no Notion)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
-                    help="inject even if the page already has images")
+                    help="REPLACE existing figure/table images (archive, then inject)")
+    ap.add_argument("--keep-text", action="store_true",
+                    help="keep flattened table text that a table image replaces")
     ap.add_argument("--figures-only", action="store_true")
     ap.add_argument("--tables-only", action="store_true")
     a = ap.parse_args()
@@ -601,7 +661,8 @@ def main() -> int:
             print("ERROR no --pdf/--arxiv and the page has no arxiv Paper URL",
                   file=sys.stderr)
             return 2
-    rep = inject(a.page, source, apply=not a.dry_run, force=a.force, kinds=kinds)
+    rep = inject(a.page, source, apply=not a.dry_run, force=a.force, kinds=kinds,
+                 keep_text=a.keep_text)
     print(json.dumps(rep, ensure_ascii=False, indent=1))
     return 0
 
