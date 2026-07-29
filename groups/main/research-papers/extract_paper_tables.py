@@ -304,7 +304,7 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
 
 
 def heal_tables(page_id: str, apply: bool = False) -> dict:
-    aid = ef.arxiv_id_from_page(page_id)
+    aid = ef.ensure_arxiv_id(page_id, apply=apply)
     if not aid:
         return {"page": page_id, "arxiv": None, "placed": 0}
     return inject_tables(page_id, aid, apply=apply)
