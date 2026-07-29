@@ -189,6 +189,11 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
 
 _ARXIV_RE = re.compile(r"arxiv\.org/(?:abs|html|pdf)/(\d{4}\.\d{4,5})", re.I)
 
+# Backfilling a Paper URL points every downstream healer at that paper, so the
+# title has to match almost exactly — the arxiv API's own confidence gate is not
+# enough on its own (it only compares candidates against each other).
+_TITLE_MATCH_MIN = 0.9
+
 
 def arxiv_id_from_page(page_id: str):
     """Return the arxiv id from the page's 'Paper URL' property, or None."""
@@ -202,11 +207,60 @@ def arxiv_id_from_page(page_id: str):
     return None
 
 
+def _page_title(page: dict) -> str:
+    for prop in (page.get("properties") or {}).values():
+        if prop.get("type") == "title":
+            return "".join(t.get("plain_text", "") for t in prop.get("title") or [])
+    return ""
+
+
+def ensure_arxiv_id(page_id: str, apply: bool = False):
+    """The page's arxiv id, resolving it from the TITLE when Paper URL is empty.
+
+    Why: every visual/citation healer is keyed on the arxiv id parsed out of
+    `Paper URL`. A paper added without one therefore makes `heal_figures`,
+    `heal_tables` and `verify_citations` return `placed: 0` FOREVER — a silent
+    no-op that looks identical to "already clean", so the page can never be
+    repaired no matter how many times the healer runs. Observed on a real page
+    whose figures and tables were both broken and un-healable.
+
+    The resolve is deliberately strict — a wrong id would translate/illustrate a
+    DIFFERENT paper, the failure this repo already has scar tissue for. It goes
+    through the authoritative arxiv API (which refuses on ambiguity) and then
+    additionally demands a near-exact title match, so it only ever fills in an id
+    that is already implied by the title on the page.
+    """
+    aid = arxiv_id_from_page(page_id)
+    if aid:
+        return aid
+    import resolve_arxiv
+    from translate_fulltext import notion
+
+    pg = notion("GET", f"/pages/{page_id}")
+    title = _page_title(pg).strip()
+    if len(title) < 12:
+        return None
+    try:
+        hit = resolve_arxiv.resolve(title)
+    except Exception:
+        return None
+    if hit.get("ask_user") or not hit.get("arxiv_id"):
+        return None
+    if resolve_arxiv._sim(title, hit.get("title") or "") < _TITLE_MATCH_MIN:
+        return None
+    url_prop = next((name for name, p in (pg.get("properties") or {}).items()
+                     if p.get("type") == "url"), None)
+    if apply and url_prop:
+        notion("PATCH", f"/pages/{page_id}",
+               {"properties": {url_prop: {"url": hit["url"]}}})
+    return hit["arxiv_id"]
+
+
 def heal_figures(page_id: str, apply: bool = False) -> dict:
     """Healer entry: inject figures when the page has none and its Paper URL
     resolves to an arxiv id. Idempotent no-op otherwise (missing id, or the page
     already has images — inject_figures guards on both)."""
-    aid = arxiv_id_from_page(page_id)
+    aid = ensure_arxiv_id(page_id, apply=apply)
     if not aid:
         return {"page": page_id, "arxiv": None, "placed": 0}
     return inject_figures(page_id, aid, apply=apply)

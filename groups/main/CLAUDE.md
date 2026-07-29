@@ -40,6 +40,10 @@ Known fixes accumulated so far:
 | Same paper double-created on an on-demand request (not just the nightly job) | On 2026-05-28 a subagent processing a paper ran `collect_papers.py --add-paper` **in the background** and never read its `ADDED <page_id>` output. It then tried to *find* the just-created page by querying Notion — but the query index hadn't caught up (eventual consistency, ~10-30s), so the lookup returned empty. Concluding "the page wasn't created," it fell back to **raw `curl POST /v1/pages`**, producing a second page. The `--add-paper` idempotency was fine; the agent simply went around it. Raw POST bypasses every in-script guard, so prose ("never raw POST") can't prevent this | Two-part fix. (1) **Structural healer:** `collect_papers.py --dedupe` groups all pages by arxiv_id / normalized title, keeps the richest (most child blocks), backfills a missing URL onto the keeper, archives the rest. Wired as a third `ExecStart` in `paperclaw-qa-heal.service` (every 5 min); all three ExecStarts now carry a `-` prefix so one healer's failure no longer blocks the others. Catches duplicates regardless of how they were created. (2) **Prompt + tooling:** `--add-paper` now prints `SKIPPED already-in-notion <page_id>` (id included) and `add_to_notion` returns the existing id, so the agent never needs a post-create lookup. Subagent step 3 rewritten: run `--add-paper` in the foreground, capture the `<page_id>` from stdout, never query-to-find a just-created page, never raw POST |
 | Agent stops uploading to Notion mid-session, claims "토큰 만료" / "Notion API 토큰 문제" — token is actually fine | Notion's PATCH `/blocks/{id}/children` occasionally returns `401 "API token is invalid"` for non-auth reasons (large/oddly-formatted payloads, transient edge issues). On 2026-05-05 a 43KB block batch hit this; the same token had just succeeded on a `POST /pages` call and a `GET /pages/{id}` call moments later, and the same PATCH succeeded once split into 4 × ~10KB batches. The agent correctly recovered for that one paper, but **locked the wrong "token expired" mental model** into context. ~1100 turns later, asked to upload two new documents, it skipped Notion entirely and only saved translations to `/tmp/` (lost when container exits), telling the user "Notion 토큰 문제로 즉시 업로드 불가" — pure misdiagnosis | (1) **Never conclude "token expired" from a single 401.** If `GET /pages/{id}` with the same `$NOTION_TOKEN` returns 200, the token is valid — full stop. (2) On PATCH 401, **first action is split the children array in half and retry** before suspecting auth. Keep halving until either it succeeds or you get a 401 on a single-block payload (only then is the token actually suspect). (3) Once you've decided to translate something, **always create the Notion page and PATCH blocks** — `/tmp/` files are ephemeral and wasted work. If you genuinely cannot upload, raise the failing curl command + full response to the user instead of silently saving to `/tmp/` |
 | Translated page had duplicated sections, a one-sentence stub section, and summarized subsections | Three independent failure modes in one processing run: (1) the subagent batched all of a section's subsections into ONE `notebooklm ask`, and NotebookLM compressed them to fit its output limit (~700 chars each vs 5-15k source chars — a summary, not a translation); (2) a slow per-section ask was dispatched as a *background* task, polled, timed out, and the section was re-asked with a trimmed prompt → one-sentence stub; (3) hand-rolled multi-batch PATCH assembly lost track of what was uploaded and re-appended two whole sections → duplicates. Step 2-C's heading-count check passed anyway (duplicates inflate the count) | `research-papers/verify_sections.py` — structural auditor run as a MANDATORY gate (new Step 2-C + subagent template step 5): flags DUPLICATE (with the extra heading ids to archive), CONTENT_LOSS (< 400 chars), SUMMARIZED (translated/source ratio < 0.35; faithful ko translations measure 0.55-0.7), MISSING (vs Step 2-A list). Source spans are measured by locating each `number + title` heading (last occurrence, so ToC hits are skipped) and cutting the tail at References. Plus three new anti-pattern rules: never batch subsections into one ask, never background an ask, never re-append after partial upload without auditing the page |
+| PDF figures came out as **whole-page screenshots** — title, abstract and body paragraphs baked into the image, and the right half of the figure chopped off | A PDF-only paper (no `arxiv.org/html`, ar5iv redirects to the abs page) fell through BOTH `extract_paper_figures` and `extract_paper_tables`, which parse LaTeXML HTML. Its only figure path was the ~90-line PyMuPDF snippet pasted into this file as "Phase 3b" — pasted prose the agent copy-ran, so nobody ever reviewed its geometry. Two independent crop bugs, both reproduced pixel-exactly against the shipped images: (1) `fig_top = min(y of every vector drawing above the caption)` — a running-header rule IS a vector drawing at the top of the page, so the crop started at the page margin and swallowed everything above the figure (10 of 16 figures); (2) the figure's column was inferred from the CAPTION's x-extent (`is_fullwidth = cx0 < 0.3W and cx1 > 0.7W`), so a short centred caption on a SINGLE-column paper read as a left-column figure and the crop stopped at `cx1 + 6`, cutting the figure in half | `research-papers/extract_pdf_media.py` — committed, and renders **tables as well as figures** (a PDF-only paper had no table path at all, which is why its tables stayed flattened text). It stops inferring the box from the caption: text blocks are split into `barriers` (body prose, detected by MEASURE — most lines running the block's full width — plus headings by font size) and `elements` (drawings, images, axis labels, sub-captions); from the caption the region grows one element at a time and stops as soon as a barrier is nearer than the next element, i.e. at the first line of body text. Running heads/feet are found by REPETITION across pages (with the hairline rule under them) and excluded, as is the rotated arxiv margin stamp — but *not* a figure's own rotated y-axis label, which has the same shape and must stay. The crop is then the UNION of everything inside the band, so single- and two-column figures both come out whole. **Verify crops before injecting: `--pdf <file> --out <dir>` renders without touching Notion.** **Repair:** `heal_pdf_media` on the 5-min healer |
+| A paper page can never be healed: figures, tables and citations stay broken no matter how many times the healer runs | `heal_figures`, `heal_tables` and `verify_citations` are all keyed on the arxiv id parsed out of the page's **Paper URL** property. A paper added with that property EMPTY makes `arxiv_id_from_page` return `None`, and every one of them returns `placed: 0` — a silent no-op indistinguishable from "already clean". Nothing logs, nothing flags, and the page is permanently un-healable | `extract_paper_figures.ensure_arxiv_id(page_id, apply=)` resolves the id from the page TITLE via the authoritative arxiv API and writes the URL back; all three healers now call it. Deliberately strict — a wrong id would illustrate a DIFFERENT paper — so on top of the API's own refusal-on-ambiguity it also demands a >=0.9 title similarity, i.e. it only fills in an id the title already implies |
+| A page shows raw `\| --- \|` pipes where its tables should be, and `verify_sections` passes it anyway | `build_answer_blocks` converts a markdown table to a `code` block on purpose (it preserves alignment without building a Notion table schema) — but the TABLE_FLATTENED check only scanned `paragraph` and heading blocks, so a page whose every table came through the text path looked clean. Tables that landed as ESCAPED pipes inside one paragraph were caught; the code-block form was invisible | TABLE_FLATTENED now also scans `code` blocks for a markdown table (a pipe row followed by a `\|---\|` separator). Verified against a real broken page: both code-block tables detected, no false positive on prose. The fix for the page itself is to inject real table images — `extract_pdf_media.py` for a PDF-only paper, `extract_paper_tables.py` when HTML exists |
+| A duplicate pair survives `--dedupe` forever: a blank stub page sitting next to the real page | `_dedup_key` returned the arxiv id **or**, failing that, the normalized title. The commonest duplicate shape is a stub with an EMPTY Paper URL beside the real page that has one — so the two got different keys (`title:…` vs `arxiv:…`), landed in different groups, and were never seen as duplicates. Backfilling a URL onto one of a pair actively *breaks* their grouping, which is a trap when repairing a page by hand | `_dedup_keys` emits BOTH keys for every page and `_group_by_identity` unions pages sharing ANY key (union-find), so a stub groups with its twin through the title while two URL-bearing copies still group through the arxiv id. Verified on the live shapes: stub+URL'd pair groups, both-URL'd pair groups, a retitled page with the same arxiv id groups, and two genuinely different papers stay apart |
 
 ## Language Policy (Token Optimization)
 
@@ -627,136 +631,40 @@ Save the output: `python3 << 'PYEOF' ... PYEOF > /tmp/figure_map.json`
 
 **If no HTML is available** (script outputs `{}`), use the **PDF figure extraction fallback** below — do NOT skip figures or block translation.
 
-#### Phase 3b: PDF Figure Extraction Fallback (when ar5iv fails)
+#### Phase 3b: PDF figures AND tables (when there is no usable HTML)
 
-When ar5iv returns `{}`, extract figures directly from the arxiv PDF using PyMuPDF:
+`arxiv.org/html/<id>` 404s for company tech reports and for very fresh
+submissions, and ar5iv then just redirects to the abstract page — so Phase 3
+finds nothing at all. **Do NOT hand-roll a PyMuPDF crop here.** This step used to
+be a ~90-line snippet pasted into this file, and its crop math shipped whole-page
+screenshots for months (root cause in the Known Issues row "PDF figures came out
+as whole-page screenshots"). Run the committed script instead — it renders
+figures AND tables from the PDF and injects both:
 
 ```bash
-pip install pymupdf --break-system-packages -q
+python3 /workspace/group/research-papers/extract_pdf_media.py \
+  --page <notion_page_id> --arxiv <arxiv_id>        # or: --pdf /tmp/paper.pdf
 
-python3 << 'PYEOF'
-import fitz, re, json, sys, os, subprocess, urllib.request
-
-ARXIV_ID = "ARXIV_ID"
-PDF_PATH = f"/tmp/{ARXIV_ID}.pdf"
-OUT_DIR  = f"/tmp/{ARXIV_ID}_figs"
-os.makedirs(OUT_DIR, exist_ok=True)
-
-# Download PDF
-urllib.request.urlretrieve(f"https://arxiv.org/pdf/{ARXIV_ID}", PDF_PATH)
-
-doc = fitz.open(PDF_PATH)
-PAGE_MARGIN = 70
-MARGIN = 45
-
-# Find all "Figure X:" captions and their pages
-fig_pages = {}
-for pn in range(len(doc)):
-    for m in re.finditer(r'Figure\s+(\d+)[:\.]', doc[pn].get_text()):
-        fn = int(m.group(1))
-        if fn not in fig_pages:
-            fig_pages[fn] = pn
-
-results = {}
-for fig_num, pn in sorted(fig_pages.items()):
-    page = doc[pn]
-    page_w = page.rect.width
-
-    # Find caption bounding box (may span multiple consecutive blocks)
-    blocks_sorted = sorted(page.get_text("dict")["blocks"], key=lambda x: x["bbox"][1])
-    cap_idx = None
-    for i, b in enumerate(blocks_sorted):
-        if b["type"] != 0: continue
-        text = " ".join(s["text"] for l in b["lines"] for s in l["spans"])
-        if re.search(rf'Figure\s+{fig_num}[:\.]', text):
-            cap_idx = i
-            break
-    if cap_idx is None:
-        continue
-
-    cb = blocks_sorted[cap_idx]
-    cx0, cy0, cx1, cy1 = cb["bbox"]
-    cap_fonts = {round(s["size"],1) for l in cb["lines"] for s in l["spans"]}
-    cap_text  = " ".join(s["text"] for l in cb["lines"] for s in l["spans"])
-
-    # Extend cy1 if the caption runs into subsequent same-font, same-column blocks
-    # (happens when LaTeX splits a long caption at a column/page break).
-    # Stop as soon as: the current text ends with a sentence-terminating '.', or
-    # the next block has a different font size, a large gap (>25pt), or is off-column.
-    cur_y1, cur_text = cy1, cap_text
-    for nb in blocks_sorted[cap_idx + 1:]:
-        if nb["type"] != 0: continue
-        if cur_text.rstrip().endswith("."): break        # caption is complete
-        nx0, ny0, nx1, ny1 = nb["bbox"]
-        if ny0 - cur_y1 > 25: break                     # too far
-        if abs(nx0 - cx0) > 40: break                   # different column
-        nb_fonts = {round(s["size"],1) for l in nb["lines"] for s in l["spans"]}
-        if not nb_fonts <= cap_fonts | {max(cap_fonts)}: break  # different font
-        cur_y1   = ny1
-        cur_text = " ".join(s["text"] for l in nb["lines"] for s in l["spans"])
-    cy1 = cur_y1
-    is_fullwidth = (cx0 < page_w * 0.3 and cx1 > page_w * 0.7)
-    is_left = cx0 < page_w / 2
-
-    # Determine fig_top using drawing/raster-image bounding boxes.
-    # Text-based heuristics are unreliable because figure labels (short, scattered
-    # text inside diagrams) look like body text to PyMuPDF.
-    # Instead: find the minimum y of all vector drawings AND raster images that
-    # belong to this figure's column and lie above the caption.
-    def in_col(r):
-        if r[3] >= cy0 - 2: return False          # below or at caption
-        if r[3] <= r[1] + 2: return False          # zero-height element
-        if is_fullwidth: return True
-        # For single-column figures, the drawing must START in (or very near) the
-        # correct column — this avoids picking up full-width tables or the other
-        # column's content.
-        if is_left:  return r[0] < page_w * 0.6
-        else:        return r[0] > page_w * 0.35   # drawing starts in right half
-
-    y_tops = []
-    for d in page.get_drawings():
-        r = d["rect"]
-        if in_col(r) and r[1] >= PAGE_MARGIN - 10:
-            y_tops.append(r[1])
-    for b in page.get_text("dict")["blocks"]:
-        if b["type"] != 1: continue
-        r = b["bbox"]
-        if in_col(r) and r[1] >= PAGE_MARGIN - 10:
-            y_tops.append(r[1])
-
-    fig_top = max(min(y_tops) - 4, PAGE_MARGIN - 5) if y_tops else PAGE_MARGIN
-    fig_bottom = cy1 + 6
-
-    # For single-column figures, anchor on the caption's actual x0/x1 so the
-    # caption text is never clipped. Add ±6pt margin and clamp to page bounds.
-    if is_fullwidth:
-        crop = fitz.Rect(MARGIN, fig_top, page_w - MARGIN, fig_bottom)
-    elif is_left:
-        crop = fitz.Rect(MARGIN, fig_top, min(cx1 + 6, page_w - MARGIN), fig_bottom)
-    else:
-        crop = fitz.Rect(max(cx0 - 6, MARGIN), fig_top, page_w - MARGIN, fig_bottom)
-
-    out_path = f"{OUT_DIR}/fig{fig_num}.png"
-    page.get_pixmap(matrix=fitz.Matrix(250/72, 250/72), clip=crop, alpha=False).save(out_path)
-
-    # Upload PRIVATELY into Notion (NOT a public host) — see image hosting below.
-    from notion_upload import upload_image
-    fid = upload_image(out_path)
-    if fid:
-        results[fig_num] = {"file_upload": fid, "page": pn + 1}
-
-print(json.dumps(results, indent=2))
-PYEOF
+# look at the crops first, without touching Notion:
+python3 /workspace/group/research-papers/extract_pdf_media.py \
+  --pdf /tmp/paper.pdf --out /tmp/media
 ```
 
-Save output to `/tmp/figure_map_pdf.json`.
+**Tables matter as much as figures here.** `extract_paper_tables` screenshots
+arxiv HTML, so a PDF-only paper has no table path either — without this script
+every table stays the unreadable run of numbers the fulltext translation
+produced, or lands as a raw `| --- |` markdown code block.
 
-**Figure → Section mapping:** Ask NotebookLM which section each figure belongs to:
-```bash
-notebooklm ask "각 Figure가 어느 섹션에 속하는지 알려줘. Figure 번호, 캡션 요약, 해당 섹션 번호를 알려줘." --notebook <id>
-```
+Placement is deterministic: each image goes after the first body block that
+mentions its number (`그림 N` / `Figure N`, `표 N` / `Table N`), falling back to the
+page end. **Do not ask NotebookLM which section a figure belongs to** — the
+reference in the translated body already answers it, and the round-trip only adds
+a way to be wrong.
 
-Then use the section mapping to insert image blocks via Notion `after` parameter (insert after the first paragraph of each figure's section).
+**Repair:** `heal_pdf_media` runs on the 5-minute healer for any paper whose
+Paper URL resolves to an arxiv id that has no HTML. It short-circuits the moment
+HTML *is* available, so it never competes with Phase 3.
+
 
 **Image hosting (MANDATORY): upload figures PRIVATELY into Notion — never a public host.** Use `research-papers/notion_upload.py`:
 ```python

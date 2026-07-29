@@ -445,14 +445,58 @@ def _block_count(page_id):
     return total
 
 
-def _dedup_key(page):
-    """Group key: arxiv_id when available (most reliable), else normalized
-    title. Returns None for pages with neither (left untouched)."""
+def _dedup_keys(page):
+    """EVERY identity key a page carries: its arxiv id AND its normalized title.
+
+    Both, not "arxiv id else title". The commonest duplicate shape is a stub page
+    with no Paper URL beside the real page that has one — under an either/or key
+    those two land in DIFFERENT groups (`title:…` vs `arxiv:…`) and the sweep
+    never sees them as duplicates, so the pair survives forever. Emitting both
+    keys and unioning on any shared one groups them.
+    """
+    keys = []
     aid = extract_arxiv_id(_page_url(page))
     if aid:
-        return f"arxiv:{aid}"
+        keys.append(f"arxiv:{aid}")
     t = _normalize_title(_page_title(page))
-    return f"title:{t}" if len(t) >= 8 else None
+    if len(t) >= 8:
+        keys.append(f"title:{t}")
+    return keys
+
+
+def _group_by_identity(pages):
+    """Group pages that share ANY identity key (union-find over the key sets)."""
+    parent = list(range(len(pages)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    seen = {}
+    keyed = set()
+    for i, p in enumerate(pages):
+        for k in _dedup_keys(p):
+            keyed.add(i)
+            if k in seen:
+                union(seen[k], i)
+            else:
+                seen[k] = i
+    groups = {}
+    for i in sorted(keyed):
+        groups.setdefault(find(i), []).append(pages[i])
+    # Label each group by a stable key so the log line stays informative.
+    out = {}
+    for root, grp in groups.items():
+        keys = _dedup_keys(pages[root])
+        out[keys[0] if keys else f"group:{root}"] = grp
+    return out
 
 
 def _patch_page(page_id, payload):
@@ -469,11 +513,7 @@ def dedupe_notion(dry_run=False):
         print("ERROR missing NOTION_TOKEN/NOTION_RESEARCH_DB", file=sys.stderr)
         sys.exit(2)
     pages = _query_all_pages()
-    groups = {}
-    for p in pages:
-        k = _dedup_key(p)
-        if k:
-            groups.setdefault(k, []).append(p)
+    groups = _group_by_identity(pages)
     dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
     if not dup_groups:
         print(f"OK no duplicates among {len(pages)} pages")

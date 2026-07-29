@@ -57,6 +57,9 @@ import urllib.request
 import auto_save_qa as aq  # shared Notion helpers: api_get, _block_text, headers
 
 HEADING_TYPES = ("heading_1", "heading_2", "heading_3")
+
+# A markdown pipe table: a row, then the `|---|---|` separator underneath.
+_MD_TABLE_RE = re.compile(r"^\s*\|.*\|\s*\n\s*\|[\s:|-]*-[\s:|-]*\|\s*$", re.M)
 # Body-bearing block types whose text counts toward a section's length.
 BODY_TYPES = ("paragraph", "bulleted_list_item", "numbered_list_item",
               "quote", "callout", "toggle", "code")
@@ -525,6 +528,14 @@ def main() -> int:
         flat_ids = [b["id"] for b in blocks
                     if b["type"] in ("paragraph",) + HEADING_TYPES
                     and _is_pure_table(aq._block_text(b))]
+        # A markdown table reaching build_answer_blocks becomes a `code` block —
+        # by design, to preserve alignment. That is still a table rendered as
+        # TEXT, and it was invisible here because the scan only looked at
+        # paragraphs/headings: a page whose every table came through the text
+        # path passed the check while showing raw `| --- |` pipes to the reader.
+        flat_ids += [b["id"] for b in blocks
+                     if b["type"] == "code"
+                     and _MD_TABLE_RE.search(aq._block_text(b))]
     except Exception:
         flat_ids = []
     has_table_img = any(

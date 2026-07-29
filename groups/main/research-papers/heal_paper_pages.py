@@ -31,6 +31,11 @@ for one-off remediation across the whole DB, on the healer's 5-minute cadence:
     and inject them if the page has none, archiving only PURE-table flattened text
     (never prose). Tables translated from HTML fulltext otherwise land as an
     unreadable run of numbers.
+  * heal_pdf_media — render figures AND tables straight from the paper PDF for a
+    paper with no LaTeXML HTML (company tech report, brand-new submission). Both
+    heals above need `arxiv.org/html/<id>` or ar5iv, so such a paper silently got
+    neither: whole-page screenshots (from the pasted-prose fallback) and tables
+    left as flattened runs of numbers.
   * heal_verify — run the verify_sections structural audit (the MANDATORY Step 2-C
     gate the agent skips): auto-dedup duplicate sections and LOUDLY flag dropped /
     short / summarized sections so a page the agent's hand-rolled Notion assembly
@@ -61,6 +66,7 @@ from heal_equations import heal_equations
 from strip_furniture import strip_furniture
 from extract_paper_figures import heal_figures
 from extract_paper_tables import heal_tables
+from extract_pdf_media import heal_pdf_media
 from heal_verify import heal_verify
 
 
@@ -138,6 +144,16 @@ def heal(pages, apply):
             n_tbl = heal_tables(pid, apply=apply).get("placed") or 0
         except Exception as e:
             print(f"  {pid}: table-heal error {type(e).__name__}: {e}", file=sys.stderr)
+        # PDF-only papers (no arxiv/ar5iv HTML) fall through BOTH heals above —
+        # they parse LaTeXML HTML that does not exist for a tech report or a
+        # too-new submission. This renders their figures AND tables from the PDF.
+        # It no-ops the moment HTML is available, so it never competes with them.
+        n_pdf = 0
+        try:
+            n_pdf = heal_pdf_media(pid, apply=apply).get("placed") or 0
+        except Exception as e:
+            print(f"  {pid}: pdf-media-heal error {type(e).__name__}: {e}",
+                  file=sys.stderr)
         # Structural audit (verify_sections): auto-dedup duplicate sections and,
         # crucially, LOUDLY flag dropped/short/summarized sections that the agent's
         # hand-rolled Notion assembly leaves behind — so a broken page never ships
@@ -150,10 +166,12 @@ def heal(pages, apply):
                 print(f"  {pid}: AUDIT {flag}", file=sys.stderr)
         except Exception as e:
             print(f"  {pid}: verify-heal error {type(e).__name__}: {e}", file=sys.stderr)
-        if n_bm or n_url or n_math or n_eq or n_fur or n_fig or n_tbl or n_dedup:
+        if (n_bm or n_url or n_math or n_eq or n_fur or n_fig or n_tbl or n_pdf
+                or n_dedup):
             healed += 1
             print(f"  {pid}: back-matter={n_bm} url={n_url} math={n_math} eq={n_eq} "
-                  f"furniture={n_fur} figures={n_fig} tables={n_tbl} dedup={n_dedup}")
+                  f"furniture={n_fur} figures={n_fig} tables={n_tbl} "
+                  f"pdf-media={n_pdf} dedup={n_dedup}")
     print(f"healed {healed}/{len(pages)} paper page(s)"
           f"{' (dry-run)' if not apply else ''}")
 
