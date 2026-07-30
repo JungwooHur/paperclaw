@@ -497,10 +497,12 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     def _img_kind(b):
         return "table" if _img_caption(b).startswith("table") else "figure"
 
+    # Count/replace images ANYWHERE on the page, not just at top level — see
+    # _all_image_blocks for why nested ones exist and what missing them costs.
+    page_images = _all_image_blocks(blocks)
     have = {"figure": 0, "table": 0}
-    for b in blocks:
-        if b["type"] == "image":
-            have[_img_kind(b)] += 1
+    for b in page_images:
+        have[_img_kind(b)] += 1
     todo = tuple(k for k in kinds if force or not have[k])
     rep = {"page": page_id, "existing": have, "kinds": list(todo),
            "found": 0, "placed": 0, "replaced": 0, "text_archived": 0}
@@ -519,7 +521,7 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     # whole-page-screenshot path already has an image per figure, so injecting
     # without clearing first doubles every figure and makes the page worse than
     # it was. Old images go only after the new ones rendered successfully.
-    stale = [b for b in blocks if b["type"] == "image" and _img_kind(b) in todo]
+    stale = [b for b in page_images if _img_kind(b) in todo]
     if force and stale:
         rep["replaced"] = len(stale)
         if apply:
@@ -558,9 +560,144 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
             notion("PATCH", f"/blocks/{page_id}/children", body)
             time.sleep(0.34)
 
-    if "table" in todo and not keep_text:
-        rep["text_archived"] = _archive_flattened_tables(page_id, blocks, apply)
+    if not keep_text:
+        if "table" in todo:
+            rep["text_archived"] = _archive_flattened_tables(page_id, blocks, apply)
+        # Charts leave flattened label runs too, and they sit right above the image
+        # that replaces them. Verified against the figure's own PDF box, so only
+        # text the figure actually contains is removed.
+        rep["chart_text_archived"] = _archive_flattened_figure_text(
+            page_id, blocks, _media_text(pdf, media), apply)
     return rep
+
+
+def _all_image_blocks(top_blocks: list, max_depth: int = 2) -> list:
+    r"""Every image block on the page, INCLUDING ones nested under another block.
+
+    Why this can't just scan top level: the old hand-rolled injector PATCHed
+    `/blocks/{paragraph-id}/children`, so its figures are CHILDREN of the caption
+    paragraph rather than page-level blocks — the same wrong-parent mistake this
+    repo already has scar tissue for with Q&A callouts. A top-level-only scan then
+    fails twice over:
+
+      * the page looks like it has ZERO figures, so a normal run happily injects a
+        second copy of every figure right next to the stale one, and
+      * `--force` "replaces" only what it can see.
+
+    Observed on a real page: 15 whole-page screenshots (title + abstract + figure,
+    right edge clipped) survived a `--force` run that reported `replaced: 1`, so the
+    page still rendered the broken images the fix was supposed to remove.
+
+    Depth is bounded (a figure may sit under a paragraph, or a column inside a
+    column_list) and child fetches are best-effort: a page we can't fully walk must
+    degrade to "found fewer images", never crash the healer.
+    """
+    from translate_fulltext import notion
+
+    out = []
+
+    def children_of(bid):
+        got, cur = [], None
+        while True:
+            path = f"/blocks/{bid}/children?page_size=100"
+            if cur:
+                path += f"&start_cursor={cur}"
+            d = notion("GET", path)
+            got += d.get("results", [])
+            if not d.get("has_more"):
+                return got
+            cur = d["next_cursor"]
+
+    def walk(blocks, depth):
+        for b in blocks:
+            if b.get("type") == "image":
+                out.append(b)
+            if b.get("has_children") and depth < max_depth:
+                try:
+                    walk(children_of(b["id"]), depth + 1)
+                except Exception:
+                    continue
+    walk(top_blocks, 0)
+    return out
+
+
+def _media_text(pdf_path: str, media: dict) -> str:
+    r"""All text lying INSIDE the rendered figure/table boxes, normalized.
+
+    Used to spot body paragraphs that are nothing but a chart's flattened labels.
+    Matching against the source region (rather than guessing from shape) is what
+    makes the removal safe: translated prose is Korean and cannot match this
+    English text, so only the untranslated label runs can ever be archived.
+    """
+    import fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        parts = []
+        for item in media.values():
+            pno = item.get("page", 0) - 1
+            box = item.get("box")
+            if not box or not (0 <= pno < doc.page_count):
+                continue
+            parts.append(doc[pno].get_text(clip=fitz.Rect(*box)))
+    finally:
+        doc.close()
+    return re.sub(r"\s+", " ", " ".join(parts)).lower()
+
+
+def _archive_flattened_figure_text(page_id: str, blocks: list, media_text: str,
+                                   apply: bool) -> int:
+    r"""Drop body paragraphs that are just a figure's flattened chart labels.
+
+    A chart translated out of a PDF lands as a run of bare label/number text
+    ("DeepSWE GPT-5.6 Sol 73.0 Fable 5 70.0 ..."), which then sits directly above
+    the figure image that replaces it — the page shows the same data twice, once
+    unreadable. `_is_pure_table` does not catch these: it demands >=12 decimals and
+    a chart label run has ~half that, so figure-derived text was nobody's job.
+
+    Rather than loosen that threshold globally (which risks eating real prose on
+    every page), each candidate must be VERIFIABLY part of a rendered figure: its
+    tokens have to appear in the text inside that figure's own box in the PDF. A
+    paragraph that isn't reproduced there is left alone, whatever it looks like.
+    """
+    from translate_fulltext import notion
+
+    def _text(b):
+        return "".join(x.get("plain_text", "")
+                       for x in (b.get(b["type"]) or {}).get("rich_text", []))
+
+    doomed = []
+    for b in blocks:
+        if b["type"] != "paragraph":
+            continue
+        t = _text(b).strip()
+        toks = t.split()
+        if len(toks) < 8:
+            continue
+        if sum(1 for c in t if "가" <= c <= "힣") / max(1, len(t)) >= 0.15:
+            continue                                  # translated prose — keep
+        if len(re.findall(r"\d", t)) < 5:
+            continue                                  # not a data run
+        # Bibliography citations mark BODY text — a chart label never cites. Without
+        # this an in-text benchmark enumeration ("Agentic: BrowseComp [1], ...")
+        # scores ~0.95 against the figures, because those same product names are
+        # printed inside the charts, and real content gets archived.
+        if re.search(r"\[\d+(?:\s*,\s*\d+)*\]", t):
+            continue
+        if "`" in t:
+            continue    # literal template/code text (a figure panel spelled out) — readable, keep
+        norm = [w for w in re.sub(r"[^\w.%+-]+", " ", t.lower()).split() if w]
+        if not norm:
+            continue
+        hit = sum(1 for w in norm if w in media_text)
+        if hit / len(norm) >= 0.9:                    # reproduced inside a figure
+            doomed.append(b["id"])
+    if apply:
+        import time
+        for bid in doomed:
+            notion("PATCH", f"/blocks/{bid}", {"archived": True})
+            time.sleep(0.2)
+    return len(doomed)
 
 
 def _archive_flattened_tables(page_id: str, blocks: list, apply: bool) -> int:
