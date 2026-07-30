@@ -351,7 +351,23 @@ def main() -> int:
     blocks = fetch_blocks(args.page)
     sections = group_sections(blocks)
     if not sections:
-        print("No headings on page — nothing translated yet, or wrong page id.")
+        # `--json` is a CONTRACT: callers parse stdout as JSON no matter the exit
+        # code (heal_verify treats unparseable output as a crash and aborts the whole
+        # page's audit). This branch used to print a bare sentence, so every
+        # not-yet-translated page — a page freshly added to the DB, which is a NORMAL
+        # state — surfaced as `verify-heal error RuntimeError` on the 5-minute healer
+        # and skipped that page's dedup/flagging entirely. Emit the same shape as the
+        # normal path, with the condition as a finding.
+        msg = "No headings on page — nothing translated yet, or wrong page id."
+        if args.json:
+            print(json.dumps({"page": args.page, "title": page_title(args.page),
+                              "section_count": 0, "sections": [],
+                              "findings": [{"type": "NOT_TRANSLATED", "section": None,
+                                            "block_count": len(blocks), "block_ids": [],
+                                            "detail": msg}]},
+                             ensure_ascii=False, indent=2))
+        else:
+            print(msg)
         return 2
 
     findings = []
