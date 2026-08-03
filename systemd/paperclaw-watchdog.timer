@@ -2,8 +2,14 @@
 Description=Run the PaperClaw WhatsApp watchdog every 30 minutes
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=30min
+# WALL-CLOCK, deliberately not OnBootSec/OnUnitActiveSec — mixing those MONOTONIC
+# triggers with `Persistent=true` (a REALTIME stamp) leaves the timer permanently
+# unarmed after a reboot: `active`, `enabled`, and `NextElapse=infinity`. One
+# reboot silently killed this watchdog for six days, so nothing was guarding the
+# WhatsApp connection. See groups/main/research-papers/systemd/paperclaw-qa-heal.timer
+# for the full write-up. Check liveness with `list-timers` (NEXT), not `is-active`.
+OnCalendar=*:0/30
+AccuracySec=1min
 Persistent=true
 
 [Install]

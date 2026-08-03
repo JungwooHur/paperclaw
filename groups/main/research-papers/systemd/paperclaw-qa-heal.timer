@@ -2,9 +2,27 @@
 Description=Run PaperClaw Q&A auto-healer every 5 minutes
 
 [Timer]
-# Fire 2 minutes after boot, then every 5 minutes thereafter.
-OnBootSec=2min
-OnUnitActiveSec=5min
+# WALL-CLOCK, deliberately not OnBootSec/OnUnitActiveSec.
+#
+# This timer used `OnBootSec=2min` + `OnUnitActiveSec=5min` together with
+# `Persistent=true`, and that combination is a trap: `Persistent=` writes a
+# REALTIME stamp (~/.local/share/systemd/timers/stamp-*.timer) while those two
+# triggers are MONOTONIC (relative to the current boot). After a reboot systemd
+# cannot map the pre-reboot realtime stamp onto the new boot's monotonic timeline,
+# so the timer stays `active` with `NextElapseUSecMonotonic=infinity` — armed,
+# enabled, and never firing again.
+#
+# It fails SILENTLY: `is-active` says active and `is-enabled` says enabled; only
+# `list-timers` reveals it, as `NEXT` = `-`. Real incident: one reboot left this
+# healer AND the WhatsApp watchdog dead for SIX DAYS, and a paper page shipped
+# with 123 of its 124 equations invalid — a defect `heal_equations` repairs
+# automatically on every run.
+#
+# `OnCalendar=` is wall-clock, so the next elapse is always computable and
+# `Persistent=true` becomes meaningful (a missed run is caught up after downtime).
+# To verify a timer is really alive, check NEXT — never just `is-active`:
+#   systemctl --user list-timers paperclaw-qa-heal.timer
+OnCalendar=*:0/5
 AccuracySec=30s
 Persistent=true
 

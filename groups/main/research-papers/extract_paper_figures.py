@@ -139,8 +139,14 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
         cap = "".join(c.get("plain_text", "") for c in
                       ((b.get("image") or {}).get("caption") or [])).strip().lower()
         return not cap.startswith("table")
-    have_imgs = sum(1 for b in blocks if _is_fig_img(b))
-    rep = {"page": page_id, "existing_images": have_imgs,
+    # Look inside nested blocks too: an agent-injected figure is often PATCHed as a
+    # child of its caption paragraph, and a top-level-only scan both miscounts the
+    # page as empty and leaves those images behind on --force (same defect already
+    # fixed in extract_pdf_media).
+    from extract_pdf_media import _all_image_blocks
+    page_imgs = [b for b in _all_image_blocks(blocks) if _is_fig_img(b)]
+    have_imgs = len(page_imgs)
+    rep = {"page": page_id, "existing_images": have_imgs, "replaced": 0,
            "found": 0, "placed": 0, "skipped_existing": False}
     if have_imgs and not force:
         rep["skipped_existing"] = True          # idempotent: don't duplicate
@@ -153,6 +159,18 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     figs = parse_figures(html_text, src)
     rep["found"] = len(figs)
     rep["source"] = src
+
+    # --force means REPLACE, not "add a second set". Without this it only bypassed
+    # the skip, so forcing a page that already had figures left it with BOTH copies
+    # — the doubling bug extract_pdf_media already fixed. Old images go only after
+    # the source parsed successfully, so a failed fetch can't strip a good page.
+    if force and page_imgs and figs:
+        rep["replaced"] = len(page_imgs)
+        if apply:
+            for b in page_imgs:
+                notion("PATCH", f"/blocks/{b['id']}", {"archived": True})
+                time.sleep(0.2)
+            blocks = vs.fetch_blocks(page_id)
 
     # group images by anchor block, preserving document order within a group
     groups, order = {}, []
@@ -257,13 +275,35 @@ def ensure_arxiv_id(page_id: str, apply: bool = False):
 
 
 def heal_figures(page_id: str, apply: bool = False) -> dict:
-    """Healer entry: inject figures when the page has none and its Paper URL
-    resolves to an arxiv id. Idempotent no-op otherwise (missing id, or the page
-    already has images — inject_figures guards on both)."""
+    r"""Healer entry: inject figures when the page has none — or when the ones it
+    has clearly did not come from this injector — and its Paper URL resolves to an
+    arxiv id. Idempotent no-op otherwise.
+
+    Why the second case exists: "the page has images" is NOT the same as "the page's
+    figures are done". An agent that injects figures by hand uploads them with NO
+    caption and drops them wherever it happens to be — typically bunched at the end
+    of a section instead of after each figure's first mention. The healer then saw
+    images, reported `skipped_existing`, and could never repair the placement, so
+    the page stayed wrong forever (observed: 7 uncaptioned images clustered at
+    section ends while the source HTML had all 7 with proper captions).
+
+    Every image THIS code writes carries a `Figure N:` caption, so an image set with
+    no such caption is a reliable signal that the figures are not ours and should be
+    re-done. Deliberately narrow: if even one properly-captioned figure is present
+    the page is left alone, so a half-healed page is never churned.
+    """
     aid = ensure_arxiv_id(page_id, apply=apply)
     if not aid:
         return {"page": page_id, "arxiv": None, "placed": 0}
-    return inject_figures(page_id, aid, apply=apply)
+    import verify_sections as vs
+    from extract_pdf_media import _all_image_blocks
+
+    imgs = _all_image_blocks(vs.fetch_blocks(page_id))
+    caps = ["".join(c.get("plain_text", "") for c in
+                    ((b.get("image") or {}).get("caption") or [])).strip().lower()
+            for b in imgs]
+    foreign = bool(caps) and not any(c.startswith(("figure", "그림")) for c in caps)
+    return inject_figures(page_id, aid, apply=apply, force=foreign)
 
 
 def upload_image_from_url(url: str):

@@ -67,6 +67,18 @@ The paper-page healers (back-matter, source-URL, math, furniture, figure, table 
 
 **Fix / prevention:** the installed units are now **symlinks** to the repo files (content can't drift), and `/update` re-links + `daemon-reload`s them. If healers "aren't applying," first check the installed unit actually contains every `ExecStart` from the repo unit and run `systemctl --user daemon-reload`. Note: `heal_figures`/`heal_tables` are HTML-based (arxiv `arxiv.org/html/<id>`) — a **PDF-only paper (HTML 404)** can't be auto-healed for figures/tables.
 
+## A timer can be `active` + `enabled` and still never fire again (check NEXT)
+
+Both `paperclaw-qa-heal.timer` and `paperclaw-watchdog.timer` used `OnBootSec=` + `OnUnitActiveSec=` **together with `Persistent=true`**. That combination is a trap: `Persistent=` anchors on a REALTIME stamp (`~/.local/share/systemd/timers/stamp-*.timer`) while those two triggers are MONOTONIC (relative to the current boot). After a reboot systemd cannot map the pre-reboot stamp onto the new boot's monotonic timeline, so the timer sits with `NextElapseUSecMonotonic=infinity` — armed and dead.
+
+**It fails silently in the worst way:** `systemctl --user is-active` says `active`, `is-enabled` says `enabled`, the unit files are correctly symlinked, and nothing is logged. **Only `list-timers` shows it — `NEXT` is `-`.** Real incident: one reboot killed BOTH timers for **six days**. Nothing healed and nothing guarded WhatsApp in that window, and a paper processed inside it shipped with 123 of its 124 equations invalid — a defect `heal_equations` repairs automatically on every run.
+
+**Fix:** both timers now use wall-clock `OnCalendar=` (`*:0/5`, `*:0/30`), where the next elapse is always computable and `Persistent=true` actually means "catch up a missed run". **When a healer "isn't applying", check `systemctl --user list-timers` FIRST** — a blank `NEXT` means it has not been running at all, and no amount of debugging the healer code will explain the symptom:
+```bash
+systemctl --user list-timers 'paperclaw-*'     # NEXT must be a real timestamp
+ls -la ~/.local/share/systemd/timers/          # stamp mtime = last real trigger
+```
+
 ## Concurrent paper requests (NotebookLM serialization)
 
 Multiple paper requests are meant to run as **parallel background subagents** (the dispatcher pattern in `groups/main/CLAUDE.md`) — the user sends N papers and must **never** have to serialize them by hand. The catch: every subagent drives ONE shared NotebookLM browser profile (`~/.notebooklm`), and Chrome can't be driven by two processes at once — concurrent `notebooklm ask` calls would collide and yield summarized/stub sections. So **`container/bin/notebooklm` is a `flock` wrapper** installed over the real CLI in the Dockerfile: it serializes every NotebookLM call system-wide, so parallel subagents QUEUE their asks instead of conflicting, while the rest of each paper's pipeline (figures, tables, Notion upload) still runs in parallel. **Do NOT advise sending papers one at a time — serialization is the wrapper's job.** Requires a container rebuild to take effect. (This is a real risk but was NOT the cause of the mid-July broken batch — that was the assembly bug below; don't conflate the two.)
