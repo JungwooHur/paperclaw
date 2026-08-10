@@ -42,9 +42,9 @@ import re
 # save_qa_callout._MATH so we never touch or double-wrap existing equations.
 _DELIMITED = re.compile(
     r"\$\$.+?\$\$"
-    r"|\\\[.+?\\\]"
+    r"|\\{1,2}\[.+?\\{1,2}\]"
     r"|\$(?![\s$])[^$\n]+?(?<![\s$])\$"
-    r"|\\\(.+?\\\)",
+    r"|\\{1,2}\(.+?\\{1,2}\)",
     re.DOTALL)
 
 # Brace group with up to THREE levels of nesting, so a subscript whose content
