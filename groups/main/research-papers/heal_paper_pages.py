@@ -18,6 +18,9 @@ for one-off remediation across the whole DB, on the healer's 5-minute cadence:
   * wrap_math — wrap bare LaTeX (`\mathbf{c}_{v}`, `L_{s}<m_{1}`) left in text
     spans in $...$ so it renders as Notion equations (NotebookLM emits math
     undelimited ~half the time; build_answer_blocks only converts delimited math).
+  * heal_mangled_math — rebuild a paragraph whose math delimiters were mis-parsed
+    so badly that prose ended up stored INSIDE equation spans (the severe form of
+    the bug heal_equations repairs); classifies by content, not by delimiters.
   * heal_equations — strip the parasitic trailing `\` from inline equations a
     hand-rolled path built with bare-paren `(...)` semantics instead of `\(...\)`
     (every `\(EXPR\)` became eq `EXPR\` + a stray `\` in the preceding text), which
@@ -63,6 +66,7 @@ from strip_backmatter import strip_backmatter
 from clean_source_urls import clean_page
 from wrap_math import wrap_math_page
 from heal_equations import heal_equations
+from heal_mangled_math import heal_page as heal_mangled
 from strip_furniture import strip_furniture
 from extract_paper_figures import heal_figures
 from extract_paper_tables import heal_tables
@@ -122,6 +126,7 @@ def heal(pages, apply):
             cu = clean_page(pid, apply=apply)
             wm = wrap_math_page(pid, apply=apply)
             eq = heal_equations(pid, apply=apply)
+            mm = heal_mangled(pid, apply=apply)
             fu = strip_furniture(pid, apply=apply)
         except Exception as e:
             print(f"  {pid}: text-heal error {type(e).__name__}: {e}", file=sys.stderr)
@@ -130,6 +135,7 @@ def heal(pages, apply):
         n_url = (cu.get("edited") or 0) + (cu.get("archived") or 0)
         n_math = wm.get("edited") or 0
         n_eq = eq.get("equations") or 0
+        n_mm = mm.get("new_blocks") or 0
         n_fur = fu.get("archived") or fu.get("would_archive") or 0
         # Visual heals hit the network / headless Chromium — isolate each so a
         # transient failure (arxiv down, playwright hiccup) never blocks the text
@@ -169,7 +175,7 @@ def heal(pages, apply):
         if (n_bm or n_url or n_math or n_eq or n_fur or n_fig or n_tbl or n_pdf
                 or n_dedup):
             healed += 1
-            print(f"  {pid}: back-matter={n_bm} url={n_url} math={n_math} eq={n_eq} "
+            print(f"  {pid}: back-matter={n_bm} url={n_url} math={n_math} eq={n_eq} mangled={n_mm} "
                   f"furniture={n_fur} figures={n_fig} tables={n_tbl} "
                   f"pdf-media={n_pdf} dedup={n_dedup}")
     print(f"healed {healed}/{len(pages)} paper page(s)"
