@@ -186,8 +186,14 @@ def group_sections(blocks: list) -> list:
                 "occurrence": seen.get(key, 0),
             }
             sections.append(cur)
-        elif t in BODY_TYPES and cur is not None:
-            cur["chars"] += len(aq._block_text(b))
+        elif cur is not None and (t in BODY_TYPES or t == "equation"):
+            # An equation BLOCK is body content too. Counting only rich_text made
+            # every math-heavy section look summarized: one real section measured
+            # 1082 prose chars against 3831 source chars (ratio 0.28, flagged) while
+            # carrying another 832 chars inside standalone equation blocks — 0.50
+            # once counted, i.e. a faithful translation the auditor kept rejecting.
+            cur["chars"] += (len((b.get("equation") or {}).get("expression", ""))
+                             if t == "equation" else len(aq._block_text(b)))
     return sections
 
 
@@ -304,8 +310,18 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
         words = [w for w in re.split(r"\W+", title) if len(w) > 2][:6]
         if not key or not words:
             continue
+        # Join the kept words allowing a few SKIPPED short words between them.
+        # The old needle dropped words of <=2 chars and then glued the rest with
+        # `\W+`, which cannot span the word it just dropped: a title such as
+        # "Properties of the Method" became `properties\W+method` and never
+        # matched, so that heading was NOT
+        # FOUND and its span silently merged into the previous section — doubling
+        # the previous section's measured source length and firing SUMMARIZED at a
+        # translation that was actually complete (one real section measured 5622
+        # source chars against a true span of 2629).
+        gap = r"(?:\W+\w+){0,3}?\W+"
         needle = (re.escape(key.lower()) + r"\.?\s+"
-                  + r"\W+".join(re.escape(w.lower()) for w in words))
+                  + gap.join(re.escape(w.lower()) for w in words))
         last = None
         for mm in re.finditer(needle, low):
             last = mm

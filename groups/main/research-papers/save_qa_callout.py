@@ -188,11 +188,20 @@ def _normalize_lang(lang: str) -> str:
 # $...$ / $$...$$ (also \(...\) / \[...\]). The '$' inline forms require a
 # non-space char right inside each delimiter, so prose money ("$5 and $10") is not
 # mistaken for math. Order matters: $$..$$ / \[..\] are tried before $..$.
+#
+# The backslash delimiters accept ONE OR TWO backslashes, and that is load-bearing.
+# The Step 2-B prompt shows the delimiters escaped for the shell (`\\(…\\)`), and
+# NotebookLM copies that escaping into its answer, so real answers arrive with
+# `\\(m = n\\)`. Matching only `\(` made the regex start at the SECOND backslash:
+# the first was left behind in the prose and the closing one was swallowed into the
+# expression, producing text `…\` + equation `m = n\`. A lone trailing backslash is
+# invalid KaTeX, so EVERY equation on such a page rendered as a red error — the
+# defect heal_equations exists to repair after the fact. This is where it was born.
 _MATH = re.compile(
-    r"\$\$(?P<disp>.+?)\$\$"                        # $$ ... $$
-    r"|\\\[(?P<dispb>.+?)\\\]"                       # \[ ... \]
-    r"|\$(?![\s$])(?P<inl>[^$\n]+?)(?<![\s$])\$"     # $ ... $
-    r"|\\\((?P<inlb>.+?)\\\)",                       # \( ... \)
+    r"\$\$(?P<disp>.+?)\$\$"                          # $$ ... $$
+    r"|\\{1,2}\[(?P<dispb>.+?)\\{1,2}\]"              # \[ ... \]  /  \\[ ... \\]
+    r"|\$(?![\s$])(?P<inl>[^$\n]+?)(?<![\s$])\$"      # $ ... $
+    r"|\\{1,2}\((?P<inlb>.+?)\\{1,2}\)",              # \( ... \)  /  \\( ... \\)
     re.DOTALL)
 
 
@@ -237,7 +246,8 @@ def _paragraph_blocks(text: str) -> list[dict]:
             for ch in chunks(text)]
 
 
-_DISPLAY_MATH = re.compile(r"\$\$(.+?)\$\$|\\\[(.+?)\\\]", re.DOTALL)
+# Same one-or-two-backslash rule as _MATH — see the note there.
+_DISPLAY_MATH = re.compile(r"\$\$(.+?)\$\$|\\{1,2}\[(.+?)\\{1,2}\]", re.DOTALL)
 
 
 def _prose_paragraphs(text: str) -> list[dict]:
