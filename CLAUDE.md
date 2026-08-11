@@ -79,6 +79,24 @@ systemctl --user list-timers 'paperclaw-*'     # NEXT must be a real timestamp
 ls -la ~/.local/share/systemd/timers/          # stamp mtime = last real trigger
 ```
 
+### …but a blank NEXT can ALSO mean the opposite: the timer is saturated
+
+Read `NEXT` together with `LAST`, because the two failure states look identical in
+that one column. systemd will not start a second instance of a service that is
+already running, so **while the triggered unit is active the timer has no armed next
+elapse and `list-timers` prints `-` for NEXT** — same as the dead-timer case above.
+`LAST` is what separates them: dead means LAST is old or never, saturated means LAST
+is seconds ago. `systemctl --user show <timer> -p LastTriggerUSec` is the direct read;
+`ActiveState=activating` on the *service* confirms it is mid-run.
+
+Observed on `paperclaw-qa-heal`: one cycle takes ~15 min against a `*:0/5` schedule
+(`auto_fix_qa.py` alone spends ~14 min scanning every page in the DB), so runs go
+back-to-back forever and NEXT is permanently blank. Nothing is broken — the journal
+shows a normal `healed N/M` every cycle — but the real cadence is **~96 runs/day, not
+288**, so "the healer runs every 5 minutes" is not a safe assumption when reasoning
+about how fast a repair reaches a page. Count `Starting …` lines over 24h to get the
+true rate.
+
 ## Concurrent paper requests (NotebookLM serialization)
 
 Multiple paper requests are meant to run as **parallel background subagents** (the dispatcher pattern in `groups/main/CLAUDE.md`) — the user sends N papers and must **never** have to serialize them by hand. The catch: every subagent drives ONE shared NotebookLM browser profile (`~/.notebooklm`), and Chrome can't be driven by two processes at once — concurrent `notebooklm ask` calls would collide and yield summarized/stub sections. So **`container/bin/notebooklm` is a `flock` wrapper** installed over the real CLI in the Dockerfile: it serializes every NotebookLM call system-wide, so parallel subagents QUEUE their asks instead of conflicting, while the rest of each paper's pipeline (figures, tables, Notion upload) still runs in parallel. **Do NOT advise sending papers one at a time — serialization is the wrapper's job.** Requires a container rebuild to take effect. (This is a real risk but was NOT the cause of the mid-July broken batch — that was the assembly bug below; don't conflate the two.)
