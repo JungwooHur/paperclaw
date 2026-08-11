@@ -324,6 +324,69 @@ def _group_list_items(para: str, marker_re: str) -> list[str]:
     return [it for it in items if it]
 
 
+_MATH_LANGS = {"math", "latex", "tex", "equation"}
+_KOREAN_RE = re.compile(r"[가-힣]")
+# Real code, not a formula. Braces are deliberately NOT a code signal — `e^{i\theta}`
+# is ordinary LaTeX, and treating `{}` as code kept genuine formulas out.
+_CODE_HINT = re.compile(r"\b(def|class|import|from|return|for|while|if|else|print|"
+                        r"lambda|self|None|True|False|const|let|var|function)\b"
+                        r"|;|//|#\s|\bpip\b")
+# A STRONG signal — one of these must be present. Two weak ones were removed after a
+# whole-DB dry run turned them into false positives: a lone `·` matched a weather
+# forecast used as a bullet separator, and a bare `[_^][A-Za-z0-9]` matched the `_r`
+# in `car_rental`, i.e. every snake_case identifier. A subscript therefore has to
+# follow a SINGLE-letter variable (`x_m`, `q_t`) sitting on a word boundary.
+_MATH_HINT = re.compile(r"\\[a-zA-Z]+|[_^]\{|\b[A-Za-z]\d*[_^]"
+                        r"|=|≈|≤|≥|≠|≡|→|⊗|⊤|∑|∏|∫|∇|∂|√|∈|∉|⊂|⊆|∪|∩|±|∞"
+                        r"|[α-ωΑ-Ω]")
+# Data/prose that a math signal alone would wave through: a python dict repr carries
+# `=`, and a weather forecast used `·` as a bullet separator. `%` is a LaTeX comment
+# char (never valid in an expression) and a period followed by a lowercase word is a
+# sentence. A quote only counts when it OPENS a string — `'ident'` — because a lone
+# or trailing `'` is prime notation (`reward'`, `o'_{t+k}`), which is real maths.
+_NOT_MATH = re.compile(r"\"|(?<![A-Za-z0-9_])'[^']*'|(?<!\\)%|\.\s+[a-z]")
+
+
+def is_formula_fence(lang: str, text: str) -> bool:
+    r"""True if a fenced block is really a FORMULA and should become a Notion
+    equation block instead of a code block.
+
+    Why this exists: body math arrives as `$…$` and becomes equation objects, but an
+    ANSWER often writes its math inside a ``` fence, which the converter faithfully
+    turns into monospace code — so the same formula renders as maths in the body and
+    as plain text in a Q&A. Answers should read like the body.
+
+    Deliberately conservative, because the failure modes are worse than a missed
+    conversion. Measured against 26 real fenced blocks from the DB, it converts 8
+    single-line formulas and keeps the rest as code:
+      * Korean inside  -> keep. Converting would put prose INSIDE an equation, the
+        exact corruption heal_mangled_math exists to undo.
+      * multi-line     -> keep. These are ASCII-art matrices and flow diagrams whose
+        meaning is the alignment; KaTeX would destroy it.
+      * code / a declared language other than math -> keep.
+      * quotes, a `%`, or a sentence (`. ` + lowercase) -> keep. A whole-DB dry run
+        found these hiding behind a real math signal: a python dict repr carries `=`,
+        and a weather forecast used `·` as a bullet separator.
+    """
+    lang = (lang or "").strip().lower()
+    body = (text or "").strip()
+    if not body:
+        return False
+    if lang in _MATH_LANGS:
+        return True                       # declared intent — trust it
+    if lang not in ("", "plain text", "plaintext", "text"):
+        return False
+    if _KOREAN_RE.search(body) or "\n" in body or re.search(r"\s{2,}", body):
+        return False
+    if _CODE_HINT.search(body) or _NOT_MATH.search(body):
+        return False
+    if not _MATH_HINT.search(body):
+        return False
+    if body.count("{") != body.count("}") or body.rstrip().endswith("\\"):
+        return False                      # would be invalid KaTeX
+    return len(body) <= 200
+
+
 def _prose_blocks(prose_md: str) -> list[dict]:
     """Convert prose markdown (no fenced code blocks) into Notion blocks."""
     blocks: list[dict] = []
@@ -393,7 +456,12 @@ def build_answer_blocks(answer_md: str) -> list[dict]:
         prose = answer_md[pos:m.start()]
         if prose.strip():
             blocks.extend(_prose_blocks(prose))
-        blocks.append(_code_block(m.group(2), m.group(1)))
+        lang, body = m.group(1), m.group(2)
+        if is_formula_fence(lang, body):
+            blocks.append({"object": "block", "type": "equation",
+                           "equation": {"expression": body.strip()[:1000]}})
+        else:
+            blocks.append(_code_block(body, lang))
         pos = m.end()
     tail = answer_md[pos:]
     if tail.strip():
