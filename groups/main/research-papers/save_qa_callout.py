@@ -109,6 +109,19 @@ def block_text(b: dict) -> str:
 HEADING_LEVEL = {"heading_1": 1, "heading_2": 2, "heading_3": 3}
 
 
+_QPREFIX = re.compile(r"^\s*(?:Q\s*[:.]\s*)+", re.I)
+
+
+def strip_q_prefix(question: str) -> str:
+    """Collapse repeated "Q:" markers.
+
+    The caller passes `--question "Q: ..."` and the renderer adds its own marker, so
+    saved callouts read "Q: Q: ...". Cosmetic on the page, but it also skews the
+    dedup comparison that keeps a question from being filed twice.
+    """
+    return _QPREFIX.sub("", question or "").strip()
+
+
 def find_after_for_section(blocks: list[dict], section_query: str) -> str | None:
     """Return the ID of the LAST top-level block of the section whose heading
     contains `section_query`. Returns None if no heading matches.
@@ -116,15 +129,37 @@ def find_after_for_section(blocks: list[dict], section_query: str) -> str | None
     "Last block of the section" = the block immediately before the next heading
     at an equal or shallower level (or the end of the page).
     """
-    q = section_query.strip().lower()
+    q = section_query.strip().lower().rstrip(".")
     start = None
     start_level = None
+    # A section LABEL must match as a label, not as a substring. Plain `q in text`
+    # makes "4" match the heading "3.4. …" and "4.1" match "3.4.1. …" — both appear
+    # earlier in the page, so the callout lands in a different section entirely.
+    # Labels are anchored to the start of the heading and must end on a boundary,
+    # so "3.2" no longer matches "3.2.2". A non-label query (e.g. "Method") keeps
+    # the old substring behaviour, which is what makes it useful.
+    label = re.fullmatch(r"[0-9]+(?:\.[0-9]+)*|[ivxlc]+(?:-[a-z])?|[a-z](?:\.[0-9]+)*",
+                         q) is not None
+    # The label ends here only if no further number follows it: a trailing "." is
+    # part of the label ("4."), but ".2" means this heading is a deeper section.
+    needle = (re.compile(r"^\s*" + re.escape(q) + r"(?![0-9])(?!\.[0-9])")
+              if label else None)
     for i, b in enumerate(blocks):
         lvl = HEADING_LEVEL.get(b["type"])
-        if lvl and q in block_text(b).lower():
-            start = i
-            start_level = lvl
+        if not lvl:
+            continue
+        text = block_text(b).lower()
+        if needle.search(text) if needle else (q in text):
+            start, start_level = i, lvl
             break
+    if start is None and label:
+        # The page may not label its headings at all (a translated title only).
+        # Fall back to the substring match rather than refusing to place.
+        for i, b in enumerate(blocks):
+            lvl = HEADING_LEVEL.get(b["type"])
+            if lvl and q in block_text(b).lower():
+                start, start_level = i, lvl
+                break
     if start is None:
         return None
     end = len(blocks)
@@ -480,7 +515,9 @@ def build_callout(question: str, answer_md: str) -> dict:
 
     The toggle keeps the answer collapsed by default so the page stays scannable.
     """
-    q = sanitize(question)[:2000]
+    # Exactly one "Q: " marker, whatever the caller passed. Callers disagree —
+    # some prefix it, some do not, and saved callouts read "Q: Q: …".
+    q = "Q: " + strip_q_prefix(sanitize(question))[:1990]
     return {
         "object": "block",
         "type": "callout",
