@@ -215,7 +215,12 @@ def build_toggle_callout(question: str, answer_children: list[dict]) -> dict:
     }
 
 
-SECTION_RE = re.compile(r"(?<![\w.])(\d{1,2}\.\d{1,2}(?:\.\d+)?)\b")
+# `\b` cannot end a section number in Korean: a particle attaches directly to it
+# ("3.2.2는"), and 는 is a word character, so the boundary only succeeds after the
+# SHORTER "3.2" — the question about 3.2.2 was filed under 3.2, next to a copy the
+# agent had placed correctly. End on "no further number instead", and refuse a
+# multiplier ("2.5배") which is a quantity, not a section.
+SECTION_RE = re.compile(r"(?<![\w.])(\d{1,2}(?:\.\d{1,2}){1,2})(?![\d.])(?!\s*배)")
 FIGURE_RE = re.compile(r"(?:Figure|Fig\.?|Table|Eq\.?|Equation|Algorithm|Alg\.?)\s*(\d+)", re.IGNORECASE)
 
 
@@ -252,9 +257,13 @@ def guess_section_after(page_children: list[dict], question: str) -> str | None:
 
     # 1) explicit "N.M"
     candidates = SECTION_RE.findall(question)
-    for num in candidates:
+    # Longest first: a question naming "3.2.2" must not be filed under "3.2" just
+    # because that number also appears in the text.
+    for num in sorted(candidates, key=len, reverse=True):
         for hi, _, _, htxt in ranges:
-            if htxt.strip().startswith(num):
+            head = htxt.strip()
+            # Same label boundary as save_qa_callout: "3.2" must not match "3.2.2".
+            if re.match(re.escape(num) + r"(?![\d])(?!\.[\d])", head):
                 return last_block_id_of_section(page_children, hi)
 
     # 2) Figure/Table/Eq reference → deepest section whose body mentions it.

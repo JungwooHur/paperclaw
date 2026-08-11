@@ -37,6 +37,7 @@ groups/main/research-papers/*
 !groups/main/research-papers/heal_equations.py
 !groups/main/research-papers/heal_mangled_math.py
 !groups/main/research-papers/heal_math_fences.py
+!groups/main/research-papers/notebook_registry.py
 !groups/main/research-papers/remap_citations.py
 !groups/main/research-papers/strip_furniture.py
 !groups/main/research-papers/extract_paper_figures.py

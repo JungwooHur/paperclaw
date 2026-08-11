@@ -70,6 +70,7 @@ COMMON_WORDS = {
 }
 
 MIN_ANSWER_CHARS = 1200           # substantive answer threshold
+MIN_PAPER_ANSWER_CHARS = 400      # ...relaxed once the pair is tied to a paper
 DEFAULT_LOOKBACK_HOURS = 48
 MAX_MSGS_PER_CHAT = 200           # cap scan per chat
 
@@ -101,7 +102,7 @@ def api_post(path: str, body: dict) -> dict:
 # ---- Notion ---------------------------------------------------------------
 
 def load_paper_pages() -> list[dict]:
-    """Return [{'id', 'title', 'keywords'}]. Uses sort-stabilized pagination
+    """Return [{'id', 'title', 'url', 'keywords'}]. Uses sort-stabilized pagination
     (see auto_fix_qa.py — unsorted queries silently drop pages)."""
     db = os.environ.get("NOTION_RESEARCH_DB")
     if not db:
@@ -121,9 +122,15 @@ def load_paper_pages() -> list[dict]:
                 if v.get("type") == "title":
                     title = "".join(r["plain_text"] for r in v["title"])
                     break
+            url = ""
+            for v in p["properties"].values():
+                if v.get("type") == "url" and v.get("url"):
+                    url = v["url"]
+                    break
             out.append({
                 "id": p["id"],
                 "title": title,
+                "url": url,          # carries the arxiv id, the one exact identifier
                 "keywords": extract_title_keywords(title),
             })
         if d.get("has_more"): cur = d["next_cursor"]
@@ -280,6 +287,16 @@ def _has_paper_reference(text: str, kws: list[str]) -> bool:
     return False
 
 
+def _norm_for_title(text: str) -> str:
+    """Letters and digits only — titles differ by punctuation, case and spacing."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _arxiv_id_of(paper: dict) -> str:
+    m = re.search(r"\b(\d{4}\.\d{4,5})\b", paper.get("url") or "")
+    return m.group(1) if m else ""
+
+
 def active_paper_at(window: list[dict], papers: list[dict],
                     bot_reply: str, user_question: str) -> dict | None:
     """Pick the paper for this Q&A pair.
@@ -306,14 +323,56 @@ def active_paper_at(window: list[dict], papers: list[dict],
     history = window[:-1]  # everything except the current bot reply
     pair_text = bot_reply + "\n" + user_question
 
-    # Tier 1 — explicit paper reference in current pair with ≥2 distinct kws
+    # Tier 0 — the pair NAMES the paper: its full title, or its arxiv id. This is
+    # concrete evidence and outranks every keyword heuristic. Without it, a question
+    # quoting a title verbatim was still filed under a different paper, because the
+    # tier below returned the FIRST paper that cleared a threshold rather than the
+    # best one, and a sibling sharing a generic word ("transformer") came first.
+    # The USER's question is checked on its own first. Searching the whole pair at
+    # once let a bot reply that ENUMERATES other papers win on "longest title": a
+    # question naming one paper verbatim was filed under a different paper the bot
+    # had merely listed. What the user asked about is the paper in play.
+    for text in (user_question, pair_text):
+        named = []
+        for p in papers:
+            title_norm = _norm_for_title(p.get("title", ""))
+            if len(title_norm) >= 16 and title_norm in _norm_for_title(text):
+                named.append((len(title_norm), p))
+                continue
+            aid = _arxiv_id_of(p)
+            if aid and aid in text:
+                named.append((10_000, p))
+        if named:
+            named.sort(key=lambda x: -x[0])   # arxiv id, else longest title match
+            return named[0][1]
+
+    # Tier 1 — explicit paper reference in current pair with ≥2 distinct kws.
+    # Rank the candidates instead of taking the first one the DB happens to list.
+    tier1 = []
     for text in (bot_reply, user_question):
         for p in papers:
             if (_has_paper_reference(text, p["keywords"])
                     and _distinct_kw(text, p["keywords"]) >= 2):
+                tier1.append((_weighted_kw(text, p["keywords"]),
+                              _distinct_kw(text, p["keywords"]), p))
+    if tier1:
+        tier1.sort(key=lambda x: (-x[0], -x[1]))
+        return tier1[0][2]
+
+    # Tier 2 — an EXPLICIT "X 논문" statement earlier in the thread, when the
+    # current pair is consistent with it. This now outranks the keyword score
+    # below: naming a paper is evidence, a keyword score is a guess, and a
+    # follow-up ("그러니까, …") names nothing, so the guess used to win and filed
+    # the answer on a neighbouring page. Explicit paper reference in history, with current-pair
+    # consistency check. Most recent wins.
+    for m in reversed(history):
+        for p in papers:
+            if (_has_paper_reference(m["content"], p["keywords"])
+                    and _distinct_kw(m["content"], p["keywords"]) >= 2
+                    and _distinct_kw(pair_text, p["keywords"]) >= 1):
                 return p
 
-    # Tier 2 — distinct keywords in current pair (no "paper" mention
+    # Tier 3 — distinct keywords in current pair (no "paper" mention
     # needed). Base filter: ≥2 distinct kws AND IDF-weighted score ≥ 0.5
     # (i.e. at least one matched kw must be reasonably rare — a title-
     # unique compound name scores 1.0, so this passes any
@@ -333,15 +392,6 @@ def active_paper_at(window: list[dict], papers: list[dict],
         scored.sort(key=lambda x: (-x[1], -x[0]))
         return scored[0][2]
 
-    # Tier 3 — explicit paper reference in history, with current-pair
-    # consistency check. Most recent wins.
-    for m in reversed(history):
-        for p in papers:
-            if (_has_paper_reference(m["content"], p["keywords"])
-                    and _distinct_kw(m["content"], p["keywords"]) >= 2
-                    and _distinct_kw(pair_text, p["keywords"]) >= 1):
-                return p
-
     # Tier 4 — window scan with current-pair consistency check
     hits: list[tuple[int, dict]] = []
     for p in papers:
@@ -358,8 +408,19 @@ def active_paper_at(window: list[dict], papers: list[dict],
     return hits[0][1]
 
 
-def is_substantive_answer(content: str) -> bool:
-    if not content or len(content) < MIN_ANSWER_CHARS:
+def is_substantive_answer(content: str, paper_context: bool = False) -> bool:
+    """Is this bot message an answer worth filing on a paper page?
+
+    `paper_context` means the caller has ALREADY tied this pair to a specific
+    paper (resolved paper page + the pair naming something paper-specific). That
+    is far stronger evidence than any shape heuristic, so the markdown-structure
+    score is dropped there and the length floor lowered: a correct answer about
+    one equation is often plain prose and well under 1200 chars, and rejecting it
+    is exactly the "질문이 자동으로 안 올라간다" complaint — the agent skipped Step 4
+    and the backstop then declined to cover for it.
+    """
+    floor = MIN_PAPER_ANSWER_CHARS if paper_context else MIN_ANSWER_CHARS
+    if not content or len(content) < floor:
         return False
     # exclude scheduled task summaries / daily reports / "task done" confirmations
     low = content.lower()
@@ -380,6 +441,10 @@ def is_substantive_answer(content: str) -> bool:
     if re.search(r"^\s*[-*]\s", content, re.M): score += 1
     if re.search(r"^\s*\d+\.\s", content, re.M): score += 1
     if "|" in content and content.count("|") >= 6: score += 2
+    # Math is structure too — a derivation answer often has no headings or bullets.
+    if re.search(r"\$[^$\n]+\$|\\\[|\\frac|\\theta|\\sum", content): score += 2
+    if paper_context:
+        return True          # paper identity already carries the decision
     return score >= 2
 
 
@@ -398,16 +463,20 @@ def is_question_like(content: str) -> bool:
     cl = c.lower()
     if any(cl.endswith(t) for t in imperative_tails):
         return False
-    # Any of these is a strong question signal
-    if "?" in c: return True
-    if re.search(r"(왜|뭐야|무엇|어떻게|어디|누구|언제|얼마|차이|의미|설명"
-                 r"해|알려줘|뜻이야)", c):
+    if "?" in c:
         return True
-    # Long substantive prompt (not just a single imperative) — likely asking
-    # for explanation
-    if len(c) >= 60 and "해" not in c[-4:]:
+    # A sentence that CLOSES like a statement is a remark, not a question. One such
+    # ("…그 결과를 보여준다.") was filed as a Q&A, so the callout asked nothing.
+    if re.search(r"(다|네|군|구나|음|임|죠|네요|습니다)\.?$", c):
+        return False
+    # Explicit "I want this explained" markers. The old rule ended here with
+    # `len(c) >= 60 and "해" not in c[-4:]`, which rejected a real question purely
+    # because it happened to end on a syllable containing 해 ("…까지는 이해했어") —
+    # a question about the paper then never reached Notion at all.
+    if re.search(r"(왜|뭐야|무엇|어떻게|어디|누구|언제|얼마|차이|의미|설명해|알려줘|뜻이야"
+                 r"|이해가 안|이해 안|모르겠|헷갈|궁금|무슨|어느|은지|는지|을까|ㄹ까)", c):
         return True
-    return False
+    return len(c) >= 60
 
 
 def bot_mentions_paper(content: str, paper: dict) -> bool:
@@ -423,6 +492,23 @@ def bot_mentions_paper(content: str, paper: dict) -> bool:
 
 def _norm_tokens(text: str) -> set[str]:
     return set(re.findall(r"[A-Za-z가-힣]{3,}", text.lower()))
+
+
+_SECTION_LABEL = re.compile(r"(?<![\w.])(\d{1,2}(?:\.\d{1,2}){1,2})(?![\d.])(?!\s*배)")
+
+
+def guess_section_label(question: str, answer: str) -> str:
+    """The section this Q&A belongs to, as a heading label like "3.4.3".
+
+    The question is authoritative — it is what the reader asked about — and only
+    if it names no section do we look at the answer. Deepest label wins, so a
+    question about 3.2.2 is not filed under 3.2.
+    """
+    for text in (question, answer):
+        found = _SECTION_LABEL.findall(text or "")
+        if found:
+            return max(found, key=len)
+    return ""
 
 
 def already_saved(question: str, answer: str,
@@ -453,8 +539,19 @@ def already_saved(question: str, answer: str,
         # (a') question token-set overlap
         eq_tokens = _norm_tokens(eq)
         if q_tokens and eq_tokens:
-            overlap = len(q_tokens & eq_tokens) / max(len(q_tokens), len(eq_tokens))
-            if overlap >= 0.65: return True
+            inter = len(q_tokens & eq_tokens)
+            if inter / max(len(q_tokens), len(eq_tokens)) >= 0.65:
+                return True
+            # CONTAINMENT, not just symmetric overlap. When the agent saves a Q&A it
+            # rewrites the question ("…27번 수식까지는 이해했어" -> "…27번 수식 이후부터 왜
+            # position…"), so one wording is largely contained in the other while the
+            # symmetric ratio stays low — a real pair measured 0.38 symmetric but 0.75
+            # contained, and was about to be filed a second time. Unrelated questions
+            # on the same page measured 0.12, so the two are far apart. Require enough
+            # tokens that a short question cannot be swallowed by a longer one.
+            if (min(len(q_tokens), len(eq_tokens)) >= 4
+                    and inter / min(len(q_tokens), len(eq_tokens)) >= 0.70):
+                return True
 
         # (b) answer body token-set overlap — the robust signal
         eb_tokens = _norm_tokens(eb)
@@ -489,15 +586,25 @@ def save_callout(page_id: str, question: str, answer_md: str,
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write(answer_md)
         answer_path = f.name
+    cmd = ["python3", SAVE_SCRIPT,
+           "--page", page_id,
+           "--expect-title", expect_title,
+           "--question", question[:2000],
+           "--answer-file", answer_path]
+    # Aim at a section. Without --section the callout is appended at the PAGE END,
+    # and auto_fix_qa only re-places callouts that are nested under another block —
+    # a top-level one keeps its position — so everything this backstop saved stayed
+    # stranded after the conclusion, far from the section it is about.
+    section = guess_section_label(question, answer_md)
     try:
-        r = subprocess.run(
-            ["python3", SAVE_SCRIPT,
-             "--page", page_id,
-             "--expect-title", expect_title,
-             "--question", question[:2000],
-             "--answer-file", answer_path],
-            capture_output=True, text=True,
-        )
+        r = subprocess.run(cmd + (["--section", section] if section else []),
+                           capture_output=True, text=True)
+        if r.returncode != 0 and section:
+            # The page may not label that heading; placing it at the end is still
+            # better than not saving it at all.
+            print(f"    section '{section}' did not match — retrying unplaced",
+                  file=sys.stderr)
+            r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"    save FAIL: {r.stderr.strip()[:300]}", file=sys.stderr)
             return False
@@ -532,7 +639,9 @@ def main() -> None:
         for i, m in enumerate(ordered):
             if not (m["is_bot_message"] and m["is_from_me"]):
                 continue
-            if not is_substantive_answer(m["content"]):
+            # Cheap floor only; the real decision is made below, once the pair
+            # has been tied to a paper (see is_substantive_answer's docstring).
+            if not m["content"] or len(m["content"]) < MIN_PAPER_ANSWER_CHARS:
                 continue
             # find preceding user message (not from bot)
             user_msg = None
@@ -557,6 +666,11 @@ def main() -> None:
             if not (bot_mentions_paper(m["content"], paper)
                     or bot_mentions_paper(user_msg["content"], paper)):
                 continue
+            # The pair is now tied to a paper, so judge the answer with that in
+            # hand. An answer that OFFERS to save ("Notion에 추가할까요?") is proof the
+            # agent did not save it — exactly the pair this backstop exists for.
+            if not is_substantive_answer(m["content"], paper_context=True):
+                continue
             question = f"Q: {user_msg['content'].strip()}"
             answer_md = strip_bot_prefix(m["content"])
 
@@ -574,16 +688,36 @@ def main() -> None:
                 if cp["id"] == paper["id"]: continue
                 if _distinct_kw(pair_text, cp["keywords"]) >= 1:
                     candidate_ids.add(cp["id"])
+            # Also every paper the CONVERSATION has been about. A follow-up names
+            # nothing ("그러니까, …"), so it shares no title keyword with the paper
+            # under discussion and the pair-only filter above cannot see the page
+            # where this very Q&A was already filed — it would be saved a second
+            # time on whichever page the resolver picked.
+            window_text = "\n".join(w["content"] or "" for w in window)
+            ctx = sorted(((_weighted_kw(window_text, cp["keywords"]), cp["id"])
+                          for cp in papers
+                          if _distinct_kw(window_text, cp["keywords"]) >= 2),
+                         reverse=True)
+            # Cap it: every candidate is one Notion fetch, and an unbounded set trips
+            # the rate limit, which now defers the pair instead of deduping it.
+            candidate_ids.update(pid for _, pid in ctx[:8])
 
             already = False
+            unknown = False
             for pid in candidate_ids:
                 existing = q_cache.get(pid)
                 if existing is None:
                     try:
                         existing = fetch_top_callouts(pid)
                     except Exception as e:
-                        print(f"  fetch {pid} failed: {e}", file=sys.stderr)
-                        existing = []
+                        # FAIL CLOSED. This used to fall back to `existing = []`,
+                        # i.e. "the page has no Q&A" — so a transient 429 turned the
+                        # dedup off and the pair was filed again. A duplicate callout
+                        # is permanent; a save deferred to the next cycle is not.
+                        print(f"  fetch {pid} failed: {e} — deferring this pair",
+                              file=sys.stderr)
+                        unknown = True
+                        break
                     q_cache[pid] = existing
                 if already_saved(question, answer_md, existing):
                     if pid != paper["id"]:
@@ -591,6 +725,8 @@ def main() -> None:
                               f"{pid[-12:]}): {question[:60]}", file=sys.stderr)
                     already = True
                     break
+            if unknown:
+                continue
             if already:
                 continue
 

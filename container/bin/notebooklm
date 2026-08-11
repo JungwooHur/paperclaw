@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Serialize EVERY NotebookLM CLI call across parallel paper subagents.
+# Wrapper around the real NotebookLM CLI. Two jobs, both structural — they hold
+# regardless of what the agent remembers to do.
 #
+# 1) SERIALIZE every call.
 # There is a single shared browser profile at ~/.notebooklm, and Chrome/Playwright
 # cannot drive one profile from two processes at once (SingletonLock). So when the
 # dispatcher runs several paper subagents in parallel and they each call
@@ -13,6 +15,51 @@
 # This is the structural reason the user never has to serialize requests by hand.
 # Lock next to the ~/.notebooklm profile it guards (same container user -> same
 # HOME -> same lock, still serialized); avoids a /tmp file owned by another user.
+#
+# 2) Make `create` IDEMPOTENT and SELF-RECORDING.
+# Registering a new notebook in notebooks.json was a prose rule, and a missed
+# registration is expensive: the next question about that paper finds nothing,
+# creates ANOTHER notebook, re-uploads the PDF and waits for NotebookLM to index it
+# before it can even ask — minutes of latency, a duplicate notebook, and daily
+# chat quota burned. Routing `create` through the registry means an existing
+# notebook is reused and a new one records itself, so the agent cannot forget.
+set -uo pipefail
+
+REAL=/usr/local/lib/notebooklm-real
+REGISTRY_PY=${NOTEBOOK_REGISTRY_PY:-/workspace/group/research-papers/notebook_registry.py}
+
 exec 9>"${HOME:-/tmp}/notebooklm.lock"
 flock 9
-exec /usr/local/lib/notebooklm-real "$@"
+
+if [ "${1:-}" = "create" ] && [ -n "${2:-}" ] && [ -f "$REGISTRY_PY" ]; then
+  title=$2
+  shift 2
+  json="" use=""
+  for arg in "$@"; do
+    case "$arg" in
+      --json) json=--json ;;
+      --use|-u) use=1 ;;
+    esac
+  done
+  # The registry prints the same {"notebook": {...}} shape the real CLI does, so a
+  # caller parsing `create --json` needs no change. On any failure fall through to
+  # the real CLI rather than blocking a create.
+  if out=$(NOTEBOOKLM_REAL=$REAL python3 "$REGISTRY_PY" --get-or-create \
+             --title "$title" $json 2>/dev/null) && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    # --use asks for the notebook to become the active context; honour it for a
+    # reused notebook too, otherwise a later `source add` would target the wrong one.
+    if [ -n "$use" ]; then
+      nb_id=$(printf '%s' "$out" | python3 -c \
+        'import sys,json,re
+raw=sys.stdin.read()
+try: print((json.loads(raw).get("notebook") or {}).get("id",""))
+except Exception:
+    m=re.search(r"[0-9a-f-]{36}",raw); print(m.group(0) if m else "")' 2>/dev/null)
+      [ -n "$nb_id" ] && "$REAL" use "$nb_id" >/dev/null 2>&1
+    fi
+    exit 0
+  fi
+fi
+
+exec "$REAL" "$@"
