@@ -320,6 +320,66 @@ def last_block_id_of_section(page_children: list[dict], heading_idx: int) -> str
     return page_children[end - 1]["id"]
 
 
+_SWEEP_STAMP = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            ".auto_fix_qa_full_sweep")
+FULL_SWEEP_HOURS = 24
+
+
+def _full_sweep_due() -> bool:
+    """One full-DB pass a day, so recency can never strand an old broken page.
+
+    Stamped on disk rather than inferred from the clock: the healer's own cadence
+    drifts, and a missed window must not skip the sweep for another day.
+    """
+    import time as _t
+    try:
+        age = _t.time() - os.path.getmtime(_SWEEP_STAMP)
+    except OSError:
+        age = float("inf")
+    if age < FULL_SWEEP_HOURS * 3600:
+        return False
+    try:
+        with open(_SWEEP_STAMP, "w") as fh:
+            fh.write("")
+    except OSError:
+        pass
+    return True
+
+
+def query_recent_paper_pages(hours: float) -> list[str]:
+    """Paper pages edited in the last `hours`.
+
+    A full-DB scan is one Notion round-trip PER PAGE, and at ~730 pages that took
+    ~14 minutes against a 5-minute timer — so runs went back-to-back and the real
+    cadence was ~96/day rather than 288. Nothing was broken, but "the 5-minute
+    healer" stopped being true, and a repair reached a page three times slower than
+    the schedule claims. A broken Q&A callout is created by an EDIT, which moves
+    last_edited_time, so recency finds everything this healer exists to fix; a
+    periodic full sweep (see main) still covers anything edited before a fix landed.
+    """
+    import datetime
+    db = os.environ.get("NOTION_RESEARCH_DB")
+    if not db:
+        sys.exit("NOTION_RESEARCH_DB not set")
+    since = (datetime.datetime.now(datetime.timezone.utc)
+             - datetime.timedelta(hours=hours)).replace(microsecond=0).isoformat()
+    out: list[str] = []
+    cur = None
+    while True:
+        body: dict = {
+            "page_size": 100,
+            "filter": {"timestamp": "last_edited_time",
+                       "last_edited_time": {"on_or_after": since}},
+            "sorts": [{"timestamp": "last_edited_time", "direction": "descending"}],
+        }
+        if cur: body["start_cursor"] = cur
+        d = api_post(f"/databases/{db}/query", body)
+        out.extend(p["id"] for p in d["results"])
+        if d.get("has_more"): cur = d["next_cursor"]
+        else: break
+    return out
+
+
 def query_paper_pages() -> list[str]:
     db = os.environ.get("NOTION_RESEARCH_DB")
     if not db:
@@ -427,11 +487,20 @@ def heal_page(page_id: str, dry_run: bool = False) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--page", help="Fix only this page (default: scan whole Paper DB)")
+    ap.add_argument("--page", help="Fix only this page (default: recently edited)")
+    ap.add_argument("--since-hours", type=float, default=6.0,
+                    help="only pages edited in the last N hours (default 6)")
+    ap.add_argument("--all", action="store_true",
+                    help="scan the whole Paper DB (slow: one request per page)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    pages = [args.page] if args.page else query_paper_pages()
+    if args.page:
+        pages = [args.page]
+    elif args.all or _full_sweep_due():
+        pages = query_paper_pages()
+    else:
+        pages = query_recent_paper_pages(args.since_hours)
     total_fixed = 0
     for p in pages:
         n = heal_page(p, dry_run=args.dry_run)

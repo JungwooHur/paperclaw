@@ -129,7 +129,8 @@ _UNION_JS = """e => {
 }"""
 
 
-def render_tables(arxiv_id: str, tables: list, outdir: str) -> list:
+def render_tables(arxiv_id: str, tables: list, outdir: str,
+                  source_url: str = "") -> list:
     """Return [{num, caption, path}], one crisp image per table number.
 
     Pass 1 (preferred): element.screenshot() the substantial <table>/panel element
@@ -149,11 +150,16 @@ def render_tables(arxiv_id: str, tables: list, outdir: str) -> list:
             browser = p.chromium.launch()
         pg = browser.new_page(viewport={"width": 2400, "height": 3200},
                               device_scale_factor=2)
+        # Render the SAME document the tables were parsed from. This used to be
+        # hardcoded to arxiv-native HTML while the parser falls back to ar5iv, so a
+        # paper whose native HTML 404s (common for older submissions) loaded a 404
+        # page here: every id lookup missed and the run reported found: N, rendered:
+        # 0 with no error at all, and the page kept its flattened table text.
+        url = source_url or f"https://arxiv.org/html/{arxiv_id}"
         try:
-            pg.goto(f"https://arxiv.org/html/{arxiv_id}", wait_until="networkidle",
-                    timeout=60000)
+            pg.goto(url, wait_until="networkidle", timeout=60000)
         except Exception:
-            pg.goto(f"https://arxiv.org/html/{arxiv_id}", timeout=60000)
+            pg.goto(url, timeout=60000)
         pg.wait_for_timeout(150)
         group_el, group_nums = {}, {}
         for t in sorted(tables, key=lambda x: x["num"]):
@@ -243,7 +249,7 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
             if m:
                 existing.add(int(m.group(1)))
 
-    html_text, _ = ef.fetch_html(arxiv_id)
+    html_text, html_src = ef.fetch_html(arxiv_id)
     if not html_text:
         rep["error"] = "no HTML source"
         return rep
@@ -261,7 +267,7 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         return rep
 
     outdir = tempfile.mkdtemp(prefix="paper_tables_")
-    images = render_tables(arxiv_id, tables, outdir)   # [{num, caption, path}]
+    images = render_tables(arxiv_id, tables, outdir, html_src)  # [{num, caption, path}]
     rep["rendered"] = len(images)
 
     # place images grouped by anchor (first `표 N` mention), in document order
