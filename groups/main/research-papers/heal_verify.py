@@ -88,7 +88,11 @@ def dedupe_duplicates(page_id, blocks, apply):
             scope = f"{parent}>{s['key']}"
             scoped.setdefault(scope, []).append(s)
         else:
-            scope = f"{parent}>~{s['heading'][:12]}"
+            # Match verify_sections: an unlabelled heading IS dup-checked, but only
+            # within its own parent — otherwise the healer reports a duplicate the
+            # audit found and then archives nothing.
+            scope = f"{parent}>~{vs._echo_norm(s['heading'])[:16]}"
+            scoped.setdefault(scope, []).append(s)
         stack.append((s["level"], scope))
     ranges = _section_ranges(blocks)
     seen, to_archive = set(), []
@@ -96,6 +100,10 @@ def dedupe_duplicates(page_id, blocks, apply):
         if len(occ) < 2:
             continue
         occ.sort(key=lambda s: s["chars"], reverse=True)   # keep the richest
+        if not occ[0]["key"]:
+            # Same rule the audit uses: an unlabelled title repeats legitimately,
+            # so only archive a copy whose BODY matches the one being kept.
+            occ = [occ[0]] + [o for o in occ[1:] if vs.dup_confirmed(occ[0], o)]
         for d in occ[1:]:
             for bid in ranges.get(d["heading_id"], []):
                 if bid not in seen:            # overlapping parent/child dup ranges

@@ -162,6 +162,41 @@ def page_title(page_id: str) -> str:
     return ""
 
 
+def dup_confirmed(a: dict, b: dict) -> bool:
+    """Are these two same-titled sections really the SAME section, duplicated?
+
+    A repeated section NUMBER is unambiguous, but a repeated unlabelled title is
+    not: a paper may legitimately carry "Results" under two different experiments.
+    A re-append, by contrast, copies the body — so require the bodies to match, or
+    one copy to be an empty leftover heading. Without this the healer would archive
+    a real section on any page that reuses a subheading.
+    """
+    if min(a["chars"], b["chars"]) < 120:
+        return True                      # an empty twin is always the leftover
+    ta, tb = _words(a["text"]), _words(b["text"])
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / min(len(ta), len(tb)) >= 0.6
+
+
+def _words(text: str) -> set:
+    return set(re.findall(r"[A-Za-z가-힣]{3,}", (text or "").lower()))
+
+
+def _same_heading(a: str, b: str) -> bool:
+    """Same heading text ignoring the label, the (translation) half and casing."""
+    na, nb = english_title(a).lower(), english_title(b).lower()
+    na, nb = re.sub(r"[^a-z0-9]", "", na), re.sub(r"[^a-z0-9]", "", nb)
+    return bool(na) and na == nb
+
+
+# A section with less than this and no source span to compare against is empty in any
+# reading. Calibrated on a real page: its shortest complete appendix subsection was
+# 109 chars — two sentences that match the source exactly — so the bar has to sit
+# below that, and a dropped section is 0 anyway.
+_EMPTY_SECTION_CHARS = 80
+
+
 def group_sections(blocks: list) -> list:
     """Ordered list of section dicts, body text aggregated under each heading.
 
@@ -175,6 +210,20 @@ def group_sections(blocks: list) -> list:
         if t in HEADING_TYPES:
             txt = aq._block_text(b)
             key = section_key(txt)
+            # A heading that merely REPEATS the one right above it, adding the
+            # number ("Model Evaluation" -> "3 Model Evaluation"), is an echo, not a
+            # section. Treated as its own section it becomes an empty shell that
+            # owns the number, so the real section measures 0 chars and is reported
+            # as a dropped translation while the page carries 7k characters there.
+            # Absorb it: the parent adopts the number and the echo is recorded so it
+            # can be archived.
+            if cur is not None and _same_heading(txt, cur["heading"]):
+                if key and not cur["key"]:
+                    cur["key"] = key
+                    seen[key] = seen.get(key, 0) + 1
+                    cur["occurrence"] = seen[key]
+                cur.setdefault("echo_ids", []).append(b["id"])
+                continue
             seen[key] = seen.get(key, 0) + 1 if key else 0
             cur = {
                 "key": key,
@@ -182,6 +231,7 @@ def group_sections(blocks: list) -> list:
                 "heading": txt,
                 "level": int(t[-1]),
                 "chars": 0,
+                "text": "",
                 "heading_id": b["id"],
                 "occurrence": seen.get(key, 0),
             }
@@ -192,9 +242,42 @@ def group_sections(blocks: list) -> list:
             # 1082 prose chars against 3831 source chars (ratio 0.28, flagged) while
             # carrying another 832 chars inside standalone equation blocks — 0.50
             # once counted, i.e. a faithful translation the auditor kept rejecting.
-            cur["chars"] += (len((b.get("equation") or {}).get("expression", ""))
-                             if t == "equation" else len(aq._block_text(b)))
+            piece = ((b.get("equation") or {}).get("expression", "")
+                     if t == "equation" else aq._block_text(b))
+            cur["chars"] += len(piece)
+            if len(cur["text"]) < 4000:
+                cur["text"] += " " + piece
+    _rollup(sections)
     return sections
+
+
+def _rollup(sections: list) -> None:
+    """Fold every subsection's text into its parent's `chars`.
+
+    The source span for a section is cut at the next heading of EQUAL OR SHALLOWER
+    level, so it already contains that section's subsections. The page side counted
+    each heading on its own, so the two were not the same measurement: a section
+    whose body sits under UNNUMBERED subheadings ("Architecture", "Tasks") scored
+    0 chars and was reported as a dropped translation, while the page in fact
+    carried 7k characters there. Re-translating on that report would have replaced
+    a complete section — the expensive way to act on a measurement bug.
+    """
+    for i, sec in enumerate(sections):
+        own = sec["chars"]
+        total = own
+        for nxt in sections[i + 1:]:
+            if nxt["level"] < sec["level"]:
+                break
+            # A LABELLED heading at the same depth starts the next section...
+            if nxt["level"] == sec["level"] and nxt["key"]:
+                break
+            # ...but an unlabelled one at the same depth is a sub-subsection the
+            # assembler flattened ("D.1 Tasks" followed by "Addition", "Sorting",
+            # … all as heading_3). Level alone cannot see that nesting, so folding
+            # only deeper headings still left the parent looking empty.
+            total += nxt["chars"]
+        sec["own_chars"] = own
+        sec["chars"] = total
 
 
 # ---- source loading -------------------------------------------------------
@@ -406,11 +489,19 @@ def main() -> int:
             s["_dupkey"] = scope
             dup_keys.setdefault(scope, []).append(s)
         else:
-            # Unlabeled heading: scope children by its title, never dup-checked.
+            # An UNLABELLED heading repeats legitimately across the paper ("Tasks"
+            # in the body and again under an appendix), so it can only be compared
+            # inside the SAME parent — where a second copy really is the re-append
+            # this check exists for. Skipping them entirely hid 8 duplicated
+            # subsections on one page, several carrying near-identical bodies.
             scope = f"{parent}>~{_echo_norm(s['heading'])[:16]}"
+            s["_dupkey"] = scope
+            dup_keys.setdefault(scope, []).append(s)
         stack.append((lvl, scope))
     for scope, occ in dup_keys.items():
-        key = occ[0]["key"]
+        key = occ[0]["key"] or occ[0]["heading"][:40]
+        if not occ[0]["key"]:
+            occ = [occ[0]] + [o for o in occ[1:] if dup_confirmed(occ[0], o)]
         if len(occ) > 1:
             extra_ids = [o["heading_id"] for o in occ[1:]]
             findings.append({
@@ -688,7 +779,14 @@ def main() -> int:
             # intrinsically tiny — nothing to lose.
             if sc is not None and sc < args.min_source:
                 continue
-            if tc < args.min_chars:
+            # With NO located source span there is no evidence of loss, only a short
+            # section — and appendix subsections are legitimately short ("D.3
+            # Compute" is a few sentences). Firing the absolute rule there reported
+            # six complete sections as dropped translations on one page; measured by
+            # hand they ran 0.60-0.79 of their source. Without a span, flag only a
+            # section that is essentially EMPTY, which is the unambiguous case.
+            floor = args.min_chars if sc is not None else _EMPTY_SECTION_CHARS
+            if tc < floor:
                 findings.append({
                     "type": "CONTENT_LOSS", "section": key,
                     "heading": s["heading"][:70], "chars": tc,
