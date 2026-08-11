@@ -414,8 +414,60 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
     out = {key: None for key, _ in ordered_sections}
     for n, (key, idx) in enumerate(found):
         nxt = found[n + 1][1] if n + 1 < len(found) else len(body)
-        out[key] = max(nxt - idx, 0)
+        # A section present in the SOURCE but absent from the page list is never
+        # located, so its text used to merge into the previous section's span — one
+        # section measured 2488 chars of which 824 belonged to the subsection after
+        # it, and its complete translation was reported as summarized. Cut at the
+        # next section label the source itself shows, wherever it comes from.
+        nxt = min(nxt, _next_source_heading(body, idx, nxt))
+        out[key] = _prose_chars(body[idx:nxt])
     return out
+
+
+_SRC_HEAD = re.compile(r"^[ \t]*\d+(?:\.\d+){0,3}\.?[ \t]+[A-Z][A-Za-z]", re.M)
+
+
+def _next_source_heading(body: str, idx: int, limit: int) -> int:
+    """Offset of the next numbered heading line after `idx`, else `limit`.
+
+    Deliberately narrow: the label must open a SHORT line (a heading, not a
+    numbered sentence) and be followed by a capitalised word.
+    """
+    for m in _SRC_HEAD.finditer(body, idx + 1, limit):
+        line_end = body.find("\n", m.start())
+        line = body[m.start():line_end if line_end != -1 else limit]
+        if len(line.strip()) < 80:
+            return m.start()
+    return limit
+
+
+def _prose_chars(span: str) -> int:
+    """Length of a source span counting PROSE only, not flattened table rows.
+
+    A source table arrives as a run of one-cell-per-line fragments ("Model",
+    "BERT-512", "64.13%"). Those are never translated — they are re-injected as a
+    rendered table image — so counting them inflates the span and the section reads
+    as summarized. One real section measured 2488 source chars of which only ~470
+    were prose, and its complete 746-char translation was reported at ratio 0.30.
+    A single short line is ordinary text; a RUN of them is a table.
+    """
+    lines = span.splitlines()
+    keep, run = [], []
+
+    def flush():
+        # Fewer than 4 consecutive fragments is not a table — keep them.
+        keep.extend(run if len(run) < 4 else [])
+        run.clear()
+
+    for line in lines:
+        t = line.strip()
+        if t and len(t) < 40 and not re.search(r"[.!?][\"')\]]*$", t):
+            run.append(t)
+        else:
+            flush()
+            keep.append(t)
+    flush()
+    return len("\n".join(keep))
 
 
 def load_manifest(path: str | None) -> list:
