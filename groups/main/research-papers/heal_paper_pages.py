@@ -18,6 +18,9 @@ for one-off remediation across the whole DB, on the healer's 5-minute cadence:
   * wrap_math — wrap bare LaTeX (`\mathbf{c}_{v}`, `L_{s}<m_{1}`) left in text
     spans in $...$ so it renders as Notion equations (NotebookLM emits math
     undelimited ~half the time; build_answer_blocks only converts delimited math).
+  * heal_math_fences — a Q&A answer usually writes its formulas inside a ``` fence,
+    so the same maths renders typeset in the body and as monospace text in the
+    answer below it; converts the ones that are unambiguously formulas.
   * heal_mangled_math — rebuild a paragraph whose math delimiters were mis-parsed
     so badly that prose ended up stored INSIDE equation spans (the severe form of
     the bug heal_equations repairs); classifies by content, not by delimiters.
@@ -67,6 +70,7 @@ from clean_source_urls import clean_page
 from wrap_math import wrap_math_page
 from heal_equations import heal_equations
 from heal_mangled_math import heal_page as heal_mangled
+from heal_math_fences import heal_page as heal_fences
 from strip_furniture import strip_furniture
 from extract_paper_figures import heal_figures
 from extract_paper_tables import heal_tables
@@ -127,6 +131,7 @@ def heal(pages, apply):
             wm = wrap_math_page(pid, apply=apply)
             eq = heal_equations(pid, apply=apply)
             mm = heal_mangled(pid, apply=apply)
+            mf = heal_fences(pid, apply=apply)   # never raises; reports via "error"
             fu = strip_furniture(pid, apply=apply)
         except Exception as e:
             print(f"  {pid}: text-heal error {type(e).__name__}: {e}", file=sys.stderr)
@@ -136,6 +141,9 @@ def heal(pages, apply):
         n_math = wm.get("edited") or 0
         n_eq = eq.get("equations") or 0
         n_mm = mm.get("new_blocks") or 0
+        n_mf = mf.get("converted") or 0
+        if mf.get("error"):
+            print(f"  {pid}: fence-heal error {mf['error']}", file=sys.stderr)
         n_fur = fu.get("archived") or fu.get("would_archive") or 0
         # Visual heals hit the network / headless Chromium — isolate each so a
         # transient failure (arxiv down, playwright hiccup) never blocks the text
@@ -172,11 +180,14 @@ def heal(pages, apply):
                 print(f"  {pid}: AUDIT {flag}", file=sys.stderr)
         except Exception as e:
             print(f"  {pid}: verify-heal error {type(e).__name__}: {e}", file=sys.stderr)
-        if (n_bm or n_url or n_math or n_eq or n_fur or n_fig or n_tbl or n_pdf
-                or n_dedup):
+        # n_mm / n_mf belong here too: a page whose ONLY repair was mangled-math or
+        # a math fence was counted as untouched and never printed a line, so that
+        # work was invisible in the journal.
+        if (n_bm or n_url or n_math or n_eq or n_mm or n_mf or n_fur or n_fig
+                or n_tbl or n_pdf or n_dedup):
             healed += 1
             print(f"  {pid}: back-matter={n_bm} url={n_url} math={n_math} eq={n_eq} mangled={n_mm} "
-                  f"furniture={n_fur} figures={n_fig} tables={n_tbl} "
+                  f"fences={n_mf} furniture={n_fur} figures={n_fig} tables={n_tbl} "
                   f"pdf-media={n_pdf} dedup={n_dedup}")
     print(f"healed {healed}/{len(pages)} paper page(s)"
           f"{' (dry-run)' if not apply else ''}")
