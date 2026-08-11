@@ -75,22 +75,68 @@ def parse_figures(html_text: str, source_url: str) -> list:
     # dir and 404. Others have no <base> and srcs already include the version dir.
     bm = re.search(r'<base[^>]+href=["\']?([^"\'>\s]+)', html_text, re.I)
     base = urljoin(source_url, _html.unescape(bm.group(1))) if bm else source_url
-    out, seen = [], set()
+    out, seen, no_image = [], set(), []
     for fid, body in _FIG.findall(html_text):
         img = _IMG.search(body)
         if not img:
+            # A <figure> with a caption but no <img>: the converter rendered it as
+            # markup rather than an image (common on ar5iv when arxiv-native 404s).
+            # Recording it matters — this is how a page silently lost its Figure 1
+            # while an appendix figure sat in that slot, and nothing reported it.
+            if ".T" in fid:
+                continue        # a <figure class="ltx_table"> — extract_paper_tables owns it
+            cap = _CAP.search(body)
+            no_image.append(figure_label(fid, _clean(cap.group(1)) if cap else "")
+                            or fid)
             continue
         url = urljoin(base, _html.unescape(img.group(1)))
         if url in seen:
             continue
         seen.add(url)
-        num = _FNUM.search(fid)
         cap = _CAP.search(body)
+        caption = _clean(cap.group(1))[:1900] if cap else ""
         out.append({"id": fid,
-                    "num": int(num.group(1)) if num else None,
+                    "num": figure_label(fid, caption),
                     "img_url": url,
-                    "caption": _clean(cap.group(1))[:1900] if cap else ""})
+                    "caption": caption})
+    parse_figures.no_image = no_image     # read by inject_figures for its report
     return out
+
+
+def _has_our_caption(block: dict) -> bool:
+    """True if this injector wrote the image (it always captions "Figure N")."""
+    cap = "".join(c.get("plain_text", "") for c in
+                  ((block.get("image") or {}).get("caption") or []))
+    return bool(re.match(r"\s*(?:figure|fig\.?|그림)\s*\S", cap, re.I))
+
+
+def figure_label(fid: str, caption: str = "") -> str | None:
+    r"""The figure's printed label: "3" for a body figure, "F.2" for an appendix one.
+
+    The id alone is not enough. LaTeXML numbers appendix figures inside their own
+    appendix (`A6.F2` is Figure F.2), and the old parser read `F(\d+)` out of the id
+    and threw the appendix away — so `A1.F1` and `S1.F1` both became 1. Placement
+    then anchored on the first mention of "Figure 1", and the appendix figure landed
+    in the body next to (or instead of) the real one. On one paper this displaced
+    five figures and put an appendix figure where Figure 1 belongs.
+
+    The caption states the label outright ("Figure F.2: ..."), so trust it first and
+    fall back to deriving it from the id (`A<k>` is the k-th appendix, i.e. letter k).
+    """
+    m = re.match(r"\s*(?:Figure|Fig\.?|그림)\s*([A-Za-z]?\.?\s?\d+(?:\.\d+)?)\s*[:.]",
+                 caption or "")
+    if m:
+        return re.sub(r"\s+", "", m.group(1)).strip(".") if "." in m.group(1) \
+            else m.group(1).strip()
+    m = re.match(r"(?:S(\d+)|A(\d+))\.F(\d+)", fid or "")
+    if m:
+        if m.group(2):                       # appendix: A1 -> "A", A6 -> "F"
+            idx = int(m.group(2))
+            if 1 <= idx <= 26:
+                return f"{chr(ord('A') + idx - 1)}.{m.group(3)}"
+        return m.group(3)
+    m = _FNUM.search(fid or "")
+    return m.group(1) if m else None
 
 
 def _block_text(b: dict) -> str:
@@ -104,12 +150,23 @@ def _anchor_for(num, blocks: list):
     number, else the section heading whose number matches, else None (page end)."""
     if num is None:
         return None
-    ref = re.compile(rf"(?:그림|Figure|Fig\.?)\s*0*{num}\b")
+    # The label must match as a WHOLE label. `Figure\s*2` would otherwise match
+    # "Figure F.2" at the "2", which is how appendix figures ended up beside the
+    # body figure sharing their digit.
+    ref = re.compile(rf"(?:그림|Figure|Fig\.?)\s*0*{re.escape(str(num))}(?![\w.]|\.\d)")
     for b in blocks:
         if b["type"] in TEXT_TYPES and ref.search(_block_text(b)):
             return b["id"]
+    letter = re.match(r"([A-Za-z])\.", str(num))
+    if letter:
+        # An appendix figure belongs in its appendix, never in the body.
+        app = re.compile(rf"(?:appendix|부록)\s*{letter.group(1)}\b", re.I)
+        for b in blocks:
+            if b["type"].startswith("heading") and app.search(_block_text(b)):
+                return b["id"]
+        return None
     # fallback: a numbered section heading `N ...` / `N.M ...` starting with num
-    head = re.compile(rf"^\s*{num}(?:[.\s])")
+    head = re.compile(rf"^\s*{re.escape(str(num))}(?:[.\s])")
     for b in blocks:
         if b["type"].startswith("heading") and head.match(_block_text(b)):
             return b["id"]
@@ -159,15 +216,30 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     figs = parse_figures(html_text, src)
     rep["found"] = len(figs)
     rep["source"] = src
+    missing = getattr(parse_figures, "no_image", [])
+    if missing:
+        # Loud, because the page will look complete: it still gets every other
+        # figure, and FIGURES_MISSING only fires when a page has NO images at all.
+        rep["no_image"] = missing
 
     # --force means REPLACE, not "add a second set". Without this it only bypassed
     # the skip, so forcing a page that already had figures left it with BOTH copies
     # — the doubling bug extract_pdf_media already fixed. Old images go only after
     # the source parsed successfully, so a failed fetch can't strip a good page.
     if force and page_imgs and figs:
-        rep["replaced"] = len(page_imgs)
+        # Replace only images this pipeline is responsible for. Ours always carry a
+        # "Figure N" caption; an agent-injected one carries none but sits NESTED
+        # under its caption paragraph. A TOP-LEVEL image with no caption is neither
+        # — it is one a human placed by hand (e.g. supplying a figure the source
+        # renders as markup and we cannot extract), and re-healing must not delete
+        # someone's manual repair.
+        top_ids = {b["id"] for b in blocks if b["type"] == "image"}
+        replaceable = [b for b in page_imgs
+                       if _has_our_caption(b) or b["id"] not in top_ids]
+        rep["replaced"] = len(replaceable)
+        rep["kept_manual"] = len(page_imgs) - len(replaceable)
         if apply:
-            for b in page_imgs:
+            for b in replaceable:
                 notion("PATCH", f"/blocks/{b['id']}", {"archived": True})
                 time.sleep(0.2)
             blocks = vs.fetch_blocks(page_id)

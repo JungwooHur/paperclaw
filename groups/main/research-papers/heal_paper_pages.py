@@ -151,7 +151,12 @@ def heal(pages, apply):
         # already done (existing images), so clean pages pay nothing.
         n_fig = n_tbl = 0
         try:
-            n_fig = heal_figures(pid, apply=apply).get("placed") or 0
+            _fig = heal_figures(pid, apply=apply)
+            n_fig = _fig.get("placed") or 0
+            if _fig.get("no_image"):
+                # The page keeps every other figure, so it looks complete; say so.
+                print(f"  {pid}: FIGURES no image in source for "
+                      f"{','.join(map(str, _fig['no_image']))}", file=sys.stderr)
         except Exception as e:
             print(f"  {pid}: figure-heal error {type(e).__name__}: {e}", file=sys.stderr)
         try:
