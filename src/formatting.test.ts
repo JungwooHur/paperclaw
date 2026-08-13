@@ -6,6 +6,7 @@ import {
   formatMessages,
   formatOutbound,
   stripInternalTags,
+  stripSaveOffer,
 } from './router.js';
 import { NewMessage } from './types.js';
 
@@ -233,5 +234,47 @@ describe('trigger gating (requiresTrigger interaction)', () => {
   it('non-main group with requiresTrigger=false always processes (no trigger needed)', () => {
     const msgs = [makeMsg({ content: 'hello no trigger' })];
     expect(shouldProcess(false, false, msgs)).toBe(true);
+  });
+});
+
+describe('stripSaveOffer', () => {
+  // Real replies the agent sent. The first four are genuine questions and must
+  // survive; the last four are the offer this rule exists to remove.
+  const keep = [
+    '어떤 방법을 선호하시나요? 아니면 가장 중요한 몇 개 챕터의 핵심 figure만 추가할까요?',
+    '어떤 문서를 전체 내용 생략없이 정리해드릴까요?',
+    '그 논문이 Notion DB에 있나요? 아니면 이 논문을 새로 추가해서 정리해드릴까요?',
+    '이 부분이 이해되셨나요?',
+  ];
+  const strip = [
+    '자세한 설명 Notion에 추가할까요?',
+    '이 설명도 Notion에 추가할까요?',
+    '이 설명도 정리할까요?',
+    '이 설명을 Notion에 정리해드릴까요?',
+  ];
+
+  it('leaves genuine questions untouched', () => {
+    for (const q of keep) {
+      expect(stripSaveOffer(`본문 설명입니다.\n\n${q}`)).toContain(q);
+    }
+  });
+
+  it('removes a trailing offer to save the answer', () => {
+    for (const q of strip) {
+      const out = stripSaveOffer(`본문 설명입니다.\n\n${q}`);
+      expect(out).not.toContain(q);
+      expect(out).toContain('본문 설명입니다.');
+    }
+  });
+
+  it('never empties a message that is only the offer', () => {
+    // Better an unnecessary question than a blank reply.
+    expect(stripSaveOffer('이 설명을 Notion에 정리해드릴까요?')).not.toBe('');
+  });
+
+  it('only strips at the end, not mid-message', () => {
+    const t =
+      '이 설명을 Notion에 정리해드릴까요?\n\n그리고 다음 내용도 있습니다.';
+    expect(stripSaveOffer(t)).toBe(t.trim());
   });
 });

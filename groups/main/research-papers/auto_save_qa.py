@@ -287,6 +287,11 @@ def _has_paper_reference(text: str, kws: list[str]) -> bool:
     return False
 
 
+# Short enough that a partly-typed title still resolves, long enough that a generic
+# phrase ("positional encoding") cannot match several papers at once.
+_TITLE_PREFIX_MIN = 20
+
+
 def _norm_for_title(text: str) -> str:
     """Letters and digits only — titles differ by punctuation, case and spacing."""
     return re.sub(r"[^a-z0-9]", "", (text or "").lower())
@@ -334,10 +339,22 @@ def active_paper_at(window: list[dict], papers: list[dict],
     # had merely listed. What the user asked about is the paper in play.
     for text in (user_question, pair_text):
         named = []
+        norm = _norm_for_title(text)
         for p in papers:
             title_norm = _norm_for_title(p.get("title", ""))
-            if len(title_norm) >= 16 and title_norm in _norm_for_title(text):
-                named.append((len(title_norm), p))
+            # A PREFIX counts, not just the whole title. People name a paper by its
+            # opening words ("The impact of positional encoding 논문에서 …"), and
+            # requiring the full title made that miss — the pair then fell through
+            # to keyword scoring and was filed under a different paper that merely
+            # shares a generic word. The longest prefix wins, so a paper whose title
+            # starts the same way but continues differently cannot steal it.
+            hit = 0
+            for length in range(len(title_norm), _TITLE_PREFIX_MIN - 1, -1):
+                if title_norm[:length] in norm:
+                    hit = length
+                    break
+            if hit:
+                named.append((hit, p))
                 continue
             aid = _arxiv_id_of(p)
             if aid and aid in text:

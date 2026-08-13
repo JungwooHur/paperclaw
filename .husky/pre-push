@@ -1,0 +1,6 @@
+# The rest of what CI runs, so a red build is caught before it is pushed rather
+# than a minute later on GitHub. Kept out of pre-commit deliberately: these are
+# slow enough to be annoying on every commit, and the format/secret checks there
+# are the ones that must never be skipped.
+npm run typecheck
+npx vitest run
