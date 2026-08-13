@@ -108,6 +108,19 @@ describe('fetch-upstream.sh', () => {
           encoding: 'utf-8',
           stdio: 'pipe',
           timeout: 30_000,
+          // Keep the suite OFFLINE. fetch-upstream.sh runs `git fetch` against
+          // https://github.com/... when no usable remote exists, so this file used
+          // to make a real network call on every CI run — a wait that can outlast
+          // the test timeout for reasons that have nothing to do with the code.
+          // GIT_ALLOW_PROTOCOL=file rejects https in ~4ms with "transport 'https'
+          // not allowed" while still permitting the local bare repos the other
+          // cases fetch from, and `git remote -v` still reports the GitHub URL, so
+          // every assertion here is unchanged.
+          env: {
+            ...process.env,
+            GIT_ALLOW_PROTOCOL: 'file',
+            GIT_TERMINAL_PROMPT: '0',
+          },
         },
       );
       return { stdout, exitCode: 0 };
@@ -186,7 +199,8 @@ describe('fetch-upstream.sh', () => {
     }
   });
 
-  it('adds upstream remote when none exists', { timeout: 15_000 }, () => {
+  // No extended timeout: the fetch this used to wait on now fails immediately.
+  it('adds upstream remote when none exists', () => {
     // Remove origin if any
     try {
       execSync('git remote remove origin', {
@@ -199,8 +213,8 @@ describe('fetch-upstream.sh', () => {
 
     const { stdout } = runFetchUpstream();
 
-    // It will try to add upstream pointing to github (which will fail to fetch),
-    // but we can verify it attempted to add the remote
+    // It adds upstream pointing at github; the fetch is refused offline (see
+    // runFetchUpstream), which is exactly the path being asserted here.
     expect(stdout).toContain('Adding upstream');
 
     // Verify the remote was added

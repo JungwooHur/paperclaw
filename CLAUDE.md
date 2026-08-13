@@ -157,6 +157,23 @@ red build is caught before the push instead of a minute later on GitHub.
 Verified by staging deliberately mangled TypeScript: the file inside the resulting
 commit came out formatted.
 
+### The test suite must stay offline
+
+`skills-engine/__tests__/fetch-upstream.test.ts` exercises a script that runs
+`git fetch` against a GitHub URL when no usable remote exists, so the suite made a
+real network call on every CI run — a wait that can outlast the test timeout for
+reasons that have nothing to do with the code. It never actually failed CI, but it
+was the first thing suspected when CI went red, which cost a wrong diagnosis.
+
+The helper now runs git with `GIT_ALLOW_PROTOCOL=file`: https is refused in ~4 ms
+("transport 'https' not allowed") while the local bare repos the other cases fetch
+from still work, and `git remote -v` still reports the GitHub URL, so no assertion
+was weakened. Verified by running the suite with every proxy pointed at a dead
+port — still green, in under a second.
+
+**Keep it that way.** A test that reaches the network turns an unrelated outage
+into a red build, and a red build that isn't your fault trains you to ignore it.
+
 ## Public Repo Hygiene (MANDATORY before every commit/push/PR)
 
 This is a **public repository**. The owner's personal data and research activity must never reach tracked files, commit messages, or PR titles/bodies.
@@ -170,14 +187,19 @@ This is a **public repository**. The owner's personal data and research activity
 **Enforcement (structural, not just prose):**
 - `.husky/pre-commit` + `.husky/commit-msg` run `scripts/check-sensitive.sh`, which blocks forbidden paths (even `git add -f`) and scans added lines / commit messages for secrets, emails, phones, JIDs, arxiv IDs, and UUIDs.
 - False positive? Fix the wording first; only as a last resort `PAPERCLAW_ALLOW_SENSITIVE=1 git commit ...`.
-- **No assistant session URLs or tool footers, in commits OR PR bodies.** A
-  session-URL trailer, and a "Generated with
-  Claude Code" footer are added by the assistant's own tooling by default. The
-  session URL is not a credential — it returns 403 to anyone but the owner — but it
-  is an account-linked activity trace that is permanent, public, and useless to
-  every reader, since nobody else can open it. It reached 34 commits and 12 PR
-  bodies before anyone looked, because nothing scanned for it. `check-sensitive.sh`
-  now blocks it in commit messages and added lines; PR bodies are on you.
+- **No assistant session URLs and no tool footers — in commit messages AND in PR
+  bodies.** Both are appended by the assistant's own tooling by default, so they
+  have to be removed on every commit and every PR, not just remembered once.
+  * The **session URL** is not a credential — it returns 403 to anyone but the
+    owner, so no conversation content is exposed — but it is an account-linked
+    activity trace that is permanent, public, and useless to every reader, since
+    nobody else can open it. It reached 34 commits and 12 PR bodies before anyone
+    looked, because nothing scanned for it.
+  * The **"Generated with Claude Code" footer** carries no private data; it is
+    simply not wanted on this repo's public history. It was in all 42 PR bodies.
+  * `check-sensitive.sh` blocks the session URL in commit messages and added
+    lines. **PR bodies are not reachable from a git hook, so both rules are on
+    you there** — write the body without them rather than editing it afterwards.
 - PR bodies aren't covered by git hooks — apply the same rules manually when writing them.
 
 ## Living Documentation Policy
