@@ -1,2 +1,21 @@
 bash scripts/check-sensitive.sh --staged
-npm run format:fix
+
+# Format the STAGED files and RE-STAGE them.
+#
+# This used to be a bare `npm run format:fix`, which rewrote the working tree but
+# never staged the result — so the COMMIT kept the unformatted content while the
+# local tree passed `format:check`, and CI failed on a branch that looked clean
+# locally. The tell was `git push` printing "Warning: 1 uncommitted change".
+#
+# Only paths that are already staged are re-added, so an unrelated dirty file is
+# never swept in. (A partially staged file does get its remaining hunks staged —
+# unavoidable without lint-staged, and strictly better than the old behaviour,
+# which rewrote that file in the tree and committed the stale version anyway.)
+staged=$(git diff --cached --name-only --diff-filter=ACM -- 'src/*.ts' 'src/**/*.ts')
+if [ -n "$staged" ]; then
+  echo "$staged" | xargs npx prettier --write
+  echo "$staged" | xargs git add
+  # Gate on exactly what was staged, not the whole tree: an unformatted file the
+  # author did not stage never reaches CI, so it must not block their commit.
+  echo "$staged" | xargs npx prettier --check
+fi

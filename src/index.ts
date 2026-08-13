@@ -199,8 +199,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      // Single outbound path: formatOutbound strips <internal> blocks AND the
+      // trailing "shall I save this to Notion?" offer. This used to inline only
+      // the <internal> strip, so the offer-stripping rule silently did not apply
+      // to the agent's main reply — the one place it matters most.
+      const text = formatOutbound(raw);
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         await channel.sendMessage(chatJid, text);
