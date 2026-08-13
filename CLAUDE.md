@@ -136,6 +136,27 @@ The main service's WhatsApp socket (baileys) can drop with `Connection closed re
 
 The original watchdog decided "hung" purely from `logs/paperclaw.log` freshness, assuming "healthy operation writes every ~10 min." **That assumption was false** — paperclaw legitimately logs *nothing* for ~1h when idle, and also while a long paper batch's subagent containers grind through NotebookLM. So the watchdog kept restarting a perfectly healthy service **~hourly** (journal: `restarting paperclaw (log frozen 58m)`), and **each restart detached the batch's containers and destroyed the in-memory dispatcher loop that owns `papers_queue.json`** — a 27-paper batch stalled this way with 12 papers never dispatched and one task frozen `in_progress` for days. The dispatcher pattern assumes the main agent stays alive for the whole batch and has no restart-recovery, so an orphaned queue just sits there. **Fix:** `src/index.ts` emits an unconditional `heartbeat whatsapp=up|down` every 10 min, so log-freshness only goes stale when the event loop is *actually* hung; the watchdog's condition (3) reads the heartbeat's WA status to still catch a dead-but-not-reconnecting socket (which keeps the log fresh via heartbeats, so condition 1 can't see it). **Lesson: a liveness check needs a signal the healthy process actively emits — inferring liveness from incidental activity (log writes) false-positives the moment the process is correctly quiet.** If a long batch ever stalls, check whether a service restart orphaned it: `docker ps` (no paper containers), `papers_queue.json` mtime old with `pending`/stuck-`in_progress` entries, and `journalctl --user -u paperclaw-watchdog.service` for restart lines.
 
+## CI only ever fails one way: the pre-commit formatter did not re-stage
+
+Every CI failure this repo has had — 2 of 30 runs, months apart — failed on the
+same step, **Format check**, from the same cause. `.husky/pre-commit` ran
+`npm run format:fix`, which rewrites the WORKING TREE but stages nothing. So the
+commit kept the unformatted content while `npm run format:check` passed locally
+against the formatted tree. The branch looks clean, CI fails, and the diagnosis
+goes looking for flakiness that isn't there.
+
+**The tell is `git push` printing `Warning: N uncommitted change`** — that N is the
+formatter's own output, stranded outside the commit.
+
+Fixed structurally: the hook now formats the STAGED paths, `git add`s them back,
+and gates on exactly those files (not the whole tree — an unformatted file the
+author never staged cannot reach CI, so it must not block their commit). A
+`.husky/pre-push` runs the rest of what CI runs (`typecheck`, `vitest run`), so a
+red build is caught before the push instead of a minute later on GitHub.
+
+Verified by staging deliberately mangled TypeScript: the file inside the resulting
+commit came out formatted.
+
 ## Public Repo Hygiene (MANDATORY before every commit/push/PR)
 
 This is a **public repository**. The owner's personal data and research activity must never reach tracked files, commit messages, or PR titles/bodies.
