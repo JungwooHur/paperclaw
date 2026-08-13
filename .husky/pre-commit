@@ -1,3 +1,9 @@
+# Any failing check must abort the commit. Without this the hook's exit status is
+# just the LAST command's, so `check-sensitive.sh` printed "Commit blocked" and the
+# commit landed anyway — the guard has never actually blocked anything from here.
+# (The commit-msg hook was unaffected: it runs a single command.)
+set -e
+
 bash scripts/check-sensitive.sh --staged
 
 # Format the STAGED files and RE-STAGE them.
