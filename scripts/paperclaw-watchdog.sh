@@ -39,6 +39,17 @@ restart() {
     systemctl --user restart paperclaw
 }
 
+# A revoked device needs a human with a phone, not a restart. Without this the
+# watchdog kept calling `systemctl restart` every 30 minutes against a session
+# WhatsApp had already thrown away, adding noise to the very log you have to read
+# to find out what happened.
+AUTH_MARKER="${HOME}/paperclaw/store/auth-required"
+if [ -f "$AUTH_MARKER" ]; then
+    logger -t paperclaw-watchdog "not restarting: WhatsApp needs re-authentication" 2>/dev/null || true
+    echo "paperclaw-watchdog: WhatsApp logged out — re-authenticate with 'bash scripts/whatsapp-qr.sh'"
+    exit 0
+fi
+
 # Only act when the unit is meant to be up and the log exists.
 systemctl --user is-active --quiet paperclaw || exit 0
 [ -f "$LOG" ] || exit 0
