@@ -170,6 +170,14 @@ This is a **public repository**. The owner's personal data and research activity
 **Enforcement (structural, not just prose):**
 - `.husky/pre-commit` + `.husky/commit-msg` run `scripts/check-sensitive.sh`, which blocks forbidden paths (even `git add -f`) and scans added lines / commit messages for secrets, emails, phones, JIDs, arxiv IDs, and UUIDs.
 - False positive? Fix the wording first; only as a last resort `PAPERCLAW_ALLOW_SENSITIVE=1 git commit ...`.
+- **No assistant session URLs or tool footers, in commits OR PR bodies.** A
+  session-URL trailer, and a "Generated with
+  Claude Code" footer are added by the assistant's own tooling by default. The
+  session URL is not a credential — it returns 403 to anyone but the owner — but it
+  is an account-linked activity trace that is permanent, public, and useless to
+  every reader, since nobody else can open it. It reached 34 commits and 12 PR
+  bodies before anyone looked, because nothing scanned for it. `check-sensitive.sh`
+  now blocks it in commit messages and added lines; PR bodies are on you.
 - PR bodies aren't covered by git hooks — apply the same rules manually when writing them.
 
 ## Living Documentation Policy

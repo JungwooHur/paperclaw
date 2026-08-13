@@ -14,7 +14,8 @@
 #                          paper queues/configs. These are gitignored, but
 #                          `git add -f` bypasses gitignore; this does not.
 #   2. Secret material   - API tokens, private keys, JWTs.
-#   3. Personal data     - real-looking emails, KR phone numbers, WhatsApp JIDs.
+#   3. Personal data     - real-looking emails, KR phone numbers, WhatsApp JIDs,
+#                          assistant session URLs/trailers.
 #   4. Research activity - arxiv ids and Notion page UUIDs. Specific papers the
 #                          owner reads/processes belong in gitignored files
 #                          (groups/main/*, store/, data/), never in tracked
@@ -55,6 +56,12 @@ RE_ARXIV='\b[0-9]{4}\.[0-9]{4,5}(v[0-9]+)?\b'
 EXCL_ARXIV='2401\.12345|2501\.12345|2403\.67890|1234\.5678'   # documented dummy ids
 RE_UUID='\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'
 EXCL_UUID='00000000-0000|12036300'
+# assistant-session identifiers. Not a credential — the URL is 403 for anyone but
+# the owner — but it is an account-linked activity trace that is permanent, public,
+# and useless to every reader, since nobody else can open it. It reached 34 commits
+# and 12 PR bodies before anyone noticed, because nothing here scanned for it.
+RE_SESSION='claude[.]ai/code/sess[i]on|(^|[^A-Za-z0-9_])sess[i]on_[A-Za-z0-9]{16,}|Claude[-]Session:'
+EXCL_SESSION='sess[i]on_XXXX|<session|session_id|session_state|storage_state'
 
 # NOTE: scan_text is called at the end of pipelines, i.e. in a SUBSHELL — it
 # cannot mutate the parent's FAIL. It communicates via its exit status instead;
@@ -84,6 +91,7 @@ scan_text() {  # $1 = label of what is being scanned, stdin = text
   check "$label" "$RE_PHONE"  "$EXCL_PHONE" 'possible phone number'
   check "$label" "$RE_ARXIV"  "$EXCL_ARXIV" 'arxiv id (paper-specific content; use a placeholder)'
   check "$label" "$RE_UUID"   "$EXCL_UUID"  'UUID (Notion page/db id?; use a placeholder)'
+  check "$label" "$RE_SESSION" "$EXCL_SESSION" 'assistant session URL/trailer (drop it; only the owner can open it)'
   return $bad
 }
 
