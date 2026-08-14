@@ -4,6 +4,15 @@ import { EventEmitter } from 'events';
 // --- Mocks ---
 
 // Mock config
+// The marker's file behaviour is covered in src/auth-state.test.ts against a real
+// filesystem; `fs` is mocked here, so this file asserts only that the channel calls
+// into it at the right moments.
+vi.mock('../auth-state.js', () => ({
+  AUTH_REQUIRED_EXIT_CODE: 78,
+  markAuthRequired: vi.fn(),
+  clearAuthRequired: vi.fn(),
+}));
+
 vi.mock('../config.js', () => ({
   STORE_DIR: '/tmp/paperclaw-test-store',
   ASSISTANT_NAME: 'Andy',
@@ -299,7 +308,14 @@ describe('WhatsAppChannel', () => {
       // The channel should attempt to reconnect (calls connectInternal again)
     });
 
-    it('exits on loggedOut disconnect', async () => {
+    it('on loggedOut, exits with the no-restart code and marks re-auth needed', async () => {
+      // A logout is permanent — WhatsApp revoked the linked device. Exiting 0
+      // under `Restart=always` produced 221 restarts in four hours against a
+      // session no reconnect could revive, so the exit code must be one the
+      // unit refuses to restart, and the state must be visible without
+      // reading the log.
+      const { markAuthRequired } = await import('../auth-state.js');
+      vi.mocked(markAuthRequired).mockClear();
       const mockExit = vi
         .spyOn(process, 'exit')
         .mockImplementation(() => undefined as never);
@@ -313,8 +329,20 @@ describe('WhatsAppChannel', () => {
       triggerDisconnect(401);
 
       expect(channel.isConnected()).toBe(false);
-      expect(mockExit).toHaveBeenCalledWith(0);
+      expect(mockExit).toHaveBeenCalledWith(78);
+      expect(markAuthRequired).toHaveBeenCalled();
+
       mockExit.mockRestore();
+    });
+
+    it('clears the re-auth marker once connected again', async () => {
+      const { clearAuthRequired } = await import('../auth-state.js');
+      vi.mocked(clearAuthRequired).mockClear();
+
+      const channel = new WhatsAppChannel(createTestOpts());
+      await connectChannel(channel);
+
+      expect(clearAuthRequired).toHaveBeenCalled();
     });
 
     it('retries reconnection after 5s on failure', async () => {

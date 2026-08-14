@@ -132,6 +132,34 @@ Seen twice, both leaving the batch dead with nobody to notice: (1) a watchdog re
 
 The main service's WhatsApp socket (baileys) can drop with `Connection closed reason: 405` — a connection failure, NOT a logout (the auth session is fine) — and get stuck in a reconnect loop that eventually goes fully SILENT: the process stopped logging for 13+ hours while systemd still reported it `active (running)`, so nothing auto-recovered and WhatsApp just stopped answering. `systemctl --user restart paperclaw` reconnects instantly from the stored session. To stop it recurring, **`scripts/paperclaw-watchdog.sh` runs on a 30-minute timer** (`systemd/paperclaw-watchdog.{service,timer}`, installed as SYMLINKS so they can't drift) and restarts paperclaw on three signals: (1) `logs/paperclaw.log` frozen ≥ 40 min, (2) a reconnect loop (≥3 `Connection closed` with no `Connected to WhatsApp` after), or (3) the last ≥3 heartbeats all report `whatsapp=down`. **Do NOT diagnose "no WhatsApp reply" as a per-message problem — check the connection/service first** (`systemctl --user status paperclaw`, tail `logs/paperclaw.log`).
 
+### A LOGOUT is not a disconnect — restarting cannot fix it
+
+`Connection closed reason: 401` with `shouldReconnect: false` and a
+`<conflict type="device_removed"/>` stream error means WhatsApp **revoked this
+linked device**. It is not the 405 above: the stored session is dead server-side,
+and only a human re-scanning a QR brings it back.
+
+The old code exited 0 on that, and the unit says `Restart=always` — so systemd
+relaunched every ~5 s. A real incident logged **221 restarts over four hours**
+while the watchdog added its own restart every 30 min, and from outside it looked
+exactly like "the bot is quiet": the single line that mattered was buried under
+thousands the restarts were appending. Nothing surfaced "re-authenticate".
+
+Now: the process writes `store/auth-required` and exits **78**, the unit carries
+`RestartPreventExitStatus=78` so it stops instead of looping, the watchdog
+short-circuits while that marker exists, and a successful connection clears it.
+**If WhatsApp is silent, check `store/auth-required` first** — if it is there, no
+amount of restarting will help.
+
+Re-authenticate with **`bash scripts/whatsapp-qr.sh`**. Two traps it handles that
+cost real time: a revoked session still has `"registered": true` on disk, so
+`npm run auth` prints "Already authenticated" and exits without ever showing a QR
+until the old state is moved aside; and `qrcode-terminal` draws two characters per
+module, so a version-11 WhatsApp QR needs ~130 columns and is silently truncated —
+unreadable — in an 80-column terminal. The script moves the dead session aside
+(renames, never deletes), renders the same code in half-blocks at 65x33, and
+re-renders on each ~20-30 s rotation.
+
 ### The watchdog's own footgun: don't confuse "idle/busy" with "hung" (heartbeat)
 
 The original watchdog decided "hung" purely from `logs/paperclaw.log` freshness, assuming "healthy operation writes every ~10 min." **That assumption was false** — paperclaw legitimately logs *nothing* for ~1h when idle, and also while a long paper batch's subagent containers grind through NotebookLM. So the watchdog kept restarting a perfectly healthy service **~hourly** (journal: `restarting paperclaw (log frozen 58m)`), and **each restart detached the batch's containers and destroyed the in-memory dispatcher loop that owns `papers_queue.json`** — a 27-paper batch stalled this way with 12 papers never dispatched and one task frozen `in_progress` for days. The dispatcher pattern assumes the main agent stays alive for the whole batch and has no restart-recovery, so an orphaned queue just sits there. **Fix:** `src/index.ts` emits an unconditional `heartbeat whatsapp=up|down` every 10 min, so log-freshness only goes stale when the event loop is *actually* hung; the watchdog's condition (3) reads the heartbeat's WA status to still catch a dead-but-not-reconnecting socket (which keeps the log fresh via heartbeats, so condition 1 can't see it). **Lesson: a liveness check needs a signal the healthy process actively emits — inferring liveness from incidental activity (log writes) false-positives the moment the process is correctly quiet.** If a long batch ever stalls, check whether a service restart orphaned it: `docker ps` (no paper containers), `papers_queue.json` mtime old with `pending`/stuck-`in_progress` entries, and `journalctl --user -u paperclaw-watchdog.service` for restart lines.

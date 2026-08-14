@@ -243,6 +243,10 @@ ExecStart=${nodePath} ${projectRoot}/dist/index.js
 WorkingDirectory=${projectRoot}
 Restart=always
 RestartSec=5
+# A WhatsApp logout exits with this code. Restarting cannot fix a revoked device —
+# it just loops (221 times in four hours, once) and buries the one message that
+# matters. Stop instead; store/auth-required says what to do.
+RestartPreventExitStatus=78
 Environment=HOME=${homeDir}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
 StandardOutput=append:${projectRoot}/logs/paperclaw.log

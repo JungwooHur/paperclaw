@@ -18,6 +18,11 @@ import {
   GROUPS_DIR,
   STORE_DIR,
 } from '../config.js';
+import {
+  AUTH_REQUIRED_EXIT_CODE,
+  clearAuthRequired,
+  markAuthRequired,
+} from '../auth-state.js';
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -130,11 +135,23 @@ export class WhatsAppChannel implements Channel {
             }, 5000);
           });
         } else {
-          logger.info('Logged out. Run /setup to re-authenticate.');
-          process.exit(0);
+          // A logout is PERMANENT: WhatsApp revoked this linked device, so no
+          // amount of reconnecting can help. Exiting 0 under `Restart=always`
+          // made systemd relaunch us every few seconds — one real incident ran
+          // 221 restarts over four hours while the only thing that could fix it
+          // was a human re-scanning a QR, and nothing outside the log ever said
+          // so. Leave a marker the watchdog and the operator can see, and exit
+          // with a code the unit refuses to restart.
+          logger.error(
+            'WhatsApp logged out (device removed) — re-authenticate with ' +
+              '`bash scripts/whatsapp-qr.sh`. Not restarting; a reconnect cannot fix this.',
+          );
+          markAuthRequired(reason);
+          process.exit(AUTH_REQUIRED_EXIT_CODE);
         }
       } else if (connection === 'open') {
         this.connected = true;
+        clearAuthRequired();
         logger.info('Connected to WhatsApp');
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
