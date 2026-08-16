@@ -12,6 +12,7 @@ from typing import Any, NoReturn
 
 import click
 
+from .._app.errors import did_you_mean_hint
 from ..exceptions import (
     ArtifactTimeoutError,
     AuthError,
@@ -70,6 +71,8 @@ _NOT_FOUND_ID_ATTRS = (
     "artifact_id",
     "note_id",
     "mind_map_id",
+    "label_id",
+    "collection_id",
 )
 
 
@@ -78,7 +81,8 @@ def _not_found_extra(error: NotFoundError) -> dict[str, Any]:
 
     Surfaces whichever resource-id attribute the concrete subclass carries
     (``source_id`` / ``artifact_id`` / ``note_id`` / ``mind_map_id`` /
-    ``notebook_id``) under both its native key and a generic ``id`` key, so
+    ``label_id`` / ``collection_id`` / ``notebook_id``) under both its native key
+    and a generic ``id`` key, so
     automation can read the id without knowing the exact not-found subtype —
     mirroring the per-command ``source``/``artifact``/``note get`` payloads.
     Returns an empty dict when no known id attribute is present (e.g. a future
@@ -106,6 +110,32 @@ def _generation_status_extra(status: Any) -> dict[str, Any]:
     }
 
 
+#: Recovery line for a create whose outcome an idempotency probe could not
+#: settle (#2220). Deliberately contradicts the retry advice the typed branches
+#: would otherwise give: the write may already exist, so repeating it is the one
+#: action that can make things worse.
+_UNCONFIRMED_WRITE_NOTE = (
+    "The outcome of this write is unknown: it may or may not have been created, "
+    "and no further attempt was made once the check came back inconclusive. "
+    "Check the notebook (or the notebook's source list) before retrying — "
+    "retrying blind can create a duplicate."
+)
+
+
+def _retained_source_note(source_id: str, stage: str) -> str:
+    """Recovery line naming the source row a partial upload left behind.
+
+    ``stage`` is *where* the upload stopped, not proof that any bytes were sent
+    — it advances to ``"upload_finalize"`` before the body request is issued —
+    so the wording states only that the upload did not complete.
+    """
+    return (
+        f"The upload did not complete ({stage}). "
+        f"Source {source_id} was registered and is still there; "
+        f"delete it before retrying: notebooklm source delete {source_id}"
+    )
+
+
 def _output_error(
     message: str,
     code: str,
@@ -127,7 +157,7 @@ def _output_error(
     Note:
         Also exported as the public alias :func:`output_error`. The leading
         underscore name pre-dates the public-CLI-boundary contract enforced by
-        ``tests/unit/test_cli_boundary.py``; sibling ``cli/*`` modules may
+        ``tests/_guardrails/test_cli_boundary.py``; sibling ``cli/*`` modules may
         import the private name directly (intra-package, level-1 relative
         import), but ``cli/services/*`` and any other layer that crosses up
         through ``..error_handler`` must use the public alias to stay on the
@@ -148,7 +178,7 @@ def _output_error(
 #: Public alias for :func:`_output_error` — see the function docstring for the
 #: rationale. ``cli/services/*`` and other layers that must cross the CLI
 #: package boundary import this name to stay on the public side of the
-#: boundary contract enforced by ``tests/unit/test_cli_boundary.py``.
+#: boundary contract enforced by ``tests/_guardrails/test_cli_boundary.py``.
 output_error = _output_error
 
 
@@ -223,11 +253,81 @@ def handle_errors(verbose: bool = False, json_output: bool = False) -> Generator
             with handle_errors():
                 # ... command logic ...
     """
+
+    def emit(
+        exc: BaseException | None,
+        message: str,
+        code: str,
+        json_out: bool,
+        exit_code: int,
+        extra: dict[str, Any] | None = None,
+        hint: str | None = None,
+    ) -> NoReturn:
+        """Emit through :func:`_output_error`, folding in partial-upload recovery context.
+
+        A post-registration ``add_file()`` failure propagates as its real typed
+        cause (``AuthError`` / ``NetworkError`` / ``ValidationError`` / …) with
+        ``source_id`` / ``stage`` attributes attached rather than a wrapper type
+        (see ``_source/_upload_decode.raise_partial_upload_failure``), so it
+        always lands in whichever branch below already matches that type and
+        keeps that branch's re-auth / retry / ``retry_after`` guidance. This only
+        *adds* the retained-source recovery context when those attributes are
+        present. It is added as structured fields in JSON mode and as an extra
+        text line otherwise — never by rewriting the branch's own message,
+        because several branches build their text from a literal rather than
+        from ``str(e)`` and would silently drop it.
+        """
+        source_id = getattr(exc, "source_id", None)
+        stage = getattr(exc, "stage", None)
+        if source_id is not None and stage is not None:
+            if json_out:
+                extra = {**(extra or {}), "source_id": source_id, "stage": stage}
+            else:
+                message = f"{message}\n{_retained_source_note(source_id, stage)}"
+        if getattr(exc, "unconfirmed", False):
+            # An idempotency probe could not determine whether a create
+            # committed (#2220), so a write may be live. The branches below
+            # match on TYPE, and a probe re-raises its transport/auth failure
+            # unchanged — so a marked RateLimitError lands in the rate-limit
+            # branch and is told "Retry after Ns", a marked AuthError is told to
+            # re-login and retry, a marked NetworkError is told to try again.
+            # Each of those invites the duplicate this marker exists to prevent.
+            #
+            # Correcting it here rather than in the ladder is deliberate, and is
+            # the same reasoning as the retained-source block above: ``emit`` is
+            # the one funnel every branch passes through, and several branches
+            # build their text from a literal rather than from ``str(e)``, so a
+            # per-branch fix would be both duplicated and easy to miss on the
+            # next branch added. The code is overridden (not merely annotated)
+            # because a script keying on ``RATE_LIMITED`` would otherwise back
+            # off and retry exactly as the message told it not to.
+            code = "UNCONFIRMED_WRITE"
+            # REPLACE the branch's message rather than appending to it. The
+            # branches bake their advice into the text — the rate-limit branch
+            # renders "Error: Rate limited. Retry after 30s." and also sets a
+            # ``retry_after`` field — so appending a warning leaves the original
+            # instruction standing, first, and in JSON leaves it as the only
+            # machine-readable guidance (``_output_error`` serializes ``extra``
+            # but NOT ``hint``). ``str(exc)`` carries the underlying detail
+            # without the advice.
+            detail = str(exc) if exc is not None else message
+            message = f"Error: this write could not be confirmed ({detail})"
+            if extra:
+                # Same reason: a stale ``retry_after`` is an instruction.
+                extra = {k: v for k, v in extra.items() if k != "retry_after"}
+            if json_out:
+                extra = {**(extra or {}), "unconfirmed": True, "hint": _UNCONFIRMED_WRITE_NOTE}
+            else:
+                # Text mode prints ``hint`` after ``message``; JSON ignores it,
+                # which is why the JSON branch above carries it in ``extra``.
+                hint = _UNCONFIRMED_WRITE_NOTE
+        _output_error(message, code, json_out, exit_code, extra=extra, hint=hint)
+
     try:
         yield
     except KeyboardInterrupt:
         if json_output:
-            _output_error("Cancelled by user", "CANCELLED", True, 130)
+            emit(None, "Cancelled by user", "CANCELLED", True, 130)
         else:
             safe_echo("\nCancelled.", err=True)
             raise SystemExit(130) from None
@@ -238,7 +338,8 @@ def handle_errors(verbose: bool = False, json_output: bool = False) -> Generator
             extra_data["retry_after"] = e.retry_after
         if verbose and e.method_id:
             extra_data["method_id"] = e.method_id
-        _output_error(
+        emit(
+            e,
             f"Error: Rate limited.{retry_msg}",
             "RATE_LIMITED",
             json_output,
@@ -246,7 +347,8 @@ def handle_errors(verbose: bool = False, json_output: bool = False) -> Generator
             extra=extra_data,
         )
     except AuthError as e:
-        _output_error(
+        emit(
+            e,
             f"Authentication error: {e}",
             "AUTH_ERROR",
             json_output,
@@ -254,11 +356,12 @@ def handle_errors(verbose: bool = False, json_output: bool = False) -> Generator
             hint="Run 'notebooklm login' to re-authenticate.",
         )
     except ValidationError as e:
-        _output_error(f"Validation error: {e}", "VALIDATION_ERROR", json_output, 1)
+        emit(e, f"Validation error: {e}", "VALIDATION_ERROR", json_output, 1)
     except ConfigurationError as e:
-        _output_error(f"Configuration error: {e}", "CONFIG_ERROR", json_output, 1)
+        emit(e, f"Configuration error: {e}", "CONFIG_ERROR", json_output, 1)
     except NetworkError as e:
-        _output_error(
+        emit(
+            e,
             f"Network error: {e}",
             "NETWORK_ERROR",
             json_output,
@@ -266,7 +369,8 @@ def handle_errors(verbose: bool = False, json_output: bool = False) -> Generator
             hint="Check your internet connection and try again.",
         )
     except NotebookLimitError as e:
-        _output_error(
+        emit(
+            e,
             str(e),
             "NOTEBOOK_LIMIT",
             json_output,
@@ -285,7 +389,8 @@ def handle_errors(verbose: bool = False, json_output: bool = False) -> Generator
             ],
             "stalled_phase": e.stalled_phase,
         }
-        _output_error(
+        emit(
+            e,
             f"Artifact timeout: {e}",
             "ARTIFACT_TIMEOUT",
             json_output,
@@ -302,23 +407,30 @@ def handle_errors(verbose: bool = False, json_output: bool = False) -> Generator
         # emits the typed ``NOT_FOUND`` envelope (matching the per-command
         # ``source``/``artifact``/``note get`` convention) instead of the
         # generic ``NOTEBOOKLM_ERROR``. This makes the central handler faithful
-        # to the v0.8.0 raise-sites previewed by ``NOTEBOOKLM_FUTURE_ERRORS``
-        # (e.g. ``get()`` -> raise, ``rename``/``update`` on a missing target).
+        # to the v0.8.0 raise-sites (e.g. ``get()`` -> raise,
+        # ``rename``/``update`` on a missing target).
         nf_extra = _not_found_extra(e)
         if verbose and isinstance(e, RPCError) and e.method_id:
             nf_extra["method_id"] = e.method_id
-        _output_error(
+        # Near-miss "did you mean" candidates (issue #1787), read once and used for
+        # both the JSON envelope and the text-mode hint.
+        nf_candidates = list(getattr(e, "candidates", ()) or ())
+        if nf_candidates:
+            nf_extra["candidates"] = nf_candidates
+        emit(
+            e,
             f"Error: {e}",
             "NOT_FOUND",
             json_output,
             1,
             extra=nf_extra or None,
+            hint=did_you_mean_hint(nf_candidates) if nf_candidates else None,
         )
     except NotebookLMError as e:
         extra_info: dict[str, Any] | None = None
         if verbose and isinstance(e, RPCError) and e.method_id:
             extra_info = {"method_id": e.method_id}
-        _output_error(f"Error: {e}", "NOTEBOOKLM_ERROR", json_output, 1, extra=extra_info)
+        emit(e, f"Error: {e}", "NOTEBOOKLM_ERROR", json_output, 1, extra=extra_info)
     except click.ClickException:
         # Let Click handle its own exceptions (--help, bad args, etc.)
         raise
@@ -339,7 +451,8 @@ def handle_errors(verbose: bool = False, json_output: bool = False) -> Generator
         # Route the full exception (with cause chain + traceback) to the
         # redacting DEBUG logger so ``-vv`` users can still diagnose.
         logger.debug("Unexpected CLI exception", exc_info=True)
-        _output_error(
+        emit(
+            e,
             f"Unexpected error: {primary}",
             "UNEXPECTED_ERROR",
             json_output,

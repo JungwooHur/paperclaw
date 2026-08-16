@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import builtins
 import logging
+import reprlib
 from typing import Any, Literal
 
+from .._row_adapters.documents import build_document
+from .._row_adapters.sources import SourceFulltextRow, SourceGuideRow
 from .._runtime.contracts import RpcCaller
+from .._types.documents import StructuredDocument
 from .._types.research import SourceGuide
+from .._types.sources import _disambiguate_type_code, _pdf_url_title_fallback
 from ..rpc import RPCMethod
 from ..types import SourceFulltext, SourceNotFoundError, _extract_source_url
 
@@ -29,29 +34,13 @@ class SourceContentRenderer:
             allow_null=True,
         )
 
-        summary = ""
-        keywords: list[str] = []
-
-        if result and isinstance(result, list) and len(result) > 0:
-            outer = result[0]
-            if isinstance(outer, list) and len(outer) > 0:
-                inner = outer[0]
-                if isinstance(inner, list):
-                    # Bind the ``[1]`` summary and ``[2]`` keywords blocks to locals
-                    # so each leaf read is single-level (not chained ``inner[1][0]`` /
-                    # ``inner[2][0]``). Absent blocks legitimately leave the defaults.
-                    summary_block = (
-                        inner[1] if len(inner) > 1 and isinstance(inner[1], list) else None
-                    )
-                    if summary_block:
-                        summary = summary_block[0] if isinstance(summary_block[0], str) else ""
-                    keyword_block = (
-                        inner[2] if len(inner) > 2 and isinstance(inner[2], list) else None
-                    )
-                    if keyword_block:
-                        keywords = keyword_block[0] if isinstance(keyword_block[0], list) else []
-
-        return SourceGuide(summary=summary, keywords=tuple(keywords))
+        # Position knowledge for the ``result[0][0]`` envelope unwrap and the
+        # summary / keyword block reads lives in ``SourceGuideRow`` (the
+        # sanctioned row-adapter layer); the adapter preserves the historical
+        # soft contract — an absent / non-list envelope or block leaves the
+        # ``""`` / ``[]`` defaults rather than raising.
+        guide_row = SourceGuideRow(result)
+        return SourceGuide(summary=guide_row.summary, keywords=tuple(guide_row.keywords))
 
     async def get_fulltext(
         self,
@@ -66,12 +55,13 @@ class SourceContentRenderer:
 
         if output_format == "markdown":
             try:
-                from markdownify import markdownify as md
+                import markdownify  # noqa: F401  # presence guard; conversion is below
             except ImportError:
                 raise ImportError(
                     "The 'markdown' format requires the 'markdownify' package. "
                     "Install it with: pip install 'notebooklm-py[markdown]'"
                 ) from None
+            from .markdown import html_to_markdown
 
         params = [[source_id], [3], [3]] if output_format == "markdown" else [[source_id], [2], [2]]
 
@@ -85,36 +75,66 @@ class SourceContentRenderer:
         if not result or not isinstance(result, list):
             raise SourceNotFoundError(f"Source {source_id} not found in notebook {notebook_id}")
 
-        title = ""
         source_type = None
         url = None
         content = ""
+        document = StructuredDocument()
 
-        # ``result[0]`` is the source-descriptor row; bind it so the title and
-        # metadata reads are single-level indices instead of chained
-        # ``result[0][1]`` / ``result[0][2]`` descents.
-        descriptor = result[0]
-        if isinstance(descriptor, list) and len(descriptor) > 1:
-            title = descriptor[1] if isinstance(descriptor[1], str) else ""
+        # All positional knowledge for the ``GET_SOURCE`` envelope (descriptor
+        # row, metadata, HTML / text blocks) lives in ``SourceFulltextRow`` (the
+        # sanctioned row-adapter layer); every read preserves the historical
+        # soft contract (missing slots -> empty defaults, never a raise).
+        fulltext_row = SourceFulltextRow(result)
+        title = fulltext_row.title
+        metadata = fulltext_row.metadata
+        if metadata is not None:
+            # The type-code read is delegated to ``SourceRow.type_code``
+            # (the descriptor row has the adapter's normalized-entry
+            # layout: id-envelope, title, metadata, ...), which validates
+            # that ``metadata[4]`` holds an int. An absent / ``None`` slot
+            # keeps the silent ``None`` default; a present-but-non-int
+            # value also degrades to ``None`` (the "unknown type" default)
+            # but logs a WARNING instead of silently passing a malformed
+            # value into ``SourceFulltext._type_code`` (#1485
+            # absence-vs-malformed policy).
+            source_row = fulltext_row.source_row
+            # Disambiguate the type_code==14 native-Sheet/Drive-PDF overload by
+            # the row MIME, mirroring ``Source.from_row`` so ``source fulltext``
+            # / ``source_read`` decode a Drive-hosted PDF as PDF, not
+            # GOOGLE_SPREADSHEET (#1832). GET_SOURCE carries the same MIME at
+            # metadata[19] / metadata[9][2] as GET_NOTEBOOK (live-captured).
+            source_type = (
+                _disambiguate_type_code(source_row.type_code, source_row.mime)
+                if source_row is not None
+                else None
+            )
+            type_slot = fulltext_row.raw_metadata_type_slot
+            if source_type is None and type_slot is not None:
+                self._logger.warning(
+                    "Source %s metadata type-code slot malformed (expected "
+                    "int at metadata[4], got %s); treating type as unknown: %s",
+                    source_id,
+                    type(type_slot).__name__,
+                    reprlib.repr(metadata),
+                )
+            url = _extract_source_url(metadata, allow_bare_http=False)
 
-            if len(descriptor) > 2 and isinstance(descriptor[2], list):
-                metadata = descriptor[2]
-                if len(metadata) > 4:
-                    source_type = metadata[4]
-                url = _extract_source_url(metadata, allow_bare_http=False)
+        # Parse the document tree (#2128) regardless of which rendering the
+        # caller asked for. The response carries it either way — the two
+        # ``output_format`` values pick which *legacy flat* rendition fills
+        # ``content``, not which parts of the payload exist — so gating the
+        # parse on the text branch would leave a markdown caller unable to
+        # resolve citation offsets against a tree that was right there.
+        content_blocks = fulltext_row.text_content_blocks
+        if content_blocks is not None:
+            document = build_document(content_blocks)
 
         if output_format == "markdown":
-            html_content = None
-            # ``result[4]`` is the HTML-rendition block; bind it so the candidate
-            # read is a single-level ``html_block[1]`` index. An absent block
-            # legitimately means "no markdown rendition" (warned + empty below).
-            html_block = result[4] if len(result) > 4 and isinstance(result[4], list) else None
-            if html_block is not None and len(html_block) > 1:
-                candidate = html_block[1]
-                if isinstance(candidate, str):
-                    html_content = candidate
+            # An absent HTML rendition legitimately means "no markdown
+            # rendition" (warned + empty below).
+            html_content = fulltext_row.html_content
             if html_content is not None:
-                content = md(html_content, heading_style="ATX")
+                content = html_to_markdown(html_content, source_type=source_type)
             else:
                 self._logger.warning(
                     "Source %s (type=%s) has no HTML rendition for output_format='markdown'; "
@@ -122,16 +142,13 @@ class SourceContentRenderer:
                     source_id,
                     source_type,
                 )
-        else:
-            # ``result[3]`` is the text-content block; bind it so the blocks read
-            # is a single-level ``text_block[0]`` index. An absent block
-            # legitimately means "no text content" (empty content + warning).
-            text_block = result[3] if len(result) > 3 and isinstance(result[3], list) else None
-            if text_block:
-                content_blocks = text_block[0]
-                if isinstance(content_blocks, list):
-                    texts = self.extract_all_text(content_blocks)
-                    content = "\n".join(texts)
+        elif content_blocks is not None:
+            # An absent text block legitimately means "no text content"
+            # (empty content + warning). ``content`` stays the flat legacy
+            # rendering — byte-identical, so no existing caller moves — while
+            # ``document`` above retains the structure and offsets.
+            texts = self.extract_all_text(content_blocks)
+            content = "\n".join(texts)
 
         if not content:
             self._logger.warning(
@@ -143,17 +160,33 @@ class SourceContentRenderer:
 
         return SourceFulltext(
             source_id=source_id,
-            title=title,
+            # Same #1850 direct-PDF-URL title fallback as ``Source.from_row``,
+            # so ``source fulltext`` shows the basename too (not the raw URL).
+            # ``or title`` keeps the ``str`` type: the helper only ever returns
+            # the (str) input title or a derived stem, never ``None`` here.
+            title=_pdf_url_title_fallback(title, url, source_type) or title,
             content=content,
             _type_code=source_type,
             url=url,
             char_count=len(content),
+            document=document,
         )
 
     def extract_all_text(
         self, data: builtins.list[Any], max_depth: int = 100
     ) -> builtins.list[str]:
-        """Recursively extract all text strings from nested arrays."""
+        """Recursively extract all text strings from nested arrays.
+
+        The **legacy** flat rendering behind :attr:`SourceFulltext.content`.
+        It is deliberately frozen: every string in traversal order, structure
+        and offsets discarded, so existing callers see byte-identical output.
+        The joins its caller applies insert separators the backend's character
+        ranges never accounted for, which is why no citation offset can be used
+        against the result (#2128). The offset-bearing parse of the same tree is
+        :func:`notebooklm._row_adapters.documents.build_document`, surfaced as
+        :attr:`SourceFulltext.document`; prefer it for anything that needs to
+        know *where* text sits.
+        """
         if max_depth <= 0:
             self._logger.warning("Max recursion depth reached in text extraction")
             return []

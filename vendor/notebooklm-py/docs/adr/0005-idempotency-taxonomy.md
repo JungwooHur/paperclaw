@@ -18,7 +18,9 @@ Amended again on 2026-05-29 after the registry audit was completed:
 the production `IDEMPOTENCY_REGISTRY` now has an explicit entry for
 every active `RPCMethod`. `UNCLASSIFIED` remains only as a hand-built
 placeholder for tests and future development, not as the production
-classification for read-only RPCs.
+classification for read-only RPCs. The live singleton still lives in
+`src/notebooklm/_idempotency.py`; the default policy table is now populated
+from `src/notebooklm/_idempotency_policy.py` at import time.
 
 ## Context
 
@@ -36,23 +38,29 @@ Five retry-safety profiles cover every verified NotebookLM RPC shape:
 | `AT_LEAST_ONCE_ACCEPTED` | Caller has accepted duplicate-side-effect cost | Retries enabled; rate-limited WARN emitted |
 | `NON_IDEMPOTENT_NO_RETRY` | No dedupe key, no probe; first failure must surface | Force-disable inner retries |
 
-The taxonomy and the production registry (`IDEMPOTENCY_REGISTRY` in `_idempotency.py`) are consulted by `RpcExecutor` to compute the effective `disable_internal_retries` value. Variants (e.g. `ADD_SOURCE` `"url"` vs `"text"` vs `"drive"`) carry their own classifications when the wire-shape differs by call-site.
+The taxonomy and the production registry (`IDEMPOTENCY_REGISTRY` in `_idempotency.py`, seeded by `_idempotency_policy.py`) are consulted by `RpcExecutor` to compute the effective `disable_internal_retries` value. Variants (e.g. `ADD_SOURCE` `"url"` vs `"text"` vs `"drive"`, artifact generation/revise flows, and source-label `UPDATE_LABEL` `"add_sources"` / `"remove_sources"`) carry their own classifications when the wire-shape differs by call-site.
 
-An internal architecture audit (disease D3) flagged ten references to "Wave 2" in `_idempotency.py` whose design rationale lived only in internal planning notes. This ADR is the public home for that rationale; the in-code references now point here.
+An internal architecture audit (disease D3) flagged ten references to "Wave 2" in the idempotency policy code whose design rationale lived only in internal planning notes. This ADR is the public home for that rationale; the in-code references now point here.
 
 ## Decision
 
-Every active `RPCMethod` is registered in `IDEMPOTENCY_REGISTRY` (in `_idempotency.py`) with one of five `IdempotencyPolicy` values, optionally per *operation variant* when the call-site shape differs. The registry is the single source of truth consumed by `RpcExecutor`, and the registry-audit tests fail if a new enum member keeps the default placeholder.
+Every active `RPCMethod` is registered in `IDEMPOTENCY_REGISTRY` (the singleton in `_idempotency.py`, with defaults declared in `_idempotency_policy.py`) with one of five `IdempotencyPolicy` values, optionally per *operation variant* when the call-site shape differs. The registry is the single source of truth consumed by `RpcExecutor`, and the registry-audit tests fail if a new enum member keeps the default placeholder.
 
 The classification rules are:
 
 - **Read-only RPCs** classify as `IDEMPOTENT_SET_OP`; replay is explicitly safe because the RPC does not mutate server state.
 - **Mutating RPCs with a stable server-side dedupe key** classify as `IDEMPOTENT_SET_OP` (delete / rename / set-state) — retries are explicitly safe.
-- **Mutating RPCs without a dedupe key but with a probe RPC** classify as `PROBE_THEN_CREATE`; the inner retry loop is force-disabled, and the per-API call site owns a probe-then-create wrapper (see `idempotent_create()` in `_idempotency.py` and the per-API uses in `_notebooks.py`, `_sources.py`).
+- **Mutating RPCs without a dedupe key but with a probe RPC** classify as `PROBE_THEN_CREATE`; the inner retry loop is force-disabled, and the per-API call site owns a probe-then-create wrapper (see `idempotent_create()` in `_idempotency.py` and per-API uses such as `_notebooks.py`, `_source/add.py`, and `_source/upload.py`).
+
+  **A `PROBE_THEN_CREATE` probe must not answer what it does not know (#2220).** It may return `None` — "no match", which `idempotent_create` reads as evidence the create did not land and acts on by repeating it — only when it has affirmatively established that no matching resource exists. A probe that cannot answer, because its own list RPC failed for a non-transport reason, must raise; the retry loop then aborts and the caller is told the create is unresolved.
+
+  This is the boundary between two policies that would otherwise blur. Swallowing a probe failure and retrying anyway makes the operation at-least-once — which is `AT_LEAST_ONCE_ACCEPTED`, a policy this taxonomy requires the *caller* to opt into by name and which emits a rate-limited WARN precisely so the trade-off stays visible. A `PROBE_THEN_CREATE` path that degrades into it silently, at the one moment its guarantee is load-bearing, has misclassified itself. The four probe implementations (`notebooks.create`, `sources.add_url`, `sources.add_drive`, `register_file_source`) therefore all propagate a probe failure. The errors they raise carry an `unconfirmed` marker attribute (`_idempotency.mark_unconfirmed`) so consumers can distinguish "the write may have committed" from "the write was rejected" without matching on message text — `_app.errors` relies on it to keep an unconfirmed create out of the *retriable* and *isolate-and-continue* bands.
+
+  The *pre-create baseline* read each of those probes takes is deliberately not held to this rule: it runs before anything is written, so degrading is safe, and failing there would break creates that would otherwise succeed. It logs at WARNING (the `notebooklm` logger's default level) so the degraded call is at least observable. What it degrades *to* is uniform across all four: `None`, the "baseline unavailable" sentinel, never an empty `set()`. An empty set reads as "nothing existed" and disables the filter entirely, so the probe adopts the first same-key match it sees — for `notebooks.create` that meant a pre-existing same-titled notebook returned as freshly created, with every later `sources.add_*` / `chat.ask` in the session then aimed at the wrong notebook (#2232, the #2204-class defect for notebooks). With the sentinel, a probe running without a baseline raises on *any* match rather than on more than one. The trade is deliberate: refusing to attribute can cost a duplicate create, which is loud and visible in the notebook list, where the silent wrong identity it replaces gave the caller nothing to act on and no reason to look.
 - **Mutating RPCs that produce visible side effects (emails, billing, notifications) and that the caller has explicitly opted into** classify as `AT_LEAST_ONCE_ACCEPTED`; retries are enabled but a rate-limited WARN is emitted so operators can observe the trade-off.
 - **Mutating RPCs with no dedupe key and no reliable probe** classify as `NON_IDEMPOTENT_NO_RETRY`; the inner retry loop is force-disabled and the first failure surfaces to the caller for manual disambiguation.
 
-The completed production classifications are recorded inline in `_idempotency.py` (with the per-RPC rationale captured at the registration site). Future classifications continue to land in the same module without changes to the executor; the registry is intentionally extensible.
+The completed production classifications are recorded in `_idempotency_policy.py` (with the per-RPC rationale captured at the registration site). Future classifications continue to land in the same module without changes to the executor; the registry is intentionally extensible.
 
 The five-policy axis is *closed*. Adding a sixth policy requires updating this ADR and the executor in lock-step.
 

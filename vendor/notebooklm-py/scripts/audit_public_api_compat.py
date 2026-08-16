@@ -2,17 +2,27 @@
 
 This is a release gate, not a replacement for unit tests. It compares the
 runtime public surface in this checkout against a baseline git ref (by default
-the latest reachable tag) and reports unapproved removals, call-signature
-changes, or return-annotation changes.
+the latest reachable stable release tag; pre-releases are skipped) and reports
+unapproved removals, call-signature changes, or return-annotation changes.
 
 Usage:
     uv run python scripts/audit_public_api_compat.py
     uv run python scripts/audit_public_api_compat.py --baseline-ref v0.4.1
     uv run python scripts/audit_public_api_compat.py --json
+    uv run python scripts/audit_public_api_compat.py --check-stale
+    uv run python scripts/audit_public_api_compat.py --prune
+
+``--check-stale`` additionally fails when an ``allowed_breaks`` entry matches no
+current break against the baseline (it is already in the baseline). ``--prune``
+explicitly removes those stale entries from the allowlist, preserving all other
+policy fields and atomically rewriting the file only when entries changed.
+Use it at a release boundary (see ``docs/releasing.md`` →
+prune-allowlist-at-release).
 
 Exit codes:
-    0  No unapproved compatibility breaks.
-    1  Unapproved public API breakage detected.
+    0  No unapproved compatibility breaks (and, with --check-stale, none stale).
+    1  Unapproved public API breakage detected, or stale allowlist entries
+       under --check-stale.
     2  Script/setup error, bad baseline ref, or import/introspection failure.
 """
 
@@ -27,6 +37,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+from collections import Counter
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -39,6 +50,7 @@ EXTRA_PUBLIC_PACKAGES = ("rpc",)
 CLIENT_NAMESPACE_ATTRIBUTES = (
     "artifacts",
     "chat",
+    "labels",
     "mind_maps",
     "notes",
     "notebooks",
@@ -47,6 +59,39 @@ CLIENT_NAMESPACE_ATTRIBUTES = (
     "sharing",
     "sources",
 )
+
+# Public constants whose VALUE is part of the contract, not just their existence.
+#
+# The rest of this audit reasons about *shape* — a name's kind, its signature, its
+# class members, its enum member values. For a plain module constant it recorded
+# only ``kind`` ("str", "frozenset"), so rebinding one to a different value read as
+# no change at all. That blind spot is not theoretical: the Gemini Notebook rebrand
+# (#2072) repointed ``DEFAULT_BASE_URL`` / ``PERSONAL_BASE_HOST`` at a different
+# host and the audit stayed green, and ``REQUIRED_COOKIE_DOMAINS`` — a documented
+# public constant that callers feed to cookie extractors — has since gained
+# members the same way.
+#
+# Names listed here additionally capture an order-insensitive value fingerprint, so
+# a value change surfaces as a reviewable ``changed-constant-value`` break that has
+# to be acknowledged in the allowlist like any other. Keep the list SHORT and
+# deliberate: it is for constants downstream code compares against or feeds to an
+# API, not for every module-level literal. A name must be in the module's ``__all__``
+# (or ``extra_public_names``) to be collected at all.
+VALUE_TRACKED_CONSTANTS: dict[str, frozenset[str]] = {
+    "notebooklm.auth": frozenset(
+        {
+            "OPTIONAL_COOKIE_DOMAINS",
+            "OPTIONAL_COOKIE_DOMAINS_BY_LABEL",
+            "REQUIRED_COOKIE_DOMAINS",
+        }
+    ),
+    "notebooklm.config": frozenset(
+        {
+            "DEFAULT_BASE_URL",
+            "PERSONAL_BASE_HOST",
+        }
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -90,12 +135,34 @@ def _run_git(args: list[str], cwd: Path, *, capture: bool = True) -> subprocess.
 
 
 def latest_release_tag(repo_root: Path) -> str:
-    """Return the latest reachable version tag."""
-    result = _run_git(["describe", "--tags", "--abbrev=0"], repo_root)
+    """Return the latest reachable stable release tag.
+
+    Restricts ``git describe`` to release-shaped tags (``--match``) and drops
+    pre-release suffixes (``--exclude`` of aN/bN/rcN), so a pushed ``v0.8.0a1``
+    does not become the compat baseline. Keeping the baseline on the last stable
+    release means the audit checks the real ``vPREV -> vNEXT`` upgrade path for
+    the whole pre-release cycle, and the allowlist prunes once at the final tag.
+    """
+    result = _run_git(
+        [
+            "describe",
+            "--tags",
+            "--abbrev=0",
+            "--match",
+            "v[0-9]*.[0-9]*.[0-9]*",  # release-shaped tags only (skips recovery/*, docs-*, …)
+            "--exclude",
+            "*a[0-9]*",  # drop aN pre-releases
+            "--exclude",
+            "*b[0-9]*",  # drop bN pre-releases
+            "--exclude",
+            "*rc[0-9]*",  # drop rcN pre-releases
+        ],
+        repo_root,
+    )
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace")
         raise RuntimeError(
-            "could not resolve latest tag: "
+            "could not resolve latest stable release tag: "
             f"{stderr.strip()}. Fetch tags/history or pass --baseline-ref explicitly."
         )
     return result.stdout.decode("utf-8").strip()
@@ -137,6 +204,19 @@ CLIENT_NAMESPACE_ATTRIBUTES = set(json.loads(sys.argv[3])) if len(sys.argv) > 3 
 PKG = sys.argv[4]
 EXCLUDED = set(json.loads(sys.argv[5]))
 EXTRA_PACKAGES = tuple(json.loads(sys.argv[6]))
+# Enforce the "every public module declares __all__" rule only for the CURRENT
+# checkout. Historical baselines (e.g. v0.4.1) predate the rule and legitimately
+# lack __all__ on some public modules; raising there would abort the baseline
+# collection before any diff runs (issue #1493 review).
+ENFORCE_ALL = (sys.argv[7] == "1") if len(sys.argv) > 7 else True
+# {module: [constant names]} whose VALUE is captured, not just their kind. Passed
+# in from the driver (VALUE_TRACKED_CONSTANTS) so BOTH the baseline export and the
+# current checkout are collected against the same tracked set.
+VALUE_TRACKED = (
+    {module: set(names) for module, names in json.loads(sys.argv[8]).items()}
+    if len(sys.argv) > 8
+    else {}
+)
 
 
 def discover_modules() -> list[str]:
@@ -218,6 +298,45 @@ def kind_of(obj) -> str:
     if inspect.ismodule(obj):
         return "module"
     return type(obj).__name__
+
+
+# Return an order-insensitive fingerprint of a constant's value.
+#
+# repr() alone is unusable here: set/frozenset/dict iteration order varies with
+# PYTHONHASHSEED, so the same constant would fingerprint differently between the
+# baseline export and the current checkout and every run would report a spurious
+# break. Containers are therefore rendered sorted and recursively; everything else
+# falls back to repr. Exotic values degrade to a placeholder rather than raising --
+# the audit must never fail to *collect* a surface it is asked to compare.
+#
+# (Comments, not a docstring: this function lives inside the raw-string collector
+# script that runs in a subprocess, so a triple-quoted string here would end it.)
+def stable_value_repr(value) -> str:
+    if isinstance(value, (frozenset, set)):
+        # Tag the container type: a bare "{...}" would render a set, a frozenset
+        # and an empty dict identically, so swapping a public constant's container
+        # (frozenset -> set makes it mutable by callers) would fingerprint as no
+        # change at all.
+        rendered = ", ".join(sorted(stable_value_repr(item) for item in value))
+        label = "frozenset" if isinstance(value, frozenset) else "set"
+        return f"{label}({{{rendered}}})"
+    if isinstance(value, dict):
+        return (
+            "dict({"
+            + ", ".join(
+                f"{key!r}: {stable_value_repr(item)}"
+                for key, item in sorted(value.items(), key=lambda kv: repr(kv[0]))
+            )
+            + "})"
+        )
+    if isinstance(value, (list, tuple)):
+        # Order IS meaningful for sequences — render in place.
+        rendered = ", ".join(stable_value_repr(item) for item in value)
+        return f"[{rendered}]" if isinstance(value, list) else f"({rendered})"
+    try:
+        return repr(value)
+    except Exception:  # pragma: no cover - defensive; repr should not raise
+        return f"<unreprable {type(value).__name__}>"
 
 
 def unwrap_member(obj):
@@ -312,13 +431,27 @@ def collect_class(cls) -> dict:
 
 def collect_module(module_name: str) -> dict:
     module = importlib.import_module(module_name)
+    has_all = hasattr(module, "__all__")
+    if not has_all and ENFORCE_ALL:
+        # Every discovered public top-level module MUST declare ``__all__`` so a
+        # brand-new public module cannot ship un-baselined (its surface would
+        # otherwise be invisible to this audit). The presence flag was captured
+        # historically but never enforced; enforce it now (issue #1493) — but
+        # only for the current checkout (ENFORCE_ALL), never for an older
+        # baseline that predates the rule.
+        raise RuntimeError(
+            f"public module {module_name!r} must declare __all__ "
+            "(every public top-level module defines its exported surface so "
+            "the compat audit can baseline it)"
+        )
     all_names = list(getattr(module, "__all__", []))
     extra_names = list(EXTRA_PUBLIC_NAMES.get(module_name, []))
     names = []
     for name in [*all_names, *extra_names]:
         if name not in names:
             names.append(name)
-    payload = {"exports": {}, "has_all": hasattr(module, "__all__")}
+    payload = {"exports": {}, "has_all": has_all}
+    value_tracked = VALUE_TRACKED.get(module_name, set())
     for name in names:
         try:
             value = getattr(module, name)
@@ -338,6 +471,10 @@ def collect_module(module_name: str) -> dict:
         }
         if inspect.isclass(value):
             entry.update(collect_class(value))
+        elif name in value_tracked:
+            # Only for plain constants: a class/function is already compared by
+            # shape, and fingerprinting one would report a break on every edit.
+            entry["constant_value"] = stable_value_repr(value)
         payload["exports"][name] = entry
     return payload
 
@@ -388,8 +525,16 @@ def normalize_default_repr(default_repr: str | None) -> str | None:
 def collect_manifest(
     source_root: Path,
     extra_public_names: dict[str, list[str]] | None = None,
+    *,
+    enforce_all: bool = True,
 ) -> dict[str, Any]:
-    """Run the collector in a clean Python process for ``source_root``."""
+    """Run the collector in a clean Python process for ``source_root``.
+
+    ``enforce_all`` gates the "every public module declares ``__all__``" rule
+    (issue #1493): pass ``True`` for the current checkout and ``False`` for a
+    historical baseline that predates the rule, so baseline collection never
+    aborts before the diff.
+    """
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
     pythonpath = str(source_root / "src")
@@ -408,6 +553,11 @@ def collect_manifest(
             PUBLIC_PACKAGE,
             json.dumps(sorted(EXCLUDED_TOP_LEVEL_MODULES)),
             json.dumps(EXTRA_PUBLIC_PACKAGES),
+            "1" if enforce_all else "0",
+            json.dumps(
+                {module: sorted(names) for module, names in VALUE_TRACKED_CONSTANTS.items()},
+                sort_keys=True,
+            ),
         ],
         cwd=source_root,
         env=env,
@@ -566,6 +716,23 @@ def _compare_export(
         )
         return breaks
 
+    # Value-tracked constants (VALUE_TRACKED_CONSTANTS). Both sides are collected
+    # by THIS script — the baseline is an export of the old source imported by the
+    # current code — so a missing key means the name is not value-tracked, not that
+    # the baseline predates the feature. Comparing only when both sides carry a
+    # fingerprint keeps adding/removing a name from the tracked set from firing a
+    # break on its own.
+    old_value = old.get("constant_value")
+    new_value = new.get("constant_value")
+    if old_value is not None and new_value is not None and old_value != new_value:
+        breaks.append(
+            ApiBreak(
+                "changed-constant-value",
+                path,
+                f"value changed from {old_value} to {new_value}",
+            )
+        )
+
     if old["kind"] in {"function", "class", "enum"}:
         reason = _signature_breakage(old.get("signature"), new.get("signature"))
         if reason:
@@ -656,17 +823,26 @@ def compare_manifests(baseline: dict[str, Any], current: dict[str, Any]) -> list
     return sorted(breaks, key=lambda item: (item.code, item.object, item.detail))
 
 
+def _read_policy_payload(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"could not read allowlist {path}: {exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid JSON in {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{path} must contain a JSON object")
+    return payload
+
+
 def load_policy(path: Path | None) -> tuple[list[Allowance], dict[str, list[str]]]:
     if path is None or str(path) == "":
         return [], {}
     if not path.exists():
         raise RuntimeError(f"allowlist file not found: {path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"invalid JSON in {path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"{path} must contain a JSON object")
+    payload = _read_policy_payload(path)
     schema_version = payload.get("schema_version", 1)
     if schema_version != 1:
         raise RuntimeError(f"{path}: unsupported schema_version {schema_version!r} (expected 1)")
@@ -700,6 +876,66 @@ def load_policy(path: Path | None) -> tuple[list[Allowance], dict[str, list[str]
     return allowances, normalized_extra_names
 
 
+def prune_allowlist(path: Path, stale: list[Allowance]) -> list[Allowance]:
+    """Remove exactly stale entries and atomically rewrite *path*.
+
+    Matching includes the reason and is multiset-aware, so duplicate or
+    similarly-shaped entries cannot cause an unrelated allowance to be removed.
+    A no-op does not touch the file. The raw payload is retained so unknown
+    top-level and per-entry fields survive the deterministic rewrite.
+    """
+    if not path.exists():
+        raise RuntimeError(f"allowlist file not found: {path}")
+    load_policy(path)  # Validate the complete policy, including known fields.
+    payload = _read_policy_payload(path)
+    entries = payload.get("allowed_breaks", [])
+    stale_counts = Counter((item.code, item.object, item.reason) for item in stale)
+    removed: list[Allowance] = []
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        key = (str(entry["code"]), str(entry["object"]), str(entry["reason"]))
+        if stale_counts[key]:
+            stale_counts[key] -= 1
+            removed.append(Allowance(*key))
+        else:
+            kept.append(entry)
+
+    if not removed:
+        return []
+
+    payload["allowed_breaks"] = kept
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temporary_path: Path | None = None
+    try:
+        original_mode = path.stat().st_mode
+        if not original_mode & 0o222:
+            raise RuntimeError(f"allowlist is not writable: {path}")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.chmod(temporary_path, original_mode)
+        os.replace(temporary_path, path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except OSError as exc:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise RuntimeError(f"could not atomically rewrite allowlist {path}: {exc}") from exc
+    return removed
+
+
 def partition_allowed(
     breakages: list[ApiBreak],
     allowances: list[Allowance],
@@ -713,6 +949,83 @@ def partition_allowed(
         else:
             approved.append((breakage, allowance))
     return unapproved, approved
+
+
+def _sibling_object(obj: str) -> str | None:
+    """Return the other path-view of an exported object, or ``None``.
+
+    The audit records the same client-namespace callable under two dotted
+    paths: the re-export view ``notebooklm.X`` and the defining-module view
+    ``notebooklm.client.X``. An allowance is written against one view; this maps
+    between them so the staleness check can treat the pair as a single unit. A
+    glob object (containing ``*``) is left for the caller to handle — the
+    returned sibling is a literal string and is only consulted via an exact
+    lookup, so a glob's sibling never spuriously matches.
+    """
+    client_prefix = f"{PUBLIC_PACKAGE}.client."
+    bare_prefix = f"{PUBLIC_PACKAGE}."
+    if obj.startswith(client_prefix):
+        return bare_prefix + obj[len(client_prefix) :]
+    if obj.startswith(bare_prefix):
+        return client_prefix + obj[len(bare_prefix) :]
+    return None
+
+
+def stale_allowances(
+    breakages: list[ApiBreak],
+    allowances: list[Allowance],
+) -> list[Allowance]:
+    """Return allowances that match no current break against the baseline.
+
+    An allowance is *stale* when it describes a break already baked into the
+    baseline (so it no longer surfaces as a break against it). Such entries are
+    dead weight: harmless to the gate, but the set only ever grows. Pruning them
+    at each release boundary keeps the allowlist scoped to the breaks pending
+    the *next* release (see ``docs/releasing.md`` → prune-allowlist-at-release).
+
+    Pair-aware rule: the two path-views ``notebooklm.X`` and
+    ``notebooklm.client.X`` of the same callable are treated as one unit — a
+    unit is live (kept) if *either* view matches a break. So a non-stale
+    allowance is one that itself matches a break, or whose sibling path-view has
+    *any* matching allowance. Today both views always match together, but a
+    future change that only one view detects must not flag its still load-bearing
+    sibling.
+    """
+    # Per-allowance self-match, keyed by (code, object) so two allowances on the
+    # same object but different codes never collapse onto one another.
+    self_matched: dict[tuple[str, str], bool] = {
+        (allowance.code, allowance.object): any(
+            allowance.matches(breakage) for breakage in breakages
+        )
+        for allowance in allowances
+    }
+    # Per-object aggregate for the sibling lookup: an object is "kept" if *any*
+    # of its allowances (any code) matches a break. The pair stays live as long
+    # as the sibling object has a live allowance, regardless of code.
+    object_kept: dict[str, bool] = {}
+    for (_code, obj), is_match in self_matched.items():
+        object_kept[obj] = object_kept.get(obj, False) or is_match
+
+    def _is_live(allowance: Allowance) -> bool:
+        if self_matched[(allowance.code, allowance.object)]:
+            return True
+        sibling = _sibling_object(allowance.object)
+        return sibling is not None and object_kept.get(sibling, False)
+
+    return [allowance for allowance in allowances if not _is_live(allowance)]
+
+
+def _render_stale(stale: list[Allowance], baseline_ref: str, allowlist_path: Path | str) -> str:
+    lines = [
+        f"Stale allowlist entries — they match no break against the {baseline_ref} "
+        "baseline, so they are already in the baseline:",
+    ]
+    for allowance in stale:
+        lines.append(f"  - [{allowance.code}] {allowance.object}")
+    lines.append(
+        f"Prune them from {allowlist_path} (see docs/releasing.md → prune-allowlist-at-release)."
+    )
+    return "\n".join(lines)
 
 
 def _render_breakages(title: str, breakages: list[ApiBreak]) -> str:
@@ -741,7 +1054,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--baseline-ref",
         default=None,
-        help="Git ref to compare against. Defaults to `git describe --tags --abbrev=0`.",
+        help=(
+            "Git ref to compare against. Defaults to the latest reachable stable "
+            "release tag (pre-release aN/bN/rcN and non-release tags are skipped)."
+        ),
     )
     parser.add_argument(
         "--allowlist",
@@ -751,6 +1067,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--json", action="store_true", help="Print machine-readable output.")
+    parser.add_argument(
+        "--check-stale",
+        action="store_true",
+        help=(
+            "Also fail when an allowlist entry matches no break against the "
+            "baseline (it is already in the baseline — prune it)."
+        ),
+    )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Remove stale allowlist entries and atomically rewrite the allowlist.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -759,17 +1088,37 @@ def main(argv: list[str] | None = None) -> int:
         allowances, extra_public_names = load_policy(allowlist_path)
         with tempfile.TemporaryDirectory(prefix="notebooklm-api-compat-") as tmp:
             baseline_root = export_git_ref(repo_root, baseline_ref, Path(tmp))
-            baseline_manifest = collect_manifest(baseline_root, extra_public_names)
-            current_manifest = collect_manifest(repo_root, extra_public_names)
+            # Enforce the __all__ rule only for the current checkout; an older
+            # baseline may legitimately predate it (issue #1493 review).
+            baseline_manifest = collect_manifest(
+                baseline_root, extra_public_names, enforce_all=False
+            )
+            current_manifest = collect_manifest(repo_root, extra_public_names, enforce_all=True)
 
         breakages = compare_manifests(baseline_manifest, current_manifest)
         unapproved, approved = partition_allowed(breakages, allowances)
+        stale = stale_allowances(breakages, allowances)
+        pruned: list[Allowance] = []
+        if args.prune:
+            if allowlist_path is None:
+                raise RuntimeError("--prune requires an allowlist file")
+            if unapproved:
+                raise RuntimeError(
+                    "refusing to prune while unapproved compatibility breaks exist; "
+                    "resolve the audit failure first"
+                )
+            pruned = prune_allowlist(allowlist_path, stale)
     except RuntimeError as exc:
         if args.json:
             print(json.dumps({"error": str(exc)}, sort_keys=True))
         else:
             print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+
+    allowlist_display = allowlist_path or DEFAULT_ALLOWLIST
+    # ``--check-stale`` promotes stale entries from informational to a gate.
+    stale_blocks = args.check_stale and bool(stale) and not args.prune
+    failed = bool(unapproved) or stale_blocks
 
     if args.json:
         print(
@@ -781,12 +1130,16 @@ def main(argv: list[str] | None = None) -> int:
                         for breakage, allowance in approved
                     ],
                     "unapproved": [asdict(item) for item in unapproved],
+                    "stale_allowances": [asdict(allowance) for allowance in stale],
+                    "pruned_allowances": [asdict(allowance) for allowance in pruned],
                 },
                 indent=2,
                 sort_keys=True,
             )
         )
-    elif unapproved:
+        return 1 if failed else 0
+
+    if unapproved:
         print(
             textwrap.dedent(
                 f"""\
@@ -796,7 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
                 {_render_breakages("Unapproved compatibility breaks:", unapproved)}
 
                 Add back-compat shims, or document an intentional break in
-                {allowlist_path or DEFAULT_ALLOWLIST} with a reviewer-readable reason.
+                {allowlist_display} with a reviewer-readable reason.
                 """
             ).strip(),
             file=sys.stderr,
@@ -804,6 +1157,16 @@ def main(argv: list[str] | None = None) -> int:
         approved_text = _render_approved(approved)
         if approved_text:
             print("\n" + approved_text, file=sys.stderr)
+    elif stale_blocks:
+        # Compat surface is clean, but stale allowlist entries fail the gate
+        # under --check-stale. Don't print an "OK:" line that contradicts the
+        # non-zero exit; the stale report below carries the actionable message.
+        print(
+            f"Public API is compatible with {baseline_ref} "
+            f"({len(approved)} reviewed break(s) allowlisted), "
+            "but the allowlist has stale entries.",
+            file=sys.stderr,
+        )
     else:
         print(
             f"OK: public API is compatible with {baseline_ref} "
@@ -813,7 +1176,15 @@ def main(argv: list[str] | None = None) -> int:
         if approved_text:
             print(approved_text)
 
-    return 1 if unapproved else 0
+    if stale_blocks:
+        print("\n" + _render_stale(stale, baseline_ref, allowlist_display), file=sys.stderr)
+    if pruned:
+        print(
+            "Pruned stale allowlist entries:\n"
+            + "\n".join(f"  - [{item.code}] {item.object}" for item in pruned)
+        )
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

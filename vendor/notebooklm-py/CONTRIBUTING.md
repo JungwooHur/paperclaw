@@ -26,12 +26,12 @@ uv run ruff format --check . && \
 **No uv?** Plain pip works as a fallback (won't enforce the lockfile, so you may resolve newer dep versions than CI):
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[all]"   # [all] = browser + dev + markdown (no cookies; see installation.md)
+pip install -e ".[all]"   # [all] = browser + dev + markdown + mcp + server (no cookies; see installation.md)
 playwright install chromium
 pre-commit install
 ```
 
-For full prerequisites, headless setup, optional extras (`[cookies]`, `[markdown]`), and platform notes, see [docs/installation.md#e-contributor](docs/installation.md#e-contributor).
+For full prerequisites, headless setup, optional extras (`[cookies]`, `[markdown]`, `[mcp]`, `[server]`), and platform notes, see [docs/installation.md#e-contributor](docs/installation.md#e-contributor).
 
 > **Install-doc parity.** `docs/installation.md` is the canonical install guide; this file mirrors a small contributor-focused subset. Every fenced ``bash`` block in `installation.md` must EITHER appear verbatim in `CONTRIBUTING.md`, OR be marked with `<!-- not mirrored: <reason> -->` on the line directly before its opening fence. CI enforces this via `scripts/check_ci_install_parity.py` so a stale block can't drift in unnoticed. When you edit `installation.md`, decide on the spot whether the new content also belongs in this file.
 
@@ -97,7 +97,7 @@ When you bump a cap (e.g. moving `pytest>=8.0,<10` to `pytest>=8.0,<11`):
 2. Run the full pre-commit one-liner above.
 3. Mention the upgrade rationale in the PR description.
 
-The `dependency-audit` workflow (`.github/workflows/dependency-audit.yml`) runs `pip-audit --strict` against the locked env on every push to `main` and nightly. It is currently in soft-launch mode (`continue-on-error: true`) and will be flipped to a hard merge gate after the first release cycle. New deps should still pass `pip-audit` cleanly when introduced.
+The `dependency-audit` workflow (`.github/workflows/dependency-audit.yml`) runs `pip-audit --strict --require-hashes` against the locked env on every push to `main` and nightly. It is a **hard gate** (no `continue-on-error`): a CVE in the locked environment fails the workflow. New deps must pass `pip-audit` cleanly when introduced; pin a fixed version or record a tracked exception via `pip-audit`'s `--ignore-vuln` if no fix is yet available.
 
 ### Test tiers
 
@@ -220,7 +220,7 @@ Agents should ignore files marked `Deprecated`.
 
 1. **Link, Don't Copy** - Reference README.md sections instead of repeating commands. Prevents drift between docs.
 
-2. **Scoped Instructions** - Subfolders like `docs/examples/` may have their own README.md with folder-specific rules.
+2. **Scoped Instructions** - Subfolders like `examples/` may have their own README.md with folder-specific rules.
 
 ---
 
@@ -229,7 +229,7 @@ Agents should ignore files marked `Deprecated`.
 ```
 docs/
 ├── adr/                   # Architectural Decision Records (ADRs)
-├── architecture.md        # Monolithic Session to composable capabilities architecture map
+├── architecture.md        # Layered architecture and repository map
 ├── auth-cookie-lifecycle.md      # Cookie expiration mitigation strategies and keepalive loops
 ├── cli-exit-codes.md      # CLI exit-code convention (binding contract for scripts/CI)
 ├── cli-reference.md       # CLI command reference
@@ -237,14 +237,16 @@ docs/
 ├── deprecations.md        # Staged API deprecations tracker
 ├── development.md         # Architecture, testing, and VCR cassette practices
 ├── installation.md        # Canonical install guide (personas, extras, platform notes)
+├── mcp-guide.md           # MCP server setup, tools, and troubleshooting
 ├── python-api.md          # Python API reference
 ├── refactor-history.md    # Historical record of the Tier 12/13 refactor + downstream migration tables
 ├── releasing.md           # Release checklist
 ├── rpc-development.md     # RPC capture and debugging
 ├── rpc-reference.md       # RPC payload structures and Content Type Codes
 ├── stability.md           # API versioning and stability policy
-├── troubleshooting.md     # Common issues and solutions
-└── examples/              # Runnable example scripts
+└── troubleshooting.md     # Common issues and solutions
 ```
+
+Runnable example scripts live at the repository root under `examples/`.
 
 > When adding or modifying a CLI command, follow the [CLI Exit-Code Convention](docs/cli-exit-codes.md) — the policy table and the two intentional exceptions (`source stale`, `source wait`) are binding.

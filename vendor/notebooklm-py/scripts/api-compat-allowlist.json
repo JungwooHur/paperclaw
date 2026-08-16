@@ -1,441 +1,196 @@
 {
-  "schema_version": 1,
+  "allowed_breaks": [
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.Account",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.Account, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.GOOGLE_REGIONAL_CCTLDS",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.GOOGLE_REGIONAL_CCTLDS, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.MasterTokenError",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.MasterTokenError, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.build_cookie_jar",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.build_cookie_jar, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.build_httpx_cookies_from_storage",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.build_httpx_cookies_from_storage, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.clear_account_metadata",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.clear_account_metadata, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.cookie_names_from_storage",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.cookie_names_from_storage, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.enumerate_accounts",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.enumerate_accounts, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.exchange_master_token",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.exchange_master_token, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.extract_cookies_from_storage",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.extract_cookies_from_storage, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.extract_cookies_with_domains",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.extract_cookies_with_domains, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.extract_email_from_html",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.extract_email_from_html, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.fetch_tokens_passive",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.fetch_tokens_passive, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.fetch_tokens_with_domains",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.fetch_tokens_with_domains, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.generate_android_id",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.generate_android_id, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.get_account_email_for_storage",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.get_account_email_for_storage, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.get_authuser_for_storage",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.get_authuser_for_storage, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.mint_cookies",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.mint_cookies, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.missing_cookies_hint",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.missing_cookies_hint, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.persist_minted_jar",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.persist_minted_jar, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.read_account_metadata",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.read_account_metadata, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.read_account_metadata_from_storage_state",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.read_account_metadata_from_storage_state, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.read_master_token",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.read_master_token, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.validate_with_recovery",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.validate_with_recovery, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.write_account_metadata",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.write_account_metadata, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "removed-export",
+      "object": "notebooklm.auth.write_master_token",
+      "reason": "De-blessed from notebooklm.auth.__all__ when the module's public surface was pinned to the six names docs/stability.md promises. It was published only because __all__ doubled as the cli/_app cross-boundary import allowlist, never as a documented API. De-advertisement, not removal: still importable as notebooklm.auth.write_master_token, frozen by AUTH_CROSS_BOUNDARY_NAMES in tests/_guardrails/test_public_surface.py."
+    },
+    {
+      "code": "changed-constant-value",
+      "object": "notebooklm.config.DEFAULT_BASE_URL",
+      "reason": "Gemini Notebook rebrand (#2013 / #2067, shipped in #2072): the default app host moved to notebook.google.com while both hosts still serve. Reviewed and documented in CHANGELOG + ADR-0028; NOTEBOOKLM_BASE_URL remains the rollback lever. Surfaced only now because constant VALUES were invisible to this audit."
+    },
+    {
+      "code": "changed-constant-value",
+      "object": "notebooklm.config.PERSONAL_BASE_HOST",
+      "reason": "Gemini Notebook rebrand (#2013 / #2067, shipped in #2072): companion flip to DEFAULT_BASE_URL \u2014 the personal-tier host constant now names notebook.google.com. Same review and rollback lever."
+    },
+    {
+      "code": "changed-constant-value",
+      "object": "notebooklm.auth.REQUIRED_COOKIE_DOMAINS",
+      "reason": "Gemini Notebook rebrand (#2013, shipped in #2020): notebook.google.com and .notebook.google.com joined the required cookie-domain tier because Google sets the per-product binding cookies (OSID / __Secure-OSID) on that host. Additive for the constant's documented use (an extractor allowlist); a narrower set would drop binding cookies and break login."
+    },
+    {
+      "code": "changed-enum-value",
+      "object": "notebooklm.types.ArtifactStatus.PENDING",
+      "reason": "Value changed 2 -> 1. #2127: this client had ArtifactStatus wire codes 1 and 2 transposed relative to Google's backend enum. Code 1 is ARTIFACT_STATUS_INITIALIZED (queued; the worker has not started) and code 2 is ARTIFACT_STATUS_PROCESSING (actively generating) \u2014 confirmed by the recovered enum dump in docs/mobile/enums.txt, by two independent live traces showing 2 -> 3 on a generating artifact, and by a live probe on the fixing branch. The old integers were wrong about the wire rather than a contract worth preserving, so this is a decode correction, not an API redesign. Member NAMES and the status-string vocabulary are unchanged: PENDING has always meant 'queued' and PROCESSING 'actively generating', so callers using .is_pending / .is_processing / .status_str / GenerationState get the correct answer with no change. Only callers comparing the raw integers must flip them. Documented in CHANGELOG.md (with the timeout-exception consequence), docs/stability.md and docs/python-api.md; pinned by tests/_guardrails/_wire_contract.py ENUM_BINDINGS against the backend dump."
+    },
+    {
+      "code": "changed-enum-value",
+      "object": "notebooklm.types.ArtifactStatus.PROCESSING",
+      "reason": "Value changed 1 -> 2. #2127: this client had ArtifactStatus wire codes 1 and 2 transposed relative to Google's backend enum. Code 1 is ARTIFACT_STATUS_INITIALIZED (queued; the worker has not started) and code 2 is ARTIFACT_STATUS_PROCESSING (actively generating) \u2014 confirmed by the recovered enum dump in docs/mobile/enums.txt, by two independent live traces showing 2 -> 3 on a generating artifact, and by a live probe on the fixing branch. The old integers were wrong about the wire rather than a contract worth preserving, so this is a decode correction, not an API redesign. Member NAMES and the status-string vocabulary are unchanged: PENDING has always meant 'queued' and PROCESSING 'actively generating', so callers using .is_pending / .is_processing / .status_str / GenerationState get the correct answer with no change. Only callers comparing the raw integers must flip them. Documented in CHANGELOG.md (with the timeout-exception consequence), docs/stability.md and docs/python-api.md; pinned by tests/_guardrails/_wire_contract.py ENUM_BINDINGS against the backend dump."
+    },
+    {
+      "code": "changed-enum-value",
+      "object": "notebooklm.QuizQuantity.MORE",
+      "reason": "QuizQuantity.MORE was a value-alias of STANDARD (2) with a docstring asserting Google's API could not distinguish the two. That is false: the backend accepts and persists cardQuantity = 3, and both QuizGenerationOptions.QuestionQuantity and FlashcardsGenerationOptions.CardQuantity declare MORE = 3 (docs/mobile/enums.txt). Live-confirmed: a flashcard set generated with quantity=MORE echoed back cardQuantity=3 from the server. Deliberate wire-value correction for #2117 -- '--quantity more' previously produced a standard-sized set with no warning. MORE no longer compares equal to STANDARD; see the ### Changed entry in CHANGELOG.md."
+    },
+    {
+      "code": "changed-enum-value",
+      "object": "notebooklm.types.QuizQuantity.MORE",
+      "reason": "QuizQuantity.MORE was a value-alias of STANDARD (2) with a docstring asserting Google's API could not distinguish the two. That is false: the backend accepts and persists cardQuantity = 3, and both QuizGenerationOptions.QuestionQuantity and FlashcardsGenerationOptions.CardQuantity declare MORE = 3 (docs/mobile/enums.txt). Live-confirmed: a flashcard set generated with quantity=MORE echoed back cardQuantity=3 from the server. Deliberate wire-value correction for #2117 -- '--quantity more' previously produced a standard-sized set with no warning. MORE no longer compares equal to STANDARD; see the ### Changed entry in CHANGELOG.md."
+    },
+    {
+      "code": "changed-signature",
+      "object": "notebooklm.NotebookLMClient",
+      "reason": "#2205: the ``chat_timeout`` default changed from the literal 180.0 to an AUTO_READ_TIMEOUT sentinel meaning \"compose with the client's timeout=\". Behavior is identical for every client whose timeout= is <= 180 s (including the 30 s default): the sentinel resolves to max(DEFAULT_CHAT_TIMEOUT, timeout). It differs only where the old default was actively wrong -- NotebookLMClient(auth, timeout=600) used to be silently clamped back to 180 s for chat with no opt-out. The sentinel is what makes \"caller left it alone\" distinguishable from \"caller explicitly asked for 180\", which is required to keep an explicitly SHORTENED chat_timeout honored rather than raised by a blanket max(). Passing any float or None still behaves exactly as before, so no existing call site changes meaning; only the repr of the unpassed default moved. The same commit also appends a new optional ``import_research_timeout`` parameter to __init__ and from_storage (additive, defaulted, trailing -- not a break on its own). Contract pinned by tests/unit/test_timeout_composition.py and documented in docs/configuration.md."
+    },
+    {
+      "code": "changed-signature",
+      "object": "notebooklm.client.NotebookLMClient",
+      "reason": "#2205: the ``chat_timeout`` default changed from the literal 180.0 to an AUTO_READ_TIMEOUT sentinel meaning \"compose with the client's timeout=\". Behavior is identical for every client whose timeout= is <= 180 s (including the 30 s default): the sentinel resolves to max(DEFAULT_CHAT_TIMEOUT, timeout). It differs only where the old default was actively wrong -- NotebookLMClient(auth, timeout=600) used to be silently clamped back to 180 s for chat with no opt-out. The sentinel is what makes \"caller left it alone\" distinguishable from \"caller explicitly asked for 180\", which is required to keep an explicitly SHORTENED chat_timeout honored rather than raised by a blanket max(). Passing any float or None still behaves exactly as before, so no existing call site changes meaning; only the repr of the unpassed default moved. The same commit also appends a new optional ``import_research_timeout`` parameter to __init__ and from_storage (additive, defaulted, trailing -- not a break on its own). Contract pinned by tests/unit/test_timeout_composition.py and documented in docs/configuration.md."
+    },
+    {
+      "code": "changed-signature",
+      "object": "notebooklm.NotebookLMClient.from_storage",
+      "reason": "#2205: the ``chat_timeout`` default changed from the literal 180.0 to an AUTO_READ_TIMEOUT sentinel meaning \"compose with the client's timeout=\". Behavior is identical for every client whose timeout= is <= 180 s (including the 30 s default): the sentinel resolves to max(DEFAULT_CHAT_TIMEOUT, timeout). It differs only where the old default was actively wrong -- NotebookLMClient(auth, timeout=600) used to be silently clamped back to 180 s for chat with no opt-out. The sentinel is what makes \"caller left it alone\" distinguishable from \"caller explicitly asked for 180\", which is required to keep an explicitly SHORTENED chat_timeout honored rather than raised by a blanket max(). Passing any float or None still behaves exactly as before, so no existing call site changes meaning; only the repr of the unpassed default moved. The same commit also appends a new optional ``import_research_timeout`` parameter to __init__ and from_storage (additive, defaulted, trailing -- not a break on its own). Contract pinned by tests/unit/test_timeout_composition.py and documented in docs/configuration.md."
+    },
+    {
+      "code": "changed-signature",
+      "object": "notebooklm.client.NotebookLMClient.from_storage",
+      "reason": "#2205: the ``chat_timeout`` default changed from the literal 180.0 to an AUTO_READ_TIMEOUT sentinel meaning \"compose with the client's timeout=\". Behavior is identical for every client whose timeout= is <= 180 s (including the 30 s default): the sentinel resolves to max(DEFAULT_CHAT_TIMEOUT, timeout). It differs only where the old default was actively wrong -- NotebookLMClient(auth, timeout=600) used to be silently clamped back to 180 s for chat with no opt-out. The sentinel is what makes \"caller left it alone\" distinguishable from \"caller explicitly asked for 180\", which is required to keep an explicitly SHORTENED chat_timeout honored rather than raised by a blanket max(). Passing any float or None still behaves exactly as before, so no existing call site changes meaning; only the repr of the unpassed default moved. The same commit also appends a new optional ``import_research_timeout`` parameter to __init__ and from_storage (additive, defaulted, trailing -- not a break on its own). Contract pinned by tests/unit/test_timeout_composition.py and documented in docs/configuration.md."
+    }
+  ],
   "extra_public_names": {
     "notebooklm": [
       "configure_logging",
       "DEFAULT_STORAGE_PATH"
     ]
   },
-  "allowed_breaks": [
-    {
-      "code": "removed-export",
-      "object": "notebooklm.DEFAULT_STORAGE_PATH",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacement is notebooklm.paths.get_storage_path()."
-    },
-    {
-      "code": "removed-export",
-      "object": "notebooklm.StudioContentType",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacement is notebooklm.ArtifactType."
-    },
-    {
-      "code": "removed-export",
-      "object": "notebooklm.rpc.StudioContentType",
-      "reason": "v0.3-era raw-code alias removal completed in v0.5.0; replacement is notebooklm.ArtifactType for public code."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.Artifact.artifact_type",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacement is Artifact.kind."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.Artifact.variant",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacements are Artifact.kind, Artifact.is_quiz, and Artifact.is_flashcards."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.Source.source_type",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacement is Source.kind."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.SourceFulltext.source_type",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacement is SourceFulltext.kind."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.types.Artifact.artifact_type",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacement is Artifact.kind."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.types.Artifact.variant",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacements are Artifact.kind, Artifact.is_quiz, and Artifact.is_flashcards."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.types.Source.source_type",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacement is Source.kind."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.types.SourceFulltext.source_type",
-      "reason": "v0.3-era deprecation completed in v0.5.0; replacement is SourceFulltext.kind."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.Note.from_api_response",
-      "reason": "Dead positional parser removed (#1389). Note rows are decoded through notebooklm._row_adapters.notes.NoteRow; the classmethod had no production callers (only test_types.py exercised it). Construct Note(...) directly from NoteRow's named properties \u2014 see NotesAPI._parse_note."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.types.Note.from_api_response",
-      "reason": "Same break as notebooklm.Note.from_api_response above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_audio",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_cinematic_video",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_data_table",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_infographic",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_mind_map",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_report",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_slide_deck",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_study_guide",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_video",
-      "reason": "v0.5.0 changed omitted artifact-generation language from a hard-coded 'en' default to the runtime NOTEBOOKLM_HL/config/default resolver; pass language='en' for fixed English."
-    },
-    {
-      "code": "removed-enum-member",
-      "object": "notebooklm.rpc.RPCMethod.DISCOVER_SOURCES",
-      "reason": "v0.5.0 removed an unused raw RPC enum member that is not exercised by any client API."
-    },
-    {
-      "code": "removed-enum-member",
-      "object": "notebooklm.rpc.RPCMethod.QUERY_ENDPOINT",
-      "reason": "v0.5.0 moved the streamed-chat endpoint path out of RPCMethod because it is an endpoint URL path, not a batchexecute RPC method; use notebooklm.rpc.get_query_url()."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.rpc_call",
-      "reason": "v0.5.0 DeprecationWarning cycle completed in v0.6.0: kwarg 'source_path' was removed from the public escape-hatch wrapper. Internal-only kwargs '_is_retry' and 'operation_variant' were removed alongside but are not audit-visible (underscored). Default-shape callers (client.rpc_call(method, params)) see no behavior change since the canonical defaults still flow through RpcExecutor.rpc_call. See docs/deprecations.md 'Removed in v0.6.0' and CHANGELOG.md [0.6.0] for migration."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.client.NotebookLMClient.rpc_call",
-      "reason": "Same break as notebooklm.NotebookLMClient.rpc_call above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.artifacts.wait_for_completion",
-      "reason": "v0.5.0 DeprecationWarning cycle completed: the deprecated 'poll_interval' alias was removed; use 'initial_interval' (same cadence). Passing 'poll_interval' now raises TypeError. See docs/deprecations.md 'Removed in v0.7.0' and CHANGELOG.md [Unreleased]."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.client.NotebookLMClient.artifacts.wait_for_completion",
-      "reason": "Same break as notebooklm.NotebookLMClient.artifacts.wait_for_completion above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.sources.add_url",
-      "reason": "v0.5.0 DeprecationWarning cycle completed: the positional-wait compatibility shim (*legacy_wait_args) was removed and 'wait'/'wait_timeout' are now keyword-only. Default-shape callers are unaffected; positional wait callers must switch to wait=/wait_timeout=. See docs/deprecations.md 'Removed in v0.7.0' and CHANGELOG.md [Unreleased]."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.client.NotebookLMClient.sources.add_url",
-      "reason": "Same break as notebooklm.NotebookLMClient.sources.add_url above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.sources.add_text",
-      "reason": "v0.5.0 DeprecationWarning cycle completed: the positional-wait compatibility shim (*legacy_wait_args) was removed and 'wait'/'wait_timeout' are now keyword-only. Default-shape callers are unaffected; positional wait callers must switch to wait=/wait_timeout=. See docs/deprecations.md 'Removed in v0.7.0' and CHANGELOG.md [Unreleased]."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.client.NotebookLMClient.sources.add_text",
-      "reason": "Same break as notebooklm.NotebookLMClient.sources.add_text above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.sources.add_file",
-      "reason": "v0.5.0 DeprecationWarning cycle completed: the positional-wait compatibility shim (*legacy_wait_args) was removed and 'wait'/'wait_timeout' are now keyword-only. The functional 'mime_type' parameter is retained (it sets the upload content-type). Default-shape callers are unaffected; positional wait callers must switch to wait=/wait_timeout=. See docs/deprecations.md 'Removed in v0.7.0' and CHANGELOG.md [Unreleased]."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.client.NotebookLMClient.sources.add_file",
-      "reason": "Same break as notebooklm.NotebookLMClient.sources.add_file above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.NotebookLMClient.sources.add_drive",
-      "reason": "v0.5.0 DeprecationWarning cycle completed: the positional-wait compatibility shim (*legacy_wait_args) was removed and 'wait'/'wait_timeout' are now keyword-only. The 'mime_type' positional parameter (Drive document MIME type) is retained. Default-shape callers are unaffected; positional wait callers must switch to wait=/wait_timeout=. See docs/deprecations.md 'Removed in v0.7.0' and CHANGELOG.md [Unreleased]."
-    },
-    {
-      "code": "changed-signature",
-      "object": "notebooklm.client.NotebookLMClient.sources.add_drive",
-      "reason": "Same break as notebooklm.NotebookLMClient.sources.add_drive above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.NotebookLMClient.notes.create_from_chat",
-      "reason": "v0.5.0 DeprecationWarning cycle completed (two MINOR cycles: 0.5.0 and 0.6.0); the deprecated NotesAPI.create_from_chat forwarder was removed. Replacement is client.chat.save_answer_as_note(...), the canonical citation-rich saved-from-chat method and data owner (ADR-0013). Behavior is identical; only the call site moves. See docs/deprecations.md 'Removed in v0.7.0' and CHANGELOG.md."
-    },
-    {
-      "code": "removed-member",
-      "object": "notebooklm.client.NotebookLMClient.notes.create_from_chat",
-      "reason": "Same break as notebooklm.NotebookLMClient.notes.create_from_chat above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.artifacts.generate_mind_map",
-      "reason": "v0.7.0 #1209: now returns the typed MindMapResult dataclass instead of dict[str, Any]. MappingCompatMixin preserves dict-subscript access (warned, dropped in v0.8.0). See CHANGELOG.md [Unreleased] 'Added' and docs/deprecations.md."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.artifacts.generate_mind_map",
-      "reason": "Same break as notebooklm.NotebookLMClient.artifacts.generate_mind_map above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.research.poll",
-      "reason": "v0.7.0 #1209: now returns the typed ResearchTask dataclass instead of dict[str, Any]. MappingCompatMixin preserves dict-subscript access (warned, dropped in v0.8.0). See CHANGELOG.md [Unreleased] 'Added' and docs/deprecations.md."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.research.poll",
-      "reason": "Same break as notebooklm.NotebookLMClient.research.poll above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.research.start",
-      "reason": "v0.7.0 #1209: now returns the typed ResearchStart | None dataclass instead of dict[str, Any] | None. MappingCompatMixin preserves dict-subscript access (warned, dropped in v0.8.0). See CHANGELOG.md [Unreleased] 'Added' and docs/deprecations.md."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.research.start",
-      "reason": "Same break as notebooklm.NotebookLMClient.research.start above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.research.wait_for_completion",
-      "reason": "v0.7.0 #1209: now returns the typed ResearchTask dataclass instead of dict[str, Any]. MappingCompatMixin preserves dict-subscript access (warned, dropped in v0.8.0). See CHANGELOG.md [Unreleased] 'Added' and docs/deprecations.md."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.research.wait_for_completion",
-      "reason": "Same break as notebooklm.NotebookLMClient.research.wait_for_completion above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.sources.get_guide",
-      "reason": "v0.7.0 #1209: now returns the typed SourceGuide dataclass instead of dict[str, Any]. MappingCompatMixin preserves dict-subscript access (warned, dropped in v0.8.0). See CHANGELOG.md [Unreleased] 'Added' and docs/deprecations.md."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.sources.get_guide",
-      "reason": "Same break as notebooklm.NotebookLMClient.sources.get_guide above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.artifacts.delete",
-      "reason": "v0.7.0 #1211: delete() now returns None and is absence-idempotent (was bool). See CHANGELOG.md [Unreleased] 'delete() -> returns None, idempotent on a missing target'."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.artifacts.delete",
-      "reason": "Same break as notebooklm.NotebookLMClient.artifacts.delete above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.notebooks.delete",
-      "reason": "v0.7.0 #1211: delete() now returns None and is absence-idempotent (was bool). See CHANGELOG.md [Unreleased] 'delete() -> returns None, idempotent on a missing target'."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.notebooks.delete",
-      "reason": "Same break as notebooklm.NotebookLMClient.notebooks.delete above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.notes.delete",
-      "reason": "v0.7.0 #1211: delete() now returns None and is absence-idempotent (was bool). See CHANGELOG.md [Unreleased] 'delete() -> returns None, idempotent on a missing target'."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.notes.delete",
-      "reason": "Same break as notebooklm.NotebookLMClient.notes.delete above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.notes.delete_mind_map",
-      "reason": "v0.7.0 #1211: delete_mind_map() now returns None and is absence-idempotent (was bool). See CHANGELOG.md [Unreleased] 'delete() -> returns None, idempotent on a missing target'."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.notes.delete_mind_map",
-      "reason": "Same break as notebooklm.NotebookLMClient.notes.delete_mind_map above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.sources.delete",
-      "reason": "v0.7.0 #1211: delete() now returns None and is absence-idempotent (was bool). See CHANGELOG.md [Unreleased] 'delete() -> returns None, idempotent on a missing target'."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.sources.delete",
-      "reason": "Same break as notebooklm.NotebookLMClient.sources.delete above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.artifacts.rename",
-      "reason": "v0.7.0 #1247: rename() now re-fetches and returns the renamed Artifact | None (previously returned None even on success, an unusable return). Bulk opt-out via return_object=False. See CHANGELOG.md [Unreleased] 'rename() returns the renamed object'."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.artifacts.rename",
-      "reason": "Same break as notebooklm.NotebookLMClient.artifacts.rename above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.NotebookLMClient.sources.rename",
-      "reason": "v0.7.0 #1247: rename() return annotation widened from Source to Source | None to match the missing-strict reads/renames contract. Bulk opt-out via return_object=False. See CHANGELOG.md [Unreleased] 'rename() returns the renamed object'."
-    },
-    {
-      "code": "changed-return",
-      "object": "notebooklm.client.NotebookLMClient.sources.rename",
-      "reason": "Same break as notebooklm.NotebookLMClient.sources.rename above; this entry covers the audit's dotted-module-path view of the same callable."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.VideoStyle.CUSTOM",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.VideoStyle.CLASSIC",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.VideoStyle.WHITEBOARD",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.VideoStyle.KAWAII",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.VideoStyle.ANIME",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.VideoStyle.WATERCOLOR",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.VideoStyle.HERITAGE",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.VideoStyle.PAPER_CRAFT",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.rpc.VideoStyle.CUSTOM",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.rpc.VideoStyle.CLASSIC",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.rpc.VideoStyle.WHITEBOARD",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.rpc.VideoStyle.KAWAII",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.rpc.VideoStyle.ANIME",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.rpc.VideoStyle.WATERCOLOR",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.rpc.VideoStyle.HERITAGE",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.rpc.VideoStyle.PAPER_CRAFT",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.types.VideoStyle.CUSTOM",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.types.VideoStyle.CLASSIC",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.types.VideoStyle.WHITEBOARD",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.types.VideoStyle.KAWAII",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.types.VideoStyle.ANIME",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.types.VideoStyle.WATERCOLOR",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.types.VideoStyle.HERITAGE",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    },
-    {
-      "code": "changed-enum-value",
-      "object": "notebooklm.types.VideoStyle.PAPER_CRAFT",
-      "reason": "v0.7.2 #1594: VideoStyle wire values were stale and generated the wrong NotebookLM video style. Updated to match live Web UI captures (backport of #1597); see CHANGELOG.md."
-    }
-  ]
+  "schema_version": 1
 }

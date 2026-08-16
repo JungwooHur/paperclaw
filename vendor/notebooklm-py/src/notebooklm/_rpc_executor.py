@@ -14,9 +14,10 @@ from urllib.parse import urlencode
 
 import httpx
 
+from ._auth.account import format_authuser_value
 from ._auth_refresh_retry import RefreshBudget, refresh_and_count
 from ._deadline import RuntimeDeadline
-from ._env import get_default_language
+from ._env import get_base_url, get_default_language
 from ._idempotency import (
     IDEMPOTENCY_REGISTRY,
     resolve_effective_disable_internal_retries,
@@ -29,7 +30,7 @@ from ._transport_errors import (
     TransportServerError,
     parse_retry_after,
 )
-from .auth import format_authuser_value
+from .exceptions import DecodingError
 from .rpc import (
     ClientError,
     NetworkError,
@@ -54,8 +55,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _error_host_suffix(request: httpx.Request | None) -> str:
+    """Return ``" on <host>"`` for an error message, or ``""`` if no host is known.
+
+    The host is taken from the request that actually failed rather than re-read
+    from the environment. ``NOTEBOOKLM_BASE_URL`` is resolved lazily on every
+    endpoint build, so in a long-running process a re-point while an RPC is in
+    flight would otherwise make the message name a host this failure never
+    touched -- and a re-point to an *invalid* value would raise ``ValueError``
+    out of the ``except`` block, masking the HTTP error entirely.
+
+    The configured base URL is only a fallback, for the paths where no request
+    object survived. It degrades to an unsuffixed message rather than raising:
+    an error mapper must never fail in place of the error it is reporting.
+    """
+    host = request.url.host if request is not None else ""
+    if not host:
+        try:
+            host = httpx.URL(get_base_url()).host
+        except (ValueError, httpx.InvalidURL):
+            return ""
+    return f" on {host}" if host else ""
+
+
 class DecodeResponse(Protocol):
-    def __call__(self, raw: str, rpc_id: str, *, allow_null: bool = False) -> Any: ...
+    def __call__(
+        self,
+        raw: str,
+        rpc_id: str,
+        *,
+        allow_null: bool = False,
+        raise_on_null_status: bool = False,
+    ) -> Any: ...
 
 
 class RpcExecutor:
@@ -101,6 +132,8 @@ class RpcExecutor:
         *,
         disable_internal_retries: bool = False,
         operation_variant: str | None = None,
+        read_timeout: float | None = None,
+        raise_on_null_status: bool = False,
         _refresh_budget: RefreshBudget | None = None,
         _retry_deadline: RuntimeDeadline | None = None,
     ) -> Any:
@@ -137,6 +170,20 @@ class RpcExecutor:
         ``_refresh_budget`` it is internal-only and minted once per logical
         call; threading it through the recursion keeps the budget anchored to
         the original start time rather than resetting it on the retry leg.
+
+        ``read_timeout`` (default ``None``) overrides the client-wide
+        ``timeout_provider`` read window for this one logical call — the same
+        per-call escape hatch chat already uses on
+        ``RuntimeTransport.perform_authed_post`` (see ``_chat/transport.py``).
+        ``None`` inherits the client default, so callers that omit it are
+        unaffected.
+
+        ``raise_on_null_status`` (default ``False``) only matters alongside
+        ``allow_null=True``: it tells the decoder that a null result the server
+        tagged with a non-OK ``google.rpc.Status`` is a rejection to raise on,
+        not an empty-but-acceptable payload to swallow. See
+        :func:`notebooklm.rpc.decoder.decode_response` for why it is opt-in per
+        call site (#2188).
         """
         # Pre-open guard — preserves the historical ``RuntimeError`` surface by
         # routing through ``Kernel.get_http_client()`` (which raises the same
@@ -150,8 +197,8 @@ class RpcExecutor:
         # (``_is_retry=True``) inherits the parent's id so a single
         # decode-error → refresh → retry sequence appears under one
         # ``[req=<id>]`` in the logs. HTTP-status retries (auth + 429) happen
-        # inside ``_perform_authed_post`` without recursion, so they don't
-        # need this guard.
+        # inside ``RuntimeTransport.perform_authed_post`` without recursion, so
+        # they don't need this guard.
         if _is_retry:
             return await self._execute_once(
                 method,
@@ -161,6 +208,8 @@ class RpcExecutor:
                 _is_retry,
                 disable_internal_retries=disable_internal_retries,
                 operation_variant=operation_variant,
+                read_timeout=read_timeout,
+                raise_on_null_status=raise_on_null_status,
                 _refresh_budget=_refresh_budget,
                 _retry_deadline=_retry_deadline,
             )
@@ -182,6 +231,8 @@ class RpcExecutor:
                 _is_retry,
                 disable_internal_retries=disable_internal_retries,
                 operation_variant=operation_variant,
+                read_timeout=read_timeout,
+                raise_on_null_status=raise_on_null_status,
                 _refresh_budget=_refresh_budget,
                 _retry_deadline=_retry_deadline,
             )
@@ -199,6 +250,8 @@ class RpcExecutor:
         *,
         disable_internal_retries: bool = False,
         operation_variant: str | None = None,
+        read_timeout: float | None = None,
+        raise_on_null_status: bool = False,
         _refresh_budget: RefreshBudget | None = None,
         _retry_deadline: RuntimeDeadline | None = None,
     ) -> Any:
@@ -258,6 +311,8 @@ class RpcExecutor:
                 disable_internal_retries=effective_disable_internal_retries,
                 rpc_method=method.name,
                 refresh_budget=_refresh_budget,
+                retry_deadline=_retry_deadline,
+                read_timeout=read_timeout,
             )
         except TransportAuthExpired as exc:
             # Preserve the historical raw transport exception on refresh failure.
@@ -265,7 +320,13 @@ class RpcExecutor:
         except TransportRateLimited as exc:
             elapsed = time.perf_counter() - start
             logger.error("RPC %s failed after %.3fs: HTTP 429", method.name, elapsed)
-            msg = f"API rate limit exceeded calling {method.name}"
+            # This branch -- not the 429 arm of ``raise_rpc_error_from_http_status``
+            # -- is what a real HTTP 429 reaches: the transport converts it to
+            # ``TransportRateLimited`` once the retry budget is exhausted, or
+            # immediately when retries are disabled. It carries the same host
+            # suffix so the two 429 paths stay indistinguishable to the user.
+            on_host = _error_host_suffix(exc.original.request)
+            msg = f"API rate limit exceeded calling {method.name}{on_host}"
             if exc.retry_after:
                 msg += f". Retry after {exc.retry_after} seconds"
             raise RateLimitError(
@@ -291,7 +352,9 @@ class RpcExecutor:
                     elapsed,
                     exc.original,
                 )
-                self.raise_rpc_error_from_request_error(exc.original, method)
+                self.raise_rpc_error_from_request_error(
+                    exc.original, method, read_timeout=read_timeout
+                )
 
             raise TypeError(
                 f"Unexpected TransportServerError.original type: {type(exc.original)}"
@@ -307,7 +370,12 @@ class RpcExecutor:
             self.raise_rpc_error_from_http_status(exc, method)
 
         try:
-            result = self._decode_response(response.text, resolved_id, allow_null=allow_null)
+            result = self._decode_response(
+                response.text,
+                resolved_id,
+                allow_null=allow_null,
+                raise_on_null_status=raise_on_null_status,
+            )
             elapsed = time.perf_counter() - start
             logger.debug("RPC %s completed in %.3fs", method.name, elapsed)
             return result
@@ -348,10 +416,23 @@ class RpcExecutor:
                     exc,
                     disable_internal_retries=disable_internal_retries,
                     operation_variant=operation_variant,
+                    read_timeout=read_timeout,
+                    raise_on_null_status=raise_on_null_status,
                     _refresh_budget=_refresh_budget,
                     _retry_deadline=_retry_deadline,
                 )
                 return refreshed
+
+            # Count only genuine wire-schema drift, not every decoded
+            # ``RPCError``. ``DecodingError`` (and its ``UnknownRPCMethodError``
+            # subclass, e.g. from ``safe_index``) means "Google reshaped a
+            # response"; a decoded ``RateLimitError`` / ``AuthError`` /
+            # ``*NotFoundError`` is a semantic outcome, not drift, and must not
+            # inflate the drift signal. This is the surfaced leg only — a decode
+            # error recovered by the refresh-and-retry above returns before
+            # reaching here, so it is correctly not counted.
+            if isinstance(exc, DecodingError):
+                self._metrics.increment(rpc_decode_errors=1)
 
             error_details = [type(exc).__name__]
             if exc.rpc_code is not None:
@@ -377,6 +458,12 @@ class RpcExecutor:
             # this guard exists to remove.
             elapsed = time.perf_counter() - start
             logger.error("RPC %s failed after %.3fs: %s", method.name, elapsed, exc)
+            # Genuine shape drift: a malformed body or a missing key/index in
+            # the decoded payload. Count it under the dedicated drift signal
+            # before re-raising as ``RPCError`` (the wrap is the executor's
+            # single decode-boundary, so this is the one site for the wrapped
+            # case — symmetric with the surfaced ``DecodingError`` leg above).
+            self._metrics.increment(rpc_decode_errors=1)
             raise RPCError(
                 f"Failed to decode response for {method.name}: {exc}",
                 method_id=method.value,
@@ -410,32 +497,45 @@ class RpcExecutor:
         exc: httpx.HTTPStatusError,
         method: RPCMethod,
     ) -> NoReturn:
-        """Map an HTTP-status failure onto the RPC error hierarchy."""
+        """Map an HTTP-status failure onto the RPC error hierarchy.
+
+        Every message names the **host** as well as the method -- including the
+        401/403 fallback, which is where a wrong-host session is just as likely
+        to land. Google serves the personal app from two hosts
+        (``notebooklm.google.com`` and, since the Gemini Notebook rebrand,
+        ``notebook.google.com`` -- see ADR-0028), and ``NOTEBOOKLM_BASE_URL``
+        selects between them. Without the host in the message, "talking to the
+        wrong host" and "this account cannot see that notebook" are the same 404
+        to a user, and the only recovery lever is one they cannot tell they need.
+        """
         status = exc.response.status_code
+        on_host = _error_host_suffix(exc.request)
 
         if status == 429:
             retry_after = parse_retry_after(exc.response.headers.get("retry-after"))
-            msg = f"API rate limit exceeded calling {method.name}"
+            msg = f"API rate limit exceeded calling {method.name}{on_host}"
             if retry_after:
                 msg += f". Retry after {retry_after} seconds"
             raise RateLimitError(msg, method_id=method.value, retry_after=retry_after) from exc
 
         if 500 <= status < 600:
             raise ServerError(
-                f"Server error {status} calling {method.name}: {exc.response.reason_phrase}",
+                f"Server error {status} calling {method.name}{on_host}: "
+                f"{exc.response.reason_phrase}",
                 method_id=method.value,
                 status_code=status,
             ) from exc
 
         if 400 <= status < 500 and status not in (401, 403):
             raise ClientError(
-                f"Client error {status} calling {method.name}: {exc.response.reason_phrase}",
+                f"Client error {status} calling {method.name}{on_host}: "
+                f"{exc.response.reason_phrase}",
                 method_id=method.value,
                 status_code=status,
             ) from exc
 
         raise RPCError(
-            f"HTTP {status} calling {method.name}: {exc.response.reason_phrase}",
+            f"HTTP {status} calling {method.name}{on_host}: {exc.response.reason_phrase}",
             method_id=method.value,
         ) from exc
 
@@ -443,8 +543,17 @@ class RpcExecutor:
         self,
         exc: httpx.RequestError,
         method: RPCMethod,
+        *,
+        read_timeout: float | None = None,
     ) -> NoReturn:
-        """Map a non-status transport failure onto NetworkError/RPCTimeoutError."""
+        """Map a non-status transport failure onto NetworkError/RPCTimeoutError.
+
+        ``read_timeout`` (default ``None``) reports the actual per-call read
+        budget in ``RPCTimeoutError.timeout_seconds`` when the caller overrode
+        it (e.g. IMPORT_RESEARCH's batch-scaled budget, #2187) — otherwise a
+        timeout at a widened budget would misreport the unwidened client
+        default.
+        """
         if isinstance(exc, httpx.ConnectTimeout):
             raise NetworkError(
                 f"Connection timed out calling {method.name}: {exc}",
@@ -456,7 +565,9 @@ class RpcExecutor:
             raise RPCTimeoutError(
                 f"Request timed out calling {method.name}",
                 method_id=method.value,
-                timeout_seconds=self._timeout_provider(),
+                timeout_seconds=read_timeout
+                if read_timeout is not None
+                else self._timeout_provider(),
                 original_error=exc,
             ) from exc
 
@@ -483,6 +594,8 @@ class RpcExecutor:
         *,
         disable_internal_retries: bool = False,
         operation_variant: str | None = None,
+        read_timeout: float | None = None,
+        raise_on_null_status: bool = False,
         _refresh_budget: RefreshBudget,
         _retry_deadline: RuntimeDeadline | None = None,
     ) -> Any | None:
@@ -519,6 +632,12 @@ class RpcExecutor:
         recursion keeps the same anchored deadline. ``None`` reproduces the
         historical unclamped sleep and unconditional retry (e.g. when
         ``timeout_provider`` yields a ``None`` / non-finite timeout).
+
+        ``read_timeout`` is threaded into the retry :meth:`rpc_call` too
+        (#2187 codex review): without this, a call widened via ``read_timeout``
+        (e.g. IMPORT_RESEARCH) would silently fall back to the client-wide
+        default on its post-refresh retry leg, undermining the wider budget
+        it was explicitly given.
         """
         await refresh_and_count(
             refresh=self._auth_refresh.await_refresh,
@@ -550,6 +669,8 @@ class RpcExecutor:
             _is_retry=True,
             disable_internal_retries=disable_internal_retries,
             operation_variant=operation_variant,
+            read_timeout=read_timeout,
+            raise_on_null_status=raise_on_null_status,
             _refresh_budget=_refresh_budget,
             _retry_deadline=_retry_deadline,
         )

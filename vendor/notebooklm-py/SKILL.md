@@ -27,8 +27,15 @@ fi
 
 **From GitHub (use latest release tag, NOT main branch):**
 ```bash
-# Get the latest release tag (using curl)
-LATEST_TAG=$(curl -s https://api.github.com/repos/teng-lin/notebooklm-py/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+# Get the latest release tag (requires curl + jq)
+if ! command -v jq >/dev/null; then
+    echo "jq is required to read the latest release tag" >&2
+    exit 1
+fi
+LATEST_TAG=$(
+    curl -fsSL https://api.github.com/repos/teng-lin/notebooklm-py/releases/latest |
+    jq -r '.tag_name'
+)
 # Includes [browser] so the interactive `notebooklm login` flow works.
 pip install "notebooklm-py[browser] @ git+https://github.com/teng-lin/notebooklm-py@${LATEST_TAG}"
 ```
@@ -74,10 +81,36 @@ For automated environments, multiple accounts, or parallel agent workflows:
 **Parallel agents:** The CLI stores notebook context per profile (`~/.notebooklm/profiles/<profile>/context.json`, with a legacy fallback to `~/.notebooklm/context.json` for the implicit default profile). Multiple concurrent agents that share a profile and use `notebooklm use` can overwrite each other's context — use one of the isolation strategies below.
 
 **Solutions for parallel workflows:**
-1. **Always use explicit notebook ID** (recommended): Pass `-n <notebook_id>` (for `wait`/`download` commands) or `--notebook <notebook_id>` (for others) instead of relying on `use`
+1. **Always use explicit notebook ID** (recommended): Pass `-n <notebook_id>` / `--notebook <notebook_id>` on notebook-scoped commands instead of relying on `use`
 2. **Per-agent isolation via profiles:** `export NOTEBOOKLM_PROFILE=agent-$ID` (each profile gets its own context file)
 3. **Per-agent isolation via home:** Set unique `NOTEBOOKLM_HOME` per agent: `export NOTEBOOKLM_HOME=/tmp/agent-$ID`
 4. **Use full UUIDs:** Avoid partial IDs in automation (they can become ambiguous)
+
+### Sandboxed Agents (Claude Cowork / Headless)
+
+Sandboxed, no-display agent environments — **Claude Cowork** (Anthropic's desktop agent for non-developers) and similar headless sandboxes — can't run `notebooklm login` (it needs a browser), and they reset between sessions. Everything else works with two adjustments:
+
+1. **Bootstrap each session.** The sandbox resets, so install at the start of every session. You do **not** need `[browser]`/Playwright here — that extra exists only for the interactive `login` flow, which you run on a host machine, not in the sandbox. Chat, sources, generation, and download all run on the base install:
+   ```bash
+   pip install notebooklm-py   # no [browser] needed for queries/generation
+   ```
+   (This is the one place the mandatory `[browser]` install at the top of this file does not apply — you are reusing auth, not logging in here.)
+2. **Reuse a host-generated `storage_state.json`.** Log in once on a machine with a display (`notebooklm login`), then bring the resulting `storage_state.json` into a sandbox-accessible folder and point at it either way:
+   ```bash
+   # Per-invocation root flag (a persistent, sandbox-accessible path):
+   notebooklm --storage /path/to/storage_state.json list
+   # OR inline via env var (no file needed — e.g. from a Cowork-stored secret):
+   export NOTEBOOKLM_AUTH_JSON="$(cat /path/to/storage_state.json)"
+   notebooklm list
+   ```
+
+   > ⚠️ **`storage_state.json` / `NOTEBOOKLM_AUTH_JSON` are bearer credentials** — anyone holding them can act as your Google account. Keep the file `0600`, load it from the sandbox's secret store rather than a committed file, never print or log it, and `unset NOTEBOOKLM_AUTH_JSON` when finished.
+
+**Verify** as in [Agent Setup Verification](#agent-setup-verification) below — e.g. `notebooklm --storage <path> auth check --test --json` (require `"status": "ok"` AND `"checks.token_fetch": true`).
+
+**Context does not survive a reset** either: the selected-notebook context (`context.json`) is gone each session, so pass an explicit `-n/--notebook <id>` on notebook-scoped commands instead of relying on `notebooklm use`.
+
+If Cowork reads `~/.claude/skills/`, `notebooklm skill install` registers this skill there automatically; otherwise build the uploadable archive on the host with `notebooklm skill package` (writes `notebooklm-skill.zip`) and add it via **Claude Settings → Capabilities**. Full recipe (extras matrix, headless auth, CI env-var notes): [installation.md § AI Agent](https://github.com/teng-lin/notebooklm-py/blob/main/docs/installation.md#a-ai-agent-primary-persona).
 
 ## Agent Setup Verification
 
@@ -133,6 +166,7 @@ Before starting workflows, verify auth is in place. **Use `--test --json` (not b
 - `notebooklm use <id>` - set context (⚠️ SINGLE-AGENT ONLY - use `-n` flag in parallel workflows)
 - `notebooklm create` - create notebook
 - `notebooklm ask "..."` - chat queries (without `--save-as-note`)
+- `notebooklm suggest-prompts` - AI-suggested prompts for a notebook (read-only, no state change)
 - `notebooklm history` - display conversation history (read-only)
 - `notebooklm source add` - add sources
 - `notebooklm profile list` - list profiles
@@ -141,12 +175,13 @@ Before starting workflows, verify auth is in place. **Use `--test --json` (not b
 - `notebooklm doctor` - check environment health
 
 **Ask before running:**
-- `notebooklm delete` / `source delete` / `note delete` / `share remove` / `profile delete` - destructive. Once approved, pass `--yes`/`-y` to skip the confirmation prompt (uniform across every destructive command). On the commands that also expose `--json` (e.g. `delete`, `source delete`, `note delete`, `share remove`), `--json` implies `--yes` so non-interactive callers never hang on the prompt; `profile delete` has no `--json`, so pass `--yes` explicitly there.
+- `notebooklm delete`, `source delete`, `source delete-by-title`, `source clean`, `note delete`, `artifact delete`, `label delete`, `share remove`, `auth logout`, `clear`, `profile delete`, or `ask --new` - destructive or state-changing. Once approved, pass `--yes`/`-y` where the command supports it. Most destructive `--json` commands still require explicit `--yes` and otherwise return a structured confirmation error (`CONFIRM_REQUIRED` or `VALIDATION_ERROR`, depending on the command family); current exceptions include `share remove --json` and `ask --new --json`, which skip the prompt for non-interactive callers.
 - `notebooklm generate *` - long-running, may fail
 - `notebooklm download *` - writes to filesystem
 - `notebooklm artifact wait` - long-running (when in main conversation)
 - `notebooklm source wait` - long-running (when in main conversation)
 - `notebooklm research wait` - long-running (when in main conversation)
+- `notebooklm research cancel <run_id>` - state-changing; cancels a running research job (an in-progress job transitions to FAILED). Fire-and-forget: it does not confirm success — re-check with `notebooklm research status`.
 - `notebooklm ask "..." --save-as-note` - writes a note
 - `notebooklm history --save` - writes a note
 
@@ -175,14 +210,24 @@ Before starting workflows, verify auth is in place. **Use `--test --json` (not b
 | Add file | `notebooklm source add ./file.pdf` |
 | Add YouTube | `notebooklm source add "https://youtube.com/..."` |
 | List sources | `notebooklm source list` |
+| List sources in a label | `notebooklm source list --label <label_id_or_name>` |
 | Delete source by ID | `notebooklm source delete <source_id>` |
 | Delete source by exact title | `notebooklm source delete-by-title "Exact Title"` |
 | Wait for source processing | `notebooklm source wait <source_id>` |
+| List labels | `notebooklm label list` |
+| Expand label to sources | `notebooklm label sources <label_id_or_name>` |
+| Generate labels | `notebooklm label generate --scope unlabeled` |
+| Create label | `notebooklm label create "Topic"` |
+| Add sources to label | `notebooklm label add <label_id_or_name> <source_id>...` |
+| Remove sources from label | `notebooklm label remove <label_id_or_name> <source_id>...` |
+| Delete label | `notebooklm label delete <label_id_or_name> --yes` |
 | Web research (fast) | `notebooklm source add-research "query"` |
 | Web research (deep) | `notebooklm source add-research "query" --mode deep --no-wait` |
 | Web research (query from file) | `notebooklm source add-research --prompt-file research_query.txt --mode deep` |
 | Check research status | `notebooklm research status` |
 | Wait for research | `notebooklm research wait --import-all` |
+| Cancel research | `notebooklm research cancel <run_id>` (run_id = the `task_id` from `research status`) |
+| Suggest questions to ask | `notebooklm suggest-prompts` |
 | Chat | `notebooklm ask "question"` |
 | Chat (long prompt from file) | `notebooklm ask --prompt-file question.txt` |
 | Chat (specific sources) | `notebooklm ask "question" -s src_id1 -s src_id2` |
@@ -206,7 +251,8 @@ Before starting workflows, verify auth is in place. **Use `--test --json` (not b
 | Revise a slide | `notebooklm generate revise-slide "prompt" --artifact <id> --slide 0` |
 | Check artifact status | `notebooklm artifact list` |
 | Wait for completion | `notebooklm artifact wait <artifact_id>` |
-| Download audio | `notebooklm download audio ./output.mp3` |
+| Delete artifact | `notebooklm artifact delete <artifact_id> --yes` |
+| Download audio | `notebooklm download audio ./output.m4a` |
 | Download video | `notebooklm download video ./output.mp4` |
 | Download cinematic video | `notebooklm download cinematic-video ./cinematic.mp4` (alias for `download video`) |
 | Download infographic | `notebooklm download infographic ./infographic.png` |
@@ -232,7 +278,7 @@ Before starting workflows, verify auth is in place. **Use `--test --json` (not b
 | Health check | `notebooklm doctor` |
 | Health check (auto-fix) | `notebooklm doctor --fix` |
 
-**Parallel safety:** Use explicit notebook IDs in parallel workflows. Commands supporting `-n` shorthand: `artifact wait`, `source wait`, `research wait/status`, `download *`. Download commands also support `-a/--artifact`. Other commands use `--notebook`. For chat, use `-c <conversation_id>` to target a specific conversation.
+**Parallel safety:** Use explicit notebook IDs in parallel workflows. Notebook-scoped commands broadly support `-n/--notebook` (ask/history, source, artifact, generate, download, note, label, share, research, and notebook delete/rename/summary/metadata). Download commands also support `-a/--artifact`. For chat, use `-c <conversation_id>` to target a specific conversation.
 
 **Partial IDs:** Use first 6+ characters of UUIDs. Must be unique prefix (fails if ambiguous). Works for ID-based commands such as `use`, `source delete`, and `wait`. For exact source-title deletion, use `source delete-by-title "Title"`. For automation, prefer full UUIDs to avoid ambiguity.
 
@@ -250,7 +296,7 @@ $ notebooklm create "Research" --json
 **Add source:**
 ```bash
 $ notebooklm source add "https://example.com" --json
-{"source": {"id": "def456...", "title": "Example", "type": "SourceType.WEB_PAGE", "url": "https://example.com"}}
+{"source": {"id": "def456...", "title": "Example", "type": "web_page", "url": "https://example.com"}}
 # parse with: jq -r .source.id
 # Note: no `status` field on add — use `source list --json` or `source wait` to check processing state.
 ```
@@ -271,7 +317,7 @@ $ notebooklm ask "What is X?" --json
 **Source fulltext (get indexed content):**
 ```bash
 $ notebooklm source fulltext <source_id> --json
-{"source_id": "...", "title": "...", "content": "Full indexed text...", "_type_code": null, "url": null, "char_count": 12345}
+{"source_id": "...", "title": "...", "kind": "web_page", "content": "Full indexed text...", "url": null, "char_count": 12345}
 ```
 
 **Understanding citations:** The `cited_text` in references is often a snippet or section header, not the full quoted passage. The `start_char`/`end_char` positions reference NotebookLM's internal chunked index, not the raw fulltext. Use `SourceFulltext.find_citation_context()` to locate citations:
@@ -289,29 +335,31 @@ or `.task_id` (from `generate *`). The chat `--json` references list uses
 
 ## Generation Types
 
-All generate commands support:
-- `-s, --source` to use specific source(s) instead of all sources
-- `--language` to set output language (defaults to configured language or 'en')
-- `--json` for machine-readable output (returns `task_id` and `status`)
-- `--retry N` to automatically retry on rate limits with exponential backoff (supported on all subcommands **except** `mind-map`)
-- `--prompt-file PATH` to read description/query from a file (supported on `ask`, `generate` subcommands except `mind-map`, and `source add-research`; mutually exclusive with positional argument; use for long prompts)
+Common generate options vary by subcommand:
+- `-n, --notebook` targets the notebook.
+- `-s, --source` limits generation to specific source(s) on content generators (not `revise-slide`).
+- `--language` sets output language where supported (defaults to configured language or `en`).
+- `--wait`, `--timeout`, and `--interval` are shared polling controls where waiting is supported.
+- `--json` returns machine-readable output.
+- `--retry N` automatically retries rate limits on supported subcommands (not `mind-map`).
+- `--prompt-file PATH` reads description/query text from a file on `ask`, generation subcommands except `mind-map`, and `source add-research`.
 
 | Type | Command | Options | Download |
 |------|---------|---------|----------|
-| Podcast | `generate audio` | `--format [deep-dive\|brief\|critique\|debate]`, `--length [short\|default\|long]` | .mp3 |
-| Video | `generate video` | `--format [explainer\|brief\|cinematic]` (⁴), `--style [auto\|classic\|whiteboard\|kawaii\|anime\|watercolor\|retro-print\|heritage\|paper-craft]` | .mp4 |
+| Podcast | `generate audio` | `--format [deep-dive\|brief\|critique\|debate]`, `--length [short\|default\|long]` | .m4a |
+| Video | `generate video` | `--format [explainer\|brief\|cinematic\|short]` (⁴), `--style [auto\|custom\|classic\|whiteboard\|kawaii\|anime\|watercolor\|retro-print\|heritage\|paper-craft]`, `--style-prompt` with `--style custom` | .mp4 |
 | Slide Deck | `generate slide-deck` | `--format [detailed\|presenter]`, `--length [default\|short]` (²) | .pdf / .pptx |
 | Slide Revision | `generate revise-slide "prompt" --artifact <id> --slide N` | `--wait`, `--notebook` | *(re-downloads parent deck)* |
 | Infographic | `generate infographic` | `--orientation [landscape\|portrait\|square]`, `--detail [concise\|standard\|detailed]`, `--style [auto\|sketch-note\|professional\|bento-grid\|editorial\|instructional\|bricks\|clay\|anime\|kawaii\|scientific]` | .png |
 | Report | `generate report` | `--format [briefing-doc\|study-guide\|blog-post\|custom]`, `--append "extra instructions"` (¹) | .md |
-| Mind Map | `generate mind-map` | `--kind [interactive\|note-backed]` (³) *(default: note-backed; flips to interactive in v0.8.0)* | .json |
+| Mind Map | `generate mind-map` | `--kind [interactive\|note-backed]` (³) *(default: interactive)* | .json |
 | Data Table | `generate data-table` | description required | .csv |
 | Quiz | `generate quiz` | `--difficulty [easy\|medium\|hard]`, `--quantity [fewer\|standard\|more]` | .json/.md/.html |
 | Flashcards | `generate flashcards` | `--difficulty [easy\|medium\|hard]`, `--quantity [fewer\|standard\|more]` | .json/.md/.html |
 
 ¹ `--append` only customizes the built-in templates. With `--format custom`, pass the prompt as the positional `DESCRIPTION` argument (`notebooklm generate report "PROMPT" --format custom`); `--append` is silently ignored in that mode (the CLI prints a warning).
 
-³ **Two kinds of mind map (issue #1256).** `generate mind-map --kind note-backed` (today's default) creates the **note-backed** kind — a JSON node tree, generated synchronously. `generate mind-map --kind interactive` creates the newer **interactive** studio artifact (what the web app now makes); it is polled to completion. Both emit the same `{mind_map, note_id, kind}` JSON, list under `artifact list --type mind-map`, and export via `download mind-map`. `--instructions` applies only to the note-backed kind. **The default `--kind` switches to `interactive` in v0.8.0**; omitting `--kind` prints a one-time stderr notice (silence with `NOTEBOOKLM_QUIET_DEPRECATIONS=1`).
+³ **Two kinds of mind map (issue #1256).** `generate mind-map --kind interactive` (the default) creates the **interactive** studio artifact (what the web app now makes); it is polled to completion. `generate mind-map --kind note-backed` creates the **note-backed** kind — a JSON node tree, generated synchronously. Both emit the same `{mind_map, note_id, kind}` JSON, list under `artifact list --type mind-map`, and export via `download mind-map`. `--instructions` applies only to the note-backed kind.
 
 ⁴ **Cinematic video (Veo 3).** `generate video --format cinematic` generates AI documentary footage via Veo 3; it **ignores `--style`**, takes ~30-40 min, and requires a Google AI Ultra subscription. Also exposed as the `generate cinematic-video` alias (which forces `--format cinematic` and a longer default timeout). Download with `download video` or the `download cinematic-video` alias.
 
@@ -354,7 +402,7 @@ These capabilities are available via CLI but not in NotebookLM's web interface:
 4. `notebooklm generate audio "Focus on [specific angle]"` (confirm when asked) — *if rate limited: wait 5 min, retry once*
 5. Note the artifact ID returned
 6. Check `notebooklm artifact list` later for status
-7. `notebooklm download audio ./podcast.mp3` when complete (confirm when asked)
+7. `notebooklm download audio ./podcast.m4a` when complete (confirm when asked)
 
 ### Research to Podcast (Automated with Subagent)
 **Time:** 5-10 minutes, but continues in background
@@ -369,7 +417,7 @@ When user wants full automation (generate and download when ready):
    Task(
      prompt="Wait for artifact {task_id} in notebook {notebook_id} to complete, then download.
              Use: notebooklm artifact wait {task_id} -n {notebook_id} --timeout 1200
-             Then: notebooklm download audio ./podcast.mp3 -a {task_id} -n {notebook_id}",
+             Then: notebooklm download audio ./podcast.m4a -a {task_id} -n {notebook_id}",
      subagent_type="general-purpose"
    )
    ```
@@ -499,7 +547,7 @@ notebooklm artifact list --json
 
 `notebooklm source list --json`:
 ```json
-{"notebook_id": "...", "notebook_title": "...", "sources": [{"index": 1, "id": "...", "title": "...", "type": "SourceType.WEB_PAGE", "url": "...", "status": "ready|processing|error", "status_id": 1, "created_at": "..."}], "count": 1}
+{"notebook_id": "...", "notebook_title": "...", "sources": [{"index": 1, "id": "...", "title": "...", "type": "web_page", "url": "...", "status": "ready|processing|error", "status_id": 1, "created_at": "..."}], "count": 1}
 ```
 
 `notebooklm artifact list --json`:
@@ -647,7 +695,7 @@ notebooklm --help              # Main commands
 notebooklm auth check          # Diagnose auth issues
 notebooklm auth check --test   # Full auth validation with network test
 notebooklm source --help       # Source management
-notebooklm research --help     # Research status/wait
+notebooklm research --help     # Research status/wait/cancel
 notebooklm generate --help     # Content generation
 notebooklm artifact --help     # Artifact management
 notebooklm download --help     # Download content

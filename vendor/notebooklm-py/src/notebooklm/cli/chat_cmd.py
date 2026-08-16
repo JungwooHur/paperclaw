@@ -1,9 +1,10 @@
 """Chat and conversation CLI commands.
 
 Commands:
-    ask        Ask a notebook a question
-    configure  Configure chat persona and response settings
-    history    Get conversation history or clear local cache
+    ask             Ask a notebook a question
+    suggest-prompts Get AI-suggested prompts for a notebook
+    configure       Configure chat persona and response settings
+    history         Get conversation history or clear local cache
 """
 
 import logging
@@ -12,9 +13,23 @@ from typing import Any
 import click
 from rich.table import Table
 
-from ..client import NotebookLMClient
-from ..types import ChatMode
-from .auth_runtime import with_client
+from .._app.chat import (
+    ClearCacheResult,
+    ConfigureResult,
+    determine_conversation_id,
+    execute_clear_cache,
+    execute_configure,
+    fetch_history,
+    format_history,
+    format_single_qa,
+    get_latest_conversation_from_server,
+    save_answer_as_note,
+    validate_ask_flags,
+)
+from .._app.events import ProgressEvent
+from .._app.views import ask_result_view
+from ..exceptions import ValidationError
+from .auth_runtime import resolve_client_factory, with_client
 from .context import get_current_conversation, get_current_notebook, set_current_conversation
 from .error_handler import _output_error, exit_with_code
 from .input import resolve_prompt
@@ -29,60 +44,44 @@ from .resolve import require_notebook, resolve_notebook_id, resolve_source_ids
 
 logger = logging.getLogger(__name__)
 
+# Inclusive ``--mode`` range for ``suggest-prompts``. Mirrors the canonical 1..10
+# bound that ``NotebooksAPI.suggest_prompts`` enforces (the CLI boundary forbids
+# importing the runtime layer's private constant, so this is a deliberate copy);
+# the method re-validates server-side-bound, so a drift here only changes which
+# layer reports the same out-of-range error, never correctness.
+_SUGGEST_PROMPTS_MODE_MIN = 1
+_SUGGEST_PROMPTS_MODE_MAX = 10
 
-def _determine_conversation_id(
-    *,
-    explicit_conversation_id: str | None,
-    explicit_notebook_id: str | None,
-    resolved_notebook_id: str,
-    json_output: bool,
-) -> str | None:
-    """Determine which conversation ID to use for the ask command.
 
-    Returns None if no cached conversation exists, otherwise returns
-    the conversation ID to continue.
+def _configure_json_payload(config: ConfigureResult) -> dict[str, Any]:
+    """Build the ``configure --json`` envelope from the typed result.
+
+    Discriminated by ``config.mode``: a predefined ``--mode`` emits the compact
+    mode envelope; the persona / response-length branch emits the full settings
+    envelope. ``_app`` returns typed results only, so this CLI adapter owns the
+    envelope shape (byte-stable keys/order for scripted callers).
     """
-    if explicit_conversation_id:
-        return explicit_conversation_id
+    if config.mode is not None:
+        return {
+            "notebook_id": config.notebook_id,
+            "mode": config.mode,
+            "configured": True,
+        }
+    return {
+        "notebook_id": config.notebook_id,
+        "mode": None,
+        # Lowercase enum name (e.g. "custom") for a stable, human-readable JSON
+        # contract. The underlying RPC integer is an implementation detail.
+        "goal": config.goal_name,
+        "persona": config.persona,
+        "response_length": config.response_length,
+        "configured": True,
+    }
 
-    # Check if user switched notebooks via --notebook flag
-    cached_notebook = get_current_notebook()
-    if explicit_notebook_id and cached_notebook and resolved_notebook_id != cached_notebook:
-        if not json_output:
-            cli_print("[dim]Different notebook specified, starting new conversation...[/dim]")
-        return None
 
-    return get_current_conversation()
-
-
-async def _get_latest_conversation_from_server(
-    client, notebook_id: str, json_output: bool
-) -> str | None:
-    """Fetch the most recent conversation ID from the server.
-
-    Returns None if unavailable or empty.
-    """
-    history_unavailable = False
-    try:
-        conv_id = await client.chat.get_conversation_id(notebook_id)
-        if conv_id:
-            if not json_output:
-                cli_print(f"[dim]Continuing conversation {conv_id[:8]}...[/dim]")
-            return conv_id
-    except Exception as e:
-        logger.debug(
-            "Failed to fetch last conversation (%s): %s",
-            type(e).__name__,
-            e,
-        )
-        history_unavailable = True
-    # Emit the fallback status *outside* the ``except`` handler: it is a
-    # status line (so it must honor root ``--quiet`` via ``cli_print``), not
-    # an error diagnostic, and emitting it inside the handler would trip the
-    # error-path heuristic in ``tests/unit/cli/test_quiet_enforcement.py``.
-    if history_unavailable and not json_output:
-        cli_print("[dim]Starting new conversation (history unavailable)[/dim]")
-    return None
+def _clear_cache_json_payload(result: ClearCacheResult) -> dict[str, Any]:
+    """Build the ``history --clear --json`` envelope from the typed result."""
+    return {"cleared": result.cleared, "count": result.count}
 
 
 def _history_json_payload(
@@ -93,7 +92,8 @@ def _history_json_payload(
     """Build the shared JSON envelope for ``history --json`` modes.
 
     Same shape whether or not ``--save`` is set; the save branch merges a
-    ``note`` field on top of this base envelope.
+    ``note`` field on top of this base envelope. Owned by the CLI adapter
+    (``_app`` returns typed results only).
     """
     return {
         "notebook_id": notebook_id,
@@ -103,6 +103,85 @@ def _history_json_payload(
             {"turn": i, "question": q, "answer": a} for i, (q, a) in enumerate(qa_pairs, 1)
         ],
     }
+
+
+class _CliPrintStatusSink:
+    """:class:`ProgressSink` routing neutral status events through ``cli_print``.
+
+    Used for the conversation-selection prose, which the historical command only
+    emitted under ``not json_output`` — so the sink is constructed only on that
+    path and forwards every event to ``cli_print`` (honoring root ``--quiet``).
+    Rich markup in the message is preserved.
+    """
+
+    def emit(self, event: ProgressEvent) -> None:
+        cli_print(event.message)
+
+
+class _EmitStatusSink:
+    """:class:`ProgressSink` routing neutral status events through ``emit_status``.
+
+    Used for the ``ask --save-as-note`` status lines: routes to stderr under
+    ``--json`` (keeping stdout JSON-pure) and to stdout otherwise, honoring root
+    ``--quiet``. Rich markup is preserved.
+    """
+
+    def __init__(self, *, json_output: bool) -> None:
+        self._json_output = json_output
+
+    def emit(self, event: ProgressEvent) -> None:
+        # Status forwarder for a secondary --save-as-note action: the neutral
+        # workflow folds its own failures into the returned outcome (never
+        # raised), so this emit is never on an error path.
+        emit_status(event.message, json_output=self._json_output)
+
+
+# Re-export the neutral note-content formatters under their historical
+# command-local names so ``from notebooklm.cli.chat_cmd import _format_single_qa``
+# keeps resolving (the logic lives in ``_app.chat``).
+_format_single_qa = format_single_qa
+_format_history = format_history
+
+
+def _determine_conversation_id(
+    *,
+    explicit_conversation_id: str | None,
+    explicit_notebook_id: str | None,
+    resolved_notebook_id: str,
+    json_output: bool,
+) -> str | None:
+    """Determine which conversation ID to use for the ask command.
+
+    Thin CLI adapter over :func:`notebooklm._app.chat.determine_conversation_id`:
+    passes the CLI context helpers as **lazy callables** (read at call time, and
+    only on the branches that need them — preserving the historical
+    short-circuit) so the ``patch("...chat_cmd.get_current_*")`` seams keep
+    landing, and routes the neutral "starting new conversation" status into
+    ``cli_print`` only under ``not json_output``.
+    """
+    progress = None if json_output else _CliPrintStatusSink()
+    return determine_conversation_id(
+        explicit_conversation_id=explicit_conversation_id,
+        explicit_notebook_id=explicit_notebook_id,
+        resolved_notebook_id=resolved_notebook_id,
+        cached_notebook_id=get_current_notebook,
+        cached_conversation_id=get_current_conversation,
+        progress=progress,
+    )
+
+
+async def _get_latest_conversation_from_server(
+    client, notebook_id: str, json_output: bool
+) -> str | None:
+    """Fetch the most recent conversation ID from the server.
+
+    Thin CLI adapter over
+    :func:`notebooklm._app.chat.get_latest_conversation_from_server`: routes the
+    neutral status events into ``cli_print`` only under ``not json_output`` (so
+    status prose honors root ``--quiet`` and stays off JSON stdout).
+    """
+    progress = None if json_output else _CliPrintStatusSink()
+    return await get_latest_conversation_from_server(client, notebook_id, progress=progress)
 
 
 def register_chat_commands(cli):
@@ -209,27 +288,22 @@ def register_chat_commands(cli):
           notebooklm ask "explain X" --json             # Get answer with source references
           notebooklm ask "explain X" --save-as-note     # Save response as a note
         """
-        if new_conversation and conversation_id:
-            # Per ADR-0015 §2: under --json this mutual-exclusion conflict
-            # must emit the typed JSON envelope and exit 1 (VALIDATION_ERROR),
-            # not ride Click's parse-time UsageError path (exit 2, usage
-            # text on stderr, no JSON on stdout). Under text mode we
-            # preserve the existing Click UX so interactive users still
-            # get the ``Usage: ... / Error: ...`` formatting.
-            mutual_exclusion_message = (
-                "--new and --conversation-id are mutually exclusive: "
-                "--new starts a fresh conversation while --conversation-id resumes a specific one."
-            )
+        # Per ADR-0015 §2: under --json this mutual-exclusion conflict must emit
+        # the typed JSON envelope and exit 1 (VALIDATION_ERROR), not ride
+        # Click's parse-time UsageError path (exit 2, usage text on stderr, no
+        # JSON on stdout). Under text mode we preserve the existing Click UX so
+        # interactive users still get the ``Usage: ... / Error: ...`` formatting.
+        # The neutral core raises the public ``ValidationError``; this adapter
+        # maps it to the CLI's own ``VALIDATION_ERROR`` code / Click UsageError.
+        try:
+            validate_ask_flags(new_conversation=new_conversation, conversation_id=conversation_id)
+        except ValidationError as exc:
+            message = str(exc)
             if json_output:
-                _output_error(
-                    mutual_exclusion_message,
-                    "VALIDATION_ERROR",
-                    json_output,
-                    1,
-                )
+                _output_error(message, "VALIDATION_ERROR", json_output, 1)
             raise click.UsageError(  # cli-input-validation: --new and --conversation-id are mutually exclusive
-                mutual_exclusion_message
-            )
+                message
+            ) from exc
         question = resolve_prompt(question, prompt_file, "question", required=True)
         nb_id = require_notebook(notebook_id)
 
@@ -240,7 +314,7 @@ def register_chat_commands(cli):
             client_kwargs["chat_timeout"] = timeout_value
 
         async def _run():
-            async with NotebookLMClient(client_auth, **client_kwargs) as client:
+            async with resolve_client_factory(ctx)(client_auth, **client_kwargs) as client:
                 nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
                 if new_conversation:
                     # Dropping ``conversation_id`` alone extends the most-recent
@@ -252,8 +326,8 @@ def register_chat_commands(cli):
                     if last_conv_id:
                         # ``--json`` implies ``--yes`` so scripted callers don't
                         # hang on stdin (which would also clobber JSON stdout
-                        # purity). See cli/artifact.py:artifact_delete for the
-                        # same pattern.
+                        # purity). See ``cli/artifact_cmd.py::artifact_delete``
+                        # for the same pattern.
                         if (
                             not assume_yes
                             and not json_output
@@ -328,58 +402,30 @@ def register_chat_commands(cli):
                 note_save_error: str | None = None
 
                 if save_as_note:
-                    if not result.answer:
-                        emit_status(
-                            "[yellow]Warning: No answer to save as note[/yellow]",
-                            json_output=json_output,
-                        )
-                        note_save_error = "No answer to save as note"
-                    else:
-                        try:
-                            title = (
-                                note_title or f"Chat: {question[:50].strip().replace(chr(10), ' ')}"
-                            )
-                            if result.references:
-                                # Citation-rich path: server stores [N] markers
-                                # as hover-anchored references (issue #660).
-                                # ``client.chat.save_answer_as_note`` is the
-                                # canonical home for this primitive.
-                                note = await client.chat.save_answer_as_note(
-                                    nb_id_resolved, result, title=title
-                                )
-                            else:
-                                # No citations to preserve -- fall back to the
-                                # plain-text path so the save still succeeds.
-                                emit_status(
-                                    "[dim]No citations in answer; saving as plain-text note.[/dim]",
-                                    json_output=json_output,
-                                )
-                                note = await client.notes.create(
-                                    nb_id_resolved, title, result.answer
-                                )
-                            note_save_result = {"id": note.id, "title": note.title}
-                            emit_status(
-                                f"\n[dim]Saved as note: {note.title} ({note.id[:8]}...)[/dim]",
-                                json_output=json_output,
-                            )
-                        except Exception as e:
-                            note_save_error = str(e)
-                            # Note-save is a secondary `--save-as-note` action;
-                            # emit_status keeps the warning non-fatal so the chat
-                            # response payload still prints. output_error would
-                            # SystemExit(1) and abort that payload. Revisit when
-                            # save-as-note gains a structured non-fatal error channel.
-                            emit_status(  # quiet-ok: non-fatal warning for a secondary --save-as-note action
-                                f"[yellow]Warning: Failed to save note: {e}[/yellow]",
-                                json_output=json_output,
-                            )
+                    # The save-as-note workflow (citation-rich vs plain-text
+                    # fallback, the non-fatal error fold) lives in
+                    # ``_app.chat.save_answer_as_note``. Its Rich-markup status
+                    # lines route through ``_EmitStatusSink`` (stderr under
+                    # ``--json``, honoring root ``--quiet``); the outcome's note
+                    # / error are merged into the JSON envelope below.
+                    outcome = await save_answer_as_note(
+                        client,
+                        nb_id_resolved,
+                        result,
+                        note_title=note_title,
+                        question=question,
+                        progress=_EmitStatusSink(json_output=json_output),
+                    )
+                    note_save_result = outcome.note
+                    note_save_error = outcome.error
 
                 if json_output:
-                    from dataclasses import asdict
-
-                    data = asdict(result)
-                    # Exclude raw_response from CLI output for brevity.
-                    del data["raw_response"]
+                    # Go through the shared projection rather than a local
+                    # ``asdict`` + ``del``: it is the one place that knows which
+                    # ``AskResult`` fields are internal, so a field added there
+                    # (``answer_document``, #2120) cannot leak into this
+                    # envelope just because this call site was not updated too.
+                    data = ask_result_view(result)
                     if save_as_note:
                         # Merge note-save outcome into the envelope so the
                         # caller can observe success/failure from stdout
@@ -389,6 +435,110 @@ def register_chat_commands(cli):
                         if note_save_error is not None:
                             data["note_save_error"] = note_save_error
                     json_output_response(data)
+
+        return _run()
+
+    @cli.command("suggest-prompts")
+    @notebook_option
+    @click.option(
+        "--mode",
+        default=4,
+        type=int,
+        help=(
+            "Suggestion surface to target (1-10, default 4). 1=audio deep-dive, "
+            "2=audio brief, 3=video explainer, 4=chat questions, 5=audio critique, "
+            "6=audio debate, 8=quiz, 9=flashcards, 10=video short. "
+            "Out-of-range values exit 1 with a validation error."
+        ),
+    )
+    @click.option(
+        "--query",
+        default=None,
+        help="Free-text steer for the kind of prompts to suggest.",
+    )
+    @click.option(
+        "--source",
+        "-s",
+        "source_ids",
+        multiple=True,
+        help="Limit to specific source IDs (can be repeated). Defaults to all sources.",
+        shell_complete=_complete_sources,
+    )
+    @json_option
+    @with_client
+    def suggest_prompts_cmd(
+        ctx,
+        notebook_id,
+        mode,
+        query,
+        source_ids,
+        json_output,
+        client_auth,
+    ):
+        """Get AI-suggested prompts for a notebook.
+
+        Returns a short list of suggested prompts (each a title plus a
+        ready-to-send instruction) that you can pass to ``notebooklm ask``.
+        ``--mode`` selects the studio surface the prompts are written for:
+        1 = audio deep-dive, 2 = audio brief, 3 = video explainer,
+        4 (default) = chat questions, 5 = audio critique, 6 = audio debate,
+        8 = quiz, 9 = flashcards, 10 = video short. A mode outside 1-10 exits 1.
+
+        \b
+        Example:
+          notebooklm suggest-prompts
+          notebooklm suggest-prompts --mode 8           # quiz prompts
+          notebooklm suggest-prompts --query "key risks"
+          notebooklm suggest-prompts -s src_001 -s src_002
+          notebooklm suggest-prompts --json
+        """
+        nb_id = require_notebook(notebook_id)
+        # Validate ``mode`` up front -- BEFORE any notebook/source resolution --
+        # so an out-of-range value always surfaces the mode error (exit 1) and
+        # never pays for a ``sources.list`` resolution RPC. ``suggest_prompts``
+        # re-validates the same 1..10 range before its own RPC; this mirror keeps
+        # the bad-mode failure deterministic regardless of how ``-s`` resolves.
+        # Raises the public ``ValidationError`` so the shared error envelope
+        # (``@with_client``) maps it to a VALIDATION_ERROR exit-1 / JSON envelope.
+        if not _SUGGEST_PROMPTS_MODE_MIN <= mode <= _SUGGEST_PROMPTS_MODE_MAX:
+            raise ValidationError(
+                f"mode must be in the inclusive range "
+                f"{_SUGGEST_PROMPTS_MODE_MIN}..{_SUGGEST_PROMPTS_MODE_MAX}, got {mode!r}"
+            )
+
+        async def _run():
+            async with resolve_client_factory(ctx)(client_auth) as client:
+                nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+                sources = await resolve_source_ids(
+                    client, nb_id_resolved, source_ids, json_output=json_output
+                )
+                suggestions = await client.notebooks.suggest_prompts(
+                    nb_id_resolved,
+                    source_ids=sources,
+                    mode=mode,
+                    query=query,
+                )
+
+                if json_output:
+                    json_output_response(
+                        {
+                            "notebook_id": nb_id_resolved,
+                            "suggestions": [
+                                {"title": s.title, "prompt": s.prompt} for s in suggestions
+                            ],
+                            "count": len(suggestions),
+                        }
+                    )
+                    return
+
+                if not suggestions:
+                    console.print("[yellow]No prompt suggestions returned[/yellow]")
+                    return
+
+                console.print("[bold cyan]Suggested prompts:[/bold cyan]")
+                for i, suggestion in enumerate(suggestions, 1):
+                    console.print(f"\n[bold]{i}. {suggestion.title}[/bold]")
+                    console.print(suggestion.prompt)
 
         return _run()
 
@@ -425,65 +575,40 @@ def register_chat_commands(cli):
         \b
         Examples:
           notebooklm configure --mode learning-guide
-          notebooklm configure --persona "Act as a chemistry tutor"
-          notebooklm configure --mode detailed --response-length longer
+          notebooklm configure --persona "Act as a chemistry tutor" --response-length longer
           notebooklm configure --mode concise --json   # Machine-readable output
+
+        A --mode preset cannot be combined with --persona/--response-length.
+
+        Setting just one of --persona/--response-length merges with the current
+        settings (the field you omit is preserved). A bare `configure` with no
+        flags resets all custom chat settings to their defaults.
         """
         nb_id = require_notebook(notebook_id)
 
         async def _run():
-            from ..types import ChatGoal, ChatResponseLength
-
-            async with NotebookLMClient(client_auth) as client:
+            async with resolve_client_factory(ctx)(client_auth) as client:
                 nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+                # The mode/goal/length mapping + RPC dispatch live in
+                # ``_app.chat.execute_configure``; the adapter keeps the
+                # ``--json`` envelope build + text prose.
+                config = await execute_configure(
+                    client,
+                    nb_id_resolved,
+                    chat_mode=chat_mode,
+                    persona=persona,
+                    response_length=response_length,
+                )
+
                 if chat_mode:
-                    mode_map = {
-                        "default": ChatMode.DEFAULT,
-                        "learning-guide": ChatMode.LEARNING_GUIDE,
-                        "concise": ChatMode.CONCISE,
-                        "detailed": ChatMode.DETAILED,
-                    }
-                    await client.chat.set_mode(nb_id_resolved, mode_map[chat_mode])
                     if json_output:
-                        json_output_response(
-                            {
-                                "notebook_id": nb_id_resolved,
-                                "mode": chat_mode,
-                                "configured": True,
-                            }
-                        )
+                        json_output_response(_configure_json_payload(config))
                         return
                     console.print(f"[green]Chat mode set to: {chat_mode}[/green]")
                     return
 
-                goal = ChatGoal.CUSTOM if persona else None
-                length = None
-                if response_length:
-                    length_map = {
-                        "default": ChatResponseLength.DEFAULT,
-                        "longer": ChatResponseLength.LONGER,
-                        "shorter": ChatResponseLength.SHORTER,
-                    }
-                    length = length_map[response_length]
-
-                await client.chat.configure(
-                    nb_id_resolved, goal=goal, response_length=length, custom_prompt=persona
-                )
-
                 if json_output:
-                    json_output_response(
-                        {
-                            "notebook_id": nb_id_resolved,
-                            "mode": None,
-                            # Lowercase enum name (e.g. "custom") for a stable,
-                            # human-readable JSON contract. The underlying RPC
-                            # integer is an implementation detail.
-                            "goal": goal.name.lower() if goal else None,
-                            "persona": persona,
-                            "response_length": response_length,
-                            "configured": True,
-                        }
-                    )
+                    json_output_response(_configure_json_payload(config))
                     return
 
                 parts = []
@@ -534,7 +659,7 @@ def register_chat_commands(cli):
     ):
         """Get conversation history or save it as a note.
 
-        Shows all Q&A turns from the most recent conversation.
+        Shows up to ``--limit`` Q&A turns from the most recent conversation.
 
         \b
         Example:
@@ -549,24 +674,18 @@ def register_chat_commands(cli):
         """
 
         async def _run():
-            async with NotebookLMClient(client_auth) as client:
+            async with resolve_client_factory(ctx)(client_auth) as client:
                 if clear_cache:
-                    # Capture pre-clear conversation count so the JSON
-                    # envelope can report what was dropped. Done BEFORE the
-                    # clear call because ``clear_cache`` returns only a bool.
-                    pre_clear_count = client.chat.cache_size()
-                    cleared = client.chat.clear_cache()
+                    # The pre-clear count capture + clear lives in
+                    # ``_app.chat.execute_clear_cache``; the adapter keeps the
+                    # ``--json`` envelope + text prose.
+                    cache_result = execute_clear_cache(client)
                     if json_output:
                         # In JSON mode, stdout must be a single JSON
                         # document; no Rich/text output.
-                        json_output_response(
-                            {
-                                "cleared": bool(cleared),
-                                "count": pre_clear_count if cleared else 0,
-                            }
-                        )
+                        json_output_response(_clear_cache_json_payload(cache_result))
                         return
-                    if cleared:
+                    if cache_result.cleared:
                         console.print("[green]Local conversation cache cleared[/green]")
                     else:
                         console.print("[yellow]No cache to clear[/yellow]")
@@ -574,10 +693,9 @@ def register_chat_commands(cli):
 
                 nb_id = require_notebook(notebook_id)
                 nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
-                conv_id = await client.chat.get_conversation_id(nb_id_resolved)
-                qa_pairs = await client.chat.get_history(
-                    nb_id_resolved, limit=limit, conversation_id=conv_id
-                )
+                fetched = await fetch_history(client, nb_id_resolved, limit=limit)
+                conv_id = fetched.conversation_id
+                qa_pairs = fetched.qa_pairs
 
                 if save_as_note:
                     if not qa_pairs:
@@ -649,21 +767,3 @@ def register_chat_commands(cli):
                 console.print("\n[dim]Use 'notebooklm history --save' to save as a note.[/dim]")
 
         return _run()
-
-
-def _format_single_qa(question: str, answer: str) -> str:
-    """Format one Q&A pair as note content."""
-    parts = []
-    if question:
-        parts.append(f"**Q:** {question}")
-    if answer:
-        parts.append(f"**A:** {answer}")
-    return "\n\n".join(parts)
-
-
-def _format_history(qa_pairs: list[tuple[str, str]]) -> str:
-    """Format Q&A history as note content."""
-    turns = []
-    for i, (question, answer) in enumerate(qa_pairs, 1):
-        turns.append(f"### Turn {i}\n\n{_format_single_qa(question, answer)}")
-    return "\n\n---\n\n".join(turns)

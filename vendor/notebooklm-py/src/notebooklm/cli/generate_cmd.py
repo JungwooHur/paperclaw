@@ -1,12 +1,13 @@
 """Generate content CLI commands — thin Click handlers (ADR-0008).
 
-All validation, enum mapping, retry/wait orchestration, and output
-dispatch live in ``cli/services/generate.py``. Tests patch
-``NotebookLMClient`` / ``console`` / ``json_error_response`` /
-``json_output_response`` / ``get_language`` / ``_output_mind_map_result``
-as module-level attributes here, so those names remain imported at
-module scope and ``_output_mind_map_result`` + ``resolve_language``
-remain defined inline rather than re-exported.
+Plan validation, enum mapping, retry/wait orchestration, and per-kind
+generation execution live in the transport-neutral ``_app.generate`` core plus
+the CLI adapter in ``cli/services/generate.py``. Command-layer rendering and
+exit policy stay in this module. Tests patch ``console`` /
+``json_error_response`` / ``json_output_response`` / ``get_language`` /
+``_output_mind_map_result`` as module-level attributes here, so those names
+remain imported at module scope and ``_output_mind_map_result`` +
+``resolve_language`` remain defined inline rather than re-exported.
 """
 
 import os
@@ -15,9 +16,11 @@ from typing import Any
 import click
 from click.core import ParameterSource
 
-from ..client import NotebookLMClient
+from .._app.generate_retry import (
+    GenerationOutcome,
+)
 from ..types import MindMap, MindMapResult
-from .auth_runtime import with_client
+from .auth_runtime import resolve_client_factory, with_client
 from .error_handler import current_json_output, output_error
 from .input import resolve_prompt
 from .language_cmd import SUPPORTED_LANGUAGES, get_language
@@ -40,11 +43,10 @@ from .rendering import (
     json_output_response,
 )
 from .resolve import require_notebook
-from .services.artifact_generation import (
-    GenerationOutcome,
-)
 from .services.generate import (
     _INFOGRAPHIC_STYLE_MAP,
+    _QUIZ_DIFFICULTY_MAP,
+    _QUIZ_QUANTITY_MAP,
     GenerationExecutionResult,
     GenerationPlanValidationError,
     build_generation_plan,
@@ -254,7 +256,7 @@ def _run_generate(*, kind: str, **handler_locals: Any) -> Any:
             click.echo(line, err=True)
 
     async def _run() -> Any:
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             result = await execute_generation(
                 plan,
                 client,
@@ -381,9 +383,12 @@ def generate_audio(
 @click.option(
     "--format",
     "video_format",
-    type=click.Choice(["explainer", "brief", "cinematic"]),
+    type=click.Choice(["explainer", "brief", "cinematic", "short"]),
     default="explainer",
-    help="Video format; 'cinematic' uses Veo 3 footage (default: explainer)",
+    help=(
+        "Video format; 'cinematic' uses Veo 3 footage, 'short' is a vertical "
+        "short-form video (default: explainer)"
+    ),
 )
 @click.option(
     "--style",
@@ -402,7 +407,10 @@ def generate_audio(
         ]
     ),
     default="auto",
-    help="Visual style (default: auto). Use 'custom' with --style-prompt.",
+    help=(
+        "Visual style (default: auto). Use 'custom' with --style-prompt. "
+        "Not supported for --format cinematic or short (fixed style)."
+    ),
 )
 @click.option("--style-prompt", default=None, help="Custom visual style prompt")
 @language_option
@@ -590,13 +598,13 @@ def generate_revise_slide(
 @notebook_option
 @click.option(
     "--quantity",
-    type=click.Choice(["fewer", "standard", "more"]),
+    type=click.Choice(list(_QUIZ_QUANTITY_MAP)),
     default="standard",
     help="Number of questions (default: standard)",
 )
 @click.option(
     "--difficulty",
-    type=click.Choice(["easy", "medium", "hard"]),
+    type=click.Choice(list(_QUIZ_DIFFICULTY_MAP)),
     default="medium",
     help="Question difficulty (default: medium)",
 )
@@ -641,13 +649,13 @@ def generate_quiz(
 @notebook_option
 @click.option(
     "--quantity",
-    type=click.Choice(["fewer", "standard", "more"]),
+    type=click.Choice(list(_QUIZ_QUANTITY_MAP)),
     default="standard",
     help="Number of flashcards (default: standard)",
 )
 @click.option(
     "--difficulty",
-    type=click.Choice(["easy", "medium", "hard"]),
+    type=click.Choice(list(_QUIZ_DIFFICULTY_MAP)),
     default="medium",
     help="Flashcard difficulty (default: medium)",
 )
@@ -790,18 +798,20 @@ def generate_data_table(
 @multi_source_option
 @language_option
 @click.option(
-    "--instructions", default=None, help="Custom instructions for the mind map (note-backed only)"
+    "--instructions",
+    default=None,
+    help="Custom prompt to steer the mind map. Applied reliably for the "
+    "interactive kind; sent for note-backed too, but the server may ignore it.",
 )
 @click.option(
     "--kind",
     "map_kind",
     type=click.Choice(["interactive", "note-backed"]),
-    default="note-backed",
+    default="interactive",
     show_default=True,
     help=(
         "Which mind map to generate: 'interactive' (studio artifact, polled to "
-        "completion) or 'note-backed' (JSON tree, synchronous). The default "
-        "becomes 'interactive' in v0.8.0."
+        "completion) or 'note-backed' (JSON tree, synchronous)."
     ),
 )
 @json_option
@@ -813,14 +823,12 @@ def generate_mind_map(
 
     \b
     Two kinds (issue #1256):
-      --kind note-backed   JSON tree, synchronous (default)
-      --kind interactive   interactive studio artifact, polled to completion
+      --kind interactive   interactive studio artifact, polled to completion (default)
+      --kind note-backed   JSON tree, synchronous
     Both export the same JSON node tree via 'download mind-map'.
-
-    \b
-    Heads up: the default --kind will switch to 'interactive' in v0.8.0
-    (NotebookLM's web app already creates interactive maps). Pass --kind
-    explicitly to pin your choice. --instructions applies to note-backed only.
+    --instructions is a free-text prompt that steers generation; the
+    interactive kind applies it reliably (the note-backed kind passes it
+    through, but the server may not always honor it).
 
     \b
     Use --json for machine-readable output.

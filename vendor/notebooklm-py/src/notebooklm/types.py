@@ -12,9 +12,20 @@ Usage:
 from ._types import artifacts as _artifact_types
 from ._types import common as _common_types
 from ._types import sources as _source_types
+from ._types.artifact_content import (
+    ArtifactInfographic,
+    ArtifactMedia,
+    ArtifactMediaType,
+    ArtifactSlide,
+    ArtifactUserState,
+    AudioArtifactUserState,
+    FlashcardArtifactUserState,
+    UnknownArtifactUserState,
+)
 from ._types.artifacts import (
     Artifact,
     ArtifactType,
+    GenerationState,
     GenerationStatus,
     ReportSuggestion,
 )
@@ -22,22 +33,42 @@ from ._types.chat import (
     AskResult,
     ChatMode,
     ChatReference,
+    ChatSettings,
     ConversationTurn,
+    ConversationTurnKey,
+    NextStepSuggestion,
 )
+from ._types.collections import Collection
 from ._types.common import (
     AccountLimits,
-    AccountTier,
     CitedSourceSelection,
     ClientMetricsSnapshot,
     ConnectionLimits,
     RpcTelemetryEvent,
     UnknownTypeWarning,
+    UserSettings,
 )
+from ._types.documents import (
+    BlockKind,
+    BlockStyle,
+    DocumentAnnotation,
+    DocumentBlock,
+    ListInfo,
+    ListStyle,
+    StructuredDocument,
+    TableCell,
+    TextSpan,
+    utf16_len,
+)
+from ._types.labels import Label
 from ._types.mind_maps import MindMap, MindMapKind
 from ._types.notebooks import (
+    ChatSession,
     Notebook,
     NotebookDescription,
     NotebookMetadata,
+    PremiumFeatureInfo,
+    PromptSuggestion,
     SourceSummary,
     SuggestedTopic,
 )
@@ -49,6 +80,7 @@ from ._types.research import (
     ResearchStart,
     ResearchStatus,
     ResearchTask,
+    ResearchTerminationReason,
     SourceGuide,
 )
 from ._types.sharing import SharedUser, ShareStatus
@@ -69,6 +101,10 @@ from .exceptions import (
     ArtifactParseError,
     ArtifactPendingTimeoutError,
     ArtifactTimeoutError,
+    CollectionError,
+    CollectionNotFoundError,
+    LabelError,
+    LabelNotFoundError,
     SourceAddError,
     SourceError,
     SourceNotFoundError,
@@ -78,16 +114,20 @@ from .exceptions import (
 
 # Re-export enums from rpc/types.py for convenience
 from .rpc.types import (
+    SOURCE_STATUS_LABELS,
     ArtifactStatus,
     AudioFormat,
     AudioLength,
     ChatGoal,
     ChatResponseLength,
+    DiscoveryMode,
     DriveMimeType,
+    DriveSourceStatus,
     ExportType,
     InfographicDetail,
     InfographicOrientation,
     InfographicStyle,
+    MagicArtifactType,
     QuizDifficulty,
     QuizQuantity,
     ReportFormat,
@@ -100,10 +140,22 @@ from .rpc.types import (
     VideoFormat,
     VideoStyle,
     artifact_status_to_str,
+    discovery_mode_to_str,
+    drive_source_status_to_str,
+    share_permission_to_str,
     source_status_to_str,
 )
 from .rpc.types import (
     ArtifactTypeCode as _ArtifactTypeCode,
+)
+from .rpc.types import (
+    GrpcStatusCode as _GrpcStatusCode,
+)
+from .rpc.types import (
+    normalize_grpc_status as _normalize_grpc_status,
+)
+from .rpc.types import (
+    normalize_rpc_code as _normalize_rpc_code,
 )
 
 # Keep private facade names that first-party tests and external callers have
@@ -125,6 +177,23 @@ _warned_source_types = _source_types._warned_source_types
 # but intentionally absent from ``__all__``.
 ArtifactTypeCode = _ArtifactTypeCode
 
+# The canonical gRPC status table and its two coercion helpers, routed through
+# this facade for the ``_app`` layer: the boundary lint
+# (``tests/_guardrails/test_app_boundary.py``) forbids ``_app`` from importing
+# ``notebooklm.rpc.*`` directly, and the neutral error classifier needs both.
+# Internal plumbing, so intentionally absent from ``__all__``.
+GrpcStatusCode = _GrpcStatusCode
+normalize_grpc_status = _normalize_grpc_status
+normalize_rpc_code = _normalize_rpc_code
+
+# The local-file extension policy, routed through this facade for the ``_app``
+# layer for the same reason as the gRPC table above: the boundary lint
+# (``tests/_guardrails/test_app_boundary.py``) forbids ``_app`` from importing
+# private siblings such as ``notebooklm._types``, and the transport-neutral
+# ``source add`` path heuristic needs the derived set. Internal plumbing, so
+# intentionally absent from ``__all__``.
+_PATH_SHAPED_FILE_EXTENSIONS = _source_types._PATH_SHAPED_FILE_EXTENSIONS
+
 # Guards the ``ResearchSourceInput`` import from being removed as unused:
 # ``typing.get_type_hints(CitedSourceSelection)`` needs it in this facade's
 # globals after ``CitedSourceSelection.__module__`` is rewritten below.
@@ -134,11 +203,15 @@ _CITED_SOURCE_SELECTION_TYPE_HINT_GLOBALS = (ResearchSourceInput,)
 
 __all__ = [
     # Dataclasses
+    "AccountLimits",
+    "UserSettings",
     "CitedSourceSelection",
     "ConnectionLimits",
     "ClientMetricsSnapshot",
     "RpcTelemetryEvent",
     "Notebook",
+    "PremiumFeatureInfo",
+    "ChatSession",
     "NotebookDescription",
     "NotebookMetadata",
     "SuggestedTopic",
@@ -146,13 +219,38 @@ __all__ = [
     "SourceFulltext",
     "SourceSummary",
     "Artifact",
+    "ArtifactInfographic",
+    "ArtifactMedia",
+    "ArtifactMediaType",
+    "ArtifactSlide",
+    "ArtifactUserState",
+    "AudioArtifactUserState",
+    "FlashcardArtifactUserState",
+    "UnknownArtifactUserState",
+    "GenerationState",
     "GenerationStatus",
     "ReportSuggestion",
     "Note",
+    "Label",
+    "Collection",
     "ConversationTurn",
+    "ConversationTurnKey",
+    "NextStepSuggestion",
     "ChatReference",
+    "BlockKind",
+    "BlockStyle",
+    "DocumentAnnotation",
+    "DocumentBlock",
+    "ListInfo",
+    "ListStyle",
+    "StructuredDocument",
+    "TableCell",
+    "TextSpan",
+    "utf16_len",
     "AskResult",
     "ChatMode",
+    "ChatSettings",
+    "PromptSuggestion",
     "SharedUser",
     "ShareStatus",
     # Research / mind-map / source-guide typed returns
@@ -160,6 +258,7 @@ __all__ = [
     "ResearchSource",
     "ResearchTask",
     "ResearchStart",
+    "ResearchTerminationReason",
     "MindMap",
     "MindMapKind",
     "MindMapResult",
@@ -179,6 +278,10 @@ __all__ = [
     "ArtifactTimeoutError",
     "ArtifactPendingTimeoutError",
     "ArtifactInProgressTimeoutError",
+    "LabelError",
+    "LabelNotFoundError",
+    "CollectionError",
+    "CollectionNotFoundError",
     # Warnings
     "UnknownTypeWarning",
     # User-facing type enums (str enums for .kind property)
@@ -201,26 +304,33 @@ __all__ = [
     "ReportFormat",
     "ChatGoal",
     "ChatResponseLength",
+    "MagicArtifactType",
     "DriveMimeType",
     "ExportType",
     "SourceStatus",
+    "DriveSourceStatus",
+    "DiscoveryMode",
     "ShareAccess",
     "ShareViewLevel",
     "SharePermission",
     # Helper functions
     "artifact_status_to_str",
+    "discovery_mode_to_str",
+    "drive_source_status_to_str",
+    "share_permission_to_str",
+    "SOURCE_STATUS_LABELS",
     "source_status_to_str",
 ]
 
 
 for _public_common_type in (
     AccountLimits,
-    AccountTier,
     CitedSourceSelection,
     ClientMetricsSnapshot,
     ConnectionLimits,
     RpcTelemetryEvent,
     UnknownTypeWarning,
+    UserSettings,
 ):
     _public_common_type.__module__ = __name__
 del _public_common_type
@@ -228,12 +338,26 @@ del _public_common_type
 
 for _public_moved_type in (
     Artifact,
+    ArtifactInfographic,
+    ArtifactMedia,
+    ArtifactMediaType,
+    ArtifactSlide,
+    AudioArtifactUserState,
+    FlashcardArtifactUserState,
+    UnknownArtifactUserState,
     ArtifactType,
     AskResult,
     ChatMode,
     ChatReference,
+    ChatSettings,
+    ChatSession,
+    Collection,
     ConversationTurn,
+    ConversationTurnKey,
+    NextStepSuggestion,
+    GenerationState,
     GenerationStatus,
+    Label,
     MindMap,
     MindMapKind,
     MindMapResult,
@@ -241,11 +365,14 @@ for _public_moved_type in (
     Notebook,
     NotebookDescription,
     NotebookMetadata,
+    PremiumFeatureInfo,
+    PromptSuggestion,
     ReportSuggestion,
     ResearchSource,
     ResearchStart,
     ResearchStatus,
     ResearchTask,
+    ResearchTerminationReason,
     SharedUser,
     ShareStatus,
     Source,

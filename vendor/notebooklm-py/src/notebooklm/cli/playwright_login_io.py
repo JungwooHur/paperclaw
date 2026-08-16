@@ -17,8 +17,8 @@ the service from ``session_cmd``:
   ``PreparedPaths | PathError``); preserves the legacy
   ``(storage_path, browser_profile)`` 2-tuple contract.
 * :func:`run_login` — drives ``run_playwright_login`` with the concrete sink.
-* :func:`repair_after_refresh` — drives ``repair_playwright_account_metadata``
-  with the concrete sink (used by the file-backed ``auth refresh`` keepalive).
+* :func:`refresh_stored_session` — orchestrates the file-backed ``auth refresh``
+  keepalive and optional passive verification.
 
 Keeping the sink + wrappers here (not in ``session_cmd``) lets the command
 module collapse its five Playwright import blocks into one and keeps the
@@ -31,9 +31,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
+import click
+
+from .._app.profile import observe_profile_account
 from .error_handler import exit_with_code
-from .rendering import console
+from .rendering import console, json_error_response
 from .runtime import run_async
+from .services.auth_refresh import bootstrap_missing_storage_from_master_token
 from .services.login.io_seam import set_default_login_io_factory
 from .services.playwright_login import (
     PathError,
@@ -45,7 +49,7 @@ from .services.playwright_login import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Callable
 
     from .services.playwright_login import LoginIO
 
@@ -164,10 +168,86 @@ def repair_after_refresh(
     )
 
 
+def refresh_stored_session(
+    storage_path: Path,
+    profile: str | None,
+    *,
+    allow_headless: bool,
+    quiet: bool,
+    verify: bool,
+    json_output: bool,
+    fetch_tokens: Callable[..., Awaitable[Any]],
+) -> None:
+    """Run the stored-session keepalive, metadata repair, and optional verification."""
+    bootstrapped = run_async(bootstrap_missing_storage_from_master_token(storage_path))
+    if bootstrapped:
+        # Validate a newly minted jar once without entering any recovery layer.
+        _verify_token_fetch_after_refresh(
+            storage_path,
+            profile,
+            quiet=True,
+            json_output=json_output,
+        )
+    else:
+        run_async(fetch_tokens(storage_path, profile, allow_headless=allow_headless))
+
+    if storage_path.exists() and not observe_profile_account(storage_path).metadata_valid:
+        repair_after_refresh(storage_path, quiet=quiet)
+    if not quiet:
+        console.print(f"[green]ok[/green] refreshed: {storage_path}")
+    if verify:
+        _verify_token_fetch_after_refresh(
+            storage_path,
+            profile,
+            quiet=quiet,
+            json_output=json_output,
+            already_validated=bootstrapped,
+        )
+
+
+def _verify_token_fetch_after_refresh(
+    storage_path: Path,
+    profile: str | None,
+    *,
+    quiet: bool,
+    json_output: bool = False,
+    already_validated: bool = False,
+) -> None:
+    """Confirm a token fetch actually succeeds after ``auth refresh``.
+
+    Runs the strictly read-only passive probe (no NOTEBOOKLM_REFRESH_CMD, no
+    cookie rotation, no write). This is mandatory after a missing-file
+    master-token bootstrap. ``already_validated=True`` lets ``--verify`` render
+    that prior success without making a second request.
+
+    With ``json_output`` a verify failure is emitted as the error envelope on
+    stdout (exit 1); otherwise the human ``Error: …`` line goes to stderr. The
+    ``fetch_tokens_passive`` import is deferred so the ``notebooklm.auth`` patch
+    seam used by the auth-subcommand tests stays effective.
+    """
+    from ..auth import fetch_tokens_passive
+
+    if not already_validated:
+        try:
+            run_async(fetch_tokens_passive(storage_path, profile))
+        except Exception as exc:  # noqa: BLE001 — surface any failure as a clean exit 1
+            message = f"refresh completed but the post-refresh token fetch failed: {exc}"
+            if json_output:
+                json_error_response("post_refresh_token_fetch_failed", message)  # NoReturn
+            click.echo(f"Error: {message}", err=True)
+            exit_with_code(1)
+    # Suppress the human success line in --json mode too (not just --quiet), so the
+    # caller's single JSON document is the only thing on stdout.
+    if not quiet and not json_output:
+        console.print("[green]ok[/green] verified: token fetch succeeds after refresh")
+
+
 __all__ = [
     "PlaywrightLoginIO",
+    "_verify_token_fetch_after_refresh",
     "make_login_io",
     "prepare_paths_or_exit",
+    "refresh_stored_session",
     "repair_after_refresh",
     "run_login",
     "validate_flags_or_exit",
