@@ -1,7 +1,7 @@
 # Release Checklist
 
 **Status:** Active
-**Last Updated:** 2026-05-23
+**Last Updated:** 2026-08-05
 
 Checklist for releasing a new version of `notebooklm-py`.
 
@@ -37,7 +37,7 @@ Release Plan for vX.Y.Z:
 11. Merge PR to main
 12. ⏸️ CONFIRM: Create and push tag vX.Y.Z?
 13. Wait for PyPI publish
-14. Create GitHub release
+14. Create GitHub release (add `--prerelease` for a pre-release — see [Pre-releases](#pre-releases-alpha--beta--rc))
 15. Clean up worktree
 
 Proceed with release preparation?
@@ -56,7 +56,9 @@ Proceed with release preparation?
   ```
 - [ ] Set up the development environment:
   ```bash
-  # `[all]` excludes the cookies extra (Python 3.13+ rookiepy issue) — see docs/installation.md#all-vs-all-extras
+  # Canonical contributor install; add --extra mcp/--extra server when
+  # validating those adapters locally. `[all]` also includes mcp+server
+  # and deliberately excludes cookies (Python 3.13+ rookiepy issue).
   uv sync --frozen --extra browser --extra dev --extra markdown
   uv run playwright install chromium
   ```
@@ -73,7 +75,7 @@ Proceed with release preparation?
 - [ ] Update `Last Updated` dates in modified docs
 - [ ] Verify example scripts have valid syntax:
   ```bash
-  uv run python -m py_compile docs/examples/*.py
+  uv run python -m py_compile examples/*.py
   ```
 
 **Related docs to check/update if relevant:**
@@ -101,12 +103,19 @@ Proceed with release preparation?
   When in doubt, it's PATCH.
   ```
 
+  For a **pre-release**, target the final version plus a pre-release serial
+  (e.g. `0.8.0a1`) — see [Pre-releases](#pre-releases-alpha--beta--rc).
+
   See [Version Numbering](#version-numbering) for full details.
 
 - [ ] Update version in `pyproject.toml`:
   ```toml
   version = "X.Y.Z"
   ```
+
+- [ ] Update the matching version in `desktop-extension/manifest.json` (`"version": "X.Y.Z"`).
+  It must equal `pyproject.toml` — `tests/unit/test_mcp_desktop_extension.py` enforces this,
+  and `publish-mcpb.yml` aborts the release-asset build on a mismatch.
 
 ### Public API Compatibility Gate
 
@@ -115,8 +124,9 @@ Proceed with release preparation?
   uv run python scripts/audit_public_api_compat.py
   ```
 - [ ] Read every reported break. The audit compares this checkout with the
-  latest reachable release tag (override with `--baseline-ref vX.Y.Z` only when
-  auditing against a specific previous release).
+  latest reachable **stable** release tag (pre-releases are skipped; override
+  with `--baseline-ref vX.Y.Z` only when auditing against a specific previous
+  release).
 - [ ] If the audit reports an unapproved break, prefer a compatibility shim or
   restored alias. Do **not** proceed to packaging while unapproved breaks remain.
 - [ ] If a break is intentional and allowed by the stability policy, update all
@@ -145,11 +155,26 @@ documented client namespace methods under `NotebookLMClient.notebooks`,
 `sharing`. Function signatures include positional/keyword compatibility and
 default values; changing a default is a public behavior change.
 
+The allowlist is **release-scoped**: each entry records a break pending the
+*next* stable release, not a permanent exemption. A pre-release tag does not
+advance the baseline (see the Pre-releases section). Once a stable `vX.Y.Z`
+ships, its entries are in the baseline and must be pruned — see
+[Prune the API-Compat Allowlist](#prune-the-api-compat-allowlist). The Code
+Quality job runs the audit with `--check-stale`, so a stale entry (one matching
+no break against the baseline) is a CI failure, not silent cruft.
+
 ### Changelog
 
 - [ ] Get commits since last release:
   ```bash
   git log $(git describe --tags --abbrev=0)..HEAD --oneline
+  ```
+  During a **pre-release cycle**, base the range on the last *stable* tag so the
+  aggregate changelog captures the whole cycle (a plain `git describe` would
+  start at the alpha):
+  ```bash
+  git log $(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' \
+    --exclude '*a[0-9]*' --exclude '*b[0-9]*' --exclude '*rc[0-9]*')..HEAD --oneline
   ```
 - [ ] Generate changelog entries in Keep a Changelog format:
   - **Added** - New features
@@ -182,8 +207,9 @@ default values; changing a default is a public behavior change.
   ```bash
   uv run python scripts/check_ci_install_parity.py
   uv run python scripts/check_claude_md_freshness.py
+  uv run python scripts/check_docs_module_refs.py
   # second run confirms release edits did not introduce new API drift
-  uv run python scripts/audit_public_api_compat.py
+  uv run python scripts/audit_public_api_compat.py --check-stale
   ```
 - [ ] Fix any issues before proceeding
 
@@ -193,9 +219,11 @@ default values; changing a default is a public behavior change.
   ```bash
   git diff
   ```
-- [ ] Commit:
+- [ ] Commit (stage `uv.lock` too — the version bump changes its workspace-package
+  entry, and for a pre-release the `uv sync` re-lock in the Pre-releases section
+  requires it; staging it is a no-op on releases where it did not change):
   ```bash
-  git add pyproject.toml CHANGELOG.md docs/
+  git add pyproject.toml desktop-extension/manifest.json CHANGELOG.md uv.lock docs/
   git commit -m "chore: release vX.Y.Z"
   ```
 - [ ] Show commit to user:
@@ -224,7 +252,7 @@ default values; changing a default is a public behavior change.
 
 ### E2E Tests on Release Branch
 
-- [ ] Go to **Actions** → **Nightly E2E**
+- [ ] Go to **Actions** → **Nightly E2E Tests**
 - [ ] Click **Run workflow**, set **custom_branch** to `release/vX.Y.Z`
 - [ ] Wait for E2E tests to pass
 - [ ] If E2E tests fail:
@@ -242,6 +270,37 @@ default values; changing a default is a public behavior change.
   2. Commit and push
   3. Re-run RPC health check
 
+### MCP connector smoke (manual, per release)
+
+The nightly E2E run now installs `--extra mcp` and exercises the MCP/CLI layers
+against the live API (`tests/e2e/test_mcp*.py`, `test_cli_live.py`) — so the
+on-demand Nightly run above already covers Layer A (tools ⇄ live API) and Layer B
+(HTTP transport + signed-URL routes, in-process). What it **cannot** cover is
+claude.ai actually driving the remote connector (OAuth login + the browser
+upload/download pages). Verify that by hand, once per release (~10 min):
+
+- [ ] `cd deploy && make dev` (or point at your deployed tunnel) and connect the
+      connector in claude.ai.
+- [ ] **OAuth login page** renders and the password gate accepts your password.
+- [ ] List notebooks through the connector.
+- [ ] Add a URL source.
+- [ ] Ask a question and get a grounded answer.
+- [ ] Generate **one** artifact (e.g. a report).
+- [ ] **Upload** a local file via the signed link (open it in a browser, pick a
+      file, confirm the source lands).
+- [ ] **Download** the generated artifact via the signed link.
+
+Bootstrap / sanity helper for the upload+download halves (drives a RUNNING
+server's file routes, prints PASS/FAIL). Requires the `mcp` extra (e.g.
+`uv sync --extra mcp`):
+
+```bash
+python scripts/mcp_live_smoke.py \
+    --base-url https://your-tunnel.example.com \
+    --bearer "$NOTEBOOKLM_MCP_TOKEN" \
+    --notebook <notebook-id>
+```
+
 ---
 
 ## Package Verification
@@ -256,7 +315,7 @@ default values; changing a default is a public behavior change.
 - [ ] Wait for upload to complete
 - [ ] Verify package appears: https://test.pypi.org/project/notebooklm-py/
 
-> **Note:** TestPyPI does not allow re-uploading the same version. If you need to fix issues after publishing, bump the patch version and start over.
+> **Note:** TestPyPI does not allow re-uploading the same version. If you need to fix issues after publishing, bump the patch version and start over. For a pre-release, bump the **pre-release serial** (`a1 → a2`), not the patch.
 
 ### Verify TestPyPI Package
 
@@ -265,7 +324,8 @@ default values; changing a default is a public behavior change.
 - [ ] Wait for all tests to pass (unit, integration, E2E)
 - [ ] If verification fails:
   1. Fix issues in the release worktree
-  2. Bump patch version in `pyproject.toml`
+  2. Bump patch version in `pyproject.toml` (for a pre-release, bump the
+     pre-release serial, e.g. `0.8.0a1 → 0.8.0a2`)
   3. Update `CHANGELOG.md` with fix
   4. Commit, push, and re-run **Publish to TestPyPI**
 
@@ -273,7 +333,7 @@ default values; changing a default is a public behavior change.
 
 The **Verify Package** workflow (`.github/workflows/verify-package.yml`) exercises a published wheel in two phases so packaging bugs cannot silently fall through to a stale PyPI mirror:
 
-1. **Dep tree from `uv.lock`.** `uv sync --frozen --extra browser --extra dev --extra markdown` installs every locked dep into `.venv/` — the same canonical extras documented in `docs/installation.md`. This produces a deterministic dep tree without any TestPyPI lookups.
+1. **Dep tree from `uv.lock`.** `uv sync --frozen --extra browser --extra dev --extra markdown --extra mcp --extra server --extra headless` installs the locked dependency tree for the full non-cookies extra set into `.venv/`: browser automation, developer tooling, Markdown export, MCP, REST server, and headless master-token-auth dependencies. `cookies` stays excluded because of the Python 3.13+ `rookiepy` issue. This produces a deterministic dep tree without any TestPyPI lookups.
 2. **Wheel from the chosen index, `--no-deps`.** `uv pip install --python .venv/bin/python --no-deps --reinstall --no-cache --only-binary=:all: --index-url <testpypi|pypi> "notebooklm-py==<version>"` swaps the editable install left behind by `uv sync` for the actual published wheel. `--no-deps` is load-bearing: without it the previous `--extra-index-url https://pypi.org/simple/` fallback would mask a broken/missing TestPyPI upload by resolving an older version from PyPI. `--reinstall --no-cache --only-binary=:all:` guarantee we test the freshly-uploaded wheel and never a cached sdist. The explicit `--python .venv/bin/python` is required because `uv sync` does not seed `pip` into the project venv — a bare `source .venv/bin/activate && pip install …` would silently fall back to the runner's system pip and leave the editable install in place.
 
 The same chain runs for `source: pypi` (post-publish verification) — only the wheel index changes; the locked dep tree is identical.
@@ -321,6 +381,15 @@ The `Publish to PyPI` step in `publish.yml` also opts into **PEP 740 attestation
 
 ### GitHub Release
 
+- [ ] **⏸️ Wait for the Docker image first.** Creating the release triggers `publish-mcpb.yml`, which
+  attaches a `docker-compose.yml` **version-baked** to this tag. That file pulls
+  `tenglin/notebooklm-mcp:<version>`, so the image must exist before the release publishes. The tag
+  push started `publish-docker.yml` in parallel with `publish.yml`; confirm it finished and the tag
+  is live before creating the release:
+  ```bash
+  gh run list --workflow=publish-docker.yml --branch "vX.Y.Z" --json status,conclusion
+  docker manifest inspect tenglin/notebooklm-mcp:X.Y.Z >/dev/null && echo "image present"
+  ```
 - [ ] Create release from tag:
   ```bash
   gh release create vX.Y.Z --title "vX.Y.Z" --notes "$(cat CHANGELOG.md | sed -n '/## \[X.Y.Z\]/,/## \[/p' | sed '$d')"
@@ -331,6 +400,67 @@ The `Publish to PyPI` step in `publish.yml` also opts into **PEP 740 attestation
   - Title: `vX.Y.Z`
   - Copy release notes from `CHANGELOG.md`
   - Publish release
+
+- [ ] Publishing a release (stable **and** pre-release) fires `publish-mcpb.yml`, which attaches
+  four assets: `notebooklm-mcp.mcpb` (the one-click Claude Desktop bundle — the launcher pins this
+  release's version), `notebooklm-skill.zip`, `docker-compose.yml`, and `env.example`. The compose
+  is **version-baked** to this exact release (so a downloaded `docker compose up -d` pulls
+  `tenglin/notebooklm-mcp:<this version>`, not `:latest`). It re-checks manifest/tag/pyproject
+  agreement. Confirm all four assets appear under the release once the workflow finishes.
+
+### Prune the API-Compat Allowlist
+
+Pushing a **stable** tag advances the audit baseline — `audit_public_api_compat.py`
+resolves the latest reachable stable release tag (pre-releases are skipped), so
+the breaks you just shipped are now part of the `vX.Y.Z` baseline and are **no
+longer breaks against it**. (A pre-release tag such as `v0.8.0a1` does **not**
+advance the baseline, so the allowlist survives the whole pre-release cycle and
+prunes once, here, at the final `vX.Y.Z`.) The baseline advances automatically;
+the allowlist is the manual half that must reset, or it accumulates dead entries
+that describe nothing.
+
+The lifecycle to keep in mind:
+
+- **baseline** = the last *stable released* version (automatic — the latest
+  stable release tag; pre-releases are skipped).
+- **allowlist** = the intentional breaks pending the *next* release. It should
+  reset to (near) empty at each release boundary.
+
+The tag-triggered `publish.yml` workflow now performs this mechanically after
+publishing. It checks out the immutable tag, runs the audit with the explicit
+previous stable tag, and opens a PR from
+`automation/api-compat-prune-vX.Y.Z` when stale entries exist. Its repository
+write permission is used only for that generated branch; the workflow never
+pushes `main`. Review the generated diff and merge the PR before the next
+release.
+Reruns reuse the branch only when its complete generated tree is identical and
+an open matching PR exists. A human-modified branch or a branch without its PR
+fails without force-pushing; review or remove that branch, then rerun the
+workflow.
+
+For local recovery or a dry review of the generated change, use the explicit
+write operation (always pass the baseline you intend to compare):
+
+```bash
+uv run python scripts/audit_public_api_compat.py --baseline-ref vPREV --prune
+```
+
+`--prune` is never implied by a normal audit. It removes only stale
+`allowed_breaks` entries, preserves `extra_public_names` and other policy
+fields, and performs a deterministic atomic rewrite. It is idempotent and
+reports each removed entry. Malformed, missing, or unwritable allowlists fail
+with an actionable error; fix the file or permissions and rerun the command.
+
+- [ ] Re-run the gate in strict mode — it must report **no stale entries**:
+  ```bash
+  uv run python scripts/audit_public_api_compat.py --baseline-ref vPREV --check-stale
+  ```
+
+> **Forcing function:** the Code Quality job runs the audit with `--check-stale`,
+> which **fails** on any allowlist entry that matches no break against the
+> baseline. The pair-aware rule keeps the two path-views of a callable
+> (`notebooklm.X` and `notebooklm.client.X`) together: a unit is pruned only when
+> *neither* view still matches a break.
 
 ---
 
@@ -395,7 +525,56 @@ git push origin :refs/tags/vX.Y.Z
 
 - Check if version already exists on TestPyPI
 - TestPyPI doesn't allow re-uploading same version
-- Bump to next patch version if needed
+- Bump to next patch version if needed (for a pre-release, bump the pre-release serial, e.g. `0.8.0a1 → 0.8.0a2`)
+
+---
+
+## Pre-releases (alpha / beta / rc)
+
+Pre-releases let you stage a release for early adopters without affecting normal
+users. PEP 440 pre-release versions flow through the existing build, tag, publish,
+and verify machinery unchanged, and `pip install notebooklm-py` will not serve
+them to normal users. Follow the normal checklist above, with these differences:
+
+1. **Version format is canonical PEP 440, byte-identical everywhere.** Use
+   `X.Y.ZaN` / `X.Y.ZbN` / `X.Y.ZrcN` (e.g. `0.8.0a1`), tag `vX.Y.ZaN`. Do **not**
+   use non-canonical forms like `0.8.0-alpha.1`, `0.8.0.rc1`, or `0.8.0RC1`:
+   `publish.yml` tag-validation and `verify-package.yml` do raw string compares,
+   and Verify Package compares against the *normalized* `importlib.metadata.version()`
+   — a non-canonical spelling passes tag-match but fails Verify Package with a
+   spurious "version mismatch".
+2. **Serial progression** within one cycle: advance the serial
+   `a1 → a2 → … → b1 → … → rc1 → … → X.Y.0` (final). Do **not** bump the patch
+   between pre-releases.
+3. **A pre-release *is* the final version's real surface.** A `X.Y.ZaN` tag must
+   already contain every breaking flip for that version with deprecation shims
+   removed. The `tests/_guardrails/test_v080_release_gate.py` version parser
+   truncates the pre-release suffix, so the v0.8.0 breaking-flip release-gate
+   fires at `0.8.0a1`. A "soft" alpha that still carries shims is not supported.
+4. **Re-lock after the bump.** After editing `pyproject.toml`'s version, run
+   `uv sync` so `uv.lock`'s workspace-package version matches, else CI `--frozen`
+   installs fail as out-of-date.
+5. **Normal users are unaffected.** `pip install notebooklm-py` skips pre-releases;
+   only `pip install --pre` or an exact `==0.8.0a1` pin selects one.
+6. **Changelog.** Keep pre-release changes accumulating under `## [Unreleased]`
+   (or a single in-progress `## [0.8.0]` heading). Do **not** cut a dated
+   `[X.Y.ZaN]` section per pre-release.
+7. **Baseline / allowlist: no special handling.** `audit_public_api_compat.py`
+   keeps the baseline on the last *stable* tag through the whole pre-release cycle
+   (pre-release tags are skipped), so the allowlist behaves exactly as for a normal
+   release — one prune after the final `X.Y.0` tag.
+8. **Gates still apply; none are optional.** The public-API audit,
+   pre-commit/mypy/pytest, CI on PR, TestPyPI, and Verify Package all run
+   unchanged. Verify Package reads the version from the checked-out ref, so
+   dispatch it on the pre-release branch. Because Verify Package runs E2E, there is
+   no "skip E2E for a pre-release" shortcut.
+9. **GitHub release must be flagged as a pre-release, and the notes must extract
+   the aggregate heading** (not a per-pre-release one, which would yield empty
+   notes):
+   ```bash
+   gh release create v0.8.0a1 --prerelease --title "v0.8.0a1" \
+     --notes "$(sed -n '/## \[0.8.0\]/,/## \[/p' CHANGELOG.md | sed '$d')"
+   ```
 
 ---
 

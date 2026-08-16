@@ -49,6 +49,7 @@ class Kernel(Protocol):
         body: bytes,
         *,
         read_timeout: float | None = None,
+        max_response_bytes: int | None = None,
     ) -> httpx.Response: ...
 
     @property
@@ -82,6 +83,8 @@ class RpcCaller(Protocol):
         *,
         disable_internal_retries: bool = False,
         operation_variant: str | None = None,
+        read_timeout: float | None = None,
+        raise_on_null_status: bool = False,
     ) -> Any: ...
 
 

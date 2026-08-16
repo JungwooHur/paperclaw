@@ -3,6 +3,7 @@
 Commands:
     list        List all artifacts
     get         Get artifact details
+    get-prompt  Show the generation prompt behind an artifact
     rename      Rename an artifact
     delete      Delete an artifact
     export      Export to Google Docs/Sheets
@@ -12,12 +13,25 @@ Commands:
     suggestions Get AI-suggested report topics
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import click
 from rich.table import Table
 
-from ..client import NotebookLMClient
-from ..types import ExportType
-from .auth_runtime import with_client
+from .._app.artifacts import (
+    delete_artifact,
+    export_artifact,
+    get_artifact,
+    get_artifact_prompt,
+    poll_artifact,
+    rename_artifact,
+    retry_artifact,
+    wait_for_artifact,
+)
+from ..exceptions import ArtifactNotFoundError
+from .auth_runtime import resolve_client_factory, with_client
 from .error_handler import _output_error, exit_with_code
 from .options import json_option, list_options, notebook_option, wait_polling_options
 from .polling_ui import status_with_elapsed
@@ -37,6 +51,9 @@ from .resolve import (
 from .services.confirming_mutation import MutationPlan, run_confirmed_mutation
 from .services.listing import ListSpec, prepare_list
 
+if TYPE_CHECKING:
+    from ..client import NotebookLMClient
+
 
 @click.group()
 def artifact():
@@ -46,6 +63,7 @@ def artifact():
     Commands:
       list         List all artifacts (or by type)
       get          Get artifact details
+      get-prompt   Show the generation prompt behind an artifact
       rename       Rename an artifact
       delete       Delete an artifact
       export       Export to Google Docs/Sheets
@@ -79,6 +97,8 @@ def artifact():
             "data-table",
             "mind-map",
             "report",
+            "fantasy-map",
+            "file",
         ]
     ),
     default="all",
@@ -99,7 +119,7 @@ def artifact_list(ctx, notebook_id, artifact_type, json_output, limit, no_trunca
     type_filter = cli_name_to_artifact_type(artifact_type)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
 
             async def envelope_extras(
@@ -163,25 +183,23 @@ def artifact_get(ctx, artifact_id, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_artifact_id(
                 client, nb_id_resolved, artifact_id, json_output=json_output
             )
-            art = await client.artifacts.get_or_none(nb_id_resolved, resolved_id)
 
-            # BREAKING: not-found exits 1 with a typed error instead of the
-            # previous exit-0 ``found: false`` placeholder. See the matching
-            # change in ``cli/source.py::source_get`` and the BREAKING entry
-            # in ``CHANGELOG.md`` (Unreleased → Changed).
-            #
-            # The trailing ``raise AssertionError`` is unreachable at runtime
-            # (``_output_error`` always raises) — it exists solely to narrow
-            # ``art`` from ``Artifact | None`` to ``Artifact`` for mypy without
-            # forcing a ``NoReturn`` annotation onto
-            # ``error_handler._output_error`` (which would change the shared
-            # error helper's typing contract).
-            if art is None:
+            # The neutral ``get_artifact`` raises ``ArtifactNotFoundError`` when
+            # the backend reports the artifact gone (deleted between the
+            # partial-id resolve and the get, or a canonical UUID pointing at a
+            # since-deleted artifact). Render the historical ``NOT_FOUND``
+            # envelope here so the CLI ``--json`` body + exit-1 contract stay
+            # byte-stable (BREAKING vs the old exit-0 ``found: false``; see the
+            # matching ``cli/source_cmd.py::source_get`` change and the BREAKING
+            # entry in ``CHANGELOG.md``).
+            try:
+                art = await get_artifact(client, nb_id_resolved, resolved_id)
+            except ArtifactNotFoundError:
                 _output_error(
                     "Artifact not found",
                     code="NOT_FOUND",
@@ -189,7 +207,7 @@ def artifact_get(ctx, artifact_id, notebook_id, json_output, client_auth):
                     exit_code=1,
                     extra={"id": resolved_id, "notebook_id": nb_id_resolved},
                 )
-                raise AssertionError("unreachable")  # pragma: no cover
+                raise AssertionError("unreachable") from None  # pragma: no cover
 
             if json_output:
                 data = {
@@ -216,6 +234,58 @@ def artifact_get(ctx, artifact_id, notebook_id, json_output, client_auth):
     return _run()
 
 
+@artifact.command("get-prompt")
+@click.argument("artifact_id")
+@notebook_option
+@json_option
+@with_client
+def artifact_get_prompt(ctx, artifact_id, notebook_id, json_output, client_auth):
+    """Show the generation prompt that produced an artifact.
+
+    Prints the free-text prompt the artifact was generated from. ARTIFACT_ID
+    can be a full UUID or a partial prefix (e.g., 'abc' matches 'abc123...').
+    A missing artifact exits 1 with a typed NOT_FOUND error.
+    """
+    nb_id = require_notebook(notebook_id)
+
+    async def _run():
+        async with resolve_client_factory(ctx)(client_auth) as client:
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            resolved_id = await resolve_artifact_id(
+                client, nb_id_resolved, artifact_id, json_output=json_output
+            )
+
+            # The neutral ``get_artifact_prompt`` raises ``ArtifactNotFoundError``
+            # for an id absent from the studio listing; render the same
+            # ``NOT_FOUND`` envelope + exit 1 contract as ``artifact get``.
+            try:
+                prompt = await get_artifact_prompt(client, nb_id_resolved, resolved_id)
+            except ArtifactNotFoundError:
+                _output_error(
+                    "Artifact not found",
+                    code="NOT_FOUND",
+                    json_output=json_output,
+                    exit_code=1,
+                    extra={"id": resolved_id, "notebook_id": nb_id_resolved},
+                )
+                raise AssertionError("unreachable") from None  # pragma: no cover
+
+            if json_output:
+                json_output_response(
+                    {"notebook_id": nb_id_resolved, "id": resolved_id, "prompt": prompt}
+                )
+                return
+
+            if prompt is None:
+                console.print("[yellow]This artifact has no stored prompt.[/yellow]")
+                return
+            # Print the prompt verbatim with no Rich markup interpretation so a
+            # prompt containing literal brackets is shown exactly as authored.
+            console.print(prompt, markup=False)
+
+    return _run()
+
+
 @artifact.command("rename")
 @click.argument("artifact_id")
 @click.argument("new_title")
@@ -230,43 +300,24 @@ def artifact_rename(ctx, artifact_id, new_title, notebook_id, json_output, clien
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_artifact_id(
                 client, nb_id_resolved, artifact_id, json_output=json_output
             )
 
-            # Mind maps need kind-aware rename: note-backed maps via UPDATE_NOTE,
-            # interactive (studio-artifact) maps via RENAME_ARTIFACT — both behind
-            # the unified mind-map API (#1256). Regular artifacts use RENAME_ARTIFACT.
-            mind_maps = await client.mind_maps.list(nb_id_resolved)
-            mind_map = next((m for m in mind_maps if m.id == resolved_id), None)
-            # return_object=False: the CLI builds its confirmation from
-            # resolved_id + new_title and never uses the hydrated object, so
-            # skip the rename re-fetch (a full LIST_ARTIFACTS / get). For
-            # partial-id input, ``resolve_artifact_id`` already listed and
-            # raised on an absent id, so existence is proven before we get
-            # here. (A canonical full-UUID input fast-paths the resolver
-            # without a list, so a UUID pointing to a since-deleted artifact
-            # would print a benign no-op "success" — a pre-existing condition,
-            # not introduced here; hydrating to catch it would re-list on every
-            # already-resolved partial-id rename, which isn't worth it.)
-            if mind_map is not None:
-                await client.mind_maps.rename(
-                    nb_id_resolved, resolved_id, new_title, kind=mind_map.kind, return_object=False
-                )
-            else:
-                await client.artifacts.rename(
-                    nb_id_resolved, resolved_id, new_title, return_object=False
-                )
-            # The rename API now returns the renamed object and raises on a
-            # missing target; if no exception was raised, the operation
-            # succeeded. We display the requested new_title as confirmation.
+            # Kind-aware mind-map dispatch + the rename RPC live in the neutral
+            # core. The rename API raises on a missing target; if no exception
+            # was raised, the operation succeeded. We display the requested
+            # new_title as confirmation.
+            result = await rename_artifact(client, nb_id_resolved, resolved_id, new_title)
             if json_output:
-                json_output_response({"id": resolved_id, "renamed": True, "new_title": new_title})
+                json_output_response(
+                    {"id": result.artifact_id, "renamed": True, "new_title": result.new_title}
+                )
             else:
-                cli_print(f"[green]Renamed artifact:[/green] {resolved_id}", ctx=ctx)
-                cli_print(f"[bold]New title:[/bold] {new_title}", ctx=ctx)
+                cli_print(f"[green]Renamed artifact:[/green] {result.artifact_id}", ctx=ctx)
+                cli_print(f"[bold]New title:[/bold] {result.new_title}", ctx=ctx)
 
     return _run()
 
@@ -285,7 +336,7 @@ def artifact_delete(ctx, artifact_id, notebook_id, yes, json_output, client_auth
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
 
             async def resolve_delete(client):
                 nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
@@ -317,15 +368,14 @@ def artifact_delete(ctx, artifact_id, notebook_id, yes, json_output, client_auth
                 }
 
             async def execute_delete(client, resolved):
-                # Check if this is a mind map (stored with notes)
-                mind_maps = await client.notes.list_mind_maps(resolved["notebook_id"])
-                for mm in mind_maps:
-                    if mm[0] == resolved["artifact_id"]:
-                        await client.notes.delete(resolved["notebook_id"], resolved["artifact_id"])
-                        resolved["kind"] = "mind_map"
-                        return
-
-                await client.artifacts.delete(resolved["notebook_id"], resolved["artifact_id"])
+                # Neutral core clears note-backed mind maps via notes.delete and
+                # deletes regular artifacts via artifacts.delete; it reports back
+                # which path ran so the serializer can flag the mind-map carve-out.
+                is_mind_map = await delete_artifact(
+                    client, resolved["notebook_id"], resolved["artifact_id"]
+                )
+                if is_mind_map:
+                    resolved["kind"] = "mind_map"
 
             def serialize_success(resolved):
                 if resolved["kind"] == "mind_map":
@@ -394,33 +444,28 @@ def artifact_export(ctx, artifact_id, notebook_id, title, export_type, json_outp
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_artifact_id(
                 client, nb_id_resolved, artifact_id, json_output=json_output
             )
-            # Convert export_type string to ExportType enum
-            export_type_enum = ExportType.SHEETS if export_type == "sheets" else ExportType.DOCS
-            # Pass None for content - backend retrieves content from artifact_id
-            result = await client.artifacts.export(
-                nb_id_resolved, resolved_id, None, title, export_type_enum
-            )
+            result = await export_artifact(client, nb_id_resolved, resolved_id, title, export_type)
 
             if json_output:
                 json_output_response(
                     {
-                        "id": resolved_id,
-                        "exported": bool(result),
-                        "export_type": export_type,
-                        "title": title,
-                        "result": result,
+                        "id": result.artifact_id,
+                        "exported": result.exported,
+                        "export_type": result.export_type,
+                        "title": result.title,
+                        "result": result.result,
                     }
                 )
                 return
 
-            if result:
+            if result.exported:
                 console.print(f"[green]Exported to Google {export_type.title()}[/green]")
-                console.print(result)
+                console.print(result.result)
             else:
                 console.print("[yellow]Export may have failed[/yellow]")
 
@@ -459,16 +504,13 @@ def artifact_poll(ctx, task_id, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
-            status = await client.artifacts.poll_status(nb_id_resolved, task_id)
+            status = await poll_artifact(client, nb_id_resolved, task_id)
 
             if json_output:
                 # Mirror the GenerationStatus dataclass fields so automation can
-                # introspect status / url / error without parsing prose. Direct
-                # attribute access (rather than getattr) matches how
-                # ``artifact wait`` consumes the same dataclass and surfaces
-                # type drift instead of swallowing it.
+                # introspect status / url / error without parsing prose.
                 json_output_response(
                     {
                         "task_id": status.task_id,
@@ -519,7 +561,7 @@ def artifact_wait(ctx, artifact_id, notebook_id, timeout, interval, json_output,
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_artifact_id(
                 client, nb_id_resolved, artifact_id, json_output=json_output
@@ -543,7 +585,8 @@ def artifact_wait(ctx, artifact_id, notebook_id, timeout, interval, json_output,
                     json_output=json_output,
                     resume_hint=f"notebooklm artifact poll {resolved_id}",
                 ):
-                    status = await client.artifacts.wait_for_completion(
+                    status = await wait_for_artifact(
+                        client,
                         nb_id_resolved,
                         resolved_id,
                         initial_interval=float(interval),
@@ -563,10 +606,10 @@ def artifact_wait(ctx, artifact_id, notebook_id, timeout, interval, json_output,
                     # exits 0 for unknown/pending statuses). Without this,
                     # automation sees a JSON payload with an "error" message
                     # but the command still exits 0.
-                    if status.status != "completed":
+                    if not status.is_complete:
                         exit_with_code(1)
                 else:
-                    if status.status == "completed":
+                    if status.is_complete:
                         console.print(f"[green]✓ Artifact completed:[/green] {resolved_id}")
                         if status.url:
                             console.print(f"[dim]URL:[/dim] {status.url}")
@@ -626,13 +669,13 @@ def artifact_retry(
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_artifact_id(
                 client, nb_id_resolved, artifact_id, json_output=json_output
             )
 
-            status = await client.artifacts.retry_failed(nb_id_resolved, resolved_id)
+            status = await retry_artifact(client, nb_id_resolved, resolved_id)
 
             if not wait:
                 if json_output:
@@ -659,7 +702,8 @@ def artifact_retry(
                     json_output=json_output,
                     resume_hint=f"notebooklm artifact poll {status.task_id}",
                 ):
-                    final = await client.artifacts.wait_for_completion(
+                    final = await wait_for_artifact(
+                        client,
                         nb_id_resolved,
                         status.task_id,
                         initial_interval=float(interval),
@@ -680,10 +724,10 @@ def artifact_retry(
                             "error": final.error,
                         }
                     )
-                    if final.status != "completed":
+                    if not final.is_complete:
                         exit_with_code(1)
                 else:
-                    if final.status == "completed":
+                    if final.is_complete:
                         console.print(f"[green]✓ Artifact completed:[/green] {final.task_id}")
                         if final.url:
                             console.print(f"[dim]URL:[/dim] {final.url}")
@@ -726,7 +770,7 @@ def artifact_suggestions(ctx, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             suggestions = await client.artifacts.suggest_reports(nb_id_resolved)
 

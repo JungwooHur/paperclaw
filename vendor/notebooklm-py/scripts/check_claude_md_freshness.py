@@ -1,6 +1,9 @@
-"""Assert CLAUDE.md repo-structure paths are fresh in both directions.
+"""Assert the repo-structure file map is fresh in both directions.
 
-Prevents silent drift in the hand-maintained file map:
+The hand-maintained module map (the ``### Repository Structure`` tree) lives in
+``docs/architecture.md`` — it was moved there from CLAUDE.md to keep CLAUDE.md
+slim; the ``--claude-md`` flag is kept (name unchanged for back-compat) but now
+defaults to the architecture doc. This gate prevents silent drift:
 
 * documented paths must still exist; and
 * every ``src/notebooklm`` module/package (including subpackage members) must
@@ -8,12 +11,12 @@ Prevents silent drift in the hand-maintained file map:
 
 Usage:
     python scripts/check_claude_md_freshness.py
-    python scripts/check_claude_md_freshness.py --claude-md path/to/CLAUDE.md
+    python scripts/check_claude_md_freshness.py --claude-md path/to/doc.md
 
 Exit codes:
-    0  CLAUDE.md is fresh.
+    0  The structure doc (docs/architecture.md) is fresh.
     1  One or more paths are stale or missing from the map.
-    2  Argument error or CLAUDE.md not found.
+    2  Argument error or the structure doc not found.
 """
 
 from __future__ import annotations
@@ -165,13 +168,13 @@ def _top_level_notebooklm_modules(repo_root: Path) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--claude-md", default="CLAUDE.md")
+    ap.add_argument("--claude-md", default="docs/architecture.md")
     ap.add_argument("--repo-root", default=".")
     args = ap.parse_args(argv)
 
     claude = Path(args.claude_md)
     if not claude.is_file():
-        print(f"CLAUDE.md not found: {claude}", file=sys.stderr)
+        print(f"Structure doc not found: {claude}", file=sys.stderr)
         return 2
 
     repo_root = Path(args.repo_root).resolve()
@@ -194,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if missing or undocumented or stale_omissions or unreasoned_omissions:
         if missing:
-            print("Stale CLAUDE.md path references:", file=sys.stderr)
+            print("Stale structure-doc path references:", file=sys.stderr)
             for p in missing:
                 print(f"  {p}", file=sys.stderr)
         if undocumented:
@@ -202,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             for p in undocumented:
                 print(f"  {p}", file=sys.stderr)
         if stale_omissions:
-            print("Stale CLAUDE.md intentional omissions:", file=sys.stderr)
+            print("Stale structure-doc intentional omissions:", file=sys.stderr)
             for p in stale_omissions:
                 print(f"  {p}", file=sys.stderr)
         if unreasoned_omissions:

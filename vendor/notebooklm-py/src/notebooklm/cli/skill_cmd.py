@@ -1,132 +1,80 @@
-"""Skill management commands."""
+"""Skill management commands.
+
+Thin Click adapter over the transport-neutral
+:mod:`notebooklm._app.skill` core. The install-target catalog, path/version
+helpers, and the per-target ``create`` / ``up_to_date`` / ``overwrite``
+classification live in ``_app``; this module imports those names into its own
+namespace (so ``patch.object(skill_cmd, ...)`` test seams and the
+``from notebooklm.cli.skill_cmd import ...`` imports keep resolving) and owns
+the Click I/O, the atomic file writes, and the packaged-source loader.
+"""
 
 import re
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
 import click
 
+from .._app.skill import (
+    DEFAULT_ARCHIVE_FILENAME,
+    SCOPES,
+    SKILL_ARCHIVE_ENTRY,
+    TARGET_CREATE,
+    TARGET_OVERWRITE,
+    TARGET_UP_TO_DATE,
+    TARGETS,
+    SkillTarget,
+    add_version_comment,
+    build_skill_archive_bytes,
+    classify_target,
+    get_installed_content,
+    get_package_version,
+    get_scope_root,
+    get_skill_path,
+    get_skill_version,
+    iter_targets,
+    remove_empty_parents,
+    report_mixed_no_clobber_up_to_date,
+)
 from ..io import replace_file_atomically
 from .agent_templates import get_agent_source_content
-from .error_handler import exit_with_code
-from .rendering import console
-from .services.skill_install import report_mixed_no_clobber_up_to_date
+from .error_handler import exit_with_code, output_error
+from .rendering import console, emit_status, json_output_response
 
+__all__ = [
+    "DEFAULT_ARCHIVE_FILENAME",
+    "SCOPES",
+    "SKILL_ARCHIVE_ENTRY",
+    "TARGET_CREATE",
+    "TARGET_OVERWRITE",
+    "TARGET_UP_TO_DATE",
+    "TARGETS",
+    "SkillTarget",
+    "add_version_comment",
+    "atomic_write_bytes",
+    "atomic_write_text",
+    "build_skill_archive_bytes",
+    "classify_target",
+    "get_installed_content",
+    "get_package_version",
+    "get_scope_root",
+    "get_skill_path",
+    "get_skill_source_content",
+    "get_skill_version",
+    "iter_targets",
+    "remove_empty_parents",
+    "report_mixed_no_clobber_up_to_date",
+    "skill",
+]
 
-@dataclass(frozen=True)
-class SkillTarget:
-    """Install target metadata."""
-
-    label: str
-    relative_path: Path
-
-
-TARGETS = {
-    "claude": SkillTarget("Claude Code", Path(".claude") / "skills" / "notebooklm" / "SKILL.md"),
-    "agents": SkillTarget("Agent Skills", Path(".agents") / "skills" / "notebooklm" / "SKILL.md"),
-}
-SCOPES = ("user", "project")
+# Documented API ceiling for the SKILL.md frontmatter ``description``; longer
+# descriptions may be rejected at upload time.
+_DESCRIPTION_LIMIT = 1024
 
 
 def get_skill_source_content() -> str | None:
     """Read the skill source file from package data."""
     return get_agent_source_content("claude")
-
-
-def get_package_version() -> str:
-    """Get the current package version."""
-    try:
-        from .. import __version__
-
-        return __version__
-    except ImportError:
-        return "unknown"
-
-
-def get_skill_version(skill_path: Path) -> str | None:
-    """Extract version from skill file header comment."""
-    if not skill_path.exists():
-        return None
-
-    with open(skill_path, encoding="utf-8") as f:
-        content = f.read(500)  # Read first 500 chars
-
-    match = re.search(r"notebooklm-py v([\d.]+)", content)
-    return match.group(1) if match else None
-
-
-def get_scope_root(scope: str) -> Path:
-    """Resolve the root directory for a given install scope."""
-    return Path.home() if scope == "user" else Path.cwd()
-
-
-def get_skill_path(target: str, scope: str) -> Path:
-    """Resolve the installed skill path for a target and scope."""
-    return get_scope_root(scope) / TARGETS[target].relative_path
-
-
-def iter_targets(target: str) -> list[str]:
-    """Expand 'all' into concrete targets."""
-    return list(TARGETS) if target == "all" else [target]
-
-
-def add_version_comment(content: str, version: str) -> str:
-    """Embed the CLI version into a skill file."""
-    version_comment = f"<!-- notebooklm-py v{version} -->\n"
-
-    if "---" in content:
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            return f"---{parts[1]}---\n{version_comment}{parts[2].lstrip()}"
-
-    return version_comment + content
-
-
-def remove_empty_parents(skill_path: Path, scope: str) -> None:
-    """Remove empty skill directories without touching the scope root."""
-    stop_at = get_scope_root(scope)
-    current = skill_path.parent
-    while current != stop_at:
-        try:
-            current.rmdir()
-        except OSError:
-            break
-        current = current.parent
-
-
-def get_installed_content(target: str, scope: str) -> str | None:
-    """Read an installed skill file."""
-    skill_path = get_skill_path(target, scope)
-    if not skill_path.exists():
-        return None
-    return skill_path.read_text(encoding="utf-8")
-
-
-# Per-target classification used by ``skill install`` to decide whether each
-# target needs a write, would clobber differing content, or is already in sync.
-TARGET_CREATE = "create"
-TARGET_UP_TO_DATE = "up_to_date"
-TARGET_OVERWRITE = "overwrite"
-
-
-def classify_target(target: str, scope: str, stamped_content: str) -> tuple[str, Path]:
-    """Classify what an install would do for a single target.
-
-    Returns ``(status, skill_path)`` where ``status`` is one of
-    :data:`TARGET_CREATE`, :data:`TARGET_UP_TO_DATE`, or :data:`TARGET_OVERWRITE`.
-    """
-    skill_path = get_skill_path(target, scope)
-    if not skill_path.exists():
-        return TARGET_CREATE, skill_path
-    try:
-        existing = skill_path.read_text(encoding="utf-8")
-    except OSError:
-        # Unreadable existing file -- treat as differing so we surface intent.
-        return TARGET_OVERWRITE, skill_path
-    if existing == stamped_content:
-        return TARGET_UP_TO_DATE, skill_path
-    return TARGET_OVERWRITE, skill_path
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -157,6 +105,44 @@ def atomic_write_text(path: Path, content: str) -> None:
             except Exception:
                 pass
         raise
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Atomically write ``data`` to ``path`` (binary twin of ``atomic_write_text``)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(data)
+        replace_file_atomically(temp_path, path)
+    except Exception:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise
+
+
+def _frontmatter_description(content: str) -> str | None:
+    """Extract the single-line frontmatter ``description`` value, if parseable.
+
+    Uses the same ``split("---", 2)`` frontmatter shape as
+    ``add_version_comment``; returns ``None`` (warning skipped) rather than
+    guessing when the block or field is absent.
+    """
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return None
+    match = re.search(r"^description:\s*(.*)$", parts[1], flags=re.MULTILINE)
+    return match.group(1).strip() if match else None
 
 
 @click.group()
@@ -348,27 +334,46 @@ def install(scope: str, target_name: str, dry_run: bool, no_clobber: bool, force
     show_default=True,
     help="Inspect Claude Code, universal agent skill directories, or both.",
 )
-def status(scope: str, target_name: str):
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def status(scope: str, target_name: str, json_output: bool):
     """Check installed skill targets and version info."""
     cli_version = get_package_version()
     selected_targets = iter_targets(target_name)
-    any_installed = False
+    target_rows = []
+    for target in selected_targets:
+        skill_path = get_skill_path(target, scope)
+        skill_version = get_skill_version(skill_path)
+        installed = skill_path.exists()
+        target_rows.append(
+            {
+                "target": target,
+                "label": TARGETS[target].label,
+                "installed": installed,
+                "path": str(skill_path),
+                "skill_version": skill_version if installed else None,
+                "version_mismatch": bool(
+                    installed and skill_version and skill_version != cli_version
+                ),
+            }
+        )
+    any_installed = any(row["installed"] for row in target_rows)
+
+    if json_output:
+        json_output_response({"scope": scope, "cli_version": cli_version, "targets": target_rows})
+        return
 
     console.print(f"NotebookLM skill status ({scope} scope)")
     console.print(f"  CLI version: {cli_version}")
 
-    for target in selected_targets:
-        skill_path = get_skill_path(target, scope)
-        skill_version = get_skill_version(skill_path)
+    for row in target_rows:
         status_label = (
-            "[green]Installed[/green]" if skill_path.exists() else "[yellow]Not installed[/yellow]"
+            "[green]Installed[/green]" if row["installed"] else "[yellow]Not installed[/yellow]"
         )
-        console.print(f"  {TARGETS[target].label}: {status_label}")
-        console.print(f"    Path: {skill_path}")
-        if skill_path.exists():
-            any_installed = True
-            console.print(f"    Skill version: {skill_version or 'unknown'}")
-            if skill_version and skill_version != cli_version:
+        console.print(f"  {row['label']}: {status_label}")
+        console.print(f"    Path: {row['path']}")
+        if row["installed"]:
+            console.print(f"    Skill version: {row['skill_version'] or 'unknown'}")
+            if row["version_mismatch"]:
                 console.print(
                     "    [yellow]Version mismatch[/yellow] - run [cyan]notebooklm skill install[/cyan]"
                 )
@@ -448,3 +453,102 @@ def show(scope: str, target_name: str):
         return
 
     console.print(content)
+
+
+@skill.command()
+@click.option(
+    "--output",
+    "-o",
+    "output",
+    type=click.Path(),
+    default=None,
+    help=(
+        f"Archive path to write (default: ./{DEFAULT_ARCHIVE_FILENAME}). "
+        "If PATH is an existing directory or ends with a path separator, "
+        "the default filename is written inside it."
+    ),
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite an existing archive file.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def package(output: str | None, force: bool, json_output: bool):
+    """Build a Claude-uploadable skill archive (chat and Cowork).
+
+    Produces a ZIP whose root contains the ``notebooklm/`` skill folder,
+    ready for upload via Claude Settings -> Capabilities. Sandboxed agent
+    environments (e.g. Claude Cowork) cannot run ``skill install`` against a
+    local directory; this archive is the supported hand-off for them.
+    """
+    content = get_skill_source_content()
+    if content is None:
+        output_error(
+            "Skill source not found in package data. This may indicate an "
+            "incomplete or corrupted installation. Try reinstalling: "
+            "pip install --force-reinstall notebooklm-py",
+            code="SKILL_SOURCE_MISSING",
+            json_output=json_output,
+            exit_code=1,
+        )
+
+    version = get_package_version()
+    stamped_content = add_version_comment(content, version)
+
+    if output is None:
+        output_path = Path(DEFAULT_ARCHIVE_FILENAME)
+    else:
+        # A trailing separator signals directory intent even when the
+        # directory does not exist yet (``Path`` normalization would drop it).
+        dir_intent = output.endswith(("/", "\\"))
+        output_path = Path(output)
+        if output_path.is_dir() or dir_intent:
+            output_path = output_path / DEFAULT_ARCHIVE_FILENAME
+    if output_path.exists() and not force:
+        output_error(
+            f"Refusing to overwrite existing file: {output_path} (use --force to overwrite)",
+            code="OUTPUT_EXISTS",
+            json_output=json_output,
+            exit_code=1,
+        )
+
+    description = _frontmatter_description(stamped_content)
+    if description is not None and len(description) > _DESCRIPTION_LIMIT:
+        emit_status(
+            f"Warning: skill description is {len(description)} characters "
+            f"(over the {_DESCRIPTION_LIMIT}-character upload limit); "
+            "Claude may reject the archive.",
+            json_output=json_output,
+            style="yellow",
+        )
+
+    data = build_skill_archive_bytes(stamped_content)
+    try:
+        atomic_write_bytes(output_path, data)
+    except OSError as e:
+        output_error(
+            f"Failed to write archive {output_path}: {e}",
+            code="WRITE_FAILED",
+            json_output=json_output,
+            exit_code=1,
+        )
+
+    if json_output:
+        json_output_response(
+            {
+                "path": str(output_path),
+                "version": version,
+                "entries": [SKILL_ARCHIVE_ENTRY],
+                "size_bytes": len(data),
+            }
+        )
+        return
+
+    console.print("[green]Packaged[/green] NotebookLM skill archive")
+    console.print(f"  Version: {version}")
+    console.print(f"  Path:    {output_path}")
+    console.print(f"  Entry:   {SKILL_ARCHIVE_ENTRY}")
+    console.print("")
+    console.print("Upload via Claude Settings -> Capabilities (works in chat and Cowork).")

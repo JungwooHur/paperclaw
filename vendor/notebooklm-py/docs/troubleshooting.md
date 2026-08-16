@@ -1,7 +1,7 @@
 # Troubleshooting
 
 **Status:** Active
-**Last Updated:** 2026-05-14
+**Last Updated:** 2026-08-04
 
 Common issues, known limitations, and workarounds for `notebooklm-py`.
 
@@ -37,15 +37,23 @@ This means most "CSRF token expired" errors resolve automatically.
 
 #### Cookie freshness for long-running / unattended use
 
-Google rotates `__Secure-1PSIDTS` (the freshness partner of `__Secure-1PSID`) on its own cadence; the on-disk `Expires` field is **not** a reliable predictor of server-side validity. The library handles freshness in five layers, ordered cheapest to heaviest:
+Google rotates `__Secure-1PSIDTS` (the freshness partner of `__Secure-1PSID`) on its own cadence; the on-disk `Expires` field is **not** a reliable predictor of server-side validity. The library handles freshness in layered fallbacks, ordered cheapest to heaviest:
 
 1. **Per-call rotation poke** (default ON) — every `fetch_tokens` makes a best-effort POST to `accounts.google.com/RotateCookies`. Disable with `NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1`.
 2. **Periodic background poke** — pass `keepalive=<seconds>` to `NotebookLMClient` for clients held open for hours.
-3. **External recovery script** — `NOTEBOOKLM_REFRESH_CMD` runs when auth has fully expired, then retries once.
-4. **Manual re-login** — `notebooklm login`.
-5. **External scheduler** — `notebooklm auth refresh` driven by cron / launchd / systemd / Task Scheduler / k8s CronJob, for idle profiles with no Python process running. Recommended cadence: 15–20 minutes.
+3. **Layer-3 headless re-auth** — explicit Python opt-in via `NotebookLMClient.from_storage(allow_headless=True)` or `await client.refresh_auth(allow_headless=True)`, one-command opt-in via `notebooklm auth refresh --allow-headless`, or automatic opt-in with `NOTEBOOKLM_HEADLESS_REAUTH=1`. This drives the persisted browser profile, or attaches to a loopback Chrome DevTools endpoint from `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL`. Treat CDP as account-equivalent: only use `127.0.0.1` / `localhost`, never a remote browser.
+4. **Layer-4 master-token re-mint** — when a `master_token.json` sits beside the profile's file-backed `storage_state.json` (the `[headless]` extra; `notebooklm login --master-token`), a fully-expired session re-mints fresh cookies from the durable master token during cold start or mid-session, after layers 1–3 are exhausted. If storage is absent, `notebooklm auth refresh` mints and passively validates it from the sibling token. See [installation.md#d-headless-server-or-ci](installation.md#d-headless-server-or-ci).
+5. **External recovery script** — `NOTEBOOKLM_REFRESH_CMD` runs when auth has fully expired, then retries once.
+6. **Manual re-login** — `notebooklm login`; the legacy `notebooklm login --master-token-refresh` remains for an unconditional master-token re-mint.
+7. **External scheduler** — `notebooklm auth refresh` driven by cron / launchd / systemd / Task Scheduler / k8s CronJob, for idle profiles with no Python process running. Recommended cadence: 15–20 minutes.
 
-Most users only need layer 1 — it's on by default and requires no configuration. For the full strategy (trade-offs between layers, including Python kwargs like `keepalive_min_interval` and environment variables like `NOTEBOOKLM_REFRESH_CMD_USE_SHELL`, and ready-to-paste launchd / systemd / cron / Task Scheduler / k8s CronJob recipes), see **[docs/auth-cookie-lifecycle.md#tldr](auth-cookie-lifecycle.md#tldr)** for a quick orientation, then [§4 The architecture](auth-cookie-lifecycle.md#4--the-architecture) for the per-layer deep dive.
+> **Master-token troubleshooting:** `MasterTokenError: ... re-bootstrap` means the master token was revoked (password change / Google security action) — re-run `notebooklm login --master-token`. `MissingDependencyError: ... needs gpsoauth` means the `[headless]` extra isn't installed (`pip install "notebooklm-py[headless]"`); recovery stops with that configuration error instead of misreporting rejected credentials. A minted jar "missing required cookies" indicates a MergeSession change — file an issue.
+>
+> **"This browser or app may not be secure" during `--master-token` sign-in:** Google blocks sign-in inside the automated browser the auto-capture launches. The client drops the obvious automation flags, but Google may still block — use one of the reliable paths instead:
+> - **Attach to your own Chrome (recommended):** quit Chrome, relaunch it with `--remote-debugging-port=9222`, then `notebooklm login --master-token --account you@gmail.com --cdp-url http://127.0.0.1:9222`. It opens an EmbeddedSetup tab in your real (non-automated) browser, so Google allows sign-in, and scrapes the `oauth_token`.
+> - **Capture the token manually:** in a normal browser sign in at `accounts.google.com/EmbeddedSetup`, copy the `oauth_token` cookie (DevTools → Application → Cookies → accounts.google.com), then `notebooklm login --master-token --account you@gmail.com --oauth-token <value>`. The `oauth_token` is single-use and short-lived — use it immediately.
+
+Most users only need layer 1 — it's on by default and requires no configuration. For the full strategy (trade-offs between layers, including Python kwargs like `keepalive_min_interval` and environment variables like `NOTEBOOKLM_REFRESH_CMD_USE_SHELL`, and ready-to-paste launchd / systemd / cron / Task Scheduler / k8s CronJob recipes), see **[docs/auth-cookie-lifecycle.md#tldr](auth-cookie-lifecycle.md#tldr)** for a quick orientation, then [§4 The recovery ladder](auth-cookie-lifecycle.md#4--the-recovery-ladder) for the per-layer deep dive.
 
 #### macOS: `--browser-cookies` prompts for your password
 
@@ -90,6 +98,61 @@ security find-generic-password -s 'Chrome Safe Storage' -a 'Chrome' -w >/dev/nul
 ```
 Prints `OK` without prompting → keychain is unlocked and your user has access; the prompt you saw is the per-binary ACL re-asking for a new caller (your Python). Click *Always Allow* once and that binary is permanently approved. If it prompts → run `security unlock-keychain` first.
 
+#### Windows: `Missing required cookies: __Secure-1PSIDTS` after login, and `--browser-cookies` "Could not decrypt"
+
+On Windows, both credential paths can leave you without `__Secure-1PSIDTS` (the rotating freshness partner of `__Secure-1PSID` that every real RPC needs — see [Automatic Token Refresh](#automatic-token-refresh) above), so `notebooklm login` reports success but `notebooklm list` then fails with `Missing required cookies: __Secure-1PSIDTS` (issue [#1753](https://github.com/teng-lin/notebooklm-py/issues/1753)). Two distinct causes are in play:
+
+- **`notebooklm login --browser chrome` (Playwright flow).** The interactive browser completes Google sign-in, but Google may serve an automation-detected session *without* the token-binding cookie (and sometimes without the secondary-binding cookies `OSID` / `APISID` + `SAPISID` the automatic `RotateCookies` recovery needs to re-mint it). When that happens the saved `storage_state.json` is genuinely incomplete and re-running the same flow reproduces it.
+- **`notebooklm login --browser-cookies chrome` (or `edge`) → `Could not decrypt chrome cookies`.** Chrome 127+ (and current Edge) protect the cookie database with **App-Bound Encryption (ABE)**: the decryption key is bound to the browser process via a Windows service, so no external process can read it. This blocks every cookie-extraction library (`rookiepy`, `browser-cookie3`, `pycookiecheat`), not just `notebooklm-py`. There is no flag that bypasses ABE.
+
+Note that `notebooklm doctor` may still say the auth check passed with an older client — the check historically only looked for `SID`. Current versions surface a **warn** row when `__Secure-1PSIDTS` is missing (`auth check --test` has always reported the real error). Trust `notebooklm auth check --test` / `notebooklm list` over a green `doctor` for "is this session actually usable".
+
+Workarounds, most reliable first:
+
+1. **Use Firefox as the cookie source.** Firefox stores cookies in a plain SQLite DB — **no App-Bound Encryption** — so extraction just works. Sign in to Google in Firefox, then:
+   ```bash
+   notebooklm login --browser-cookies firefox
+   ```
+   (If your Google session lives in a Multi-Account Containers tab, use the explicit `firefox::Container` / `firefox::none` syntax — see the [macOS section above](#macos---browser-cookies-prompts-for-your-password) for the container notes.) This is the simplest fix for the ABE case.
+
+2. **Set up a master token (best for unattended / long-lived use).** `notebooklm login --master-token` (needs the `[headless]` extra: `pip install "notebooklm-py[headless]"`) stores a durable `master_token.json` beside your profile. When cookies are missing or fully expired, the client re-mints a complete, fresh cookie jar — including `__Secure-1PSIDTS` — from the master token in-process, so it does not depend on what the browser login happened to hand back. If Google blocks sign-in inside the automated capture window ("This browser or app may not be secure"), use the CDP-attach or manual `oauth_token` variants described in the [master-token troubleshooting note](#cookie-freshness-for-long-running--unattended-use) above. See also [installation.md#d-headless-server-or-ci](installation.md#d-headless-server-or-ci).
+
+   > ⚠️ **The one-time bootstrap is not browser-free.** Plain `notebooklm login --master-token` launches a headed Playwright browser to capture the single-use `oauth_token`, so on a machine where the browser cannot start at all (see [`spawn UNKNOWN`](#windows-browser-fails-to-start-with-spawn-unknown) below) it fails the same way. Only the two manual variants avoid spawning a browser: `--master-token --oauth-token <value>` (paste the cookie yourself) and `--master-token --cdp-url <url>` (attach to a Chrome you started). What *is* browser-free is everything *after* bootstrap — the layer-4 re-mint from the stored `master_token.json`.
+
+3. **Retry the Playwright login on a fresh profile.** Sometimes a stale persistent profile is the culprit rather than automation detection:
+   ```bash
+   notebooklm login --fresh
+   ```
+   If three attempts (normal, `--fresh` + password, `--fresh` + passkey) all reproduce the missing cookie, treat it as the automation-detection case and switch to Firefox or a master token above.
+
+#### Windows: browser fails to start with `spawn UNKNOWN`
+
+```text
+BrowserType.launch_persistent_context: spawn UNKNOWN
+Failed to launch: Error: spawn UNKNOWN
+```
+
+**Cause: something on the machine vetoed *executing* the browser** — this is not a missing install and not a `notebooklm-py` bug (issue [#2004](https://github.com/teng-lin/notebooklm-py/issues/2004)). `UNKNOWN` is libuv's `UV_UNKNOWN`: `CreateProcessW` returned a Win32 error that has no entry in libuv's translation table. A missing binary would surface as `ENOENT` and an ordinary ACL denial as `EACCES`, so what actually reaches `UNKNOWN` is policy- or antivirus-shaped:
+
+- `ERROR_ACCESS_DISABLED_BY_POLICY` — AppLocker, Software Restriction Policies, or WDAC blocking execution from `%LOCALAPPDATA%\ms-playwright`.
+- `ERROR_VIRUS_INFECTED` / `ERROR_VIRUS_DELETED` — Microsoft Defender or another endpoint-security agent quarantining the Chromium build.
+
+Upstream Playwright reports ([microsoft/playwright#35363](https://github.com/microsoft/playwright/issues/35363), [#28307](https://github.com/microsoft/playwright/issues/28307), [#28858](https://github.com/microsoft/playwright/issues/28858)) all resolve to group policy or endpoint security, most often on managed corporate machines.
+
+**`--headless` does not help.** It launches the identical binary through the identical spawn; the veto happens at process creation, before any window would exist.
+
+Workarounds, most reliable first:
+
+1. **Use a system browser.** Chrome and Edge install under `Program Files`, a different path — so a rule scoped to Playwright's directory does not cover them:
+   ```bash
+   notebooklm login --browser chrome
+   notebooklm login --browser msedge
+   ```
+2. **Sign in elsewhere and ship the credentials in.** This is the right answer for a non-interactive or locked-down Windows host, and needs no browser on that host at all: run `notebooklm login` on a machine with a display, then copy `storage_state.json` over (or set `NOTEBOOKLM_AUTH_JSON`) — see [installation.md#d-headless-server-or-ci](installation.md#d-headless-server-or-ci).
+3. **Have IT allow-list the directory.** Permit execution from `%LOCALAPPDATA%\ms-playwright` (or wherever `PLAYWRIGHT_BROWSERS_PATH` points), and exclude it from real-time antivirus scanning.
+
+Note that `--browser-cookies chrome` is *not* a workaround on Windows: it runs into App-Bound Encryption instead (see [the section above](#windows-missing-required-cookies-__secure-1psidts-after-login-and---browser-cookies-could-not-decrypt)). Use `--browser-cookies firefox` if you want the cookie-extraction route.
+
 #### "Unauthorized" or redirect to login page
 
 **Cause:** Session cookies expired (happens every few weeks).
@@ -106,10 +169,29 @@ notebooklm login
 **Cause:** The CSRF token (`SNlM0e`) couldn't be extracted from the NotebookLM page response. The exact wording depends on which code path raised it:
 
 - `Failed to extract CSRF token (SNlM0e). Page structure may have changed or authentication expired. Preview: '...'` — raised by `refresh_auth()` when the WIZ_global_data extraction fails ([`client.py`](../src/notebooklm/client.py)).
-- `CSRF token not found in HTML. Final URL: <url> This may indicate the page structure has changed.` — raised by the lower-level extractor when no auth redirect was detected ([`auth.py`](../src/notebooklm/auth.py)).
+- `CSRF token not found in HTML. Final URL: <url> This may indicate the page structure has changed.` — raised by the lower-level extractor when the response *did* come from a NotebookLM app host but carried no token ([`auth.py`](../src/notebooklm/auth.py)). This is the genuine "file a bug" case.
+- `CSRF token not found in HTML. Final URL: <url> The response did not come from a NotebookLM app host, so the request never reached the app …` — same extractor, but the chain landed somewhere else entirely. **The final URL is the diagnosis**: follow it to see where the request actually went. Nothing is wrong with your login.
 - `Failed to extract 'SNlM0e' from NotebookLM HTML response. This usually means Google changed the page structure. Preview: '...'` — raised as `AuthExtractionError` directly (rare; usually wrapped by one of the messages above) ([`exceptions.py`](../src/notebooklm/exceptions.py)).
 
-A related auth-redirect message — `Authentication expired. Run 'notebooklm login' to re-authenticate.` (or `Authentication expired or invalid. ...`) — surfaces the same root cause when the page redirected to Google's login flow.
+A related auth-redirect message — `Authentication expired. Run 'notebooklm login' to re-authenticate.` (or `Authentication expired or invalid. Final URL: …` / `… Redirected to: …`) — surfaces the same root cause when the page redirected to Google's login flow. Every one of these messages carries the final URL; if it does not name `accounts.google.com`, the session did not expire.
+
+> **Note:** the "did not come from a NotebookLM app host" wording exists because these two conditions used to be indistinguishable. A page-body scan for `accounts.google.com` links reported *any* Google-served page (help articles, the region gate, the app itself) as an expired login — see [#2038](https://github.com/teng-lin/notebooklm-py/issues/2038) and the six-day false alarm in [#2019](https://github.com/teng-lin/notebooklm-py/issues/2019). If you are reading an older error that says "Authentication expired" with **no URL at all**, it came from that removed code path and should not be trusted.
+
+#### "Google's CookieMismatch page was reached during this request"
+
+**Cause:** the request's redirect chain passed through `accounts.google.com/CookieMismatch` (which then forwards to a `support.google.com` help article). Google rejected the cookies as not matching the host they were sent to. This is a cookie **scoping** problem, not necessarily an expired session — the credentials themselves may be perfectly valid.
+
+Common causes:
+
+- a `storage_state.json` whose per-cookie `domain` values were flattened to a single host, so cookies scoped to `.google.com` get sent to hosts they were never issued for,
+- cookies belonging to a different Google account or session than the one being addressed,
+- a stale `__Secure-1PSIDTS` that Google could not reconcile.
+
+**Solution:**
+```bash
+notebooklm login   # re-extract cookies with their original domains
+```
+If it recurs, inspect `storage_state.json` and confirm each cookie kept its own `domain` field rather than being rewritten to one host. See [`docs/auth-cookie-lifecycle.md`](auth-cookie-lifecycle.md) for the cookie-domain model.
 
 **Note:** These errors should rarely surface, since the client automatically retries with a fresh CSRF token on auth failures (see *Automatic Token Refresh* above). When one does reach you, the automatic refresh also failed.
 
@@ -122,15 +204,15 @@ Or re-run `notebooklm login` if session cookies are also expired. If the failure
 
 #### "NotebookLM redirected this request to its region / anti-abuse access gate"
 
-**Cause:** The request to `notebooklm.google.com` was redirected to **`notebooklm.google/?location=unsupported`** — Google's region / anti-abuse risk-control gate (the marketing/landing page, which has no CSRF token). This is **not** a library bug, expired login, or page-structure change, and **re-running `notebooklm login` will not fix it** (the cookies are fine). It is driven by the *access environment*, not just the account's country, and fires even for accounts in supported regions when Google sees:
+**Cause:** The request to the personal app host — `notebook.google.com` by default since #2067, or whichever host `NOTEBOOKLM_BASE_URL` selects — was redirected to **`notebooklm.google/?location=unsupported`** — Google's region / anti-abuse risk-control gate (the marketing/landing page, which has no CSRF token). This is **not** a library bug, expired login, or page-structure change, and **re-running `notebooklm login` will not fix it** (the cookies are fine). It is driven by the *access environment*, not just the account's country, and fires even for accounts in supported regions when Google sees:
 
 - a **VPN / proxy / datacenter / shared IP** (especially previously-abused ones),
 - an **IP ↔ timezone ↔ browser-language mismatch**, or
 - a **non-browser / automated access pattern** (a raw HTTP client without a real browser fingerprint).
 
-**Confirm:** open `https://notebooklm.google.com` in a normal browser, signed in to the same account, on the same network. If it also redirects to `notebooklm.google/?location=unsupported`, the gate is environmental.
+**Confirm:** open the same host the client is using (`https://notebook.google.com` unless you set `NOTEBOOKLM_BASE_URL`) in a normal browser, signed in to the same account, on the same network. If it also redirects to `notebooklm.google/?location=unsupported`, the gate is environmental. Test the host that actually failed — the two personal hosts are gated by the same risk-control system, but diagnosing against the host you are not using is how a working setup gets misread as broken.
 
-**Solution:** access from a **residential connection in a supported region**, keep your system **timezone/language consistent** with the IP's country, and avoid shared/datacenter VPN exit IPs. (See issue [#1630](https://github.com/teng-lin/notebooklm-py/issues/1630).)
+**Solution:** access from a **residential connection in a supported region**, keep your system **timezone/language consistent** with the IP's country, and avoid shared/datacenter VPN exit IPs. When the trigger is the **non-browser fingerprint** (a raw HTTP client) rather than the IP, the opt-in browser-TLS-impersonation transport can help: set `NOTEBOOKLM_TRANSPORT=curl_cffi` (requires the `curl_cffi` package) so requests carry a real browser's TLS fingerprint. (See issue [#1630](https://github.com/teng-lin/notebooklm-py/issues/1630).)
 
 #### Browser opens but login fails
 
@@ -141,6 +223,43 @@ Or re-run `notebooklm login` if session cookies are also expired. If the failure
 2. Run `notebooklm login` again
 3. Complete any CAPTCHA or security challenges Google presents
 4. Ensure you're using a real mouse/keyboard (not pasting credentials via script)
+
+#### "Login not detected within 5 minutes" (especially on macOS)
+
+**Cause:** The bundled Chromium that `notebooklm login` launches by default opened a fresh, signed-out browser, and its login-detection wait timed out — common on macOS where bundled Chromium can also be flaky (macOS 15+).
+
+**Solution:** If you are already signed in to Google in **system Chrome**, retry with that browser so the existing session is reused instead of starting a fresh sign-in:
+
+```bash
+notebooklm login --browser chrome --storage <path>
+```
+
+`--browser chrome` drives your installed Google Chrome (with its signed-in profile), which usually detects the account immediately and sidesteps bundled-Chromium issues. `--browser msedge` is the equivalent for organizations that require Microsoft Edge for SSO.
+
+### Configuration Errors
+
+#### `ValueError: NOTEBOOKLM_BASE_URL must use https and one of: ...` lists a host that is not documented
+
+**Cause:** The error message enumerates every host the base-URL validator currently accepts. That list is not the same as the list of *supported* values in [configuration.md](configuration.md) — it now also names the Gemini Notebook rebrand host, `notebook.google.com`.
+
+**Status:** `notebook.google.com` is **the default** since #2067. A live probe on 2026-08-04 reached `batchexecute` on **both** personal hosts, so the endpoint is dual-served, not rebrand-host-only or legacy-only. The cassettes in `tests/cassettes/` now record requests against the rebrand host. The pre-rebrand host `notebooklm.google.com` remains a valid, still-served value and is the documented rollback lever; switching back is normally just the variable, with the caveats described below. See [ADR-0028](adr/0028-gemini-notebook-rename.md).
+
+**Solution:** Leave `NOTEBOOKLM_BASE_URL` unset, or set it to a documented value:
+
+```bash
+# Personal (default — no need to set it)
+export NOTEBOOKLM_BASE_URL=https://notebook.google.com
+
+# Personal, pre-rebrand host (still served; rollback lever)
+export NOTEBOOKLM_BASE_URL=https://notebooklm.google.com
+
+# Enterprise
+export NOTEBOOKLM_BASE_URL=https://notebooklm.cloud.google.com
+```
+
+Both personal hosts are documented values since #2067. `https://notebook.google.com` is the default and is what this project's cassettes now exercise; `https://notebooklm.google.com` remains served and is the supported rollback lever.
+
+Switching between them is normally just the variable. The host-scoped `OSID` does not survive the switch — it was minted on the host you left and is never sent to the other one — but it is not the only binding path: `APISID` + `SAPISID` **together with bare `LSID`** also satisfies the check, and a profile captured by `notebooklm login` normally has all three. Note the `LSID` conjunct is required; `APISID` + `SAPISID` on their own fail (see the ablation table on `_has_valid_secondary_binding`, issue #1977). If auth does fail after switching, the profile was leaning on `OSID` and is missing one of those three; recover with `notebooklm login --fresh`. Use `--fresh` rather than a plain `notebooklm login`, which can report "Already logged in" and re-mint nothing, since the login accept-set matches either personal host.
 
 ### RPC Errors
 
@@ -201,7 +320,7 @@ from notebooklm import NotebookLMClient
 - The override is applied at BOTH the URL `rpcids=` query parameter AND the
   request body `f.req` payload, so the wire format stays consistent.
 - The override is gated on the configured base host being a known Google
-  NotebookLM endpoint (`notebooklm.google.com` or
+  NotebookLM endpoint (`notebook.google.com`, `notebooklm.google.com`, or
   `notebooklm.cloud.google.com`). Overrides do NOT apply to non-Google
   hosts, so this env var cannot be weaponised to leak custom RPC IDs to a
   hostile endpoint.
@@ -243,31 +362,88 @@ from notebooklm import NotebookLMClient
 The value must be exactly `"1"` — `"0"`, `"true"`, etc. are treated as
 unset (still truncated).
 
-#### "RPCError: [3]" or "UserDisplayableError"
+#### "RPCError: [3]" (Invalid argument) / "UserDisplayableError"
 
-**Cause:** Google API returned an error, typically:
-- Invalid parameters
-- Resource not found
+**Cause:** Google's API rejected the request. Common cases:
+- Invalid parameters or a not-found resource ID
+- Account quota exceeded (for `create`, status `[3]` is also the notebook-limit signal)
 - Rate limiting
 
 **Solution:**
 - Check that notebook/source IDs are valid
 - Add delays between operations (see Rate Limiting section)
 
+**If it only affects _write_ operations** (`create`, `source add`, `generate`) while reads (`list`, `ask`) keep working — **and the web UI still works** — the likely cause is that Google changed the request payload (wire format) for those RPCs and `notebooklm-py` is still sending the old shape. Google rolls these out gradually, so it can hit some accounts before others.
+
+> **First, rule out a mis-decoded success.** Re-run the failing action, then check `notebooklm list`: if the resource was actually **created** despite the error, it's a *response*-decoding issue (share the **Response** below). If it was **not** created, Google rejected our **request** (share the **Payload** below).
+
+**Help us fix it — share the web UI's payload (no cookies needed).** Either option below leaks nothing: cookies, the `at=` CSRF token, and `Set-Cookie` live in request/response *headers*, never inside the `f.req` payload.
+
+> **⚠️ Never paste the raw `.har` itself.** A HAR contains your cookies, the `at=` CSRF token, and the full NotebookLM page HTML — which embeds API keys, the CSRF token, and your account email. Only ever share the **scrubber's output** below (or the single `f.req` line from Option B). The scrubber processes only `/batchexecute` calls and redacts every value, so the page HTML never reaches its output.
+
+**Option A — thorough, auto-scrubbed (recommended; captures every RPC + its response).**
+
+This walkthrough takes ~2 minutes. You never copy a cookie, a token, or the raw HAR — a small bundled script does the redaction for you.
+
+1. **Open DevTools on the Network tab.** In Chrome/Edge press <kbd>F12</kbd> (or <kbd>Cmd</kbd>+<kbd>Opt</kbd>+<kbd>I</kbd> on macOS); in Firefox press <kbd>F12</kbd>. Click the **Network** tab at the top of the panel.
+2. **Arm the capture.** Tick **Preserve log** (Chrome) / **Persist Logs** (Firefox) so a page reload doesn't wipe the capture, and confirm the round **● Record** button is red (it usually is by default).
+3. **Reproduce the failure.** In the NotebookLM tab, perform the exact action that fails — e.g. create a notebook, or add a source. You'll see `batchexecute?rpcids=…` rows appear in the Network list. You can stop as soon as the action errors.
+4. **Export the session to a file:**
+   - **Chrome/Edge:** click the ⤓ **Export HAR…** download icon in the Network toolbar (or right-click any row → **Save all as HAR with content**).
+   - **Firefox:** click the ⚙️ gear / **…** menu in the Network toolbar → **Save All As HAR**.
+
+   Save it as `capture.har`. (The "with content" variant matters — it's what includes the *response* bodies the scrubber reports.)
+5. **Scrub it.** From your `notebooklm-py` checkout, run the bundled script (stdlib-only — no install needed):
+
+   ```console
+   $ python scripts/scrub_rpc_har.py capture.har
+   NotebookLM RPC capture — string values → <str:N>; cookies / headers / at= / Set-Cookie never read:
+
+   CCqFvf  (CREATE_NOTEBOOK)
+     request : ["<str:7>",null,null,[2],[1]]
+     response: HTTP 200 | status_code=[3] | result=null
+
+   1 call(s). Safe to share — no cookies / CSRF / session tokens are present (they live in headers, which this tool never reads).
+   ```
+
+   Narrow to a single RPC with `--rpcid` if the capture is noisy:
+
+   ```console
+   $ python scripts/scrub_rpc_har.py capture.har --rpcid CCqFvf
+   ```
+
+   The script reads **only** each request's `f.req` field and the response body — never the headers/cookies arrays, never the non-`batchexecute` page HTML — and replaces every text value with its length (`<str:7>`). It refuses to print if any raw string ever slips through, so the output is safe by construction.
+6. **Paste that output** into the issue. Read it back first as a sanity check: every value should be `<str:N>`, never readable text.
+
+   - `status_code=[3]` with `result=null` → Google rejected our **request** (a payload/wire-format change). This is what we need to fix it.
+   - A non-null `result` → the call actually worked and this is a **response**-decode issue; share it just the same.
+
+**Option B — quick, one RPC by hand (no script).** Use this if you can't run the script.
+
+1. In DevTools → **Network**, click the `batchexecute?rpcids=…` POST for the failing call (e.g. `rpcids=CCqFvf` for create, `izAoDd` for add-source).
+2. Open the **Payload** tab (Chrome) / **Request** tab (Firefox), copy **only** the `f.req` value — **not** the `at=` field beside it, and don't open the **Cookies**/**Headers** tabs.
+3. Replace any free text (title, URL) with `REDACTED` and paste it. We diff it against what the library sends — `["<title>", null, null, [2], [1]]` for create — and update the payload.
+
 ### Generation Failures
 
-#### Audio/Video generation returns None
+#### Audio/Video generation is refused immediately
 
-**Cause:** Known issue with artifact generation under heavy load or rate limiting.
+**Cause:** NotebookLM refused the generation kickoff synchronously (often quota,
+feature availability, rate limiting, or an RPC shape drift). In v0.8.0 the
+Python API raises instead of returning `None`.
 
-**Workaround:**
+**What to do:**
 ```bash
-# Use --wait to see if it eventually succeeds
-notebooklm generate audio --wait
+# Let the CLI surface the typed error envelope / message
+notebooklm generate audio --wait --json
 
-# Or poll manually
-notebooklm artifact poll <task_id>
+# If generation was accepted and you have a task id, poll manually
+notebooklm artifact poll <task_id> --json
 ```
+
+In Python, catch `RateLimitError`, `ArtifactFeatureUnavailableError`, or
+`RPCError` depending on the failure. If kickoff succeeds and later polling
+times out, use the timeout guidance below.
 
 #### Audio/Video task times out as pending or in progress
 
@@ -318,15 +494,19 @@ You can also pipe extracted text through stdin:
 python extract_article_text.py ./article.html | notebooklm source add - --type text --title "Article"
 ```
 
-#### Text/Markdown files upload but return None
+#### Text/Markdown upload succeeds but processing/content is wrong
 
-**Cause:** Known issue with native text file uploads.
+**Cause:** The upload was accepted, but NotebookLM processed unexpected content
+or reported a source-processing error. Current `add_file()` returns a `Source`;
+missing or untrusted source IDs raise `SourceAddError` instead of returning
+`None`.
 
-**Workaround:** Use `add_text` instead:
+**Workaround:** When you control the text, bypass file-type inference and use
+`add_text`:
 ```bash
 # Instead of: notebooklm source add ./notes.txt
 # Do:
-notebooklm source add "$(cat ./notes.txt)"
+notebooklm source add - --type text --title "My Notes" < ./notes.txt
 ```
 
 Or in Python:
@@ -415,7 +595,7 @@ notebooklm source delete-by-title "Exact Source Title"
 Google enforces strict rate limits on the batchexecute endpoint.
 
 **Symptoms:**
-- RPC calls return `None`
+- `RateLimitError` in Python, or CLI JSON with `code: "RATE_LIMITED"`
 - `RPCError` with ID `R7cb6c`
 - `UserDisplayableError` with code `[3]`
 
@@ -587,6 +767,8 @@ playwright install chromium
 
 ### Windows
 
+> **Login problems?** Two Windows-specific login failures are covered under Authentication Errors above: [`spawn UNKNOWN` when the browser will not start](#windows-browser-fails-to-start-with-spawn-unknown), and [`Could not decrypt` / missing `__Secure-1PSIDTS`](#windows-missing-required-cookies-__secure-1psidts-after-login-and---browser-cookies-could-not-decrypt).
+
 **CLI hangs indefinitely (issue #75):**
 
 On certain Windows environments (particularly when running inside Sandboxie or similar sandboxing software), the CLI may hang indefinitely at startup. This is caused by the default `ProactorEventLoop` blocking at the IOCP (I/O Completion Ports) layer.
@@ -699,11 +881,52 @@ import httpx
 
 # Test basic connectivity
 async with httpx.AsyncClient() as client:
-    r = await client.get("https://notebooklm.google.com")
+    r = await client.get("https://notebook.google.com")
     print(r.status_code)  # Should be 200 or 302
 ```
 
 ---
+
+## Adapter-specific issues (MCP server, REST server)
+
+The MCP and REST servers have their own setup and failure modes documented with
+the features:
+
+- **MCP server / remote connector** (stdio & HTTP transports, self-hosted OAuth,
+  Cloudflare / Tailscale tunnels): see [mcp-guide.md#troubleshooting](mcp-guide.md#troubleshooting)
+  and [deploy/README.md](../deploy/README.md).
+- **REST server** (`notebooklm-server`): a non-loopback bind refuses to start
+  without `NOTEBOOKLM_SERVER_TOKEN`; every `/v1` request needs the bearer (401
+  otherwise). See [installation.md#rest-api-server](installation.md#rest-api-server).
+- **`curl_cffi` transport**: `NOTEBOOKLM_TRANSPORT=curl_cffi` requires the
+  `curl_cffi` package; see the region / anti-abuse gate section above.
+
+### "Unknown tool" from an MCP host (claude.ai, ChatGPT, …) after upgrading the server
+
+**Cause:** The MCP host fetches the server's tool list (`tools/list`) when it first
+connects and **caches it against the connector**. After you upgrade a deployed
+server to a version that **renamed or folded** a tool, the host keeps advertising
+the *old* manifest, so a call to a since-removed tool reaches the server and fails
+cleanly with `Unknown tool: '<name>'`. This is expected MCP-host caching, **not a
+server bug** — the server's live manifest is correct (you can confirm with
+`await Client(create_server()).list_tools()`). A server can't notify a host that
+isn't connected, and `notifications/tools/list_changed` only reaches a *live*
+session.
+
+**Solution: remove and re-add the connector** in the host's connector settings.
+A *reconnect* / re-auth / off-and-on toggle is often **not enough** — several
+hosts (notably ChatGPT) re-authenticate but keep the cached tool list and do not
+re-call `tools/list`, so the ghost tool persists across reconnects. Fully deleting
+the connector and adding it again forces a fresh `tools/list`. (Newly-added
+*optional parameters* on existing tools forward through the stale schema and keep
+working without any refresh — only *removed/renamed tools* ghost.)
+
+**Only removed or renamed _tools_ ghost this way — new _optional_ parameters
+forward through the stale schema.** For example, when `source_upload_bytes` was folded
+into `source_add(bytes_base64=…)` (and `studio_get_prompt` into
+`studio_list(item=…)`), the removed tool names failed with `Unknown tool`, but
+`source_add` with the new `bytes_base64` argument reached the upgraded server and
+worked without a reconnect.
 
 ## Getting Help
 

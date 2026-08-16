@@ -1,34 +1,73 @@
 """Source management CLI commands — thin Click-handler layer (ADR-0008).
 
-Each command builds a ``cli/services/source_*`` plan dataclass and delegates
-to its executor:
-
-* ``services/source_listing.py``   — list
-* ``services/source_mutations.py`` — delete, delete-by-title, rename,
-  refresh, add-drive
-* ``services/source_content.py``   — data fetchers for get, fulltext, guide, stale
-* ``services/source_research.py``  — add-research
-* ``services/source_wait.py``      — wait
-* ``services/source_add.py``       — add  (pre-T5; T5 added the executor)
-* ``services/source_clean.py``     — clean (pure orchestration: classify +
-  batched delete; rendering + exit codes live here in the command layer)
-
-The full per-command listing lives in the ``source`` click group docstring
-below (it is what ``notebooklm source --help`` shows).
+Each command builds a plan (or command-layer inputs) and delegates to the
+transport-neutral ``_app/source_*`` cores — ``source_content`` / ``source_wait``
+/ ``source_add`` / ``source_clean`` directly, and ``source_listing`` /
+``source_mutations`` (delete/delete-by-title/rename/refresh/add-drive/
+add-drive-file) / ``source_research`` via their ``services/`` adapters. The full
+per-command listing is the ``source`` click group docstring below.
 """
 
 import asyncio  # noqa: F401 — re-exported for regression tests that patch source_cmd.asyncio.sleep
-from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 import click
-from rich.markup import render as render_markup
-from rich.table import Table
 
-from ..client import NotebookLMClient
-from ..types import Source, source_status_to_str
-from .auth_runtime import with_client
-from .error_handler import _output_error, current_json_output, exit_with_code
+from .._app import source_add as source_add_service
+from .._app.source_add import SourceAddExecutionPlan, execute_source_add
+from .._app.source_clean import (
+    SourceCleanResult,
+    candidates_payload,
+    run_source_clean,
+)
+from .._app.source_content import (
+    SourceFulltextPlan,
+    SourceGetPlan,
+    SourceGuidePlan,
+    SourceStalePlan,
+    execute_source_fulltext,
+    execute_source_get,
+    execute_source_guide,
+    execute_source_stale,
+)
+from .._app.source_wait import (
+    SourceWaitPlan,
+    execute_source_wait,
+)
+from ..exceptions import ValidationError
+from ..types import SOURCE_STATUS_LABELS, Source
+
+# Render/validation helpers live in ``_source_render``; re-exported here so the
+# historical ``source_cmd.<helper>`` import/patch surface keeps resolving them
+# (F401: every name is an intentional re-export, some used only by sibling
+# ``_source_render`` helpers).
+from ._source_render import (  # noqa: F401
+    _available_output_path,
+    _classify_junk_sources,
+    _emit_add_research_flag_conflict,
+    _emit_source_fulltext_flag_conflict,
+    _exit_with_add_research_status,
+    _handle_source_mutation_error,
+    _looks_like_path,
+    _print_add_research_task_ids,
+    _print_clean_candidates,
+    _render_add_research_result,
+    _render_source_add_drive_file_result,
+    _render_source_add_drive_result,
+    _render_source_delete_result,
+    _render_source_fulltext_result,
+    _render_source_get_result,
+    _render_source_guide_result,
+    _render_source_refresh_result,
+    _render_source_rename_result,
+    _render_source_stale_result,
+    _render_source_wait_outcome,
+    _resolve_source_fulltext_output_path,
+    _validate_upload_path,
+    source_add_payload,
+)
+from .auth_runtime import resolve_client_factory, with_client
+from .error_handler import _output_error, exit_with_code, output_error
 from .input import read_stdin_text, resolve_prompt
 from .options import (
     json_option,
@@ -42,51 +81,24 @@ from .rendering import (
     cli_print,
     cli_status,
     console,
-    display_report,
-    display_research_sources,
-    emit_status,
     get_source_type_display,
     json_output_response,
     render_list,
 )
 from .resolve import require_notebook, resolve_notebook_id, resolve_source_id
 from .runtime import is_quiet
-from .services import source_add as source_add_service
-from .services import source_clean as source_clean_service
-from .services.source_add import SourceAddExecutionPlan, execute_source_add
-from .services.source_clean import (
-    SourceCleanResult,
-    candidates_payload,
-    run_source_clean,
-)
-from .services.source_content import (
-    SourceFulltextPlan,
-    SourceFulltextResult,
-    SourceGetPlan,
-    SourceGetResult,
-    SourceGuidePlan,
-    SourceGuideResult,
-    SourceStalePlan,
-    SourceStaleResult,
-    execute_source_fulltext,
-    execute_source_get,
-    execute_source_guide,
-    execute_source_stale,
-)
+from .services.label_listing import LabelResolutionError
 from .services.source_listing import SourceListPlan, execute_source_list
 from .services.source_mutations import (
+    SourceAddDriveFilePlan,
     SourceAddDrivePlan,
-    SourceAddDriveResult,
     SourceDeleteByTitlePlan,
-    SourceDeleteByTitleResult,
     SourceDeletePlan,
-    SourceDeleteResult,
     SourceMutationError,
     SourceRefreshPlan,
-    SourceRefreshResult,
     SourceRenamePlan,
-    SourceRenameResult,
     execute_source_add_drive,
+    execute_source_add_drive_file,
     execute_source_delete,
     execute_source_delete_by_title,
     execute_source_refresh,
@@ -95,446 +107,9 @@ from .services.source_mutations import (
 )
 from .services.source_research import (
     SourceAddResearchPlan,
-    SourceAddResearchResult,
     execute_source_add_research,
+    validate_add_research_flags,
 )
-from .services.source_serializers import (
-    source_fulltext_payload,
-    source_kind_value,
-    source_summary_payload,
-)
-from .services.source_wait import (
-    SourceWaitNotFound,
-    SourceWaitOutcome,
-    SourceWaitPlan,
-    SourceWaitProcessingError,
-    SourceWaitReady,
-    SourceWaitTimeout,
-    execute_source_wait,
-)
-
-# Compatibility wrappers — tests patch these names on this module. Each
-# one is a one-liner forwarder to the canonical service-layer home.
-
-
-def _looks_like_path(content: str) -> bool:
-    """Compatibility wrapper for tests patching source-add path detection."""
-    return source_add_service.looks_like_path(content)
-
-
-def _validate_upload_path(content: str, follow_symlinks: bool) -> Path:
-    """Compatibility wrapper for tests patching source-add upload validation."""
-    try:
-        return source_add_service.validate_upload_path(content, follow_symlinks)
-    except source_add_service.SourceAddValidationError as exc:
-        _output_error(f"Error: {exc}", "VALIDATION_ERROR", current_json_output(), 1)
-        raise AssertionError("unreachable") from None  # pragma: no cover
-
-
-def _classify_junk_sources(sources: list[Source]) -> list[tuple[str, str, str, str]]:
-    """Compatibility wrapper for tests patching source-clean classification."""
-    return source_clean_service.classify_junk_sources(sources)
-
-
-def _print_clean_candidates(candidates: list[tuple[str, str, str, str]]) -> None:
-    """Print a Rich table summarizing sources that will (or would) be deleted."""
-    table = Table(title=f"{len(candidates)} source(s) flagged for cleanup")
-    table.add_column("ID", style="dim", overflow="fold")
-    table.add_column("Title", overflow="fold")
-    table.add_column("Status")
-    table.add_column("Reason")
-    for sid, title, status, reason in candidates:
-        display_title = title if title else "[dim](no title)[/dim]"
-        table.add_row(sid[:8], display_title, status, reason)
-    console.print(table)
-
-
-def _render_source_get_result(result: SourceGetResult, *, json_output: bool) -> None:
-    """Render ``source get`` output and not-found exit policy."""
-    src = result.source
-    if src is None:
-        _output_error(
-            "Source not found",
-            code="NOT_FOUND",
-            json_output=json_output,
-            exit_code=1,
-            extra={"source_id": result.source_id, "notebook_id": result.notebook_id},
-        )
-        raise AssertionError("unreachable")  # pragma: no cover
-
-    if json_output:
-        json_output_response(
-            {
-                "source": {
-                    **source_summary_payload(src),
-                    "status": source_status_to_str(src.status),
-                    "status_id": src.status,
-                    "created_at": (src.created_at.isoformat() if src.created_at else None),
-                },
-                "found": True,
-            }
-        )
-        return
-
-    console.print(f"[bold cyan]Source:[/bold cyan] {src.id}")
-    console.print(f"[bold]Title:[/bold] {src.title}")
-    console.print(f"[bold]Type:[/bold] {get_source_type_display(src.kind)}")
-    if src.url:
-        console.print(f"[bold]URL:[/bold] {src.url}")
-    if src.created_at:
-        console.print(f"[bold]Created:[/bold] {src.created_at.strftime('%Y-%m-%d %H:%M')}")
-
-
-def _available_output_path(path: Path) -> Path:
-    """Return an available sibling path using the download command's suffix style."""
-    counter = 2
-    base_name = path.stem
-    parent = path.parent
-    ext = path.suffix
-    while path.exists():
-        path = parent / f"{base_name} ({counter}){ext}"
-        counter += 1
-    return path
-
-
-def _emit_source_fulltext_flag_conflict(message: str, *, json_output: bool) -> NoReturn:
-    """Surface a ``source fulltext`` flag conflict via the active CLI error contract."""
-    if json_output:
-        _output_error(message, "VALIDATION_ERROR", json_output, 1)
-        raise AssertionError("unreachable")  # pragma: no cover
-    raise click.UsageError(  # cli-input-validation: source fulltext flag conflict
-        message
-    )
-
-
-def _resolve_source_fulltext_output_path(
-    output: str,
-    *,
-    force: bool,
-    no_clobber: bool,
-    json_output: bool,
-) -> Path:
-    """Resolve ``source fulltext -o`` conflicts without silently overwriting."""
-    path = Path(output)
-    if path.exists() and path.is_dir():
-        _emit_source_fulltext_flag_conflict(
-            f"Output path is a directory: {path}",
-            json_output=json_output,
-        )
-    if force and no_clobber:
-        _emit_source_fulltext_flag_conflict(
-            "Cannot specify both --force and --no-clobber",
-            json_output=json_output,
-        )
-    if not path.exists() or force:
-        return path
-    if no_clobber:
-        suggestion = "Use --force to overwrite or choose a different path"
-        _output_error(
-            f"File exists: {path}",
-            "FILE_EXISTS",
-            json_output,
-            1,
-            extra={"path": str(path), "suggestion": suggestion},
-            hint=suggestion,
-        )
-        raise AssertionError("unreachable")  # pragma: no cover
-    return _available_output_path(path)
-
-
-def _render_source_fulltext_result(
-    result: SourceFulltextResult,
-    *,
-    json_output: bool,
-    output: Path | None,
-) -> None:
-    """Render ``source fulltext`` output, including optional file output."""
-    fulltext = result.fulltext
-    if json_output:
-        if output:
-            content_bytes = fulltext.content.encode("utf-8")
-            output.write_bytes(content_bytes)
-            json_output_response(
-                {
-                    "path": str(output),
-                    "bytes": len(content_bytes),
-                    "source_id": fulltext.source_id,
-                    "title": fulltext.title,
-                    "kind": source_kind_value(fulltext.kind),
-                }
-            )
-            return
-
-        json_output_response(source_fulltext_payload(fulltext))
-        return
-
-    if output:
-        output.write_text(fulltext.content, encoding="utf-8")
-        console.print(
-            f"Saved {fulltext.char_count} chars to {output}",
-            style="green",
-            markup=False,
-            soft_wrap=True,
-        )
-        return
-
-    console.print(f"[bold cyan]Source:[/bold cyan] {fulltext.source_id}")
-    console.print(f"[bold]Title:[/bold] {fulltext.title}")
-    console.print(f"[bold]Characters:[/bold] {fulltext.char_count:,}")
-    if fulltext.url:
-        console.print(f"[bold]URL:[/bold] {fulltext.url}")
-    console.print()
-    console.print("[bold cyan]Content:[/bold cyan]")
-    if len(fulltext.content) > 2000:
-        console.print(fulltext.content[:2000], markup=False, highlight=False)
-        console.print(
-            f"\n[dim]... ({fulltext.char_count - 2000:,} more chars, "
-            "use -o to save full content)[/dim]"
-        )
-    else:
-        console.print(fulltext.content, markup=False, highlight=False)
-
-
-def _render_source_guide_result(result: SourceGuideResult, *, json_output: bool) -> None:
-    """Render ``source guide`` output."""
-    if json_output:
-        json_output_response(
-            {
-                "source_id": result.source_id,
-                "summary": result.summary,
-                "keywords": result.keywords,
-            }
-        )
-        return
-
-    summary = result.summary.strip()
-    if not summary and not result.keywords:
-        console.print("[yellow]No guide available for this source[/yellow]")
-        return
-
-    if summary:
-        console.print("[bold cyan]Summary:[/bold cyan]")
-        console.print(summary)
-        console.print()
-
-    if result.keywords:
-        console.print("[bold cyan]Keywords:[/bold cyan]")
-        console.print(", ".join(result.keywords))
-
-
-def _render_source_wait_outcome(outcome: SourceWaitOutcome, *, json_output: bool) -> None:
-    """Render the ``source wait`` outcome and exit with the documented code.
-
-    Exit codes (preserved from the service-side contract):
-        * 0 — :class:`SourceWaitReady`.
-        * 1 — :class:`SourceWaitNotFound` or :class:`SourceWaitProcessingError`.
-        * 2 — :class:`SourceWaitTimeout`.
-    """
-    if isinstance(outcome, SourceWaitReady):
-        source = outcome.source
-        if json_output:
-            json_output_response(
-                {
-                    "source_id": source.id,
-                    "title": source.title,
-                    "status": "ready",
-                    "status_code": source.status,
-                }
-            )
-            return
-        console.print(f"[green]✓ Source ready:[/green] {source.id}")
-        if source.title:
-            console.print(f"[bold]Title:[/bold] {source.title}")
-        return
-
-    elif isinstance(outcome, SourceWaitNotFound):
-        not_found_error = outcome.error
-        if json_output:
-            json_output_response(
-                {
-                    "source_id": not_found_error.source_id,
-                    "status": "not_found",
-                    "error": str(not_found_error),
-                }
-            )
-        else:
-            console.print(f"[red]✗ Source not found:[/red] {not_found_error.source_id}")
-        exit_with_code(1)
-        raise AssertionError("unreachable")  # pragma: no cover
-
-    elif isinstance(outcome, SourceWaitProcessingError):
-        processing_error = outcome.error
-        if json_output:
-            json_output_response(
-                {
-                    "source_id": processing_error.source_id,
-                    "status": "error",
-                    "status_code": processing_error.status,
-                    "error": str(processing_error),
-                }
-            )
-        else:
-            console.print(f"[red]✗ Source processing failed:[/red] {processing_error.source_id}")
-        exit_with_code(1)
-        raise AssertionError("unreachable")  # pragma: no cover
-
-    elif isinstance(outcome, SourceWaitTimeout):
-        timeout_error = outcome.error
-        if json_output:
-            json_output_response(
-                {
-                    "source_id": timeout_error.source_id,
-                    "status": "timeout",
-                    "last_status_code": timeout_error.last_status,
-                    "timeout_seconds": int(timeout_error.timeout),
-                    "error": str(timeout_error),
-                }
-            )
-        else:
-            console.print(
-                f"[yellow]⚠ Timeout waiting for source:[/yellow] {timeout_error.source_id}"
-            )
-            console.print(f"[dim]Last status: {timeout_error.last_status}[/dim]")
-        exit_with_code(2)
-        raise AssertionError("unreachable")  # pragma: no cover
-
-    raise AssertionError(f"unreachable: {type(outcome)}")
-
-
-def _render_source_stale_result(
-    result: SourceStaleResult, *, json_output: bool, exit_on_stale: bool = False
-) -> None:
-    """Render ``source stale`` output and pick the exit-code policy.
-
-    Default policy is the standard CLI convention: exit ``0`` if the
-    freshness check succeeded (regardless of whether the source is fresh
-    or stale), exit ``1`` only if an error occurred (raised earlier via
-    ``handle_errors``). Callers branch on the JSON ``stale``/``fresh``
-    fields (or the rendered text) to decide what to do.
-
-    Passing ``exit_on_stale=True`` (CLI: ``--exit-on-stale``) opts into
-    the back-compat inverted-predicate semantics — exit ``0`` if stale,
-    ``1`` if fresh — so the shell idiom
-    ``if notebooklm source stale --exit-on-stale ID; then refresh; fi``
-    keeps working for scripts written against the prior default.
-
-    See ``docs/cli-exit-codes.md`` for the canonical exit-code table and
-    the ``source stale`` section for the inverted-predicate opt-in.
-    """
-    if json_output:
-        json_output_response(
-            {
-                "source_id": result.source_id,
-                "notebook_id": result.notebook_id,
-                "stale": result.stale,
-                "fresh": result.is_fresh,
-            }
-        )
-        if exit_on_stale:
-            exit_with_code(0 if result.stale else 1)
-        return
-
-    if result.is_fresh:
-        console.print("[green]✓ Source is fresh[/green]")
-        if exit_on_stale:
-            exit_with_code(1)
-        return
-
-    console.print("[yellow]⚠ Source is stale[/yellow]")
-    console.print("[dim]Run 'source refresh' to update[/dim]")
-    if exit_on_stale:
-        exit_with_code(0)
-
-
-def _handle_source_mutation_error(exc: SourceMutationError, *, json_output: bool) -> NoReturn:
-    """Render a typed source-mutation error through the CLI error contract."""
-    extra = dict(exc.extra) if exc.extra else None
-    hint = None
-    if exc.status_message:
-        plain_status = render_markup(exc.status_message).plain
-        if json_output:
-            extra = extra or {}
-            extra["status_message"] = plain_status
-        else:
-            hint = plain_status
-    _output_error(
-        exc.message,
-        code=exc.code,
-        json_output=json_output,
-        exit_code=1,
-        extra=extra,
-        hint=hint,
-    )
-    raise AssertionError("unreachable")  # pragma: no cover
-
-
-def _render_source_delete_result(
-    result: SourceDeleteResult | SourceDeleteByTitleResult,
-    *,
-    json_output: bool,
-    ctx: click.Context,
-) -> None:
-    if result.status_message:
-        emit_status(result.status_message, json_output=json_output)
-
-    if json_output:
-        json_output_response(result.payload)
-        return
-
-    if result.status == "cancelled":
-        return
-    if result.success:
-        cli_print(f"[green]Deleted source:[/green] {result.source_id}", ctx=ctx)
-    else:
-        cli_print("[yellow]Delete may have failed[/yellow]", ctx=ctx)
-
-
-def _render_source_rename_result(
-    result: SourceRenameResult,
-    *,
-    json_output: bool,
-    ctx: click.Context,
-) -> None:
-    if json_output:
-        json_output_response(result.payload)
-        return
-
-    cli_print(f"[green]Renamed source:[/green] {result.source.id}", ctx=ctx)
-    cli_print(f"[bold]New title:[/bold] {result.source.title}", ctx=ctx)
-
-
-def _render_source_refresh_result(
-    result: SourceRefreshResult,
-    *,
-    json_output: bool,
-    ctx: click.Context,
-) -> None:
-    if json_output:
-        json_output_response(result.payload)
-        return
-
-    refreshed = result.result
-    if refreshed and refreshed is not True:
-        cli_print(f"[green]Source refreshed:[/green] {refreshed.id}", ctx=ctx)
-        cli_print(f"[bold]Title:[/bold] {refreshed.title}", ctx=ctx)
-    elif refreshed is True:
-        cli_print(f"[green]Source refreshed:[/green] {result.source_id}", ctx=ctx)
-    else:
-        cli_print("[yellow]Refresh returned no result[/yellow]", ctx=ctx)
-
-
-def _render_source_add_drive_result(
-    result: SourceAddDriveResult,
-    *,
-    json_output: bool,
-    ctx: click.Context,
-) -> None:
-    if json_output:
-        json_output_response(result.payload)
-        return
-
-    cli_print(f"[green]Added Drive source:[/green] {result.source.id}", ctx=ctx)
-    cli_print(f"[bold]Title:[/bold] {result.source.title}", ctx=ctx)
 
 
 @click.group()
@@ -545,7 +120,8 @@ def source():
     Commands:
       list             List sources in a notebook
       add              Add a source (url, text, file, youtube)
-      add-drive        Add a Google Drive document
+      add-drive        Add a Google Drive document (native Docs/Slides/Sheets + PDF)
+      add-drive-file   Add an upload-only Drive file (epub/docx/txt/...) via download
       add-research     Search web/drive and add sources from results
       get              Get source details
       fulltext         Get full indexed text content
@@ -566,20 +142,49 @@ def source():
 @source.command("list")
 @notebook_option
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.option(
+    "--label",
+    "label_filter",
+    default=None,
+    help="Only list sources in this label (label id, partial prefix, or exact name).",
+)
+@click.option(
+    "--status",
+    "status_filter",
+    type=click.Choice(SOURCE_STATUS_LABELS),
+    default=None,
+    help="Only list sources with this status. Use 'preparing' to find rows a failed add left behind.",
+)
 @list_options
 @with_client
-def source_list(ctx, notebook_id, json_output, limit, no_truncate, client_auth):
+def source_list(
+    ctx, notebook_id, json_output, label_filter, status_filter, limit, no_truncate, client_auth
+):
     """List all sources in a notebook.
 
     \b
     Pagination & display:
       --limit N         Show at most N sources (default: unlimited).
       --no-truncate     Do not truncate the Title column in the table view.
+      --label <id|name> Restrict the listing to a label's sources (read-only).
+      --status <state>  Restrict to one status: ready, processing, error,
+                        preparing, or unknown.
+
+    \b
+    Finding orphaned sources:
+      A file add that fails after its source row is registered leaves that row
+      in place on purpose — it is the evidence, and it still counts against the
+      notebook's source quota. The row sits at 'preparing', not 'error', so:
+
+        notebooklm source list --status preparing
+
+      is the query that surfaces it. Rows genuinely mid-upload also appear, so
+      re-run it before deleting anything.
     """
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             plan = SourceListPlan(
                 notebook_id=nb_id_resolved,
@@ -587,8 +192,21 @@ def source_list(ctx, notebook_id, json_output, limit, no_truncate, client_auth):
                 limit=limit,
                 no_truncate=no_truncate,
                 source_type_display=get_source_type_display,
+                label_filter=label_filter,
+                status_filter=status_filter,
             )
-            render_list(await execute_source_list(client, plan))
+            try:
+                render = await execute_source_list(client, plan)
+            except LabelResolutionError as exc:
+                output_error(
+                    exc.message,
+                    code=exc.code,
+                    json_output=json_output,
+                    exit_code=1,
+                    extra=dict(exc.extra) if exc.extra else None,
+                )
+                raise AssertionError("unreachable") from None  # pragma: no cover
+            render_list(render)
 
     return _run()
 
@@ -609,9 +227,8 @@ def source_list(ctx, notebook_id, json_output, limit, no_truncate, client_auth):
     help="MIME type for uploaded file sources. Overrides filename-extension inference.",
 )
 @click.option(
-    # ``--request-timeout`` is the self-documenting canonical name (per-request
-    # HTTP socket timeout, not a poll/wait budget); ``--timeout`` stays as a
-    # back-compat alias. See the matching wiring on ``chat ask``.
+    # ``--request-timeout`` is the canonical name (per-request HTTP socket
+    # timeout, not a poll/wait budget); ``--timeout`` is a back-compat alias.
     "--request-timeout",
     "--timeout",
     "timeout",
@@ -704,17 +321,15 @@ def source_add(
     for warning in plan.warnings:
         click.echo(warning, err=True)
 
-    client_kwargs: dict = {}
-    if timeout is not None:
-        client_kwargs["timeout"] = timeout
+    client_kwargs: dict = {"timeout": timeout} if timeout is not None else {}
 
     async def _run():
-        async with NotebookLMClient(client_auth, **client_kwargs) as client:
+        async with resolve_client_factory(ctx)(client_auth, **client_kwargs) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             execution_plan = SourceAddExecutionPlan(notebook_id=nb_id_resolved, plan=plan)
             if json_output:
                 result = await execute_source_add(client, execution_plan)
-                json_output_response(result.payload)
+                json_output_response(source_add_payload(result))
                 return
 
             with cli_status(f"Adding {plan.detected_type} source...", ctx=ctx):
@@ -734,7 +349,7 @@ def source_get(ctx, source_id, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_source_id(
                 client, nb_id_resolved, source_id, json_output=json_output
@@ -762,7 +377,7 @@ def source_delete(ctx, source_id, notebook_id, yes, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             try:
                 result = await execute_source_delete(
@@ -793,7 +408,7 @@ def source_delete_by_title(ctx, title, notebook_id, yes, json_output, client_aut
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             try:
                 result = await execute_source_delete_by_title(
@@ -824,7 +439,7 @@ def source_rename(ctx, source_id, new_title, notebook_id, json_output, client_au
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             result = await execute_source_rename(
                 client,
@@ -850,7 +465,7 @@ def source_refresh(ctx, source_id, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             plan = SourceRefreshPlan(
                 notebook_id=nb_id_resolved,
@@ -867,24 +482,46 @@ def source_refresh(ctx, source_id, notebook_id, json_output, client_auth):
     return _run()
 
 
+class _DriveMimeChoice(click.Choice):
+    """``--mime-type`` choice that, on an unsupported value, steers the user to the
+    file-upload path (NotebookLM's Drive import is Google-native + PDF only)."""
+
+    def convert(self, value: Any, param: Any, ctx: Any) -> Any:
+        try:
+            return super().convert(value, param, ctx)
+        except click.BadParameter:
+            raise click.BadParameter(  # cli-input-validation: unsupported --mime-type steered to file-upload path
+                f"{value!r} is not importable via Drive. NotebookLM's Drive import "
+                "supports google-doc/google-slides/google-sheets/pdf only; download an "
+                "upload-only file (epub/docx/txt/md/rtf/odt/csv) and add it via "
+                "`source add <path> --type file` instead.",
+                ctx=ctx,
+                param=param,
+            ) from None
+
+
 @source.command("add-drive")
 @click.argument("file_id")
 @click.argument("title")
 @notebook_option
 @click.option(
     "--mime-type",
-    type=click.Choice(["google-doc", "google-slides", "google-sheets", "pdf"]),
+    type=_DriveMimeChoice(["google-doc", "google-slides", "google-sheets", "pdf"]),
     default="google-doc",
     help="Document type (default: google-doc)",
 )
 @json_option
 @with_client
 def source_add_drive(ctx, file_id, title, notebook_id, mime_type, json_output, client_auth):
-    """Add a Google Drive document as a source."""
+    """Add a Google Drive document as a source.
+
+    Only Google-native Docs/Slides/Sheets + PDF import by reference; download an
+    upload-only Drive file (epub/docx/txt/md) and add it via `source add` instead.
+    """
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             plan = SourceAddDrivePlan(
                 notebook_id=nb_id_resolved,
@@ -902,133 +539,38 @@ def source_add_drive(ctx, file_id, title, notebook_id, mime_type, json_output, c
     return _run()
 
 
-def _emit_add_research_flag_conflict(message: str, *, json_output: bool) -> NoReturn:
-    """Surface a ``source add-research`` flag conflict via the active CLI error contract.
+@source.command("add-drive-file")
+@click.argument("document_id")
+@notebook_option
+@click.option("--title", default=None, help="Custom title (default: the file's Drive name)")
+@click.option("--wait", is_flag=True, default=False, help="Wait for processing to finish")
+@json_option
+@with_client
+def source_add_drive_file(ctx, document_id, notebook_id, title, wait, json_output, client_auth):
+    """Add an upload-only Google Drive file (epub/docx/pptx/txt/md/csv/pdf/...).
 
-    Per ADR-0015, post-parse flag-combination failures route through the typed
-    JSON envelope under ``--json`` (exit ``1`` with
-    ``{"error": true, "code": "VALIDATION_ERROR", ...}`` on stdout) and via
-    Click's parser-style ``UsageError`` otherwise (exit ``2`` with usage text
-    on stderr). Never returns — both branches raise.
+    Downloads the file from Drive (server-side, using your session) and uploads it.
+    A rejected type names the full accepted set in its error (that list is derived
+    from the upload-support declaration, so this summary can't be the stale one).
+    A Drive PDF can also go by reference via `source add-drive` (which takes native
+    Docs/Slides/Sheets + PDF). DOCUMENT_ID is a raw file id or share URL.
     """
-    if json_output:
-        _output_error(message, "VALIDATION_ERROR", json_output, 1)
-        raise AssertionError("unreachable")  # pragma: no cover
-    raise click.UsageError(  # cli-input-validation: source add-research flag conflict
-        message
-    )
+    nb_id = require_notebook(notebook_id)
 
-
-def _print_add_research_task_ids(result: SourceAddResearchResult) -> None:
-    if result.start_task_id:
-        console.print(f"[dim]Task ID: {result.start_task_id}[/dim]")
-    if result.poll_task_id and result.poll_task_id != result.start_task_id:
-        console.print(f"[dim]Poll ID: {result.poll_task_id}[/dim]")
-
-
-def _exit_with_add_research_status(status: str, message: str, **extra: Any) -> NoReturn:
-    payload: dict[str, Any] = {"status": status, "error": message}
-    payload.update(extra)
-    json_output_response(payload)
-    exit_with_code(1)
-
-
-def _render_add_research_result(result: SourceAddResearchResult, *, json_output: bool) -> None:
-    """Render :class:`SourceAddResearchResult` and exit on non-success outcomes.
-
-    The handler owns all CLI I/O — text vs JSON, exit codes, the
-    ``Starting ... research`` info line, and the ``Imported N sources``
-    summary — so the service layer can stay pure (ADR-0008) and exit-policy
-    free.
-    """
-    if result.outcome == "start_failed":
-        if json_output:
-            _output_error("Research failed to start", "VALIDATION_ERROR", json_output, 1)
-        else:
-            console.print("[red]Research failed to start[/red]")
-            exit_with_code(1)
-        return  # pragma: no cover — both branches above terminate
-
-    if not json_output:
-        _print_add_research_task_ids(result)
-
-    if result.outcome == "started_no_wait":
-        if json_output:
-            payload: dict[str, Any] = {
-                "status": "started",
-                "task_id": result.start_task_id,
-            }
-            if result.poll_task_id and result.poll_task_id != result.start_task_id:
-                payload["poll_task_id"] = result.poll_task_id
-            json_output_response(payload)
-            return
-        console.print(
-            "[green]Research started.[/green] "
-            "Run 'notebooklm research wait --import-all' to commit "
-            "sources once it completes, otherwise the NotebookLM web "
-            "UI will keep an 'Add sources?' modal open."
-        )
-        return
-
-    if result.outcome == "no_research":
-        if json_output:
-            _exit_with_add_research_status("no_research", "Research failed to start")
-        else:
-            console.print("[red]Research failed to start[/red]")
-            exit_with_code(1)
-        return  # pragma: no cover
-
-    if result.outcome in ("failed", "timeout"):
-        message = "Research timed out" if result.outcome == "timeout" else "Research failed"
-        if json_output:
-            _exit_with_add_research_status(result.outcome, message)
-        else:
-            console.print(f"[red]{message}[/red]")
-            exit_with_code(1)
-        return  # pragma: no cover
-
-    if result.outcome == "unknown_status":
-        status_val = result.status or "unknown"
-        if json_output:
-            _exit_with_add_research_status(
-                "unknown_status",
-                f"Unexpected research status: {status_val}",
-                raw_status=status_val,
+    async def _run():
+        async with resolve_client_factory(ctx)(client_auth) as client:
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            plan = SourceAddDriveFilePlan(
+                notebook_id=nb_id_resolved, document_id=document_id, title=title, wait=wait
             )
-        else:
-            console.print(f"[yellow]Status: {status_val}[/yellow]")
-            exit_with_code(1)
-        return  # pragma: no cover
+            if json_output:
+                result = await execute_source_add_drive_file(client, plan)
+            else:
+                with cli_status("Downloading + adding Drive file...", ctx=ctx):
+                    result = await execute_source_add_drive_file(client, plan)
+            _render_source_add_drive_file_result(result, json_output=json_output, ctx=ctx)
 
-    # outcome == "completed"
-    if json_output:
-        completed_payload: dict[str, Any] = {
-            "status": "completed",
-            "task_id": result.poll_task_id,
-            "sources_found": len(result.sources),
-            "sources": result.sources,
-            "report": result.report,
-        }
-        import_result = result.import_result
-        if import_result is not None:
-            if import_result.cited_selection is not None:
-                completed_payload["cited_only"] = True
-                completed_payload["cited_sources_selected"] = len(import_result.sources)
-                completed_payload["cited_only_fallback"] = (
-                    import_result.cited_selection.used_fallback
-                )
-            completed_payload["imported"] = len(import_result.imported)
-            completed_payload["imported_sources"] = import_result.imported
-        json_output_response(completed_payload)
-        return
-
-    # Text mode
-    console.print()
-    display_research_sources(result.sources)
-    display_report(result.report, json_hint=False)
-    import_result = result.import_result
-    if import_result is not None:
-        console.print(f"[green]Imported {len(import_result.imported)} sources[/green]")
+    return _run()
 
 
 @source.command("add-research")
@@ -1093,25 +635,18 @@ def source_add_research(
     ``--prompt-file``.
     """
     query = resolve_prompt(query, prompt_file, "query", required=True)
-    if cited_only and not import_all:
-        # ADR-0015 §2: under --json route through the typed envelope; preserve
-        # Click's parser-style ``UsageError`` (exit 2 with usage text) in text
-        # mode so interactive callers still see the canonical conflict prose.
-        _emit_add_research_flag_conflict(
-            "--cited-only requires --import-all", json_output=json_output
-        )
-    # --no-wait + --import-all is silently broken — refuse it.
-    if no_wait and import_all:
-        _emit_add_research_flag_conflict(
-            "--import-all requires --wait (the default) or a separate "
-            "'research wait --import-all' after --no-wait.",
-            json_output=json_output,
-        )
+    # Flag-combination rules live in the neutral ``_app`` core (pure ``validate_*``
+    # raising ``ValidationError``); the command maps that to the CLI conflict
+    # contract (ADR-0015 §2): --json → typed envelope, else Click ``UsageError``.
+    try:
+        validate_add_research_flags(import_all=import_all, cited_only=cited_only, no_wait=no_wait)
+    except ValidationError as exc:
+        _emit_add_research_flag_conflict(str(exc), json_output=json_output)
 
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             if not json_output:
                 console.print(f"[yellow]Starting {mode} research on {search_source}...[/yellow]")
@@ -1189,7 +724,7 @@ def source_fulltext(
     )
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_source_id(
                 client, nb_id_resolved, source_id, json_output=json_output
@@ -1227,7 +762,7 @@ def source_guide(ctx, source_id, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_source_id(
                 client, nb_id_resolved, source_id, json_output=json_output
@@ -1266,21 +801,17 @@ def source_guide(ctx, source_id, notebook_id, json_output, client_auth):
 def source_stale(ctx, source_id, notebook_id, exit_on_stale, json_output, client_auth):
     """Check if a URL/Drive source needs refresh.
 
-    Default exit codes follow the standard CLI convention: ``0`` when the
-    freshness check completes (regardless of the result), ``1`` on error
-    (validation, auth, network, not-found, etc.). Branch on the JSON
-    ``stale`` field (or stdout text) to decide whether to refresh.
-
-    Pass ``--exit-on-stale`` to opt into the back-compat inverted-predicate
-    semantics — exit ``0`` if stale, ``1`` if fresh — so the shell idiom
-    ``if notebooklm source stale --exit-on-stale ID; then refresh; fi``
-    keeps working for scripts written against the prior default. See
-    ``docs/cli-exit-codes.md`` for the full rationale.
+    Default exit codes: ``0`` when the freshness check completes (whatever the
+    result), ``1`` on error. Branch on the JSON ``stale`` field (or stdout text)
+    to decide whether to refresh. Pass ``--exit-on-stale`` for the back-compat
+    inverted-predicate semantics (exit ``0`` if stale, ``1`` if fresh) so the
+    idiom ``if notebooklm source stale --exit-on-stale ID; then refresh; fi``
+    keeps working. See ``docs/cli-exit-codes.md`` for the full rationale.
     """
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_source_id(
                 client, nb_id_resolved, source_id, json_output=json_output
@@ -1315,7 +846,7 @@ def source_wait(ctx, source_id, notebook_id, timeout, interval, json_output, cli
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
             resolved_id = await resolve_source_id(
                 client, nb_id_resolved, source_id, json_output=json_output
@@ -1327,7 +858,6 @@ def source_wait(ctx, source_id, notebook_id, timeout, interval, json_output, cli
                     source_id=resolved_id,
                     timeout=float(timeout),
                     interval=float(interval),
-                    json_output=json_output,
                 ),
                 wait_context=lambda: status_with_elapsed(
                     f"Waiting for source {resolved_id} to finish processing...",
@@ -1356,7 +886,7 @@ def source_clean(ctx, notebook_id, dry_run, yes, json_output, client_auth):
     quiet_mode = is_quiet(ctx)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
 
             async def _list_sources(notebook_id_inner: str) -> list[Source]:
@@ -1365,10 +895,9 @@ def source_clean(ctx, notebook_id, dry_run, yes, json_output, client_auth):
                 with cli_status("Fetching sources for cleanup...", ctx=ctx):
                     return await client.sources.list(notebook_id_inner)
 
-            # In --json mode, never prompt — automation cannot
-            # answer the question. Pass a non-interactive ``confirm_delete``
-            # that always declines; once the service returns ``cancelled`` we
-            # synthesize a structured ``CONFIRM_REQUIRED`` error below.
+            # In --json mode, never prompt: pass a ``confirm_delete`` that always
+            # declines, then synthesize a ``CONFIRM_REQUIRED`` error from the
+            # resulting ``cancelled`` status below.
             confirm_delete = (
                 (lambda count: False)
                 if json_output
@@ -1413,7 +942,7 @@ def _dispatch_source_clean_result(
     """Render the source-clean outcome and exit per the result's status.
 
     Owns the Click-side rendering + exit-code policy, kept separate from
-    ``execute_source_clean`` in :mod:`.services.source_clean`.
+    ``execute_source_clean`` in :mod:`.._app.source_clean`.
     Keeping presentation here lets the service module stay free of
     ``click`` / ``..rendering`` / ``..error_handler`` imports.
     """
@@ -1473,11 +1002,9 @@ def _dispatch_source_clean_result(
         return
 
     if result.failures:
-        # Failure summary is an error diagnostic, so it must remain visible
-        # under root ``--quiet`` (policy: errors are never silenced; see
-        # ``cli/rendering.py``). Use ``console.print`` directly here instead
-        # of ``cli_print`` so the diagnostic is not swallowed when the user
-        # passes ``--quiet``.
+        # Failure summary is an error diagnostic: use ``console.print`` (not
+        # ``cli_print``) so it stays visible under root ``--quiet`` — errors are
+        # never silenced (see ``cli/rendering.py``).
         console.print(
             f"[yellow]Cleaned {result.deleted_count} source(s). "
             f"{len(result.failures)} deletion(s) failed.[/yellow]",

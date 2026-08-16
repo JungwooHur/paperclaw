@@ -12,11 +12,18 @@ break Python's package-attribute shadowing — see
 - ``generate_cmd``: Content generation commands
 - ``download_cmd``: Download commands
 - ``note_cmd``: Note management commands
-- ``session_cmd``: Session and context commands (login, use, status, clear)
-- ``notebook_cmd``: Notebook management commands (list, create, delete, rename, share, summary)
+- ``label_cmd``: Source-label management commands
+- ``share_cmd``: Notebook sharing commands
+- ``skill_cmd``: Agent skill integration commands
+- ``research_cmd``: Research status/wait commands
+- ``language_cmd``: Output-language configuration commands
+- ``profile_cmd``: Profile management commands
+- ``mcp_cmd``: MCP client installation commands
+- ``session_cmd``: Session and context commands (login, use, status, clear, auth)
+- ``notebook_cmd``: Notebook management commands (list, create, delete,
+  rename, summary, metadata)
 - ``chat_cmd``: Chat commands (ask, configure, history)
 - ``doctor_cmd``: Diagnostic and migration commands
-- ``profile_cmd``: Profile management commands
 
 The click groups themselves are still exported here under their historical
 names (``source``, ``artifact``, …) so ``from notebooklm.cli import source``
@@ -28,6 +35,7 @@ external importer.
 from .agent_cmd import agent
 from .artifact_cmd import artifact
 from .chat_cmd import register_chat_commands
+from .collection_cmd import collection
 from .doctor_cmd import register_doctor_command
 from .download_cmd import download
 from .generate_cmd import generate
@@ -60,7 +68,9 @@ from .helpers import (
     # Decorators
     with_client,
 )
+from .label_cmd import label
 from .language_cmd import get_language, language
+from .mcp_cmd import mcp
 from .note_cmd import note
 from .notebook_cmd import register_notebook_commands
 from .options import (
@@ -89,11 +99,14 @@ __all__ = [
     "generate",
     "download",
     "note",
+    "label",
+    "collection",
     "share",
     "skill",
     "research",
     "language",
     "profile",
+    "mcp",
     # Language config
     "get_language",
     # Register functions (top-level command style)

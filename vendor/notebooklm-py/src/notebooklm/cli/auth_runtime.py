@@ -7,6 +7,7 @@ as ``notebooklm.cli.helpers.get_auth_tokens`` and
 ``notebooklm.cli.helpers.run_async`` continue to affect runtime behavior.
 """
 
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -18,7 +19,12 @@ from typing import Any, NoReturn, TypeVar, cast
 import click
 
 from ..auth import AuthTokens
-from .services.auth_source import AUTH_JSON_ENV_NAME, AuthSource, has_env_auth_json
+from .services.auth_source import (
+    AUTH_JSON_ENV_NAME,
+    AuthSource,
+    has_env_auth_json,
+    read_env_auth_json,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -91,12 +97,12 @@ def get_client(ctx) -> tuple[dict, str, str]:
     resolved_storage_path = _resolved_auth_storage_path(ctx)
     typed_storage_path = cast(Path | None, resolved_storage_path)
 
-    # Load from storage (which respects env-supplied auth if resolved path is None).
-    cookies = helpers.load_auth_from_storage(resolved_storage_path)
-
     from ..auth import fetch_tokens_with_domains
 
     csrf, session_id = helpers.run_async(fetch_tokens_with_domains(typed_storage_path, profile))
+    # Recovery may have replaced the persisted cookie jar, so load only after
+    # the token fetch settles and its session has flushed storage.
+    cookies = helpers.load_auth_from_storage(resolved_storage_path)
     return cookies, csrf, session_id
 
 
@@ -114,8 +120,9 @@ def get_auth_tokens(ctx) -> AuthTokens:
     storage_path, _ = _auth_context(ctx)
     resolved_storage_path = _resolved_auth_storage_path(ctx)
     typed_storage_path = cast(Path | None, resolved_storage_path)
+    env_auth = storage_path is None and has_env_auth_json()
 
-    if has_env_auth_json() and storage_path is None:
+    if env_auth:
         from ..auth import build_httpx_cookies_from_storage
 
         jar = build_httpx_cookies_from_storage(None)
@@ -124,7 +131,13 @@ def get_auth_tokens(ctx) -> AuthTokens:
 
     # Read persisted account routing so RPC URLs target the same Google
     # account the tokens were minted for.
-    from ..auth import get_account_email_for_storage, get_authuser_for_storage
+    from ..auth import resolve_account_identity
+
+    identity = resolve_account_identity(
+        has_env_auth=env_auth,
+        storage_path=typed_storage_path,
+        env_auth_storage_state=json.loads(read_env_auth_json()) if env_auth else None,
+    )
 
     return AuthTokens(
         cookies=cookies,
@@ -132,8 +145,8 @@ def get_auth_tokens(ctx) -> AuthTokens:
         session_id=session_id,
         storage_path=typed_storage_path,
         cookie_jar=jar,
-        authuser=get_authuser_for_storage(typed_storage_path),
-        account_email=get_account_email_for_storage(typed_storage_path),
+        authuser=identity["authuser"],
+        account_email=identity["email"],
     )
 
 
@@ -257,6 +270,68 @@ def with_auth_and_errors(
         return result
 
 
+def resolve_client_factory(
+    ctx: click.Context | None,
+    default: Callable[..., AbstractAsyncContextManager[Any]] | None = None,
+) -> Callable[..., AbstractAsyncContextManager[Any]]:
+    """Resolve the ``NotebookLMClient`` factory for a CLI command.
+
+    Resolution order, evaluated at call time:
+
+    1. An injected factory in ``ctx.obj["client_factory"]`` -- the CLI seam tests
+       use this to substitute a fake client. ``ctx.obj`` is the CLI adapter's
+       client seam; a future MCP/HTTP front-end injects through the neutral
+       ``_app`` ``execute_<verb>(plan, client)`` signature, not this key (ADR-0021).
+    2. The ``default`` supplied by the call site -- during the de-monkeypatch
+       migration this is the command module's still-patchable ``NotebookLMClient``
+       name, so legacy ``patch("...X_cmd.NotebookLMClient")`` seams keep working.
+    3. A lazy import of the real :class:`~notebooklm.client.NotebookLMClient` --
+       the production fallback once the module-level default is dropped.
+
+    Null-safe: a bare ``click.Context`` has ``obj is None`` (mirrors the guard in
+    :func:`_auth_context`). The returned factory is invoked as
+    ``factory(client_auth, **client_kwargs)``, so it is typed to accept keyword
+    arguments (the ``source add`` / ``chat ask`` timeout passthrough).
+    """
+    if ctx is not None and isinstance(ctx.obj, dict):
+        injected = ctx.obj.get("client_factory")
+        if injected is not None:
+            return injected
+    if default is not None:
+        return default
+    from ..client import NotebookLMClient
+
+    return NotebookLMClient
+
+
+def auth_check_notebook_count(ctx: click.Context) -> int | None:
+    """Best-effort live notebook count for ``auth check --test``; ``None`` on any
+    failure.
+
+    Both :func:`get_auth_tokens` and the client open run their own ``run_async``
+    (the CLI's single-top-level-loop invariant), so this MUST be called from sync
+    code -- never from inside ``run_async(run_auth_check(...))``, which would nest
+    event loops. The count never affects the exit code: ``token_fetch`` is the
+    authoritative validity check, so any failure here just leaves ``None``.
+    """
+    helpers = _helpers_facade()
+    try:
+        auth = get_auth_tokens(ctx)
+    except Exception as exc:  # auth resolution failed -- skip the optional count
+        logger.debug("auth check notebook-count: auth resolution failed: %s", exc)
+        return None
+
+    async def _count() -> int:
+        async with resolve_client_factory(ctx)(auth) as client:
+            return len(await client.notebooks.list())
+
+    try:
+        return helpers.run_async(_count())
+    except Exception as exc:
+        logger.debug("auth check notebook-count probe failed: %s", exc)
+        return None
+
+
 def run_client_workflow(
     ctx: click.Context,
     *,
@@ -264,7 +339,7 @@ def run_client_workflow(
     json_output: bool,
     body: Callable[[Any], Awaitable[T]],
     auth_loader: Callable[[click.Context], AuthTokens] | None = None,
-    client_factory: Callable[[AuthTokens], AbstractAsyncContextManager[Any]] | None = None,
+    client_factory: Callable[..., AbstractAsyncContextManager[Any]] | None = None,
     body_error_handler: Callable[[Exception], T] | None = None,
 ) -> T:
     """Run a CLI workflow with shared auth, client lifetime, and error handling.
@@ -273,11 +348,13 @@ def run_client_workflow(
     ``NotebookLMClient`` rather than raw ``AuthTokens``. ``with_auth_and_errors``
     remains the lower-level primitive for commands that intentionally manage
     client lifetime themselves.
+
+    When ``client_factory`` is not supplied, the factory is resolved from
+    ``ctx.obj`` (falling back to the real client) via
+    :func:`resolve_client_factory`, so injected test factories reach this path too.
     """
     if client_factory is None:
-        from ..client import NotebookLMClient
-
-        client_factory = NotebookLMClient
+        client_factory = resolve_client_factory(ctx)
 
     async def workflow(auth: AuthTokens) -> T:
         async with client_factory(auth) as client:

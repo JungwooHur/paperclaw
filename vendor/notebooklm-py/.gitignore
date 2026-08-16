@@ -39,3 +39,15 @@ downloads/
 # VCR cassettes - committed after security review
 # Cassettes are scrubbed of sensitive data (cookies, tokens, user IDs, emails)
 # See tests/vcr_config.py for scrubbing patterns
+
+# Local working notes (process scratch — not shipped)
+docs/scratch/
+
+# Baked into the wheel by hatch_build.py; never committed.
+src/notebooklm/_commit.py
+
+# Mobile reverse-engineering working files (local only)
+# The APK is ~39MB of Google's proprietary binaries — never commit it.
+notebooklm.apk/
+frida-scripts/
+error.log

@@ -15,6 +15,7 @@ from .._deadline import Monotonic, RuntimeDeadline, Sleep
 from .._polling_registry import PollRegistry
 from .._row_adapters.artifacts import ArtifactRow
 from .._runtime.contracts import LoopGuard
+from .._types.artifacts import _status_from_code
 from ..exceptions import ArtifactInProgressTimeoutError, ArtifactPendingTimeoutError
 from ..rpc import (
     ArtifactStatus,
@@ -24,7 +25,7 @@ from ..rpc import (
     ServerError,
     artifact_status_to_str,
 )
-from ..types import GenerationStatus
+from ..types import GenerationState, GenerationStatus
 from .listing import find_artifact_row_by_id
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,6 @@ ListRawCallback = Callable[[str], Awaitable[builtins.list[Any]]]
 PollStatusCallback = Callable[[str, str], Awaitable[GenerationStatus]]
 MediaReadyCallback = Callable[[builtins.list[Any], int], bool]
 ArtifactTypeNameCallback = Callable[[int], str]
-ArtifactErrorCallback = Callable[[builtins.list[Any]], str | None]
 StatusChangeCallback = Callable[[GenerationStatus], object]
 
 
@@ -102,7 +102,6 @@ class ArtifactPollingService:
         list_raw: ListRawCallback,
         is_media_ready: MediaReadyCallback,
         get_artifact_type_name: ArtifactTypeNameCallback,
-        extract_artifact_error: ArtifactErrorCallback,
     ) -> GenerationStatus:
         """Poll the status of a generation task."""
         # List all artifacts and find by ID (no poll-by-ID RPC exists).
@@ -135,24 +134,18 @@ class ArtifactPollingService:
                     # Downgrade to PROCESSING to continue polling.
                     status_code = ArtifactStatus.PROCESSING
 
-            status = artifact_status_to_str(status_code)
-
-            error_msg: str | None = None
-            if status == "failed":
-                error_msg = extract_artifact_error(row.raw)
             url = row.artifact_url(artifact_type, suppress_drift=True)
 
             return GenerationStatus(
                 task_id=task_id,
-                status=status,
+                status=_status_from_code(status_code),
                 url=url,
-                error=error_msg,
                 metadata=metadata,
             )
 
         # Artifact not found in the list. Use a distinct status so
         # wait_for_completion can differentiate from genuine "pending".
-        return GenerationStatus(task_id=task_id, status="not_found")
+        return GenerationStatus(task_id=task_id, status=GenerationState.NOT_FOUND)
 
     async def wait_for_completion(
         self,
@@ -177,10 +170,14 @@ class ArtifactPollingService:
 
         existing = self._poll_registry.get(key)
         if existing is not None:
-            # Follower path. ``asyncio.shield`` ensures that *this* caller's
-            # cancellation does not propagate into the shared future; the
-            # leader's poll task continues on behalf of every other follower.
-            result = await asyncio.shield(existing[0])
+            # Follower path. ``existing`` is the typed ``PendingPoll`` tuple
+            # ``(shared_future, poll_task)`` — not a decoded RPC payload — so it
+            # is unpacked by name rather than indexed positionally.
+            # ``asyncio.shield`` ensures that *this* caller's cancellation does
+            # not propagate into the shared future; the leader's poll task
+            # continues on behalf of every other follower.
+            shared_future, _poll_task = existing
+            result = await asyncio.shield(shared_future)
             if on_status_change is not None:
                 await maybe_await_callback(on_status_change, result)
             return result
@@ -363,7 +360,7 @@ class ArtifactPollingService:
             # absent*: a transient/flapping omission — where the artifact keeps
             # coming back and may still complete — never accumulates toward a
             # spurious terminal ``"removed"`` (issue #1198).
-            if status.status == "not_found":
+            if status.is_not_found:
                 consecutive_not_found += 1
                 now = deadline.now()
                 if first_not_found_time is None:
@@ -404,7 +401,7 @@ class ArtifactPollingService:
                     # exception-free callers still get an actionable message.
                     removed_status = GenerationStatus(
                         task_id=task_id,
-                        status="removed",
+                        status=GenerationState.REMOVED,
                         error=(
                             "Generation incomplete: artifact was removed from the "
                             "list by the server. This may indicate a daily "
@@ -475,22 +472,6 @@ def _artifact_timeout_error(
         status_history=history,
         status_transitions=transitions,
     )
-
-
-def _extract_artifact_error(art: builtins.list[Any]) -> str | None:
-    """Try to extract a human-readable error from a failed artifact."""
-    try:
-        if not isinstance(art, list):
-            return None
-        return ArtifactRow(art).failed_error_text
-    except Exception:
-        preview = art[:6] if isinstance(art, list) else art
-        logger.warning(
-            "Failed to extract error from artifact data: %r",
-            preview,
-            exc_info=True,
-        )
-        return None
 
 
 def _get_artifact_type_name(artifact_type: int) -> str:

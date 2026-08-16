@@ -21,11 +21,12 @@ Architecture:
     - It imports command groups from the ``notebooklm.cli`` package and
       registers them on the top-level Click group ``notebooklm``.
     - The ``cli/`` package contains the actual command implementations
-      (one module per command group: ``session``, ``notebook``, ``source``,
-      ``artifact``, ``generate``, ``download``, ``chat``, ``note``,
-      ``doctor``, ``profile``, ``agent``).
-    - Editing CLI behavior: change ``cli/<group>.py``. Editing CLI surface
-      (adding a new top-level command): import + register here.
+      (``*_cmd.py`` modules for command groups and top-level command
+      registration; shared runtime helpers live in sibling modules such as
+      ``options.py``, ``runtime.py``, and ``auth_runtime.py``).
+    - Editing CLI behavior: change the relevant ``cli/*_cmd.py`` module or
+      shared helper. Editing CLI surface (adding a new top-level command):
+      import + register it here.
 
 LLM-friendly design:
   # Set context once, then use simple commands
@@ -90,15 +91,18 @@ _configure_windows_runtime()
 
 import click
 
-from . import __version__
+from ._version_info import version_string
 
 # Import command groups from cli package
 from .cli import (
     agent,
     artifact,
+    collection,
     download,
     generate,
+    label,
     language,
+    mcp,
     note,
     profile,
     register_chat_commands,
@@ -128,7 +132,7 @@ __all__ = ["cli", "main"]
 
 
 @click.group(cls=SectionedGroup)
-@click.version_option(version=__version__, prog_name="NotebookLM CLI")
+@click.version_option(version=version_string(), prog_name="NotebookLM CLI")
 @click.option(
     "--storage",
     type=click.Path(exists=False),
@@ -225,6 +229,11 @@ def cli(ctx, storage, profile, verbose, quiet):
     # Mirror the root quiet flag for call sites that already read ctx.obj.
     # ``cli.runtime.is_quiet(ctx)`` remains the canonical reader.
     ctx.obj["quiet"] = bool(quiet)
+    # Default client factory: commands resolve ``NotebookLMClient`` through
+    # ``cli.auth_runtime.resolve_client_factory``. ``setdefault`` never clobbers a
+    # factory injected via ``CliRunner.invoke(obj=...)`` (the test seam); ``None``
+    # leaves resolution to the call-site default / lazy real client.
+    ctx.obj.setdefault("client_factory", None)
 
 
 # =============================================================================
@@ -244,11 +253,14 @@ cli.add_command(agent)
 cli.add_command(generate)
 cli.add_command(download)
 cli.add_command(note)
+cli.add_command(label)
+cli.add_command(collection)
 cli.add_command(share)
 cli.add_command(skill)
 cli.add_command(research)
 cli.add_command(language)
 cli.add_command(profile)
+cli.add_command(mcp)
 
 
 # =============================================================================

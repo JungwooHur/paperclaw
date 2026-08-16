@@ -12,22 +12,25 @@ Commands:
 import click
 from rich.table import Table
 
-from ..client import NotebookLMClient
+from .._app.sharing import (
+    execute_share_add_user,
+    execute_share_remove_user,
+    execute_share_set_public,
+    execute_share_set_view_level,
+    execute_share_status,
+    execute_share_update_user,
+)
 from ..types import SharePermission, ShareViewLevel
-from .auth_runtime import with_client
+from .auth_runtime import resolve_client_factory, with_client
 from .options import notebook_option
-from .rendering import console, json_output_response
+from .rendering import console, get_permission_display, json_output_response
 from .resolve import require_notebook, resolve_notebook_id
 from .services.confirming_mutation import MutationPlan, run_confirmed_mutation
 
 
 def _permission_name(perm: SharePermission) -> str:
     """Convert permission enum to display name."""
-    return {
-        SharePermission.OWNER: "Owner",
-        SharePermission.EDITOR: "Editor",
-        SharePermission.VIEWER: "Viewer",
-    }.get(perm, "Unknown")
+    return get_permission_display(perm)
 
 
 def _view_level_display(view_level: ShareViewLevel) -> str:
@@ -80,9 +83,13 @@ def share_status(ctx, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
-            resolved_id = await resolve_notebook_id(client, nb_id, json_output=json_output)
-            status = await client.sharing.get_status(resolved_id)
+        async with resolve_client_factory(ctx)(client_auth) as client:
+            status = await execute_share_status(
+                client,
+                nb_id,
+                resolve_notebook_id=resolve_notebook_id,
+                json_output=json_output,
+            )
 
             if json_output:
                 data = {
@@ -91,6 +98,20 @@ def share_status(ctx, notebook_id, json_output, client_auth):
                     "access": status.access.name.lower(),
                     "view_level": status.view_level.name.lower(),
                     "share_url": status.share_url,
+                    # #2130. This payload is hand-built rather than routed
+                    # through ``_app.views.share_status_view``, so a field added
+                    # to ``ShareStatus`` stays invisible to CLI users until it is
+                    # listed here too — the same parity gap that hid two earlier
+                    # additions from ``source list --json``.
+                    "max_individuals_share_limit": status.max_individuals_share_limit,
+                    "is_public_sharing_allowed": status.is_public_sharing_allowed,
+                    # The verdict too, matching the MCP/REST view. It is a
+                    # property, so it would be dropped by any serialization that
+                    # walks dataclass fields — and re-deriving it here as
+                    # ``not is_public_sharing_allowed`` is the exact bug the
+                    # property exists to prevent, since that also fires on the
+                    # unknown case. Read it off the object instead.
+                    "is_public_sharing_denied": status.is_public_sharing_denied,
                     "shared_users": [
                         {
                             "email": u.email,
@@ -116,6 +137,27 @@ def share_status(ctx, notebook_id, json_output, client_auth):
                 f"[bold]View Level:[/bold] {_view_level_display(status.view_level)} "
                 "[dim](use 'share view-level' to change)[/dim]"
             )
+
+            # #2130. Only rendered when the backend actually stated them: a
+            # ``None`` means "no claim", and printing "Public Sharing: no" for a
+            # silent response would assert a policy denial that was never made.
+            if status.is_public_sharing_denied:
+                console.print(
+                    "[bold]Public Sharing:[/bold] [red]Not allowed by policy[/red] "
+                    "[dim](a 'share public --enable' call may not take effect)[/dim]"
+                )
+            elif status.is_public_sharing_allowed is True:
+                console.print("[bold]Public Sharing:[/bold] [green]Allowed[/green]")
+
+            # Deliberately NOT annotated with a "N of 1000 used" style count.
+            # ``shared_users`` includes the owner, and whether the owner counts
+            # against maxIndividualsShareLimit was never tested, so pairing the
+            # two numbers would invite a subtraction this project has not
+            # verified. Report the backend's stated ceiling and nothing more.
+            if status.max_individuals_share_limit is not None:
+                console.print(
+                    f"[bold]Collaborator Limit:[/bold] {status.max_individuals_share_limit}"
+                )
 
             # Display shared users
             if status.shared_users:
@@ -157,9 +199,14 @@ def share_public(ctx, notebook_id, enable, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
-            resolved_id = await resolve_notebook_id(client, nb_id, json_output=json_output)
-            status = await client.sharing.set_public(resolved_id, enable)
+        async with resolve_client_factory(ctx)(client_auth) as client:
+            status = await execute_share_set_public(
+                client,
+                nb_id,
+                enable,
+                resolve_notebook_id=resolve_notebook_id,
+                json_output=json_output,
+            )
 
             if json_output:
                 data = {
@@ -204,9 +251,14 @@ def share_view_level(ctx, level, notebook_id, json_output, client_auth):
     )
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
-            resolved_id = await resolve_notebook_id(client, nb_id, json_output=json_output)
-            status = await client.sharing.set_view_level(resolved_id, view_level)
+        async with resolve_client_factory(ctx)(client_auth) as client:
+            resolved_id, status = await execute_share_set_view_level(
+                client,
+                nb_id,
+                view_level,
+                resolve_notebook_id=resolve_notebook_id,
+                json_output=json_output,
+            )
 
             if json_output:
                 data = {
@@ -254,14 +306,16 @@ def share_add(ctx, email, notebook_id, permission, no_notify, message, json_outp
     perm = _parse_permission(permission)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
-            resolved_id = await resolve_notebook_id(client, nb_id, json_output=json_output)
-            await client.sharing.add_user(
-                resolved_id,
+        async with resolve_client_factory(ctx)(client_auth) as client:
+            resolved_id = await execute_share_add_user(
+                client,
+                nb_id,
                 email,
                 permission=perm,
                 notify=not no_notify,
                 welcome_message=message,
+                resolve_notebook_id=resolve_notebook_id,
+                json_output=json_output,
             )
 
             if json_output:
@@ -307,9 +361,15 @@ def share_update(ctx, email, notebook_id, permission, json_output, client_auth):
     perm = _parse_permission(permission)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
-            resolved_id = await resolve_notebook_id(client, nb_id, json_output=json_output)
-            await client.sharing.update_user(resolved_id, email, perm)
+        async with resolve_client_factory(ctx)(client_auth) as client:
+            resolved_id = await execute_share_update_user(
+                client,
+                nb_id,
+                email,
+                perm,
+                resolve_notebook_id=resolve_notebook_id,
+                json_output=json_output,
+            )
 
             if json_output:
                 data = {
@@ -342,14 +402,14 @@ def share_remove(ctx, email, notebook_id, yes, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with resolve_client_factory(ctx)(client_auth) as client:
 
             async def resolve_remove(client):
                 resolved_id = await resolve_notebook_id(client, nb_id, json_output=json_output)
                 return {"notebook_id": resolved_id, "email": email}
 
             async def execute_remove(client, resolved):
-                await client.sharing.remove_user(resolved["notebook_id"], resolved["email"])
+                await execute_share_remove_user(client, resolved["notebook_id"], resolved["email"])
 
             plan = MutationPlan(
                 entity_label="share",

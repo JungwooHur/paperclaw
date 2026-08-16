@@ -114,6 +114,37 @@ python3 -m venv /tmp/nlm && /tmp/nlm/bin/pip install -q notebooklm-py
 ```
 Also note **`notebooklm doctor` is not trustworthy for this** — it only checks that an SID cookie exists in the file and happily prints `Auth ✓ pass` while every real request redirects to the Google sign-in page. `notebooklm list --json` is the only honest check.
 
+**The auth error can also mean the SERVICE MOVED.** Google renamed the app host from
+`notebooklm.google.com` to `notebook.google.com` (the old name is now a 301), and a
+CLI pinned to the old host reports it as `Authentication expired or invalid.
+Redirected to: accounts.google.com` — the same sentence a real expiry produces. The
+A/B test above does NOT separate them when BOTH versions predate the move, and the
+tell is different: `notebooklm login` opens the browser, the user signs in
+successfully, and the CLI still times out with `Login not detected within 5
+minutes`, because it is waiting for `wait_for_url("<old host>/**")` on a URL that no
+longer exists. **When login "works" but is never detected, compare the expected host
+with the real one** — that is a one-line check and it beats hours of auth debugging:
+```bash
+python3 -c "from notebooklm.config import get_base_host; print(get_base_host())"
+curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}\n' https://notebooklm.google.com/
+```
+
+**Two more traps found in the same incident, both wearing an auth costume.** (1) The
+session path MOVED between versions: 0.3.4 kept `~/.notebooklm/storage_state.json`,
+0.7.3+ keeps `~/.notebooklm/profiles/<profile>/storage_state.json`. Checking the old
+path shows "no session" on a host that has one. **Check the file's mtime after a
+login** — if it did not change, the login never saved, whatever the terminal said.
+(2) The persistent `browser_profile/` directory can go bad and take Chrome down with
+it: the login window died instantly with `signal=SIGTRAP`, which surfaces only as
+"The browser window was closed during login". Isolate it by launching a persistent
+context on a FRESH temp dir — if that works and the CLI's dir does not, delete
+`browser_profile/` (`--fresh` did not fully clear it). **Deleting it also deletes the
+Google session that made login automatic**, so the next login is interactive; say so
+before doing it. A failed login also leaves its Chrome running and holding the
+profile, so the next attempt dies with `Opening in existing browser session` — kill
+the process whose `--user-data-dir` is that profile (never the user's own Chrome) and
+remove the stale `Singleton*` links.
+
 **Upgrading:** replace `vendor/notebooklm-py` with the new sdist (drop `tests/`, `examples/`, `PKG-INFO` — the old vendored tree tracked neither), `pip install --user --break-system-packages --upgrade ./vendor/notebooklm-py` on the host so host-side probes agree with the container, then prune the builder and rebuild (see Container Build Cache). Verify the CLI both *inside* the image and on the host with `list --json`. The image's ENTRYPOINT speaks the agent JSON protocol, so probe it with `--entrypoint`.
 
 ## Silently-broken paper assembly (verify enforcement)

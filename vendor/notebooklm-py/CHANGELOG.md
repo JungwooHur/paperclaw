@@ -7,6 +7,1219 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-14
+
+### Added
+
+- Added account-level notebook collections through `client.collections` and the
+  `notebooklm collection` CLI group, including list, create, rename, membership,
+  and delete operations.
+- Expanded source discovery with status/type filters, strict exact counts, Drive
+  health, original-file links, MIME information, word counts, and revision
+  timestamps. MCP and REST URL batches now use a single batch-capable request.
+- Added structured source documents and offset-aware citation data so callers can
+  render readable source text and align citations with both answers and sources.
+- Exposed more notebook, artifact, chat, and research metadata, including project
+  state, chat follow-up suggestions, artifact content/state, research mode,
+  timings, termination reasons, and discovered-source ordinals.
+- Added standalone `notebooklm research import`, configurable research-import
+  timeouts, bulk sharing grants with `SharingAPI.set_users()`, and sharing-policy
+  and collaborator-limit fields.
+- Added opt-in mid-session `NOTEBOOKLM_REFRESH_CMD` support for long-running
+  servers with `NOTEBOOKLM_REFRESH_CMD_MIDSESSION=1`.
+
+### Changed
+
+- The default NotebookLM host is now `https://notebook.google.com`; the previous
+  `https://notebooklm.google.com` host remains supported for existing setups.
+- `Notebook.last_viewed_at` and `NotebookMetadata.last_viewed_at` now describe the
+  backend timestamp accurately. The old `modified_at` names remain compatible
+  aliases through v0.x.
+- Deep-research CLI waits now default to 1,800 seconds instead of 300 seconds.
+- **Compatibility note:** `QuizQuantity.MORE` now has its own wire value and no
+  longer compares equal to `QuizQuantity.STANDARD`. Quiz and flashcard option
+  inputs are also validated as enums.
+
+### Deprecated
+
+- Direct `AuthTokens` storage loading and cookie projections are deprecated in
+  favor of managed `NotebookLMClient.from_storage()` lifecycles. They remain
+  available through v0.x and are scheduled for removal in v1.0.
+- The pre-profiles home-root storage layout is deprecated. Running any
+  `notebooklm` command migrates it to `profiles/default/` automatically.
+- `ChatReference.answer_start_char` / `answer_end_char` are deprecated aliases
+  for `fragment_start_char` / `fragment_end_char`; the old names remain through
+  v0.x.
+
+### Fixed
+
+- Improved authentication and login reliability across both NotebookLM hosts,
+  including Chromium setup diagnostics, custom storage paths, expired-session
+  recovery, cookie persistence, and long-running MCP/REST sessions.
+- Prevented notebook and source create retries from adopting an older item,
+  duplicating a committed item, or retrying when the idempotency probe itself
+  could not establish a safe answer.
+- File uploads now preserve partial-failure recovery details, report processing
+  failures that never resolve, and warn when a mistyped file extension would be
+  treated as pasted text.
+- Corrected chat answer selection, conversation turn numbering, Unicode and
+  multi-block citation offsets, full cited-text extraction, and source passage
+  resolution.
+- Corrected notebook ownership, not-found handling, empty-notebook decoding, and
+  create results when the pre-create baseline is unavailable.
+- Corrected artifact status decoding, generation rejection messages, quiz and
+  flashcard option ordering, and audio downloads (`.m4a` / `audio/mp4` rather
+  than `.mp3`).
+- Research imports now tolerate the backend's known retry response, distinguish
+  no-results and cancellation outcomes, and preserve typed failure reasons.
+- Corrected PowerPoint and unknown source-status decoding, Drive-source
+  idempotency, Markdown full-text formatting, table-cell rendering, and custom
+  per-RPC timeout handling.
+
+## [0.8.0] - 2026-08-03
+
+The headline of 0.8.0 is **integrations**: NotebookLM is now reachable from AI
+agents and HTTP clients through two new adapters built over the shared `_app/`
+core (ADR-0021) — an **MCP server** and an experimental **single-tenant REST API
+server** — plus a **remote MCP connector** you can self-host for **claude.ai**
+(and Claude Desktop / Code / Cursor) behind a Cloudflare Tunnel or Tailscale
+Funnel, gated by a single password.
+
+0.8.0 also lands the **breaking half** of the ADR-0019 error contract (the
+[#1346](https://github.com/teng-lin/notebooklm-py/issues/1346) umbrella):
+"absence and refusal **raise**; only success and async-lifecycle state are
+returned." Every flip previewed under `NOTEBOOKLM_FUTURE_ERRORS` in v0.7.0 is
+now the default, and the preview flag — together with the dict-subscript /
+get-returns-None / kwarg-alias deprecation machinery — has been **removed**
+(#1365). See the [Upgrading to v0.8.0](docs/upgrading-to-0.8.0.md) guide and the
+**Breaking** section below.
+
+> **⚠ `NOTEBOOKLM_FUTURE_ERRORS` is gone.** It was the v0.7.0 forward-compat
+> preview gate; its target behavior is now unconditional, so the flag is a no-op
+> (setting it changes nothing). Remove it from your environment / CI config.
+
+### Added
+
+- **MCP file upload now records and can verify a SHA-256 of the uploaded bytes.**
+  The `/files/ul` route computes the digest of exactly the received bytes and
+  stores it in the completion record (`{source_id, name, size, mime, sha256}`),
+  which `await_upload` surfaces. An optional `?sha256=<hex>` lets a client assert
+  transit integrity — a mismatch returns a clean `400` before the source is added
+  (the single-use token rolls back and stays retryable)
+  ([#1889](https://github.com/teng-lin/notebooklm-py/issues/1889)).
+- **MCP `await_upload` emits progress keepalives while it polls**, so an MCP host
+  no longer treats a long upload wait as a stalled call (`ctx.report_progress` at
+  start and on each ~2s tick; best-effort, and a no-op without a client progress
+  token) ([#1889](https://github.com/teng-lin/notebooklm-py/issues/1889)).
+- **MCP remote `studio_download` returns the report / data-table body inline**
+  (bounded, alongside the signed link) so a remote host can read a generated
+  report without a second fetch
+  ([#1911](https://github.com/teng-lin/notebooklm-py/issues/1911)).
+- **`studio_status` reports `media_ready`, `studio_download` reports
+  `size_bytes`, and `studio_retry` raises an actionable error** when an artifact
+  can't be retried, instead of a bare failure
+  ([#1924](https://github.com/teng-lin/notebooklm-py/issues/1924)).
+- **Deploy quick start for end users**: the shipped Compose defaults to the
+  `:latest` image, and each release now attaches a version-baked
+  `docker-compose.yml` + `env.example`
+  ([#1904](https://github.com/teng-lin/notebooklm-py/issues/1904)).
+- **`await_upload` — confirm a brokered file upload landed.** A new MCP tool that
+  waits for a source created via the remote signed-URL upload flow to finish,
+  returning the added source (`source_id` / name / size / mime) as soon as the
+  browser POST completes — so an agent that brokered an upload can confirm the add
+  without polling `source_list`. Accepts the upload URL, the `/u/<shortid>`
+  short-link, or the bare token.
+  ([#1889](https://github.com/teng-lin/notebooklm-py/issues/1889))
+- **Experimental in-app upload widget (opt-in).** With
+  `NOTEBOOKLM_MCP_UPLOAD_WIDGET=1` on a remote HTTP deployment, `source_add_widget`
+  renders a file picker *inline* in MCP-Apps hosts (claude.ai, ChatGPT) so a mobile
+  user can pick and upload **one or more files** (up to 10) without leaving the
+  chat — no browser round-trip. Enabling it auto-enables stateless HTTP (which
+  MCP-Apps hosts require to fetch the `ui://` widget resource). It stays off the
+  default tool surface / budgets unless enabled; the portable signed-link flow
+  remains the fallback. See [ADR-0027](docs/adr/0027-mcp-app-upload-widget.md).
+  ([#1891](https://github.com/teng-lin/notebooklm-py/issues/1891),
+  [#1894](https://github.com/teng-lin/notebooklm-py/issues/1894))
+- **`studio_download` `download_ready` now carries `filename` / `mime` /
+  `size_bytes`.** The MCP download-ready payload previously returned only the
+  local path, so an agent had to stat the file to learn what it got; the
+  artifact's server filename, content type, and byte size now travel in the
+  envelope. ([#1835](https://github.com/teng-lin/notebooklm-py/issues/1835))
+- **Explicit per-state counts in the `source_wait` aggregate.** The wait
+  aggregate now reports how many sources finished `ready` vs `error` vs still
+  `pending` (rather than a single rolled-up status), so a caller waiting on a
+  batch can see partial progress and act on the failures.
+  ([#1834](https://github.com/teng-lin/notebooklm-py/issues/1834))
+- **`notebooklm skill package` — Claude-uploadable skill archive** (#1856 item 2;
+  the docs half landed in #1857). Builds a deterministic ZIP whose root contains
+  the `notebooklm/SKILL.md` skill folder (version-stamped, frontmatter-first),
+  ready for upload via Claude **Settings → Capabilities** in chat and **Claude
+  Cowork** — the supported hand-off for sandboxed agent environments that
+  cannot run `skill install` against a local directory. Supports
+  `-o/--output` (file or directory), `--force` overwrite protection, and
+  `--json` (success payload `{"path", "version", "entries", "size_bytes"}`;
+  failures use the standard error envelope with codes `SKILL_SOURCE_MISSING` /
+  `OUTPUT_EXISTS` / `WRITE_FAILED`). Release workflow now also attaches `notebooklm-skill.zip`
+  to GitHub releases alongside the `.mcpb` bundle.
+- **`AccountLimits.tier` — a correct account-tier signal, sourced from the
+  authoritative quota block.** The v0.8.0 removal ([#1738]) dropped a tier that came
+  from `GET_USER_TIER` (`FetchRecommendations`, a **promotions** endpoint) which could
+  not tell free from paid. This adds `tier` read from `GET_USER_SETTINGS` limits[4] —
+  the *same* block as `notebook_limit` / `source_limit`, so no extra RPC. It is an
+  opaque enum key (not an ordinal): `1`=Free, `2`=Pro, `4`=Plus, `3`/`6`=Ultra
+  (20 TB / 30 TB), `5`=Expanded (legacy); only `1` and `2` are live-confirmed. The
+  MCP **and** REST `server_info(include_account=True)` account blocks now include a
+  `tier` key. The removed `plan_name` label and the promotions RPC/`AccountTier` type
+  stay gone. ([#1738](https://github.com/teng-lin/notebooklm-py/issues/1738))
+
+- **Short-form video format** across the client, CLI, MCP, and REST
+  ([#1805](https://github.com/teng-lin/notebooklm-py/issues/1805)). Video
+  generation now takes a format selector so you can request a **short** video in
+  addition to the default full-length one. The server ignores a custom style on
+  the short format, so passing one is rejected up front rather than silently
+  dropped ([#1805](https://github.com/teng-lin/notebooklm-py/issues/1805)
+  follow-up).
+
+- **MCP `source_add` gains in-channel bytes and add-and-wait modes**
+  ([#1803](https://github.com/teng-lin/notebooklm-py/issues/1803),
+  [#1807](https://github.com/teng-lin/notebooklm-py/issues/1807),
+  [#1890](https://github.com/teng-lin/notebooklm-py/issues/1890)). Rather than
+  separate `source_upload_bytes` / `source_add_and_wait` tools, both fold into
+  `source_add`: `source_add(source_type="file", bytes_base64=…, filename=…)` adds a
+  small file by sending its bytes directly through the tool call (for network-boxed
+  agents that cannot reach the signed browser-upload URL), and
+  `source_add(..., wait=True, timeout=…, interval=…)` composes the add with
+  `source_wait` for single-source adds — returning the `source_wait` aggregate plus a
+  top-level `source_id`. This keeps the MCP surface leaner (ADR-0025): one `source_add`
+  verb with input modes, not three near-duplicate add tools (MCP tool surface 36 → 34,
+  schema-char budget ratcheted down).
+
+- **Compact roster mode for `source_list` and `studio_list`**
+  ([#1806](https://github.com/teng-lin/notebooklm-py/issues/1806)) — a terser
+  listing shape that fits more entries into an agent's context window.
+
+- **MCP strict IDs-only mode + canonical-id echoes**
+  ([#1808](https://github.com/teng-lin/notebooklm-py/issues/1808)). Opt into
+  rejecting name-based refs and having tools echo the canonical id they resolved,
+  so an agent can pin every subsequent call to an unambiguous id.
+
+- **Near-miss candidates on failed name lookups**
+  ([#1787](https://github.com/teng-lin/notebooklm-py/issues/1787)). When a
+  notebook/source/note/artifact name doesn't resolve, the error now lists the
+  closest matches instead of a bare not-found.
+
+- **Experimental: MCP server** (#1484, opt-in via the `mcp` extra). A
+  [Model Context Protocol](https://modelcontextprotocol.io) server exposing
+  NotebookLM to MCP clients (Claude Desktop / Code, Cursor, Windsurf) as 34 tools
+  across notebooks, sources, chat, notes, studio artifacts, and research — built
+  as a transport-neutral sibling adapter over the `_app/` layer (ADR-0021), so it
+  behaves identically to the equivalent `notebooklm` CLI command. Run it with the
+  `notebooklm-mcp` console script (stdio by default, or loopback HTTP via
+  `--transport http`); wire it into a client with `notebooklm mcp install
+  <client>` or the one-click `.mcpb` desktop bundle. Notebook- and source-scoped
+  tool arguments accept a **name or an id**; destructive tools require
+  `confirm=true` (returning a `needs_confirmation` preview otherwise); long-running
+  generation is non-blocking (`*_generate` returns a `task_id` to poll via
+  `*_status`, then download). **The MCP tool surface is experimental and not
+  covered by the library's semver guarantees** — names, parameters, and output
+  shapes may change between releases. `pip install notebooklm-py` is unaffected:
+  the server and its dependencies (`fastmcp`) arrive only with the `mcp` extra.
+  See [docs/mcp-guide.md](docs/mcp-guide.md).
+
+- **Experimental: remote MCP connector — self-host NotebookLM for claude.ai,
+  Claude Desktop, and Cursor** (#1645, #1647). The MCP server now also runs as a
+  **remote HTTP connector**, not just a local stdio process: `notebooklm-mcp --transport http`
+  serves the same tools over HTTP behind a bearer token, and `deploy/` ships a
+  one-command Docker stack (`make dev`) that exposes it through a **Cloudflare
+  Tunnel** or a **Tailscale Funnel** — no public IP, no open port, no TLS cert to
+  manage. For **claude.ai** (whose connector UI is OAuth-only and has no bearer
+  field), the server can run its own tiny **OAuth authorization server gated by a
+  single password** (`NOTEBOOKLM_MCP_OAUTH_PASSWORD`) — no external IdP, no JWT
+  template; registered clients and tokens persist across restarts. Opt-in and
+  additive: leave the OAuth vars unset to stay bearer-only (Claude Code / Desktop
+  unaffected). The server **fail-closed** refuses to start on a non-loopback bind
+  with no auth, or on partial / weak / non-HTTPS OAuth config. Single-tenant,
+  self-hosted, one container per Google account. **The remote-deployment surface
+  is experimental and may change between releases.** See
+  [deploy/README.md](deploy/README.md) and
+  [docs/mcp-guide.md](docs/mcp-guide.md).
+
+- **Experimental: single-tenant REST API server** (#1538, opt-in via the `server`
+  extra; console script `notebooklm-server`). A FastAPI app exposing guarded
+  `/v1` routes — notebooks, sources, chat, notes, studio artifacts, sharing, and
+  research — over the same transport-neutral `_app/` core the CLI and MCP server
+  use (ADR-0021), so behavior matches the equivalent CLI command. Loopback-bound
+  by default, requires `NOTEBOOKLM_SERVER_TOKEN`, and refuses an unauthenticated
+  non-loopback bind. Native multipart source upload and `FileResponse` artifact
+  download (no signed-URL broker needed). Follow-up work closed the remaining
+  REST↔MCP capability and hardening gaps (#1620 notes CRUD, #1767). **The REST
+  surface is experimental and not covered by the library's semver guarantees.**
+  `pip install notebooklm-py` is unaffected — FastAPI / uvicorn arrive only with
+  the `server` extra. See
+  [docs/installation.md#rest-api-server](docs/installation.md#rest-api-server).
+
+- **Master-token headless auth** (#1638, #1640; ADR-0023; opt-in via the new
+  `headless` extra). NotebookLM's browser cookies are short-lived, and until now
+  the only way to re-acquire them was a human re-running `notebooklm login` in a
+  browser — fatal for long-lived headless / CI / server use. A durable Google
+  **master token** (minted once via `notebooklm login --master-token`, then stored
+  `0600` beside the profile) can now **re-mint fresh web cookies on demand with no
+  per-session browser**. Recovery is automatic: when a `master_token.json` is
+  present, an expired session re-mints in-process as the final layer of the
+  refresh ladder (single-flight, so concurrent RPCs coalesce one re-mint) instead
+  of raising "run 'notebooklm login'". `notebooklm auth check` surfaces the
+  master-token identity and `--master-token-refresh` re-mints on demand. This is
+  the foundation that makes the remote MCP connector and unattended deployments
+  viable. **Security:** the master token is a **full-account, long-lived**
+  credential — store it like a password and prefer a dedicated / throwaway account
+  for servers. It and its dependency (`gpsoauth`) arrive only with the `headless`
+  extra. See [docs/installation.md](docs/installation.md) and
+  [docs/auth-cookie-lifecycle.md](docs/auth-cookie-lifecycle.md).
+
+- **Source labels** (#1474). A new `client.labels` namespace and a `label` CLI
+  command group bring NotebookLM's source-label (tag) feature to the client:
+  list / create / rename / delete labels and assign or clear them on sources, then
+  narrow a listing with `source list --label <name>` (the MCP `source_list` tool
+  also gained a label filter). Additive new public surface across the Python API
+  and CLI.
+
+- **Suggested prompts** (#1612, #1616). New `client.chat.suggest_prompts(...)`
+  returns model-generated starter prompts for a notebook (backed by the
+  `GeneratePromptSuggestions` RPC), surfaced as a `notebooklm suggest-prompts` CLI
+  command and, later, an MCP `suggest_prompts` tool (#1726). A `mode` selector
+  targets the surface the suggestions are for (ask / audio / video / quiz /
+  flashcards / …). Additive new public surface.
+
+- **Opt-in `curl_cffi` browser-impersonation transport** (#1632). An alternative
+  HTTP backend that mimics a real browser's TLS fingerprint, selected via
+  `NOTEBOOKLM_TRANSPORT=curl_cffi` (requires the `curl_cffi` package), for
+  environments where the default `httpx` transport is fingerprint-blocked. It sits
+  behind the existing `async_client_factory` seam; the default transport is
+  unchanged.
+
+- **`--json` on every local CLI command** (#1643). The remaining local commands
+  gained a `--json` flag — now enforced by a coverage guardrail — so any
+  `notebooklm` command can emit machine-readable output for scripting and
+  automation.
+
+- **MCP soft-404 body-pattern detection.** The `source_wait` content-sanity check
+  (#1698) now also flags a READY web page that sails past the thin-text threshold
+  but whose short body matches a dead-link / error-page boilerplate phrase (e.g.
+  "Whoops! broken link") — a soft-404 that ingests as a full-bodied 200. Body-only
+  (titles are never scanned), gated to sub-2000-char bodies, advisory-only (never
+  blocks), zero extra RPC (the body is already fetched). The batch
+  `source_add(urls=[...])` now surfaces the same warning per synchronously-ready
+  web-page item.
+- **MCP artifact rename & delete tools.** Two new MCP tools close the artifact
+  CRUD gap (the server previously exposed create + read only): `artifact_rename`
+  (title-only update) and `artifact_delete` (destructive, two-step `confirm`).
+  Both accept a notebook/artifact name **or** ID, cover every studio artifact
+  type including both mind-map kinds — note-backed maps route through the note
+  system, interactive maps and regular artifacts through the artifact RPC — over
+  the shared kind-aware `_app.artifacts` cores the CLI already uses. The MCP tool
+  surface is now **28 tools**.
+- **Live-API e2e coverage for the MCP server and the CLI binary.** The nightly
+  E2E job now installs `--extra mcp`, so the MCP/CLI layers run against the real
+  NotebookLM API once per release instead of being silently `importorskip`-ped.
+  New suites: per-domain MCP tool round-trips plus a 28-tool→test matrix
+  (`tests/e2e/test_mcp.py`); the HTTP transport, bearer gate, `.well-known`
+  discovery, and signed-URL upload/download routes driven in-process over
+  `httpx.ASGITransport` (`tests/e2e/test_mcp_http.py`); live-only contract
+  checks — the `source_ids` omitted-`==`-`[]`-`==`-all collapse (#1652),
+  not-found resolution, destructive confirm-gating, and the MCP error shape
+  (`tests/e2e/test_mcp_contracts.py`); and a CLI-binary `--json` smoke including
+  stdout-purity on a live failure (`tests/e2e/test_cli_live.py`). A standalone
+  `scripts/mcp_live_smoke.py` runs the upload+download round-trip against a
+  deployed server (PASS/FAIL) to bootstrap the new per-release manual
+  "MCP connector smoke" checklist in `docs/releasing.md`.
+- **Remote MCP file upload & download** (ADR-0024). Over the remote (HTTP)
+  connector — where the claude.ai browser can't carry the MCP credential and the
+  JSON-RPC channel can't carry bytes — `source_add type=file` and
+  `artifact_download` now broker a **short-lived HMAC-signed URL** served by the
+  same container, and the browser does the byte transfer out-of-band (the
+  established remote-MCP pattern; MCP has no native upload primitive and its
+  native binary-Resource download is capped far below a podcast/video). Upload
+  accepts a raw body over `POST`/`PUT` (a browser file-picker page **or** a
+  code-execution-sandbox `curl`), bounded by a 200 MiB per-request cap and an
+  in-flight-upload limit; download returns a clickable `resource_link`. Enabled
+  by `NOTEBOOKLM_MCP_PUBLIC_URL` (falls back to `NOTEBOOKLM_MCP_OAUTH_BASE_URL`);
+  unset → the two tools return a clear "not configured" error and the server
+  still starts. **stdio (local) installs are unchanged** — they keep reading and
+  writing real local paths. The REST `server` extra already supports native
+  multipart upload + `FileResponse` download and is unaffected. See
+  [docs/mcp-guide.md](docs/mcp-guide.md#file-upload--download-remote).
+- **Retrieve the generation prompt behind an artifact** (#1571). New
+  `client.artifacts.get_prompt(notebook_id, artifact_id)` returns the free-text
+  prompt an artifact was generated from, and a matching `artifact get-prompt`
+  CLI command prints it (with `--json`). Works for every studio artifact type —
+  audio, report, video, quiz, flashcards, interactive mind map, infographic,
+  slide deck, and data table — by reading the prompt already present in the
+  `LIST_ARTIFACTS` response through the new `ArtifactRow.generation_prompt`
+  accessor (no new RPC). Returns `None` for an artifact with no stored prompt
+  (e.g. a note-backed mind map) and raises `ArtifactNotFoundError` for an
+  unknown id. The transport-neutral `_app.artifacts.get_artifact_prompt` exposes
+  the same behaviour to the MCP/HTTP adapters.
+- **Custom prompt for interactive mind maps.** `instructions` is now sent for
+  interactive (studio-artifact) mind maps, not just note-backed ones. The
+  interactive `CREATE_ARTIFACT` payload carries the free-text prompt at the
+  `[9][1][2]` slot of its options block — the same slot quizzes and flashcards
+  use — and the NotebookLM server honors it for variant 4 (verified live: the
+  prompt steers the generated node tree, and reads back via
+  `artifacts.get_prompt`). Previously `client.mind_maps.generate(...,
+  kind=INTERACTIVE, instructions=...)` and `notebooklm generate mind-map --kind
+  interactive --instructions ...` silently dropped the prompt with a warning;
+  both now apply it. The no-prompt request shape is unchanged. (Note-backed maps
+  still pass `instructions` through `GENERATE_MIND_MAP`, but the server does not
+  reliably act on them.)
+
+- **Passive auth validation for unattended monitors** (#1569). New
+  `notebooklm.auth.fetch_tokens_passive(...)` validates the cookies on disk with
+  a strictly read-only token fetch — it never runs `NOTEBOOKLM_REFRESH_CMD`,
+  never fires the layer-1 keepalive rotation poke, and never writes
+  `storage_state.json` (additive public symbol; the active
+  `fetch_tokens_with_domains` is unchanged). `notebooklm auth check --test
+  --passive` routes the token probe through it, so a systemd/cron health check
+  can answer "do the cookies currently authenticate?" without mutating state,
+  spawning a subprocess, or racing real work. The transport-neutral
+  `run_auth_check(AuthCheckPlan(..., passive=True))` exposes the same probe to
+  the MCP/HTTP adapters.
+
+- **`notebooklm auth refresh --verify`** (#1569). After a refresh completes,
+  runs the passive token probe to confirm the resulting cookies actually
+  authenticate, exiting non-zero if they still redirect to sign-in. A successful
+  refresh command alone does not prove the post-refresh cookies work — this is
+  especially valuable with `--browser-cookies`, which rewrites the cookie jar
+  but does not otherwise verify it.
+
+- **macOS login recovery hint.** When the bundled-Chromium interactive login
+  times out (`Login not detected within 5 minutes`), the message now suggests
+  retrying with `notebooklm login --browser chrome` to reuse an already
+  signed-in system Chrome session — which often detects immediately and sidesteps
+  bundled-Chromium issues on macOS.
+
+- **Layer-3 headless re-auth: `client.refresh_auth(allow_headless=True)`** (#1525,
+  P2; P1 was #1512). When NotebookLM's first-party cookies are fully dead — the
+  homepage GET 302s to the Google login page and neither token refresh (L1) nor
+  `RotateCookies` rotation (L2) can help — a persisted browser profile may still
+  hold a live Google SSO session that outlives `storage_state.json`. The new
+  opt-in re-auth layer drives an unattended **headless** browser against that
+  profile to silently re-mint cookies, then retries. It is **explicit by
+  default**: `refresh_auth(allow_headless=True)` (additive keyword-only,
+  defaults to `False`) triggers it on demand, and a *mid-RPC* auto-fire happens
+  only when `NOTEBOOKLM_HEADLESS_REAUTH=1` is set — L3 **never** fires by
+  default, so behavior with no opt-in and no profile is unchanged. Outcomes are
+  typed and honest (re-minted / profile-session-also-dead / unavailable) and it
+  never reports success on dead tokens. **SECURITY:** the persistent profile is
+  an account-equivalent credential; L3 is **local-unattended-only** and must not
+  be the auth path for a remote / hosted MCP server. It reuses the existing
+  cookie-domain allowlist and never logs a captured cookie value.
+
+- **`client.mind_maps.list_note_backed(notebook_id)`** — typed list of only
+  the **note-backed** mind maps (every `kind` is `NOTE_BACKED`, `tree`
+  populated, deleted rows excluded) via a single `GET_NOTES_AND_MIND_MAPS`
+  RPC — no `LIST_ARTIFACTS`. Factored out of `mind_maps.list()` (which now
+  builds on it) and used by the CLI `artifact delete` carve-out probe so the
+  note-backed membership check is fully typed while keeping the historical
+  single-RPC call set (recorded cassettes replay unchanged).
+
+- **Schema-drift observability: `rpc_decode_errors` counter + chat drift canary**
+  (#1492). Wire-schema drift is the stated #1 breakage class, but
+  decode/drift failures (`DecodingError` / `UnknownRPCMethodError`) were
+  invisible to metrics — they did not even reach the transport-leg
+  `rpc_calls_failed` counter (the middleware chain wraps only the transport
+  leg; decode happens after). `ClientMetricsSnapshot` now exposes a dedicated
+  `rpc_decode_errors` counter (additive, defaults to `0`, appended at the end
+  of the dataclass so existing positional construction is unaffected),
+  incremented at the executor's response-decode boundary whenever a decoded
+  response envelope is rejected as drift — both the wrapped shape-drift case
+  (bad JSON / missing key-or-index) and a surfaced `DecodingError` /
+  `UnknownRPCMethodError` from the envelope decoder. A decoded *semantic* error
+  (rate-limit, not-found, auth) is not drift and does not bump the counter; a
+  drift error recovered by refresh-and-retry is not counted. (Positional drift
+  raised later by feature-layer `safe_index` navigation, after `rpc_call`
+  returns, is not yet routed through this counter — a tracked follow-up.)
+  Operators can now alert on "Google reshaped a response" distinctly from
+  ordinary 5xx / network failures. Separately,
+  `scripts/check_rpc_health.py` now probes the streamed-chat orchestration RPC
+  `GenerateFreeFormStreamed` — a `PATH_NOT_METHOD` (`v1` URL) endpoint with no
+  obfuscated method ID — by asserting a 200 plus a recognizable stream frame,
+  closing the gap where the chat surface escaped the daily drift canary.
+
+### Documentation
+
+- **Per-tier quota & limit reference (`docs/quota-limits.md`).** A new reference
+  documenting NotebookLM's published static plan limits — notebooks, sources,
+  chats, and studio artifacts across consumer (5 tiers), Workspace (5 levels), and
+  Enterprise — keyed to the `AccountLimits.tier` int, with evidence classes for the
+  features Google leaves unquantified and a note that live per-account
+  remaining/reset counters are not API-exposed. Distilled from the research in
+  [#1825](https://github.com/teng-lin/notebooklm-py/issues/1825); cross-linked from
+  the `tier` field, `rpc-reference.md`, `mcp-guide.md`, and `python-api.md`.
+- **Sandboxed agents (Claude Cowork / headless).** Documented running
+  `notebooklm-py` from Claude Cowork and similar no-display sandboxes in
+  `SKILL.md` and `docs/installation.md`: per-session `pip install` bootstrap (no
+  `[browser]` needed for queries — that extra is only for the interactive
+  `login`, which runs on a host machine), and reusing a host-generated
+  `storage_state.json` via the root `--storage` flag or `NOTEBOOKLM_AUTH_JSON`.
+  ([#1856](https://github.com/teng-lin/notebooklm-py/issues/1856))
+
+
+### Changed
+
+- **MCP: the standalone `studio_get_prompt` tool was folded into `studio_list`**
+  (net −1 tool, ADR-0025 tool-surface consolidation). Each artifact's
+  `generation_prompt` (the free-text prompt it was generated from, `null` when it
+  records none) now rides the default `studio_list` summary listing, and
+  `studio_list(item=<artifact>)` returns it for a single artifact resolved by id or
+  exact title (the unified cross-type Studio resolver, as `studio_delete` /
+  `studio_rename` use — not the old artifact-scoped title-prefix resolver). The
+  prompt is decoded from the same `LIST_ARTIFACTS` row the listing already fetches,
+  so this adds no extra request. The CLI `notebooklm artifact get-prompt` command
+  is unchanged.
+  ([#1896](https://github.com/teng-lin/notebooklm-py/issues/1896))
+- **The in-app upload widget's token pool gets a longer (1h) TTL.** The widget
+  mints one single-use token per file up front but uploads them sequentially, so
+  a later file in a large batch could hit an expired token mid-upload; the pool
+  now uses `WIDGET_UPLOAD_TTL` instead of the 15-minute default. The single-use /
+  signed-token model is unchanged
+  ([#1894](https://github.com/teng-lin/notebooklm-py/issues/1894)).
+- **MCP name refs resolve by unique title prefix** (#1786). Notebook, source,
+  note, and artifact name arguments now match on a unique title *prefix*, not
+  just an exact title, so an agent can address an entity by the shortest
+  unambiguous fragment; an ambiguous prefix is a resolution error listing the
+  candidates.
+
+- **MCP research tools now accept the poll id under one name, `poll_task_id`.**
+  `research_status`, `research_import`, and `research_cancel` previously took the
+  value that `research_start` / `research_status` surface as `poll_task_id` under
+  mismatched parameter names (`task_id` on status/import, `run_id` on cancel),
+  forcing docstring warnings about which id goes where and inviting copy-paste
+  mistakes. All three now accept it as `poll_task_id`, so the value pastes
+  verbatim from one tool's output into the next. The old `task_id` / `run_id`
+  names still work as **deprecated aliases** (removed in v0.9.0): passing one
+  emits a `DeprecationWarning` and adds a `deprecation` note to the result;
+  passing both names with different values is a validation error.
+  ([#1789](https://github.com/teng-lin/notebooklm-py/issues/1789))
+
+- **MCP `source_wait` now returns one unified per-source aggregate** (#1669).
+  Both modes — waiting for a single `source` or for every source in the notebook
+  — return the same shape: `{notebook_id, ok, ready, timed_out, failed,
+  not_found}`. `ready` carries the sources that reached READY (with
+  `kind`/`status_label` labels); the three error buckets carry
+  `{source_id, error}` entries; `ok` is `true` iff all error buckets are empty.
+  Previously the single-source mode returned `{status: ready|not_found|failed|
+  timeout}` while the all-sources mode **threw on the first failure and discarded
+  every source that had already become ready** — the all-sources mode now reports
+  **partial progress** instead. (A `source` reference that does not resolve still
+  raises NOT_FOUND before the wait — an input error, distinct from a resolved
+  source the backend reports missing/failed/slow.)
+- **Regenerable test baselines (Phase 1; contributor-facing, no public API
+  change).** Frozen public-surface snapshots that were hand-typed copies of
+  values the code already derives — `_FROZEN_TYPES_ALL` and
+  `_UNGATED_PUBLIC_ALL_SNAPSHOT` in
+  `tests/_guardrails/test_public_surface_manifest.py` — are now *derived*
+  baselines committed under `tests/fixtures/baselines/` (`types_all.json`,
+  `ungated_surface.json`) and registered in `tests/_baselines/registry.py`
+  alongside the existing CLI contract. A single freeze test diffs each committed
+  file against `derive()`; a dev-only `--update-baselines` pytest flag (wrapped by
+  `python scripts/regen_baselines.py`) regenerates them. Adding a public symbol is
+  now one regen command plus a reviewed diff instead of hand-editing several
+  literals. CI never regenerates — it only diffs (the regen flag is refused under
+  `CI`). The authored `_DOCUMENTED_PUBLIC_IMPORTS` (promised-import *intent*) and
+  `_TOP_LEVEL_TYPE_EXPORTS` (fuzzy derivation) stay hand-curated. See
+  [ADR-0022](docs/adr/0022-regenerable-baselines.md).
+- **`notebooklm.rpc` public surface narrowed to the two documented power-user
+  imports** (#1589). `notebooklm.rpc.__all__` now lists only `RPCMethod` and
+  `resolve_rpc_id`; the ~47 other names it used to advertise (the batchexecute
+  wire helpers `encode_rpc_request` / `decode_response` / `extract_rpc_result` /
+  …, the endpoint URL constants and helpers, `safe_index`, and the enum /
+  exception **re-exports** that remain public under their canonical names —
+  most enums as `notebooklm.<X>` / `notebooklm.types.<X>`, the exceptions as
+  `notebooklm.<X>` / `notebooklm.exceptions.<X>`, with `ArtifactStatus` /
+  `artifact_status_to_str` `notebooklm.types`-only and `ArtifactTypeCode` having
+  no public alias) are no longer part of the
+  blessed, compat-gated public surface. This aligns the audited surface with
+  `docs/stability.md`, which has always marked `notebooklm.rpc.*` internal. **Not
+  a removal:** every name stays importable as `notebooklm.rpc.<name>` for
+  back-compat — only the public-API *advertisement* shrank. New code should
+  import the canonical public name (or `RPCMethod` / `resolve_rpc_id` for
+  raw-RPC power use). See [docs/deprecations.md](docs/deprecations.md).
+
+- **`notebooklm.auth` public surface narrowed (PR-1)** (#1592). `auth.__all__`
+  drops 23 internal re-exports that only first-party `src`/tests imported (the
+  cookie-snapshot/storage helpers `save_cookies_to_storage` / `snapshot_cookie_jar`
+  / `CookieSnapshot*` / `CookieSaveResult` / `advance_cookie_snapshot_after_save`,
+  the WIZ-extraction helpers `extract_csrf_from_html` / `extract_session_id_from_html`
+  / `extract_wiz_field`, `authuser_query` / `format_authuser_value`,
+  `load_httpx_cookies` / `normalize_cookie_map`, `ALLOWED_COOKIE_DOMAINS` /
+  `MINIMUM_REQUIRED_COOKIES`, the env/URL constants `KEEPALIVE_ROTATE_URL` /
+  `NOTEBOOKLM_REFRESH_CMD_ENV` / `NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV` /
+  `NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV`, `load_auth_from_storage`, `fetch_tokens`,
+  and `recover_psidts_in_memory`). These were migration leftovers from the
+  `_auth/*` extraction (ADR-0003 → ADR-0014); `docs/stability.md` has always marked
+  `notebooklm.auth.*` internal. **Not a removal:** every name stays importable as
+  `notebooklm.auth.<name>` for back-compat — first-party code now imports them from
+  their `notebooklm._auth.<sub>` home. The documented imports (`AuthTokens`,
+  `convert_rookiepy_cookies_to_storage_state`, the cookie-domain constants) and the
+  cohesive operations (`enumerate_accounts`, `fetch_tokens_with_domains`,
+  `fetch_tokens_passive`, …) are unchanged. See
+  [docs/deprecations.md](docs/deprecations.md).
+
+### Removed
+
+- **`SettingsAPI.get_account_tier()` and the `AccountTier` type** (BREAKING).
+  `client.settings.get_account_tier()`, `notebooklm.AccountTier` /
+  `notebooklm.types.AccountTier`, and the underlying `GET_USER_TIER` RPC are
+  removed. The tier came from `FetchRecommendations`, a **promotions** endpoint,
+  and was a promotion-eligibility signal that could not distinguish free from
+  paid — both a free and a Pro account reported
+  `NOTEBOOKLM_TIER_PRO_CONSUMER_USER`. Use `client.settings.get_account_limits()`
+  (`AccountLimits.notebook_limit` / `source_limit`) for quota decisions instead.
+  The MCP `server_info(include_account=True)` account block drops its `tier` and
+  `plan_name` keys (now `{email, authuser, available, notebook_limit,
+  source_limit, output_language}`). See
+  [docs/deprecations.md](docs/deprecations.md).
+
+### Fixed
+
+- `notebooklm login --storage <path>` now gives each custom storage file an
+  isolated persistent browser profile, with login, logout, `status --paths`,
+  doctor's L3 readiness row, and L3 headless re-auth resolving the same
+  storage-specific path. New explicit-storage browser directories carry an
+  ownership marker: `login --fresh` refuses to recursively delete unowned
+  sidecars and logout leaves them intact (and reports the preserved path).
+  Canonical legacy and named-profile layouts remain managed even when selected
+  through `--storage`. Very long storage filenames use a stable canonical-path hash to
+  stay within filesystem component limits. Existing custom-storage browser
+  sessions are not auto-migrated because the old shared profile cannot be safely
+  attributed to a storage file or account. (#2026)
+- `notebooklm login --master-token` now starts Playwright with the required Windows
+  event-loop policy, avoiding a pre-browser `NotImplementedError` (#2011).
+- `notebooklm login` now recognizes `notebook.google.com` as the personal app landing
+  host after the Gemini Notebook rebrand, preventing successful browser sign-ins from
+  timing out after five minutes. Enterprise and RPC base-host validation remain
+  unchanged. (#2013)
+- `server_info(include_account=True)` (MCP tool and the REST `GET /v1/server/info`
+  route) now adds an `output_language_is_default` boolean to the account block. When
+  the account has never set an explicit output language, `output_language` is `null`
+  **and** `output_language_is_default` is `true`, signalling that the account uses
+  NotebookLM's default language rather than a bare null that reads as
+  missing/broken. A genuinely unparseable settings response still degrades to
+  `available: false` (so it stays distinguishable from the unset-uses-default case).
+- **Self-hosted MCP OAuth: switching the served account no longer resets the client
+  registry.** OAuth-registered clients + issued tokens (`oauth_state.json`) were stored
+  under the *served account's profile dir*, so pointing the server at a different profile
+  silently orphaned every connected client (ChatGPT / claude.ai → "Client ID not found").
+  The OAuth state is now **deployment-scoped**, keyed on `NOTEBOOKLM_MCP_OAUTH_BASE_URL`
+  (the OAuth issuer) at `<home>/oauth/<slug>.json` — independent of the served profile,
+  and distinct per issuer so two servers on one host stay isolated. New
+  `NOTEBOOKLM_MCP_OAUTH_STATE_PATH` overrides the path; the Docker deploy mounts a
+  dedicated `/data/oauth` volume (`NOTEBOOKLM_OAUTH_STATE_DIR`). Existing installs are
+  migrated once on startup (the legacy profile-dir `oauth_state.json` is copied over, then
+  renamed `.migrated` so it is never re-read). This deliberately reverses the profile-dir
+  coupling introduced in #1765, and applies the deployment-vs-data separation that the
+  proposed multi-profile server
+  ([#1901](https://github.com/teng-lin/notebooklm-py/issues/1901)) builds on — without
+  implementing it.
+- **`source_add` now honors an explicit `title` for YouTube, Google Drive, and
+  web-page imports.** These source types re-derive the display title server-side
+  (from the video / Drive / page metadata), so a caller-supplied `title` was
+  silently dropped. `SourcesAPI.add_url` (new optional `title=`) and
+  `add_drive` now apply the requested title via a best-effort post-add
+  `rename` — a rename failure is non-fatal (the added source is kept with its
+  upstream title and a warning is logged). The MCP `source_add` tool flags a miss
+  with `title_override_applied: false` + a `warning`
+  ([#1960](https://github.com/teng-lin/notebooklm-py/issues/1960)).
+- **Fresh conversations are no longer reported as follow-ups.** A null-conversation
+  ask now checks whether the server-assigned current conversation has any turns
+  before setting `AskResult.is_follow_up` ([#1973](https://github.com/teng-lin/notebooklm-py/issues/1973)).
+- **MCP `source_add` bytes upload no longer defaults to a generic
+  `upload.bin`.** Passing `bytes_base64` without an explicit `filename` used to
+  spool the file as `upload.bin`, which NotebookLM rejected with an HTTP 400
+  ("file type unsupported") even for plain text. The filename/extension is now
+  seeded from the `title` and/or `mime_type` (falling back to `upload.bin` only
+  when neither yields one), so a bytes upload succeeds without a caller-supplied
+  filename ([#1955](https://github.com/teng-lin/notebooklm-py/issues/1955)).
+- **Research import is now idempotent.** Re-importing a completed research task
+  no longer duplicates its sources: `import_sources_with_verification` (and the
+  MCP `research_import` tool that drives it) pre-filters requested sources whose
+  URL already exists in the notebook on *every* attempt, not only on the
+  timeout-retry path. A repeat import adds nothing and reports the skipped
+  sources — the MCP result gains `newly_imported` / `already_present` (with the
+  existing source ids) and a `status` of `already_imported`. Pass
+  `allow_duplicate=True` (MCP) to force a re-add. Report / pasted-text entries
+  have no dedupable URL and are unaffected
+  ([#1961](https://github.com/teng-lin/notebooklm-py/issues/1961)).
+- `chat.ask()` (and the `chat_ask` MCP tool / `AskResult`) now report
+  `is_follow_up=True` when an implicit ask (no `conversation_id`) continues the
+  notebook's existing current conversation, instead of always reporting `False`
+  on the implicit path. A genuinely new (first-ever) conversation still reports
+  `is_follow_up=False`
+  ([#1965](https://github.com/teng-lin/notebooklm-py/issues/1965)).
+- **A missing optional-dependency error now points at the right fix.** Reading a
+  source with `output_format="markdown"` without the `markdownify` extra
+  installed used to report the wrong remediation ("Check the auth profile /
+  storage configuration.") because the missing-extra error was classified as a
+  configuration error. It now raises a dedicated `MissingDependencyError`
+  (classified as a new `DEPENDENCY` category) whose hint names the install
+  command — e.g. `pip install 'notebooklm-py[markdown]'` — across the MCP
+  (`DEPENDENCY` code) and REST (`dependency` / HTTP 500) surfaces
+  ([#1959](https://github.com/teng-lin/notebooklm-py/issues/1959)).
+- **MCP `notebook_describe(include_metadata=true)` no longer reports a source
+  count that disagrees with its own `sources` list.** The exposed
+  `metadata.notebook.sources_count` is now re-projected to the enumerated
+  (id-bearing, deduped) source count instead of the raw unfiltered
+  `GET_NOTEBOOK` row count, which could inflate it (e.g. 168 vs 50) and mislead
+  autonomous agents on quota / completeness. Source enumeration
+  (`source_list` / `metadata.sources`) also dedups duplicate id-bearing rows
+  (research re-imports, ghost/probe echoes), keeping the first occurrence
+  ([#1919](https://github.com/teng-lin/notebooklm-py/issues/1919)).
+- **MCP `research_import` is safe for unattended use.** The tool now imports via
+  the timeout-tolerant `import_sources_with_verification` (as the CLI does), so a
+  deep-research import that times out is reconciled against what the server
+  actually committed instead of failing as if nothing imported (hiding a large
+  partial import). It also gained optional `cited_only` (import only the sources
+  the report cites) and `max_sources` (cap the count imported, applied after
+  `cited_only`) so one call can't silently blow a notebook to its source cap.
+  ([#1920](https://github.com/teng-lin/notebooklm-py/issues/1920))
+- **`source_add` batch mode isolates a per-URL failure** instead of aborting the
+  whole batch: a bad URL now yields a per-item `SourceAddError` while the other
+  sources in the same call still add, matching the tool's documented behavior
+  ([#1905](https://github.com/teng-lin/notebooklm-py/issues/1905)).
+- **MCP `studio_generate` for interactive mind maps** now normalizes its payload
+  to the bare node tree and returns a terminal poll shape, fixing malformed
+  generate requests and non-terminal status reports
+  ([#1908](https://github.com/teng-lin/notebooklm-py/issues/1908),
+  [#1914](https://github.com/teng-lin/notebooklm-py/issues/1914)).
+- **MCP `research_cancel` distinguishes an already-cancelled run** and surfaces
+  the raw status code instead of a generic failure
+  ([#1922](https://github.com/teng-lin/notebooklm-py/issues/1922)).
+- **Content-sanity flags bot-challenge / WAF interstitial pages**, so a source
+  that fetched a challenge page instead of real content is reported rather than
+  silently ingested as thin content
+  ([#1929](https://github.com/teng-lin/notebooklm-py/issues/1929)).
+- **`suggest_prompts` strips a leading list marker** from returned prompts, and
+  `research_start` drops redundant ids from its result
+  ([#1909](https://github.com/teng-lin/notebooklm-py/issues/1909)).
+- **The MCP server warns at startup when the upload widget is enabled but
+  stateless HTTP is disabled** (`FASTMCP_STATELESS_HTTP` explicitly falsey),
+  which would silently stop the widget from rendering
+  ([#1915](https://github.com/teng-lin/notebooklm-py/issues/1915)).
+- **RPC failures no longer leak the obfuscated method id or raw status code into
+  the client-facing message.** A null-result RPC error used to read
+  `RPC LBwxtb returned null result with status code 9 (Failed precondition).
+  Found IDs: [...]` — surfacing the obfuscated method id (the #1 breakage class,
+  which changes whenever Google re-obfuscates a method) and the raw numeric gRPC
+  code to agents/users through MCP, REST, and the CLI. The message is now a
+  stable, human-readable `The server rejected this request (failed precondition).`
+  (or `The server returned an empty result …` when no status is attached); the
+  method id, status code, and found-id list remain on the exception attributes
+  (`method_id` / `rpc_code` / `found_ids`) for logging and debugging.
+  ([#1921](https://github.com/teng-lin/notebooklm-py/issues/1921),
+  [#1931](https://github.com/teng-lin/notebooklm-py/issues/1931))
+- **A blank `FASTMCP_STATELESS_HTTP` no longer crash-loops the remote MCP server.**
+  The deploy compose passed the variable through as `${FASTMCP_STATELESS_HTTP:-}`,
+  which injects an **empty string** when unset — and FastMCP's settings bool-parse
+  it at import and raise, so a docker deploy that didn't set the var crash-looped.
+  The compose passthrough is removed (the upload widget auto-enables stateless in
+  code; a non-widget deploy stays stateful), and an import-time guard treats an
+  empty/whitespace-only value as unset so a blank value from any source can't crash
+  the server. ([#1898](https://github.com/teng-lin/notebooklm-py/issues/1898))
+- **Upstream upload errors surface as a clean, redacted 4xx — not an opaque 500.**
+  An unsupported file type (or other upstream rejection) during a remote
+  `/files/ul` upload used to leak a raw `httpx.HTTPStatusError` as an unclassified
+  500 with no CORS header — which a browser upload widget could only report as
+  "Failed to fetch". Upload HTTP errors are now classified at the client layer
+  (429 → rate-limit, 5xx → server, 401/403/3xx → auth, other 4xx → validation)
+  into a redacted, CORS-carrying response, so the user sees the real reason. Fixes
+  the REST/CLI `add_file` path too.
+  ([#1892](https://github.com/teng-lin/notebooklm-py/issues/1892))
+- **Upload-only Drive file types auto-route to the file-upload path.** Adding a
+  Drive file whose type NotebookLM only accepts as an upload (not an add-by-URL)
+  used to fail at the RPC; the add-from-Drive path now detects those types and
+  routes them through the upload flow, and when a Drive add can't be recovered the
+  error now names the file-upload path as the remedy instead of a generic failure.
+  ([#1887](https://github.com/teng-lin/notebooklm-py/issues/1887),
+  [#1885](https://github.com/teng-lin/notebooklm-py/issues/1885))
+- **Loopback MCP HTTP transport rejects non-loopback `Host` headers.** The
+  loopback-bound HTTP transport now refuses requests whose `Host` header is not a
+  loopback name, closing a DNS-rebinding vector against a locally bound MCP server.
+  ([#1876](https://github.com/teng-lin/notebooklm-py/issues/1876))
+- **Null-conversation chat asks are serialized with explicit follow-ups.**
+  Consecutive asks against a fresh (null) conversation could race the
+  conversation-id assignment; they are now serialized and threaded as explicit
+  follow-ups so each ask lands on the intended conversation.
+  ([#1880](https://github.com/teng-lin/notebooklm-py/issues/1880))
+- **Multi-source `source_wait` no longer polls O(N²).** Waiting on N sources took
+  one snapshot per source per tick; the wait now reads a single notebook snapshot
+  per tick and derives every source's state from it, and the overall wait duration
+  is bounded. ([#1882](https://github.com/teng-lin/notebooklm-py/issues/1882))
+- **Raised the streamed chat-response size cap.** Long answers were truncated at
+  the previous streamed-response ceiling; the cap is raised so full responses come
+  through. ([#1852](https://github.com/teng-lin/notebooklm-py/issues/1852))
+- **Aggregate retry deadline threaded through the RPC path; OAuth `fsync`
+  offloaded.** The aggregate retry now honors a single deadline across attempts
+  instead of resetting per call, and the OAuth token `fsync` is moved off the event
+  loop so it can't stall concurrent requests.
+  ([#1881](https://github.com/teng-lin/notebooklm-py/issues/1881))
+- **`studio_download` rejects an unknown `output_format` self-documentingly.** An
+  invalid `output_format` now returns an error that lists the accepted formats
+  instead of an opaque rejection.
+  ([#1833](https://github.com/teng-lin/notebooklm-py/issues/1833))
+- **MCP source waits stay JSON-first.** `source_wait` output is emitted as
+  structured JSON rather than prose, matching the rest of the MCP source surface.
+  ([#1830](https://github.com/teng-lin/notebooklm-py/issues/1830))
+- **Deep-research null-start no longer leaks an internal method id.** A failed
+  deep-research start surfaced the obfuscated RPC method id in the error; it is now
+  hidden. ([#1851](https://github.com/teng-lin/notebooklm-py/issues/1851))
+- **REST server resource-limit hardening.** Several bounds were added to the
+  experimental REST server so a single client can't exhaust it: per-route JSON
+  request-body size caps ([#1846](https://github.com/teng-lin/notebooklm-py/issues/1846)),
+  route-group backpressure to cap concurrent in-flight requests
+  ([#1847](https://github.com/teng-lin/notebooklm-py/issues/1847)), a bounded fanout
+  for multi-source waits ([#1844](https://github.com/teng-lin/notebooklm-py/issues/1844)),
+  a shared suggest-surface map so the suggest routes don't each rebuild it
+  ([#1843](https://github.com/teng-lin/notebooklm-py/issues/1843)), and
+  `PendingRegistry.drop()` now removes the stale FIFO tuple so the pending queue
+  can't leak entries ([#1879](https://github.com/teng-lin/notebooklm-py/issues/1879)).
+  Diagnostics endpoints also stay live when auth is stale instead of failing with
+  the guarded routes ([#1845](https://github.com/teng-lin/notebooklm-py/issues/1845)),
+  and the account block is fetched with a single `GET_USER_SETTINGS` call instead of
+  two ([#1862](https://github.com/teng-lin/notebooklm-py/issues/1862)).
+- **Artifact-generation validation footguns** ([#1874]). Three input-validation
+  hardenings on the artifact surface: (A) the REST `POST /artifacts`
+  (`ArtifactGenerate`) body now rejects unknown fields (`extra="forbid"`) with a
+  422 instead of silently ignoring a typo (`{"stylee": …}`) and starting a default
+  artifact; (B) `generate_report` now coerces/validates `report_format` at the
+  boundary, raising a clear `ValidationError` (that names `source_ids`) instead of
+  an opaque `TypeError` deep in the payload builder when a caller misplaces a
+  positional `source_ids` list; (C) `export()` enforces exactly-one-of
+  (`artifact_id`, `content`) instead of firing a meaningless no-op RPC when both
+  default to `None`. **Breaking:** `export()`'s `content` is now **keyword-only** so
+  its positional slots match `export_report` / `export_data_table` (title in slot
+  3) — this fixes a silent title→content misbind; pass `content=…` explicitly.
+  ([#1874](https://github.com/teng-lin/notebooklm-py/issues/1874))
+
+- **MCP source tools no longer swallow fatal errors or fan out unbounded.** The MCP
+  `source_add` batch and `source_wait` had drifted from the REST route's policy: a
+  batch `source_add` caught *every* per-URL exception — so an expired auth / rate
+  limit / upstream 5xx was reported as a per-item "error" inside a **success**
+  envelope, hiding it from the agent; and multi-source `source_wait` spawned one
+  poller per source with no concurrency limit. The shared policy (the batch/wait
+  caps, the fatal-vs-isolate classifier, and the bounded multi-source wait pool) now
+  lives in the transport-neutral `_app` core (`_app.source_batch` / `_app.source_wait`)
+  and is used by **both** adapters, with a parity guardrail (`tests/_guardrails/
+  test_source_policy_parity.py`) that prevents future drift. Behavior change: a fatal
+  batch item now aborts the whole `source_add` call (so an agent can re-auth/retry),
+  only per-URL 4xx-input failures isolate; `source_wait` now bounds concurrency at 8,
+  caps the source count at 100 on **both** the explicit-subset and the omitted-`sources`
+  wait-all path (enforced at one shared chokepoint so the adapters can't drift), caps
+  timeout at 3600s, and rejects non-finite (`NaN`/`Infinity`) timeout/interval — all via
+  a shared `_app` validator used by the REST route too. Per-URL SSRF/validation isolation
+  is unchanged.
+  ([#1871](https://github.com/teng-lin/notebooklm-py/issues/1871))
+- **Direct-PDF-URL sources no longer show the raw URL as their title.** Adding a
+  source whose URL points straight at a `.pdf` left the full request URL in the
+  title slot (the server extracts `<title>` for HTML pages but not for a direct
+  PDF link), while HTML sources got proper titles. A PDF source whose title is
+  **exactly the source URL** (the server degradation — not a user-set title that
+  merely resembles a URL) now falls back to the URL path basename — e.g.
+  `https://host/papers/SomePaper.pdf` → `SomePaper` (query and fragment ignored;
+  percent-encoding decoded; a URL whose basename has no `.pdf` extension, such as
+  `…/download?file=x.pdf`, keeps the raw URL rather than a misleading `download`).
+  Applied consistently across `source list`/get (`Source.from_row`) **and**
+  `source fulltext` (`SourceContentRenderer`). No network I/O and no PDF
+  dependency; PDF `/Title` metadata extraction is out of scope. Because the fix
+  lives in the shared read paths it applies **retroactively** — a source added
+  before this release displays the derived title on the next read, so callers
+  that relied on `source delete-by-title "<the raw URL>"` should use the new
+  basename (URL-add idempotency is unaffected — it keys off the source `url`, not
+  title). ([#1850](https://github.com/teng-lin/notebooklm-py/issues/1850))
+- **Drive-hosted PDFs no longer list as `google_spreadsheet`.** The backend
+  returns type code `14` for both native Google Sheets and Drive-hosted PDFs,
+  and Drive sources carry no URL, so the read paths (`source_list` /
+  `GET_NOTEBOOK` **and** `source fulltext` / `source_read` / `GET_SOURCE`)
+  mislabeled Drive PDFs as `kind="google_spreadsheet"`. `kind` now disambiguates
+  code `14` by the source MIME (`metadata[19]` / `metadata[9][2]` from a live
+  capture): `application/pdf` → `pdf`, while real Google Sheets
+  (`application/vnd.google-apps.spreadsheet`) are unchanged. This completes the
+  read-path half of the fix started in #1831 (the add path).
+  ([#1832](https://github.com/teng-lin/notebooklm-py/issues/1832))
+
+- **Remote MCP connector: pin `fastmcp==3.4.2` so claude.ai can connect.**
+  fastmcp 3.4.3 regressed the RFC 9728 protected-resource-metadata route
+  (`/.well-known/oauth-protected-resource/mcp` started returning **404**), which
+  dead-ends the claude.ai remote-connector OAuth discovery — the connector fails
+  with *"Couldn't connect to the server."* Because the `mcp` extra previously
+  allowed `fastmcp>=3.0,<4`, the published `0.8.0a2` Docker image floated to the
+  broken 3.4.3 at build time even though the client code was unchanged. The
+  `mcp` extra is now pinned to the last-good `fastmcp==3.4.2`; the pin will be
+  lifted once a fixed fastmcp ships.
+
+- **First-class human/mobile upload path in `upload_required`**
+  ([#1801](https://github.com/teng-lin/notebooklm-py/issues/1801)). When a source
+  add needs a browser upload, the `upload_required` response now surfaces the
+  human/mobile hand-off path as a first-class option rather than burying it.
+
+- **`server_info` and the profile probe report the resolved profile, not the
+  raw active one** ([#1790](https://github.com/teng-lin/notebooklm-py/issues/1790)).
+  The REST server's `server_info` and its startup profile probe now bind and
+  report the profile that was actually resolved for the request.
+
+- **The `.mcpb` desktop bundle now ships for pre-releases and launches the
+  pinned pre-release.** The bundled launcher (`run_server.py`) always ran
+  `uvx --from "notebooklm-py[mcp]"`, which resolves the latest *stable* server —
+  so a pre-release bundle would have run the stable release, not the
+  pre-release (which is why `publish-mcpb.yml` skipped pre-releases). The
+  launcher now reads its version from the bundled `manifest.json` and, for a
+  `vX.Y.ZaN` bundle, pins the exact version (`uvx --from
+  "notebooklm-py[mcp]==X.Y.ZaN"` — the explicit `==` pin resolves the pre-release
+  under uv's default resolver, without loosening transitive dependency
+  resolution); stable bundles stay unpinned and track the latest stable server.
+  `publish-mcpb.yml` now ships a bundle for pre-releases too.
+
+- **`notebooklm doctor` no longer greenlights a session that is missing
+  `__Secure-1PSIDTS`** (#1753). The auth check previously passed on `SID`
+  presence alone, so a login that captured only half the Tier-1 cookie set — a
+  common outcome on Windows, where Chrome 127+ App-Bound Encryption blocks
+  `--browser-cookies` decryption and an automation-detected Playwright login can
+  be served a session without the rotating token-binding cookie — reported "All
+  checks passed" even though every real RPC then failed with `Missing required
+  cookies: __Secure-1PSIDTS`. Doctor now emits a **warn** row (not a hard fail —
+  the cookie legitimately rotates and can be re-minted at runtime, so a static
+  offline probe must not false-negative a recoverable session) pointing at the
+  Firefox `--browser-cookies` and `--master-token` workarounds. `auth check
+  --test` already reported the real error and is unchanged. New
+  [troubleshooting.md](docs/troubleshooting.md) section documents the Windows
+  App-Bound Encryption limitation and its workarounds.
+
+- **`notebooklm auth check` text mode now exits non-zero when an executed check
+  fails, matching `--json` mode** (#1569). Previously the Rich-table renderer
+  printed the failed checks but always exited `0`, so an unattended health check
+  using `auth check --test` (without `--json`) silently treated expired auth as
+  healthy — text and JSON modes had different process contracts. Both modes now
+  exit `0` only when every *executed* check passes (skipped checks — e.g. the
+  token fetch without `--test` — do not count as failures) and non-zero (`1`)
+  otherwise. Behavioral fix to the CLI exit-code contract; no API change.
+
+- **`Notebook.created_at` now reflects the true creation time instead of the
+  last-modified time; `Notebook.modified_at` is newly exposed.** The notebook
+  metadata block carries two timestamps — the creation instant at
+  `data[5][8][0]` (pinned across edits) and the last-modified instant at
+  `data[5][5][0]` (advances on every modification). `Notebook.from_api_response`
+  read the *modified* slot (`data[5][5]`) and labeled it `created_at`, so the
+  field — and everything built on it (`--json` output, `metadata` export, the
+  `Created` table column) — silently reported the last edit time. `created_at`
+  now reads the creation slot (`data[5][8]`), and the last-modified time is
+  surfaced additively as `Notebook.modified_at` (new field, defaults to `None`,
+  appended at the end so positional construction is unaffected; also added to
+  `NotebookMetadata.to_dict()` and the notebook `--json` envelopes). This
+  applies to both `notebooks.get()` and `notebooks.list()` (the homepage/recent
+  feed), which share the decode path. No signature change — `created_at` keeps
+  its type, only its source value is corrected — so this is a behavioral fix,
+  not an API-compat break, and `modified_at` is purely additive.
+- **Decoded `created_at` timestamps are now tz-aware UTC instead of naive
+  host-local time** (#1519). The shared decoder `_datetime_from_timestamp`
+  (backing `Notebook`/`Source`/`Artifact`/`MindMap.created_at`) called
+  `datetime.fromtimestamp(value)` with no `tz`, producing a **naive** datetime in
+  the host's local zone — so the same epoch surfaced as a different wall-time
+  string per machine, and `created_at.isoformat()` / `--json` output, the
+  `strftime` table cells, etc. mis-stated the absolute instant (a notebook
+  created `13:40:05` UTC rendered as the offset-less `08:40:05` under
+  `America/New_York`). It now returns `datetime.fromtimestamp(value, tz=utc)`:
+  the value is tz-aware UTC and host-independent. `.timestamp()` round-trips
+  unchanged, so internal sort/dedup/download ordering is provably unaffected —
+  only the rendered string changes (now offset-aware, identical everywhere).
+  This is the production sibling of the timezone slip pinned out of the #1511
+  golden VCR test.
+- **Artifact downloads re-validate every redirect hop against the trusted-host
+  allowlist (SSRF-adjacent)** (#1521). Both download clients
+  (`download_url` single + `download_urls_batch`) use
+  `follow_redirects=True`, but the host-allowlist + HTTPS gate validated only
+  the *initial* URL. A trusted Google URL whose `Location` pointed
+  off-allowlist — a non-HTTPS hop, or a private/link-local host such as
+  `169.254.169.254` / `localhost` — was followed and its body written to the
+  caller's `output_path`, defeating the explicit allowlist. (Google session
+  cookies were already not leaked to a non-Google redirect host — the stdlib
+  cookie policy is domain-scoped — so this never exposed credentials; the
+  residual harm was attacker-influenced bytes landing on the filesystem.) Both
+  clients now attach an httpx `request` event hook that re-checks every hop's
+  host + scheme **before the request is sent**, raising `ArtifactDownloadError`
+  on the first off-allowlist or non-HTTPS hop so the untrusted host never
+  receives a connection. Legitimate trusted→trusted redirects (Google
+  signed-URL CDNs already on the allowlist) are unaffected. The host-allowlist
+  check (`_is_trusted_download_host`) also no longer percent-decodes the host
+  before matching: decoding created a parser differential where
+  `evil%2egoogleapis.com` (`%2e`→`.`) was judged trusted while httpx connected
+  to the raw, non-Google host — the guard now matches the exact host httpx
+  connects to and rejects any host containing `%`.
+
+- **`source delete` now honors exact-id-wins over prefix matching, in lockstep
+  with `source get` / `rename` / `refresh`** (#1522). The delete-path resolver
+  (`_app/source_mutations.resolve_source_for_delete`) built its prefix-match
+  list and branched solely on `len(matches)` with no exact-id short-circuit, so
+  `source delete abc` raised `AMBIGUOUS_ID` when a notebook held both `abc` and
+  `abcdef` — even though the shared resolvers (`cli.resolve.resolve_partial_id_in_items`
+  and its `_app` twin `_app.resolve.resolve_ref`) both return on an exact
+  (case-insensitive) id match before evaluating prefixes, so the other verbs
+  resolved the same input. The delete resolver now mirrors that Rule 3: a
+  source whose id equals the input (case-insensitively) wins over any
+  longer-id prefix match (and is not treated as a partial expansion, so no
+  "Matched:" prose is emitted). Genuine prefix ambiguity (two strict prefixes,
+  no exact match) and the not-found / title-instead-of-id paths are unchanged.
+- **`Note.created_at` and note-backed `MindMap.created_at` are now populated**
+  (#1529). Both fields were declared `datetime | None` but never filled in,
+  even though the raw `GET_NOTES_AND_MIND_MAPS` / `CREATE_NOTE` responses carry
+  the creation timestamp in the note metadata envelope at `row[1][2][2][0]` —
+  the same slot the artifact path already decodes. `NoteRow` gains a
+  `created_at_raw` / `created_at` property pair (mirroring `ArtifactRow`) that
+  centralizes the descent behind named position constants, and every
+  note-creation surface now reads it: `notes.list` / `notes.get`,
+  `notes.create` (both the wrapped `[[id, …]]` and the flat
+  `[id, …]` CREATE_NOTE response shapes), `chat.save_answer_as_note`, and the
+  note-backed `mind_maps.list_note_backed` / `mind_maps.generate`.
+  `Artifact.from_mind_map` was lifted to reuse the shared `NoteRow` extraction
+  so the position knowledge lives in one place. Additive: absent / legacy
+  rows still yield `None`; no signature change.
+- **`profile` filesystem commands now surface a friendly error + exit 1
+  instead of a raw traceback** (#1520). The `profile delete` (`shutil.rmtree`),
+  `profile create` (directory materialization), `profile rename` (`os.rename`),
+  and text-mode `profile list` paths performed their pure-filesystem operations
+  unguarded, so an `OSError` — a half-deleted or locked profile directory, a
+  read-only mount, or a browser-profile file held by AV/the browser on Windows
+  — escaped `SectionedGroup.main` (which only catches `ClickException`/`Abort`)
+  and printed a Python traceback. Each now mirrors `profile switch`'s existing
+  `except OSError -> click.ClickException` idiom, yielding the documented
+  friendly-message + exit-1 CLI contract. The `--json profile list` path keeps
+  its existing `handle_errors` envelope (an unexpected `OSError` there stays the
+  `UNEXPECTED_ERROR` / exit-2 contract automation relies on).
+- **Runtime secret redaction now derives from one canonical registry, closing
+  several credential-disclosure gaps** (#1517, #1518). The logging redaction
+  cookie-name alternation in `_logging.py` was hand-enumerated and had drifted
+  from the project's own cassette sanitizer: the session cookies `NID`,
+  `LSOLH`, and `__Host-GAPS` (classified must-scrub by
+  `tests/cassette_patterns.py`) were absent, so a bare `NID=g.a000-…` token —
+  exactly what `_auth/refresh.py` logs at DEBUG from refresh-command
+  stdout/stderr through the redacting logger — passed through `scrub_secrets`
+  verbatim (#1517). Google API keys (`AIza…`) and any future `__Secure-*` /
+  `__Host-*` cookie carrying an opaque (non-token-shaped) value were also not
+  redacted at runtime. Separately, `UnknownRPCMethodError.data_at_failure` was
+  spliced unscrubbed with `!r` into `__str__` / `__repr__` / tracebacks (a
+  string splice that bypasses the logging `RedactingFilter`), unlike the
+  sibling `raw_response` which was already scrubbed, so a credential-shaped
+  indexed value leaked through every rendering regardless of `NOTEBOOKLM_DEBUG`
+  (#1518). All are fixed by a single canonical runtime registry
+  (`notebooklm._secrets`): `RUNTIME_SESSION_COOKIES` (the bare must-scrub cookie
+  names the redaction alternation now derives from), `SECURE_HOST_UMBRELLA_PATTERNS`
+  (`__Secure-*` / `__Host-*` prefix umbrellas whose name class spans the full
+  RFC 6265 `token` charset — any future secure/host cookie name fails closed by
+  construction), and `AUTH_TOKEN_SHAPE_PATTERNS` (carrier-agnostic
+  `g.a000-` / `sidts-` / `ya29.` token catch-alls plus the `AIza…` Google
+  API-key shape, ported from the cassette registry as defense in depth so a
+  secret under an unknown carrier name still fails closed). `data_at_failure`
+  (and the already-scrubbed `AuthExtractionError.payload_preview`) are routed
+  through `scrub_secrets`, so all three additions cover the exception surfaces
+  too. Every name-anchored value pattern (cookies, the `__Secure-*`/`__Host-*`
+  umbrellas, and the `at=`/`csrf=`/`f.sid=`/`upload_id=`/OAuth/`Bearer` query +
+  header forms) now also redacts an RFC 6265 / JSON **double-quoted** value
+  (`SID="opaque"`, `f.sid="opaque"`): the value class excluded `"`, so a quoted
+  value made the whole pattern miss and leaked verbatim — the optional
+  surrounding quotes redact the inner value while preserving the quotes. A
+  parity guardrail
+  (`tests/_guardrails/test_runtime_secret_registry_parity.py`) asserts the
+  runtime registry stays in lockstep with the cassette sanitizer on every axis:
+  bare-cookie superset, secure/host umbrella coverage by construction, and
+  regex-string equality of the credential-shape set — so a new must-scrub shape
+  added to the cassette registry forces the runtime registry to keep up.
+- **Playwright login: closing the browser during the final storage-state
+  capture now shows the browser-closed help instead of a bug-report prompt**
+  (#1514, deferred from the #1512 review). Every in-flow Playwright call in
+  the login flow (page recovery, the navigation retry loop, the login wait,
+  cookie-forcing) already mapped `TargetClosedError` to the friendly
+  `BROWSER_CLOSED_HELP` text + exit 1, but a closure in the narrow window
+  during the final `context.storage_state()` capture fell through the outer
+  handler's bare `raise` and exited 2 ("Unexpected error … please report a
+  bug"). The outer handler in `run_browser_capture` now recognizes
+  TargetClosed and surfaces the same help + exit 1; every other unexpected
+  failure keeps the exit-2 bug-report contract.
+- **Playwright storage-state filter hardened against malformed cookie rows
+  and exact-duplicate identities** (#1513, deferred from the #1512 review).
+  `filter_storage_state_cookies_by_domain_policy` no longer crashes the whole
+  persist when rookiepy / Playwright emits a malformed row: non-dict entries,
+  cookies whose `domain` is not a str, and cookies whose `name` is not a
+  non-empty str are skipped with one bounded `logger.warning` per row
+  (`reprlib` preview) instead of raising in `.get` / `.lstrip`. It also
+  dedups rows sharing an exact RFC 6265 identity `(name, domain, path)`
+  (path normalized via `or "/"`, matching every loader): the last occurrence
+  in capture order wins whole (fields are never merged), mirroring the
+  persistence-merge rule in `save_cookies_to_storage` where the newer
+  observation overwrites the stored row for the same key. Same-name rows on
+  *different* domains or paths are all kept — cross-domain same-name
+  resolution remains a load-time concern (the flat loaders rank by
+  `_auth_domain_priority`); deduping by bare name at write time would starve
+  the `(name, domain, path)`-keyed runtime loader
+  (`build_httpx_cookies_from_storage`), which legitimately holds e.g. the
+  per-product `OSID` cookie on `notebooklm.google.com` and
+  `myaccount.google.com` as distinct jar entries.
+
+- **Split-state PSIDTS recovery no longer writes a duplicate
+  `__Secure-3PSIDTS` row to `storage_state.json`** (#1523). On the
+  `--browser-cookies` path, when `__Secure-1PSIDTS` is missing/expired (so
+  recovery fires) but a fresh `__Secure-3PSIDTS` is already in the source jar,
+  Google's `RotateCookies` POST returns both rotated SIDTS cookies and the
+  in-memory recovery append loop emitted a second `__Secure-3PSIDTS` (and a
+  stale `__Secure-1PSIDTS` twin) entry with no analog in any real browser jar.
+  Auth still worked (the row is deduped on load), but the on-disk artifact
+  diverged from the true cookie set. `recover_psidts_in_memory` now keys the
+  source jar by RFC 6265 identity `(name, domain, path)` (path normalized via
+  `or "/"`, matching every loader) and overwrites the existing row in place
+  with the rotated occurrence instead of appending — exactly one row per key,
+  carrying the fresh value, mirroring the last-occurrence-wins dedup added to
+  `filter_storage_state_cookies_by_domain_policy` in #1513.
+
+- **`sources.add_text` no longer swallows typed transport errors into
+  `SourceAddError`.** Its bare `except RPCError` wrapped *everything* —
+  including the `RPCError` subclasses `RateLimitError`, `AuthError`, and
+  `ServerError` — so callers could not catch a rate-limited `add_text` to
+  back off via `retry_after` (or re-login on `AuthError`). It now re-raises
+  the narrow transport types unwrapped before wrapping only the residual
+  broad `RPCError`, matching the ADR-0019 catch ordering its siblings
+  `add_url`/`add_drive` already follow. The rule is now *enforced*, not just
+  documented: a new AST guardrail
+  (`tests/_guardrails/test_error_contract_catch_ordering.py`) fails any
+  `except RPCError` clause that wrap-and-raises a different exception class
+  without a preceding narrow-transport re-raise clause in the same `try`
+  (scope: `src/notebooklm/**` minus the `rpc/` protocol layer, where the
+  transport subtree originates).
+
+- **`notebooklm note create --json` no longer reports failure on every
+  successful create.** It previously emitted `{"id": null, "created": false,
+  "error": "Creation may have failed"}` for every note it successfully
+  created: a leftover raw-shape decoder in the `_app` layer went dead when
+  `notes.create` was typed to return a `Note` (it expected the retired
+  raw-list RPC shape and yielded `None` for a typed `Note`). The bug was
+  masked in the unit suite by stale raw-list mocks of `notes.create`. The CLI
+  now emits the real note id with `"created": true`; facade failures
+  propagate as exceptions through the standard CLI error handler instead of
+  a soft-failure envelope.
+
+- **14 positional-decode sites no longer fabricate wrong-but-valid values
+  silently on wire drift.** Guarded single-level reads of decoded
+  `batchexecute` payloads could swallow a Google reshape into a plausible
+  default — an empty notebook / mind-map id, an empty share email, a deleted
+  mind map leaking as live, a silently-empty chat history, a `LIST_NOTEBOOKS`
+  wrapper mis-dispatch feeding garbage rows, an unvalidated source type code,
+  and a note lookup flipping found → not-found. Per the #1485
+  absence-vs-malformed policy, genuine absence (short rows, `None` slots,
+  legitimately-empty containers) keeps its soft degrade, while
+  present-but-malformed data is now loud: the chat conversation-history walk
+  moved behind a new `ConversationTurnRow` adapter and raises
+  `UnknownRPCMethodError` on a truthy non-list payload or turns container
+  (malformed individual turn rows and unrecognized role codes are skipped
+  with a DEBUG diagnostic); `notebooks.list()` raises `DecodingError` on an
+  unrecognized payload shape; mind-map rows are decoded through `NoteRow`
+  and WARN when a null content slot lacks the soft-delete sentinel;
+  notebook-id, share-email, and source-type-code slots WARN with a bounded
+  payload preview when present-but-wrong-type (keeping list parsing alive);
+  and `notes.get_or_none` id matching reads through `NoteRow.id`. One
+  behavior nuance: `SharedUser.email` is now always a `str` — a `None` email
+  slot normalizes to `""` instead of leaking `None` through the `str`-typed
+  field.
+- **Chat citation-structure drift is no longer swallowed at DEBUG** (#1505
+  continuity — the last named survivor of that drift-swallow class). A Google
+  reshape of the streamed-chat citation structure previously degraded to
+  "answers with no citations" via a blanket `except → logger.debug → []` in
+  `parse_citations` — invisible, and it also discarded already-parsed
+  citations. Per the absence-vs-malformed policy: genuine absence (no type
+  block, short type block, `None`/empty citation slot — the routine "answer
+  without citations" shapes on real traffic) stays completely silent; a
+  truthy non-list where the citation *container* belongs (`first[4][3]`) is
+  structural wire drift and raises `UnknownRPCMethodError` (matching the
+  parser's existing `inner_data[0]` raise and `unwrap_conversation_turns`);
+  a present-but-unusable individual citation row now logs at least one
+  bounded WARNING and is skipped, so a good answer keeps its surviving
+  citations. Surviving citations keep their **raw wire ordinal** as
+  `citation_number` (a skipped row leaves a hole; with nothing skipped this
+  equals the dense numbering always produced), so the answer's literal `[N]`
+  markers never shift onto a different citation. Correspondingly,
+  save-as-note's positional marker fallback (`references[N-1]`) now applies
+  only when that positional reference carries no `citation_number`: a holed
+  marker drops its anchor with a warning instead of anchoring the wrong
+  chunk.
+
+### Security
+
+- **The loopback DNS-rebinding `Host` guard is no longer bypassed on a tokenless
+  local bind.** The guard is skipped only when an external bind is opted into
+  **and** authentication (bearer or OAuth) is configured — the
+  `ALLOW_EXTERNAL_BIND` flag alone (e.g. set while `--host` stays at loopback) no
+  longer disables it, closing a rebinding gap on an unauthenticated local server
+  ([#1935](https://github.com/teng-lin/notebooklm-py/issues/1935)).
+
+### Breaking
+
+- **`sources` / `artifacts` / `notes` / `mind_maps` `.get()` raise on a miss**
+  (#1247). A genuine miss now raises the matching `*NotFoundError`
+  (`SourceNotFoundError` / `ArtifactNotFoundError` / `NoteNotFoundError` /
+  `MindMapNotFoundError`) instead of returning `None` (and the v0.7.0
+  `DeprecationWarning` is gone), matching `notebooks.get`. Return annotations
+  narrow from `X | None` to `X`. Use the unchanged, warning-free `get_or_none()`
+  for the sanctioned `None`-on-miss lookup, or wrap in `try/except *NotFoundError`.
+- **Typed research / mind-map / guide returns are attribute-only** (#1251). The
+  `MappingCompatMixin` dict-subscript bridge is removed from `ResearchTask` /
+  `ResearchStart` / `MindMapResult` / `SourceGuide` / `ResearchSource`:
+  `result["key"]` raises `TypeError`; `result.get(...)` / `.keys()` / `.items()` /
+  `.values()` raise `AttributeError`; `"k" in result` / `iter(result)` /
+  `len(result)` raise `TypeError`. Only attribute access (`result.status`,
+  `guide.keywords`, …) and `to_public_dict()` survive. `ResearchStatus` stays a
+  `str`-enum, so `status == "completed"` keeps working.
+- **`research.wait_for_completion(interval=...)` removed** (#1254). The deprecated
+  `interval=` keyword alias is gone (its v0.7.0 `DeprecationWarning` cycle is
+  complete); passing it now raises the standard `TypeError` for an unexpected
+  keyword. Use `initial_interval=` (same poll cadence).
+- **`generate mind-map` defaults to interactive** (#1272). The CLI
+  `notebooklm generate mind-map <nb>` (and `artifact`/`download` mind-map paths)
+  now default `--kind` to `interactive` instead of the note-backed JSON map. Pass
+  `--kind note-backed` to keep the note-backed behavior.
+- **`sources.refresh()` / `chat.delete_conversation()` return `None`** (#1290).
+  Both previously returned `True` on success (uninformative — any failure raised
+  first); they now return `None` and their annotations change from `-> bool` to
+  `-> None`. `chat.clear_cache(...)` is deliberately unchanged and stays `-> bool`
+  (its bool is meaningful).
+- **Synchronous generation-kickoff refusals raise** (#1342). `artifacts.generate_*`
+  and `revise_slide` no longer swallow a `USER_DISPLAYABLE_ERROR` refusal into a
+  `GenerationStatus(status="failed")` — they re-raise the underlying
+  `RateLimitError` / `RPCError`. `_parse_generation_result` raises
+  `ArtifactFeatureUnavailableError` / `DecodingError` on a missing artifact id.
+  `research.start` raises `DecodingError` on an empty / non-list payload or a
+  falsey `task_id` (return type narrows from `ResearchStart | None` to
+  `ResearchStart`). The public `artifacts.with_rate_limit_retry` helper retries
+  only on a *raised* `RateLimitError` and re-raises on budget exhaustion (a
+  returned rate-limited status is no longer a retry signal).
+- **Derived-read / lister drift raises `DecodingError`** (#1344). A
+  structurally-unrecognized RPC payload that previously collapsed to an empty
+  value now raises `DecodingError`, so callers can distinguish a genuine miss from
+  server-side shape drift: `sources.check_freshness()`, the note lister, and the
+  artifact raw lister reject malformed-but-truthy payloads. Legitimate
+  empty / stale shapes are unchanged.
+- **Mutate-existing ops fail loud on a missing target** (#1362). `notes.update`
+  preflights existence and raises `NoteNotFoundError` before firing the update
+  RPC; `sources.rename(..., return_object=False)` and
+  `artifacts.rename(..., return_object=False)` run the existence preflight on the
+  `False` path and raise `SourceNotFoundError` / `ArtifactNotFoundError` on a miss.
+  `return_object=False` still returns `None` on success.
+- **`NotebooksAPI.share()` removed + research poll/wait raise on ambiguity**
+  (#1363). The deprecated `client.notebooks.share()` is gone — use
+  `client.sharing.set_public(...)` + `client.notebooks.get_share_url(...)`.
+  `research.poll(task_id=None)` / `wait_for_completion(task_id=None)` now raise the
+  new `AmbiguousResearchTaskError` when two or more tasks are in flight (instead of
+  warning and guessing); with a single in-flight task they resolve it silently.
+- **Removed `NOTEBOOKLM_FUTURE_ERRORS` and the deprecation machinery** (#1365).
+  The forward-compat preview gate and the `warn_get_returns_none` /
+  `deprecated_kwarg` / `MappingCompatMixin` deprecation helpers are deleted now
+  that every break they previewed is the default. `warn_deprecated` and
+  `NOTEBOOKLM_QUIET_DEPRECATIONS` remain for future one-off deprecations.
+
 ## [0.7.3] - 2026-06-29
 
 Maintenance patch on the 0.7.x line. Backports fixes from `main`
@@ -601,7 +1814,7 @@ Maintenance patch on the 0.7.x line. Backports two fixes from `main`
 > to the `RPCError` parent), matching the `NotebookNotFoundError` signature.
 > All positional call sites remain source-compatible.
 
-- **`notebooklm source stale <ID>` now follows the standard CLI exit-code convention by default.** Exit `0` indicates the freshness check succeeded (regardless of whether the source is fresh or stale); exit `1` indicates an error. Previously the command used an inverted predicate (`0` = stale, `1` = fresh) so the shell idiom `if notebooklm source stale ID; then refresh; fi` worked naturally. **Migration:** scripts that depended on the inverted predicate can opt back into the legacy semantics with the new `--exit-on-stale` flag (`if notebooklm source stale --exit-on-stale ID; then refresh; fi`). Scripts written for the new default should branch on the JSON `stale`/`fresh` fields or stdout text. See [`docs/cli-exit-codes.md`](docs/cli-exit-codes.md#notebooklm-source-stale-source_id--opt-in-inverted-predicate) for the full rationale + the new `Exit code semantics` summary.
+- **`notebooklm source stale <ID>` now follows the standard CLI exit-code convention by default.** Exit `0` indicates the freshness check succeeded (regardless of whether the source is fresh or stale); exit `1` indicates an error. Previously the command used an inverted predicate (`0` = stale, `1` = fresh) so the shell idiom `if notebooklm source stale ID; then refresh; fi` worked naturally. **Migration:** scripts that depended on the inverted predicate can opt back into the legacy semantics with the new `--exit-on-stale` flag (`if notebooklm source stale --exit-on-stale ID; then refresh; fi`). Scripts written for the new default should branch on the JSON `stale`/`fresh` fields or stdout text. See [`docs/cli-exit-codes.md`](docs/cli-exit-codes.md#source-stale-exit-on-stale) for the full rationale + the new `Exit code semantics` summary.
 - **`NotebookLMClient.rpc_call(...)` no longer accepts `source_path`, `_is_retry`, or `operation_variant`** — the three kwargs deprecated in v0.5.0 (`docs/deprecations.md`) were removed after one MINOR cycle. The public escape hatch's primary contract (`client.rpc_call(method, params)`) is unchanged and the default-shape call keeps working with no migration. Migration:
   - **Keyword callers**: drop the removed kwarg from the call. The previous default-shape behavior (`source_path="/"`, `_is_retry=False`, `operation_variant=None`) is now what every call gets unconditionally — `source_path` was a leaky internal seam, `_is_retry` was an internal retry-loop flag, and `operation_variant` is part of the mutating-RPC idempotency registry. Calls that genuinely needed a non-`"/"` `source_path` or a specific `operation_variant` were already on the wrong layer; build a typed method on a sub-client instead, or open an issue describing the workflow.
   - **Positional callers** (rare): the positional order of the remaining parameters is `(method, params, allow_null, *, disable_internal_retries=...)`, so a previously-positional `source_path` / `_is_retry` argument now binds to a different parameter slot. A pre-cut `client.rpc_call(method, params, "/", True)` (which passed `source_path="/"`, `allow_null=True`) becomes `client.rpc_call(method, params, allow_null=True)` after the cut — switch to keyword arguments for `allow_null` to avoid this footgun.
@@ -1223,7 +2436,9 @@ This is the initial public release of `notebooklm-py`. While core functionality 
 - **Authentication expiry**: CSRF tokens expire after some time. Re-run `notebooklm login` if you encounter auth errors.
 - **Large file uploads**: Files over 50MB may fail or timeout. Split large documents if needed.
 
-[Unreleased]: https://github.com/teng-lin/notebooklm-py/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/teng-lin/notebooklm-py/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/teng-lin/notebooklm-py/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/teng-lin/notebooklm-py/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/teng-lin/notebooklm-py/compare/v0.7.0...v0.7.1
