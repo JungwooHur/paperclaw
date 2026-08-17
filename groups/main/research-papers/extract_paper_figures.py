@@ -434,7 +434,12 @@ def heal_figures(page_id: str, apply: bool = False) -> dict:
     caps = ["".join(c.get("plain_text", "") for c in
                     ((b.get("image") or {}).get("caption") or [])).strip().lower()
             for b in imgs]
-    foreign = bool(caps) and not any(c.startswith(("figure", "그림")) for c in caps)
+    # `Fig. 4:` is our own caption too — it is copied verbatim from the source, and
+    # IEEE-style papers write the short form. Testing only for "figure"/"그림" made
+    # every such page look FOREIGN, so the healer force-replaced its own correct
+    # figures on every cycle, forever. Match the short form as well.
+    ours = re.compile(r"^\s*(?:fig\.?|figure|그림)\s*[0-9]", re.I)
+    foreign = bool(caps) and not any(ours.match(c) for c in caps)
     return inject_figures(page_id, aid, apply=apply, force=foreign)
 
 
