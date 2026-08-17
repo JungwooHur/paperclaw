@@ -69,6 +69,8 @@ Known fixes accumulated so far:
 | The healer force-replaces its OWN figures on every cycle, forever | `heal_figures` decides the existing images are "not ours" — and re-does them — when none of their captions start with `figure`/`그림`. But the caption is copied verbatim from the source, and IEEE-style papers write **`Fig. 4:`**, which fails that test. So on every such paper the healer treated its own correct figures as an agent's hand-placed ones and force-replaced them on each run: churn with no end state, and a fresh upload of every figure each cycle. Same family as the two rows below — a short-form label not recognised — and the reason it stayed invisible is that the result LOOKS right after every run | Match `fig.`/`fig`/`figure`/`그림` followed by a number. Measured before/after on the same DB sweep: the healer went from wanting to touch 11 of 21 pages to leaving them alone. **When a healer keeps "fixing" pages that are already correct, check what it uses to recognise its own output.** |
 | The same tables are injected again on every healer cycle, and land at the page end | `TABLE I` is IEEE style, and both the "already placed" check (`re.match(r"table\s*(\d+)")`) and the body-reference anchor read arabic numerals only. So a placed table was never recognised as placed — one page accumulated TABLE I/II/III **four times over** — and the reference "TABLE II" never matched, so each copy was appended at the end instead of beside the text citing it | `caption_number()` reads arabic **and** roman, and the anchor accepts either form. Verified idempotent: a second run reports `placed: 0, skipped_existing: true`. **A number in a caption is not always arabic — check before assuming a page "has no tables".** |
 | The audit passes a page that visibly shows every title twice and has headings a paragraph long | Two blind spots. `group_sections` ABSORBS a heading that repeats the one above it so the section measures correctly — a measurement fix that silently stopped anything from reporting the duplicate, leaving eight visible echoes on a "clean" page. **Measuring a defect away is not fixing it.** And nothing checked heading LENGTH, so the assembler emitting a subsection title together with its whole body as one heading block (up to 1244 chars) rendered as a wall of bold text and hid the section boundary from every check that reads headings | `HEADING_ECHO` now reports the ids `group_sections` absorbed, and `HEADING_BLOAT` flags any heading over 160 chars. Repair is mechanical: archive the echo, and split the bloated heading into its title plus `build_answer_blocks` of the remainder |
+| A paper is reported "이미 Notion에 있었음" and never translated — the page ends up with figures and not one word of text | The subagent's dedup step asked **whether a row exists**, not whether the paper is DONE: `url contains <arxiv_id>` → non-empty → return `already_existed`. That is self-defeating, because the DISPATCHER creates the Notion page when it INGESTS the request — so by the time the subagent checks, the row it is about to find is the one the dispatcher just made, and the check is always true. The translation never runs; `heal_figures` still injects the figures (it only needs the Paper URL); and the result is a page with 38 images and zero text that every LATER request skips again for the same reason. Four papers were lost this way in one day, each reported to the user as a success | `collect_papers.py --status <id>` answers the real question — `MISSING` / `UNPROCESSED` / `PROCESSED` — and only `PROCESSED` may short-circuit. `page_has_content()` ignores images deliberately, since figures are placed from the Paper URL without any translation, and returns True on an API error so a transient failure can never trigger a rebuild. **Detection too:** a page with no headings is NORMAL right after it is added, which is why `NOT_TRANSLATED` is quiet — but FIGURES on such a page mean it has been sitting long enough to be healed while its text never arrived, so that shape is reported as `SKIPPED_TRANSLATION` and flagged loudly by the healer |
+| Driving the per-section loop by hand: four ways to corrupt the page | All four hit while repairing one batch. (1) **Archiving without pagination** — a single `page_size=100` GET leaves the tail of a longer page in place and the new copy is appended on top, doubling the text and producing DUPLICATE/PARA_DUP that look like translation faults but are pure assembly. (2) **Echo-drop compared the wrong way**: the translated heading is LONGER than the section name (`1 Introduction` → `1 Introduction (1 서론)`), so a one-way `in` test never matched and every section shipped its title twice — normalise and compare BOTH directions. (3) **Section titles carry maths** (`V-A The \(π_{0.6}\) model`); emitting the name as one plain span leaves raw LaTeX in a heading, because only the body goes through the converter. (4) **Indent width varies between listings** (2 spaces here, 4 there) — rank the distinct indents instead of hard-coding thresholds, or a 2-space list reads as one flat level and no parent is ever detected |
 | A duplicate pair survives `--dedupe` forever: a blank stub page sitting next to the real page | `_dedup_key` returned the arxiv id **or**, failing that, the normalized title. The commonest duplicate shape is a stub with an EMPTY Paper URL beside the real page that has one — so the two got different keys (`title:…` vs `arxiv:…`), landed in different groups, and were never seen as duplicates. Backfilling a URL onto one of a pair actively *breaks* their grouping, which is a trap when repairing a page by hand | `_dedup_keys` emits BOTH keys for every page and `_group_by_identity` unions pages sharing ANY key (union-find), so a stub groups with its twin through the title while two URL-bearing copies still group through the arxiv id. Verified on the live shapes: stub+URL'd pair groups, both-URL'd pair groups, a retitled page with the same arxiv id groups, and two genuinely different papers stay apart |
 
 ## Language Policy (Token Optimization)
@@ -964,17 +966,24 @@ Paper:
 
 Steps (in this order, no exceptions):
 
-0. **DEDUP CHECK FIRST — before anything else.** Query the Notion DB for an existing page:
+0. **DEDUP CHECK FIRST — ask whether the paper is DONE, not whether a row exists.**
    ```bash
-   curl -s -X POST "https://api.notion.com/v1/databases/$NOTION_RESEARCH_DB/query" \
-     -H "Authorization: Bearer $NOTION_TOKEN" \
-     -H "Notion-Version: 2022-06-28" \
-     -H "Content-Type: application/json" \
-     -d '{"filter":{"property":"Paper URL","url":{"contains":"<arxiv_id>"}}}'
+   python3 /workspace/group/research-papers/collect_papers.py --status <arxiv_id_or_url>
+   # -> MISSING            : no page yet — create it and process (step 1)
+   # -> UNPROCESSED <id>    : a page exists but carries NO translation — PROCESS INTO IT
+   # -> PROCESSED <id>      : genuinely done — return already_existed
    ```
-   If `results` is non-empty, the paper already exists. Return IMMEDIATELY without any NotebookLM call, page creation, or PATCH:
+   Only `PROCESSED` may short-circuit:
    `{"status":"done","notion_page_id":"<existing-id>","note":"already_existed"}`
-   Only proceed to step 1 if dedup confirms the paper is NEW.
+
+   > **Never decide this with a raw `url contains` query.** That is what this step
+   > used to do, and it is self-defeating: the dispatcher creates the Notion page when
+   > it INGESTS the request, so by the time you run the check the row is already there
+   > and "results non-empty" is always true. The paper is then never translated, the
+   > healer still injects its figures (it only needs the Paper URL), and the page ends
+   > up with images and not one word of text — reported to the user as "이미 Notion에
+   > 있었음". Four papers were lost this way in a single day, and every later request
+   > skipped them again for the same reason.
 
 1. NotebookLM section-by-section translation (Phase 1 + 2 of CLAUDE.md). Use a paper-specific notebook ID; NEVER reuse another paper's notebook.
 

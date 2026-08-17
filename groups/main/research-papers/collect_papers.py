@@ -15,7 +15,14 @@ from datetime import datetime, timedelta
 from xml.etree import ElementTree as ET
 from difflib import SequenceMatcher
 
-CONFIG_PATH = "/workspace/group/research-papers/config.json"
+# The container path first, then the script's own directory. Hardcoding only the
+# container path meant every host-side run of --add-paper died on FileNotFoundError,
+# so the one sanctioned way to create a paper page could not be used while
+# repairing pages from the host. Other scripts here already resolve paths this way.
+_CONTAINER_CONFIG = "/workspace/group/research-papers/config.json"
+CONFIG_PATH = (_CONTAINER_CONFIG if os.path.exists(_CONTAINER_CONFIG)
+               else os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "config.json"))
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DB = os.environ.get("NOTION_RESEARCH_DB")
 
@@ -197,6 +204,63 @@ def _find_existing_page(paper_url, title=None):
     return None
 
 
+def paper_status(paper_url, title=None) -> tuple:
+    """(state, page_id) where state is MISSING / UNPROCESSED / PROCESSED.
+
+    This is the question the dedup step actually needs answered. Asking "does a row
+    exist" instead is what let four papers in one day be reported done while their
+    pages held nothing but figures.
+    """
+    page = _find_existing_page(paper_url, title=title)
+    if not page:
+        return "MISSING", None
+    pid = page["id"].replace("-", "")
+    return ("PROCESSED" if page_has_content(pid) else "UNPROCESSED"), pid
+
+
+def page_has_content(page_id, min_chars: int = 500) -> bool:
+    """Does this paper page actually carry a translation?
+
+    "A row exists" is NOT "the paper is done". The dispatcher creates the Notion
+    page when it INGESTS a request, so by the time the subagent runs its dedup
+    check the page is already there — and the rule "results non-empty -> return
+    already_existed" then makes the paper permanently un-processable. Figures still
+    get injected by the healer (it only needs the Paper URL), so the page ends up
+    with images and not one word of text, and every later request skips it again.
+    Observed on four papers in one day.
+
+    Images do not count: they are placed from the source without any translation.
+    """
+    import urllib.error
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+    headers = {"Authorization": f"Bearer {NOTION_TOKEN}",
+               "Notion-Version": "2022-06-28"}
+    chars = 0
+    try:
+        while url:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                d = json.load(r)
+            for b in d.get("results", []):
+                t = b.get("type")
+                if t == "image":
+                    continue
+                payload = b.get(t) or {}
+                if isinstance(payload, dict):
+                    chars += sum(len(x.get("plain_text", ""))
+                                 for x in payload.get("rich_text", []))
+                    chars += len((payload.get("expression") or "")) if t == "equation" else 0
+            if chars >= min_chars:
+                return True
+            cur = d.get("next_cursor") if d.get("has_more") else None
+            url = (f"https://api.notion.com/v1/blocks/{page_id}/children"
+                   f"?page_size=100&start_cursor={cur}") if cur else None
+    except (urllib.error.URLError, OSError, ValueError):
+        # Unknown beats "empty": never let a transient error trigger a rebuild.
+        return True
+    return chars >= min_chars
+
+
 def check_notion_exists(paper_url, title=None):
     """Bool wrapper around _find_existing_page (back-compat for callers
     that only need existence, e.g. the nightly fetch dedup)."""
@@ -332,8 +396,13 @@ def add_to_notion(paper, areas, labs, venue_field):
                 "id": existing.get("id")}
 
     # Format authors
-    authors_list = paper.get('authors', [])
-    if isinstance(authors_list[0], dict):
+    authors_list = paper.get('authors') or []
+    if isinstance(authors_list, str):
+        # A plain string arrives from --add-paper's stdin JSON; an EMPTY one then
+        # indexed [0] and crashed page creation with "string index out of range",
+        # which the CLI reported as an opaque `ERROR notion-call`.
+        authors_list = [a.strip() for a in authors_list.split(',') if a.strip()]
+    if authors_list and isinstance(authors_list[0], dict):
         authors_str = ', '.join([a.get('name', '') for a in authors_list[:5]])
     else:
         authors_str = ', '.join(authors_list[:5])
@@ -785,6 +854,9 @@ def main():
                         help='Override labs (comma-separated) for --add-paper')
     parser.add_argument('--venue', type=str, default=None,
                         help='Override venue for --add-paper (e.g. TRO, CoRL)')
+    parser.add_argument('--status', type=str, default=None, metavar='URL_OR_ID',
+                        help='print MISSING/UNPROCESSED/PROCESSED <page_id>; '
+                             'exit 0 only when the paper is actually translated')
     parser.add_argument('--dedupe', action='store_true',
                         help='Archive duplicate paper pages (same arxiv_id or normalized '
                              'title), keeping the richest in each group. Backfills a missing '
@@ -796,6 +868,10 @@ def main():
 
     # --dedupe runs out-of-band (host systemd timer) and must not require the
     # container-only config.json, so handle it before load_config().
+    if args.status:
+        st, pid = paper_status(args.status)
+        print(f"{st} {pid or ''}".strip())
+        return 0 if st == "PROCESSED" else 1
     if args.dedupe:
         dedupe_notion(dry_run=args.dry_run)
         return

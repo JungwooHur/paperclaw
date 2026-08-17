@@ -509,11 +509,22 @@ def main() -> int:
         # state — surfaced as `verify-heal error RuntimeError` on the 5-minute healer
         # and skipped that page's dedup/flagging entirely. Emit the same shape as the
         # normal path, with the condition as a finding.
-        msg = "No headings on page — nothing translated yet, or wrong page id."
+        # A page with no headings is NORMAL right after it is added, which is why
+        # NOT_TRANSLATED is reported quietly. But FIGURES on such a page are not
+        # normal: they are injected from the Paper URL alone, so their presence means
+        # the paper has been sitting here long enough to be healed while its text
+        # never arrived — the signature of a dedup check that saw the row and
+        # skipped the translation. That one is worth shouting about.
+        imgs = sum(1 for b in blocks if b["type"] == "image")
+        kind = "SKIPPED_TRANSLATION" if imgs >= 3 else "NOT_TRANSLATED"
+        msg = ("No headings on page — nothing translated yet, or wrong page id."
+               if kind == "NOT_TRANSLATED" else
+               f"{imgs} figures but no text at all — the paper was never translated "
+               f"(a dedup check saw the page and skipped it); re-process into it")
         if args.json:
             print(json.dumps({"page": args.page, "title": page_title(args.page),
                               "section_count": 0, "sections": [],
-                              "findings": [{"type": "NOT_TRANSLATED", "section": None,
+                              "findings": [{"type": kind, "section": None,
                                             "block_count": len(blocks), "block_ids": [],
                                             "detail": msg}]},
                              ensure_ascii=False, indent=2))

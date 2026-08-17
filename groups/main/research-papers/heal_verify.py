@@ -141,7 +141,7 @@ def heal_verify(page_id: str, apply: bool = False) -> dict:
     # sections) — these are the silent breakage the agent's assembly produces
     for f in findings:
         if f.get("type") in ("MISSING", "CONTENT_LOSS", "SUMMARIZED",
-                              "DUPLICATE", "PARA_DUP"):
+                              "DUPLICATE", "PARA_DUP", "SKIPPED_TRANSLATION"):
             rep["flags"].append(f"{f['type']}({f.get('section') or ''}): "
                                 f"{(f.get('detail') or '')[:70]}")
     return rep
