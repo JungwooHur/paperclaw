@@ -384,9 +384,20 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
     Notion side aggregates body text under each heading. A heading that can't
     be located maps to None (checks are skipped for it)."""
     body = full_text
-    m = _TAIL_RE.search(full_text)
-    if m:
-        body = full_text[: m.start()]
+    # Cut at the LAST back-matter heading, not the first. An arxiv HTML page opens
+    # with a table of contents that lists "References" like any other entry, and
+    # cutting there left 1,140 characters of TOC as the entire "source": every
+    # section then located inside that list, 15-17 characters apart, so every ratio
+    # was meaningless and SUMMARIZED/CONTENT_LOSS could not fire at all. The audit
+    # passed a page it had never actually measured.
+    #
+    # Guarded both ways: a cut that keeps less than half the document is not a tail,
+    # it is a TOC hit, so ignore it entirely rather than measure against a stub.
+    last = None
+    for m in _TAIL_RE.finditer(full_text):
+        last = m
+    if last and last.start() >= len(full_text) * 0.5:
+        body = full_text[: last.start()]
     low = body.lower()
     found = []
     for key, title in ordered_sections:
@@ -402,7 +413,13 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
         # the previous section's measured source length and firing SUMMARIZED at a
         # translation that was actually complete (one real section measured 5622
         # source chars against a true span of 2629).
-        gap = r"(?:\W+\w+){0,3}?\W+"
+        # Allow more skipped words between the label and the title words. A title
+        # carrying maths expands in the source — "VI The π₀.₇ Model…" is written
+        # "VI The π 0.7 \pi_{0.7} Model…", four tokens where the page shows one — so
+        # a 3-word allowance located neither VI nor VII. Their spans then merged into
+        # the previous section, whose ratio collapsed and reported a SUMMARIZED that
+        # was not real. Verified on that paper: 3 and 5 find nothing, 8 finds both.
+        gap = r"(?:\W+\w+){0,8}?\W+"
         needle = (re.escape(key.lower()) + r"\.?\s+"
                   + gap.join(re.escape(w.lower()) for w in words))
         last = None
