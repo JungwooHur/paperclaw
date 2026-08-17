@@ -223,7 +223,7 @@ def group_sections(blocks: list) -> list:
                     seen[key] = seen.get(key, 0) + 1
                     cur["occurrence"] = seen[key]
                 cur.setdefault("echo_ids", []).append(b["id"])
-                continue
+                continue    # reported as HEADING_ECHO — see the check below
             seen[key] = seen.get(key, 0) + 1 if key else 0
             cur = {
                 "key": key,
@@ -598,6 +598,34 @@ def main() -> int:
                       f"stdout uploaded unsanitized, markdown-* = NotebookLM markdown "
                       f"not run through build_answer_blocks. Rebuild the body via the "
                       f"converter (see Phase 4 step 2)",
+        })
+
+    # 1b1b. HEADING_ECHO on HEADINGS (no source needed). group_sections absorbs a
+    # heading that merely repeats the one above it, so the section measures
+    # correctly — but the page still SHOWS every title twice, and absorbing it
+    # silently meant the audit went clean on a page with eight visible duplicates.
+    # Measuring it away is not the same as fixing it.
+    echo_ids = [i for s_ in sections for i in s_.get("echo_ids", [])]
+    if echo_ids:
+        findings.append({
+            "type": "HEADING_ECHO", "section": None,
+            "block_count": len(echo_ids), "block_ids": echo_ids[:50],
+            "detail": f"{len(echo_ids)} heading(s) merely repeat the heading above "
+                      f"them, so every title renders twice — archive them",
+        })
+
+    # 1b1c. HEADING_BLOAT (no source needed): a heading carrying a whole paragraph.
+    # The assembler sometimes emits a subsection title and its body as ONE heading
+    # block, which renders as a wall of bold text and hides the section boundary
+    # from every check that reads headings.
+    bloated = [b["id"] for b in blocks
+               if b["type"] in HEADING_TYPES and len(aq._block_text(b)) > 160]
+    if bloated:
+        findings.append({
+            "type": "HEADING_BLOAT", "section": None,
+            "block_count": len(bloated), "block_ids": bloated[:50],
+            "detail": f"{len(bloated)} heading(s) are over 160 chars — the title and "
+                      f"its body were emitted as one heading block; split them",
         })
 
     # 1b2. BARE_MATH (no source needed): un-delimited LaTeX left in a TEXT span
