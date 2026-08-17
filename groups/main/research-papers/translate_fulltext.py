@@ -70,7 +70,19 @@ def notion(method, path, body=None, tries=12):
             if e.code == 429:
                 time.sleep(float(e.headers.get("Retry-After", 5)) + 2 * a)
                 continue
-            raise
+            # Notion says exactly which block is invalid and why, in the response
+            # BODY — "body.children[37].equation.expression should be not empty".
+            # Re-raising the bare HTTPError threw that away, leaving only
+            # "HTTP Error 400: Bad Request" for a 474-block upload: the one fact
+            # needed to fix it, discarded at the moment it arrived.
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:500]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Notion {method} {path} -> HTTP {e.code}: {detail or e.reason}"
+            ) from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             # transient network/read timeout — retry (a mid-rebuild crash here
             # would leave the page half-archived). Backoff and try again.
