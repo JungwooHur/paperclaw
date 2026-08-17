@@ -96,9 +96,16 @@ _BACKGROUND_AREA_FRAC = 0.8  # a box this big is a page background, not content
 
 
 def _caption_re(kind: str, num: int):
-    """Matches a `Figure 7:` / `Table 3.` caption opener for one number."""
-    word = "Figure" if kind == "figure" else "Table"
-    return re.compile(rf"^\s*{word}\s+0*{num}\s*[:.]")
+    """Matches a `Figure 7:` / `Fig. 7:` / `Table 3.` caption opener for one number.
+
+    IEEE-style papers write `Fig. 7:`, and accepting only the long form made
+    `crop_box` return None for EVERY caption on such a PDF — 15 of 15 — so the whole
+    PDF figure path found nothing while reporting no error. The same long-form-only
+    assumption existed in the caption scan in `render_media`; both are fixed, and
+    both are needed: one finds the caption, the other locates its box.
+    """
+    word = r"(?:Fig\.?|Figure)" if kind == "figure" else r"(?:Table|TABLE)"
+    return re.compile(rf"^\s*{word}\s*0*{num}\s*[:.]", re.I)
 
 
 def _spans(block):
@@ -392,6 +399,24 @@ def crop_box(page, kind: str, num: int, band=(float("-inf"), float("inf"))):
         return None
     blocks = page.get_text("dict")["blocks"]
     barriers, elements = _page_parts(page, caption_box, _body_size(blocks), band)
+    # ANOTHER float's caption is a hard boundary. The walk stops at body prose, but
+    # a figure stacked directly above another figure or a table has no prose between
+    # them, so the region kept growing: one crop swallowed the table AND the figure
+    # above the one being rendered. Whatever sits beyond another caption belongs to
+    # that float, never to this one.
+    other_cap = re.compile(r"^\s*(?:Fig\.?|Figure|Table|TABLE)\s*0*(\d+)\s*[:.]", re.I)
+    for b in blocks:
+        if b.get("type") != 0:
+            continue
+        m = other_cap.match(_block_text(b))
+        if not m or int(m.group(1)) == num:
+            continue
+        box = tuple(b["bbox"])
+        barriers.append(box)
+        # _page_parts classifies a caption line as an ELEMENT (it looks like a
+        # sub-caption), and the walk steps over elements — so adding it as a
+        # barrier is not enough while it is still on the element list.
+        elements = [e for e in elements if not _overlaps(e, box)]
     upward = kind == "figure"
     edge = _grow(caption_box, barriers, elements, upward=upward)
     top = edge if upward else caption_box[1]
@@ -416,12 +441,16 @@ def crop_box(page, kind: str, num: int, band=(float("-inf"), float("inf"))):
     return rect if rect.width > 40 and rect.height > 20 else None
 
 
-def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table")) -> dict:
+def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
+                 only: set = None) -> dict:
     """Render every figure/table found in the PDF.
 
     Returns {(kind, num): {"path", "page", "caption"}}. A number is rendered from
     the FIRST page whose caption line introduces it, so a body reference
     ("as Figure 3 shows") never wins over the real caption.
+
+    `only` restricts rendering to those numbers — used to fill the specific figures
+    the HTML could not supply, without re-rendering the ones it already did.
     """
     import fitz
 
@@ -436,10 +465,16 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table")) -> dict
             blocks = [b for b in page.get_text("dict")["blocks"]
                       if b.get("type") == 0]
             for b in blocks:
-                m = re.match(r"\s*(Figure|Table)\s+0*(\d+)\s*[:.]", _block_text(b))
+                # `Fig. 4:` is as common as `Figure 4:` in IEEE-style papers, and
+                # requiring the long form matched ZERO captions on one such PDF —
+                # so every PDF-side figure path silently found nothing there.
+                m = re.match(r"\s*(Fig\.?|Figure|Table|TABLE)\s*0*(\d+)\s*[:.]",
+                             _block_text(b), re.I)
+                if m and only is not None and int(m.group(2)) not in only:
+                    continue
                 if not m:
                     continue
-                kind = m.group(1).lower()
+                kind = "table" if m.group(1).lower().startswith("tab") else "figure"
                 num = int(m.group(2))
                 if kind not in kinds or (kind, num) in found:
                     continue
@@ -479,7 +514,8 @@ def fetch_pdf(source: str) -> str:
 
 
 def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
-           kinds=("figure", "table"), keep_text: bool = False) -> dict:
+           kinds=("figure", "table"), keep_text: bool = False,
+           only: set = None) -> dict:
     """Render from the PDF and insert each image after its first mention."""
     import time
 
@@ -503,7 +539,26 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     have = {"figure": 0, "table": 0}
     for b in page_images:
         have[_img_kind(b)] += 1
-    todo = tuple(k for k in kinds if force or not have[k])
+    # `only` means "fill these specific numbers". Whether the page has OTHER
+    # figures says nothing about whether figure 4 is present, so the blanket
+    # "already has figures, skip" guard must not apply — it made the HTML-gap
+    # fallback a no-op on exactly the pages that needed it. Drop numbers that are
+    # already there instead.
+    if only is not None:
+        present = set()
+        for b in page_images:
+            m = re.match(r"\s*(?:figure|fig\.?|그림)\s*0*(\d+)", _img_caption(b))
+            if m:
+                present.add(int(m.group(1)))
+        only = {n for n in only if n not in present}
+        if not only:
+            rep = {"page": page_id, "existing": have, "kinds": [], "found": 0,
+                   "placed": 0, "replaced": 0, "text_archived": 0,
+                   "skipped_existing": True}
+            return rep
+        todo = tuple(k for k in kinds if k == "figure")
+    else:
+        todo = tuple(k for k in kinds if force or not have[k])
     rep = {"page": page_id, "existing": have, "kinds": list(todo),
            "found": 0, "placed": 0, "replaced": 0, "text_archived": 0}
     if not todo:
@@ -512,7 +567,7 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
 
     pdf = fetch_pdf(source)
     out_dir = tempfile.mkdtemp(prefix="pdfmedia_")
-    media = render_media(pdf, out_dir, kinds=todo)
+    media = render_media(pdf, out_dir, kinds=todo, only=only)
     rep["found"] = len(media)
     if not media:
         return rep

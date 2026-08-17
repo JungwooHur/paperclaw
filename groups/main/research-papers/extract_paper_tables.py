@@ -41,6 +41,26 @@ _TABLE_REF = None  # built per-number
 _TID = re.compile(r'\bid="((?:S|A)\d+\.T(\d+))"')
 
 
+_ROMAN = {"i":1,"ii":2,"iii":3,"iv":4,"v":5,"vi":6,"vii":7,"viii":8,"ix":9,"x":10,
+          "xi":11,"xii":12,"xiii":13,"xiv":14,"xv":15}
+
+
+def caption_number(cap: str):
+    """The table number a caption states, arabic or ROMAN.
+
+    IEEE papers label tables `TABLE I:`. Reading only `Table 1` meant a placed table
+    was never recognised as placed, so every healer cycle injected another copy —
+    one page ended up with TABLE I/II/III four times over — and the body reference
+    ("TABLE II") never matched either, so each copy landed at the page end instead
+    of beside the text that cites it.
+    """
+    m = re.match(r"\s*table\s*([0-9]+|[ivxIVX]+)\s*[:.]?", cap or "", re.I)
+    if not m:
+        return None
+    tok = m.group(1)
+    return int(tok) if tok.isdigit() else _ROMAN.get(tok.lower())
+
+
 def parse_tables(html_text: str) -> list:
     """Ordered list of {id, num, caption} for each table id `SnTm` / `AnTm`.
     Scans ids directly (not <figure> boundaries) so nested table-figures — which
@@ -65,7 +85,9 @@ def _table_anchor(num, blocks: list):
     """First block mentioning `표 N` / `Table N`; fallback numbered section heading."""
     if num is None:
         return None
-    ref = re.compile(rf"(?:표|Table)\s*0*{num}\b")
+    roman = {v: k for k, v in _ROMAN.items()}.get(num, "")
+    alts = [rf"0*{num}"] + ([roman] if roman else [])
+    ref = re.compile(rf"(?:표|Table)\s*(?:{'|'.join(alts)})\b", re.I)
     for b in blocks:
         if b["type"] in ef.TEXT_TYPES and ref.search(ef._block_text(b)):
             return b["id"]
@@ -245,9 +267,9 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         if b["type"] == "image":
             cap = "".join(c.get("plain_text", "") for c in
                           ((b.get("image") or {}).get("caption") or []))
-            m = re.match(r"\s*table\s*(\d+)", cap, re.I)
-            if m:
-                existing.add(int(m.group(1)))
+            n = caption_number(cap)
+            if n is not None:
+                existing.add(n)
 
     html_text, html_src = ef.fetch_html(arxiv_id)
     if not html_text:

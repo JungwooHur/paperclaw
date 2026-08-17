@@ -76,7 +76,8 @@ def parse_figures(html_text: str, source_url: str) -> list:
     bm = re.search(r'<base[^>]+href=["\']?([^"\'>\s]+)', html_text, re.I)
     base = urljoin(source_url, _html.unescape(bm.group(1))) if bm else source_url
     out, seen, no_image = [], set(), []
-    for fid, body in _FIG.findall(html_text):
+    for fid, body in _iter_figures(html_text):
+        imgs = _IMG.findall(body)
         img = _IMG.search(body)
         if not img:
             # A <figure> with a caption but no <img>: the converter rendered it as
@@ -103,11 +104,53 @@ def parse_figures(html_text: str, source_url: str) -> list:
     return out
 
 
+_FIG_OPEN = re.compile(r'<figure[^>]*\bid="([^"]+)"[^>]*>', re.I)
+_SUBFIG = re.compile(r"\.sf\d+$", re.I)
+
+
+def _iter_figures(html_text: str):
+    """(id, body) per figure, with the body spanning NESTED figures too.
+
+    The old `<figure[^>]*>(.*?)</figure>` stopped at the FIRST `</figure>`, so a
+    composite figure — one that wraps its panels in their own `<figure>` elements —
+    was truncated to its first panel. The panels were then ALSO yielded on their own,
+    each carrying a sub-caption like "(a) Table Bussing" instead of a figure number,
+    so one composite figure arrived as six unanchored images that piled up at the end
+    of the page. extract_paper_tables already had to stop using this pattern for
+    exactly the same reason.
+
+    Sub-figures are skipped: a panel is part of its parent, never a figure of its own.
+    """
+    for m in _FIG_OPEN.finditer(html_text):
+        fid = m.group(1)
+        if _SUBFIG.search(fid):
+            continue
+        # walk forward keeping the figure nesting depth, so the body ends at the
+        # </figure> that closes THIS element
+        depth, i = 1, m.end()
+        while depth and i < len(html_text):
+            nxt_open = html_text.find("<figure", i)
+            nxt_close = html_text.find("</figure", i)
+            if nxt_close == -1:
+                break
+            if nxt_open != -1 and nxt_open < nxt_close:
+                depth += 1
+                i = nxt_open + 7
+            else:
+                depth -= 1
+                i = nxt_close + 8
+        yield fid, html_text[m.end():max(m.end(), i - 9)]
+
+
 def _has_our_caption(block: dict) -> bool:
     """True if this injector wrote the image (it always captions "Figure N")."""
     cap = "".join(c.get("plain_text", "") for c in
                   ((block.get("image") or {}).get("caption") or []))
-    return bool(re.match(r"\s*(?:figure|fig\.?|그림)\s*\S", cap, re.I))
+    # A "(a) Table Bussing" sub-caption is a figure PANEL this pipeline emitted
+    # before composite figures were handled — ours, and replaceable. Without this
+    # those leftovers read as manual inserts and survive every --force forever.
+    return bool(re.match(r"\s*(?:figure|fig\.?|그림)\s*\S", cap, re.I)
+                or re.match(r"\s*\([a-z]\)\s+\S", cap, re.I))
 
 
 def figure_label(fid: str, caption: str = "") -> str | None:
@@ -217,6 +260,23 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     rep["found"] = len(figs)
     rep["source"] = src
     missing = getattr(parse_figures, "no_image", [])
+    rep["pdf_fallback"] = 0
+    numeric_missing = {int(x) for x in missing if str(x).isdigit()}
+    if numeric_missing and apply:
+        # The HTML has these figures but not as images — LaTeXML rendered them as
+        # vector markup, so there is no <img> to upload and the page silently ends
+        # up short. Nothing covered this: heal_pdf_media deliberately stands down
+        # whenever HTML exists, so "HTML present but this figure missing" belonged
+        # to no one. The PDF always has every figure; render just the missing
+        # numbers so the ones HTML did supply are not re-done.
+        try:
+            import extract_pdf_media as pm
+            sub = pm.inject(page_id, arxiv_id, apply=True, force=False,
+                            kinds=("figure",), keep_text=True,
+                            only=numeric_missing)
+            rep["pdf_fallback"] = sub.get("placed") or 0
+        except Exception as e:
+            rep["pdf_fallback_error"] = f"{type(e).__name__}: {e}"[:160]
     if missing:
         # Loud, because the page will look complete: it still gets every other
         # figure, and FIGURES_MISSING only fires when a page has NO images at all.
@@ -374,7 +434,12 @@ def heal_figures(page_id: str, apply: bool = False) -> dict:
     caps = ["".join(c.get("plain_text", "") for c in
                     ((b.get("image") or {}).get("caption") or [])).strip().lower()
             for b in imgs]
-    foreign = bool(caps) and not any(c.startswith(("figure", "그림")) for c in caps)
+    # `Fig. 4:` is our own caption too — it is copied verbatim from the source, and
+    # IEEE-style papers write the short form. Testing only for "figure"/"그림" made
+    # every such page look FOREIGN, so the healer force-replaced its own correct
+    # figures on every cycle, forever. Match the short form as well.
+    ours = re.compile(r"^\s*(?:fig\.?|figure|그림)\s*[0-9]", re.I)
+    foreign = bool(caps) and not any(ours.match(c) for c in caps)
     return inject_figures(page_id, aid, apply=apply, force=foreign)
 
 
