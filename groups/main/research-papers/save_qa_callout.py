@@ -275,10 +275,30 @@ def _inline_rich_text(text: str) -> list[dict]:
     return out or [{"type": "text", "text": {"content": ""}}]
 
 
+# Notion rejects any block carrying more than this many rich_text spans.
+MAX_RICH_TEXT_SPANS = 100
+
+
+def _split_spans(spans: list[dict]) -> list[list[dict]]:
+    """Break a span list into groups Notion will accept.
+
+    `chunks()` bounds a paragraph by CHARACTERS, which says nothing about span
+    count: one maths-heavy paragraph alternates text/equation spans and reached 113
+    for well under the character limit. Notion then rejects the whole PATCH —
+    `body.children[84].paragraph.rich_text.length should be ≤ 100` — so a single
+    dense paragraph fails an entire 90-block batch, and with the error body
+    discarded it surfaced only as "HTTP Error 400".
+    """
+    if len(spans) <= MAX_RICH_TEXT_SPANS:
+        return [spans]
+    return [spans[i:i + MAX_RICH_TEXT_SPANS]
+            for i in range(0, len(spans), MAX_RICH_TEXT_SPANS)]
+
+
 def _paragraph_blocks(text: str) -> list[dict]:
-    return [{"object": "block", "type": "paragraph",
-             "paragraph": {"rich_text": _inline_rich_text(ch)}}
-            for ch in chunks(text)]
+    return [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": group}}
+            for ch in chunks(text)
+            for group in _split_spans(_inline_rich_text(ch))]
 
 
 # Same one-or-two-backslash rule as _MATH — see the note there.
@@ -451,12 +471,14 @@ def _prose_blocks(prose_md: str) -> list[dict]:
         if first.lstrip().startswith(("- ", "* ")):
             for txt in _group_list_items(para, r"^\s*[\-*]\s+(.*)"):
                 blocks.append({"object": "block", "type": "bulleted_list_item",
-                               "bulleted_list_item": {"rich_text": _inline_rich_text(txt[:2000])}})
+                               "bulleted_list_item": {"rich_text":
+                                   _inline_rich_text(txt[:2000])[:MAX_RICH_TEXT_SPANS]}})
             continue
         if re.match(r"^\s*\d+\.\s", first):
             for txt in _group_list_items(para, r"^\s*\d+\.\s+(.*)"):
                 blocks.append({"object": "block", "type": "numbered_list_item",
-                               "numbered_list_item": {"rich_text": _inline_rich_text(txt[:2000])}})
+                               "numbered_list_item": {"rich_text":
+                                   _inline_rich_text(txt[:2000])[:MAX_RICH_TEXT_SPANS]}})
             continue
         if first.lstrip().startswith("> "):
             quote = "\n".join(re.sub(r"^\s*>\s?", "", ln) for ln in para.split("\n"))

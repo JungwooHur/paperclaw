@@ -126,13 +126,17 @@ def heal(pages, apply):
     healed = 0
     for pid in pages:
         try:
+            # Furniture FIRST: leaked arxiv chrome can carry a heading like
+            # "Acknowledgments <url>", and back-matter stripping keyed on that cut
+            # away the whole body. Remove the chrome before anything reads headings
+            # as section boundaries.
+            fu = strip_furniture(pid, apply=apply)
             bm = strip_backmatter(pid, apply=apply)
             cu = clean_page(pid, apply=apply)
             wm = wrap_math_page(pid, apply=apply)
             eq = heal_equations(pid, apply=apply)
             mm = heal_mangled(pid, apply=apply)
             mf = heal_fences(pid, apply=apply)   # never raises; reports via "error"
-            fu = strip_furniture(pid, apply=apply)
         except Exception as e:
             print(f"  {pid}: text-heal error {type(e).__name__}: {e}", file=sys.stderr)
             continue

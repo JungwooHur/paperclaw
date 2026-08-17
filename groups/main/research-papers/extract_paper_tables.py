@@ -301,10 +301,23 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
 
     # safe removal: archive only pure-table blocks (never mixed/prose)
     if not keep_text:
+        # `blocks` is the snapshot taken before the images were inserted, so a block
+        # another pass already archived is still listed here. Re-archiving it is a
+        # hard 400 ("Can't edit block that is archived") that aborted the whole run
+        # AFTER the tables had been placed — leaving the page half-done and the
+        # command looking like a total failure. Skip what is already gone, and never
+        # let a single stubborn block undo the work that succeeded.
+        seen = set()
         for b in blocks:
+            if b["id"] in seen or b.get("archived"):
+                continue
+            seen.add(b["id"])
             if b["type"] in ef.TEXT_TYPES and _is_pure_table(ef._block_text(b)):
-                notion("PATCH", f"/blocks/{b['id']}", {"archived": True})
-                rep["archived"] += 1
+                try:
+                    notion("PATCH", f"/blocks/{b['id']}", {"archived": True})
+                    rep["archived"] += 1
+                except Exception as e:
+                    rep.setdefault("archive_failed", []).append(f"{b['id'][-8:]}: {e}"[:120])
                 time.sleep(0.34)
     return rep
 

@@ -82,19 +82,41 @@ def _text(b):
     return "".join(x.get("plain_text", "") for x in o.get("rich_text", []))
 
 
+# Back matter is, by definition, the TAIL. If the match says most of the page is
+# back matter, the match is wrong — and acting on it destroys the paper. A leaked
+# arxiv table of contents once produced a heading "Acknowledgments https://…#S7…"
+# near the TOP, and archiving "everything after it" took 463 of 475 blocks: the
+# entire translated body, 129k characters, gone in one pass.
+MAX_BACKMATTER_FRACTION = 0.5
+
+
 def strip_backmatter(page_id, apply=False):
     blocks = fetch_blocks(page_id)
     start = None
     for i, b in enumerate(blocks):
-        if b["type"].startswith("heading") and _BACKMATTER.match(_text(b).strip()):
-            start = i
-            break
+        if not b["type"].startswith("heading"):
+            continue
+        text = _text(b).strip()
+        if not _BACKMATTER.match(text):
+            continue
+        # A real section heading does not carry a URL. One that does is leaked page
+        # chrome (a TOC entry), which strip_furniture removes — never a section
+        # boundary to cut the page at.
+        if "http://" in text or "https://" in text:
+            continue
+        start = i
+        break
     rep = {"page": page_id, "scanned": len(blocks), "backmatter_from": None, "archived": 0}
     if start is None:
         return rep
     victims = blocks[start:]
     rep["backmatter_from"] = _text(blocks[start]).strip()[:60]
     rep["would_archive"] = len(victims)
+    if blocks and len(victims) > len(blocks) * MAX_BACKMATTER_FRACTION:
+        rep["refused"] = (f"{len(victims)}/{len(blocks)} blocks is not back matter — "
+                          f"refusing to archive; check for leaked page chrome")
+        rep["would_archive"] = 0
+        return rep
     if apply:
         for b in victims:
             _api("PATCH", f"/blocks/{b['id']}", {"archived": True})
