@@ -259,7 +259,24 @@ This is a **public repository**. The owner's personal data and research activity
   * `check-sensitive.sh` blocks the session URL in commit messages and added
     lines. **PR bodies are not reachable from a git hook, so both rules are on
     you there** — write the body without them rather than editing it afterwards.
-- PR bodies aren't covered by git hooks — apply the same rules manually when writing them.
+- **PR bodies aren't covered by git hooks — so run the checker, every time.**
+  ```bash
+  python3 scripts/check-pr-body.py --file body.md   # BEFORE gh pr create
+  python3 scripts/check-pr-body.py --sweep          # audit everything already up
+  ```
+  A hook only sees commits; a PR body goes straight to GitHub, so every pattern
+  `check-sensitive.sh` blocks is unenforced there. And the leak that actually keeps
+  recurring is not a secret — it is PAPER CONTENT: section titles, which figure the
+  text cites where, one paper's results. Two PRs carried verbatim section titles
+  from a page before anyone noticed. The checker therefore also compares the body
+  against the real section titles on recent Notion paper pages, fetched live, which
+  is the only oracle that stays current as papers are added.
+
+  **Write the body about the CODE, not about the paper.** "a figure with no anchor
+  fell to the page end" is the finding; "the Experimental Evaluation section had its
+  figures stranded" names someone's research. Anonymise concretely — `section 4`,
+  `an appendix`, `one affected page` — and keep the numbers, which are what make a
+  claim checkable.
 
 ## Living Documentation Policy
 
