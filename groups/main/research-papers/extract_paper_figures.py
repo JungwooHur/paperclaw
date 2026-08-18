@@ -196,7 +196,12 @@ def _anchor_for(num, blocks: list):
     # The label must match as a WHOLE label. `Figure\s*2` would otherwise match
     # "Figure F.2" at the "2", which is how appendix figures ended up beside the
     # body figure sharing their digit.
-    ref = re.compile(rf"(?:그림|Figure|Fig\.?)\s*0*{re.escape(str(num))}(?![\w.]|\.\d)")
+    # The boundary must reject a LONGER NUMBER, not a following word: Korean glues a
+    # particle straight onto the reference ("Fig. 10에서"), and 에 is a word character,
+    # so `(?![\w.])` refused every such mention. Those figures found no anchor and were
+    # appended at the page end — which is the appendix — so Fig 3, 10 and 15 ended up
+    # there while the text that cites them sat chapters earlier.
+    ref = re.compile(rf"(?:그림|Figure|Fig\.?)\s*0*{re.escape(str(num))}(?![0-9]|\.[0-9])")
     for b in blocks:
         if b["type"] in TEXT_TYPES and ref.search(_block_text(b)):
             return b["id"]
@@ -260,23 +265,6 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     rep["found"] = len(figs)
     rep["source"] = src
     missing = getattr(parse_figures, "no_image", [])
-    rep["pdf_fallback"] = 0
-    numeric_missing = {int(x) for x in missing if str(x).isdigit()}
-    if numeric_missing and apply:
-        # The HTML has these figures but not as images — LaTeXML rendered them as
-        # vector markup, so there is no <img> to upload and the page silently ends
-        # up short. Nothing covered this: heal_pdf_media deliberately stands down
-        # whenever HTML exists, so "HTML present but this figure missing" belonged
-        # to no one. The PDF always has every figure; render just the missing
-        # numbers so the ones HTML did supply are not re-done.
-        try:
-            import extract_pdf_media as pm
-            sub = pm.inject(page_id, arxiv_id, apply=True, force=False,
-                            kinds=("figure",), keep_text=True,
-                            only=numeric_missing)
-            rep["pdf_fallback"] = sub.get("placed") or 0
-        except Exception as e:
-            rep["pdf_fallback_error"] = f"{type(e).__name__}: {e}"[:160]
     if missing:
         # Loud, because the page will look complete: it still gets every other
         # figure, and FIGURES_MISSING only fires when a page has NO images at all.
@@ -304,10 +292,31 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
                 time.sleep(0.2)
             blocks = vs.fetch_blocks(page_id)
 
-    # group images by anchor block, preserving document order within a group
-    groups, order = {}, []
+    # Resolve anchors first, then fill the gaps IN NUMERIC ORDER. A figure the body
+    # never cites (or whose citation the translation dropped) used to fall straight
+    # to "__end__" — which is the last section, so it surfaced in the appendix while
+    # the figures around it sat chapters earlier. Anchoring it to the nearest
+    # lower-numbered figure that IS placed keeps the sequence readable; the page end
+    # remains the last resort, for a figure with no placed neighbour at all.
+    def _sort_key(f):
+        m = re.match(r"([A-Za-z]*)\.?(\d+)", str(f["num"] or ""))
+        return (m.group(1) or "", int(m.group(2))) if m else ("", 0)
+
+    resolved = {}
     for f in figs:
-        anchor = _anchor_for(f["num"], blocks)
+        resolved[id(f)] = _anchor_for(f["num"], blocks)
+    ordered_figs = sorted(figs, key=_sort_key)
+    for i, f in enumerate(ordered_figs):
+        if resolved[id(f)]:
+            continue
+        for prev in reversed(ordered_figs[:i]):
+            if resolved[id(prev)] and _sort_key(prev)[0] == _sort_key(f)[0]:
+                resolved[id(f)] = resolved[id(prev)]
+                break
+
+    groups, order = {}, []
+    for f in ordered_figs:
+        anchor = resolved[id(f)]
         key = anchor or "__end__"
         if key not in groups:
             groups[key] = []
@@ -334,6 +343,28 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
                 body["after"] = key
             notion("PATCH", f"/blocks/{page_id}/children", body)
             time.sleep(0.34)
+
+    # AFTER the HTML pass and after --force has archived the old images: running it
+    # earlier meant the "is this number already present?" check saw images that
+    # were about to be deleted, so the fallback skipped every one of them.
+    rep["pdf_fallback"] = 0
+    numeric_missing = {int(x) for x in missing if str(x).isdigit()}
+    if numeric_missing and apply:
+        # The HTML has these figures but not as images — LaTeXML rendered them as
+        # vector markup, so there is no <img> to upload and the page silently ends
+        # up short. Nothing covered this: heal_pdf_media deliberately stands down
+        # whenever HTML exists, so "HTML present but this figure missing" belonged
+        # to no one. The PDF always has every figure; render just the missing
+        # numbers so the ones HTML did supply are not re-done.
+        try:
+            import extract_pdf_media as pm
+            sub = pm.inject(page_id, arxiv_id, apply=True, force=False,
+                            kinds=("figure",), keep_text=True,
+                            only=numeric_missing)
+            rep["pdf_fallback"] = sub.get("placed") or 0
+        except Exception as e:
+            rep["pdf_fallback_error"] = f"{type(e).__name__}: {e}"[:160]
+
     return rep
 
 

@@ -790,7 +790,11 @@ def _anchor_for(kind: str, num: int, blocks: list):
     import extract_paper_figures as ef
 
     words = (r"그림|Figure|Fig\.?") if kind == "figure" else (r"표|Table")
-    ref = re.compile(rf"(?:{words})\s*0*{num}\b")
+    # `\b` does not hold before a Korean particle — "Fig. 10에서" — because 에 is a
+    # word character, so every such mention was invisible and the figure was appended
+    # at the page end instead of beside the text citing it. Reject only a LONGER
+    # NUMBER, which is the thing that actually matters here.
+    ref = re.compile(rf"(?:{words})\s*0*{num}(?![0-9])")
     for b in blocks:
         if b["type"] in ef.TEXT_TYPES and ref.search(ef._block_text(b)):
             return b["id"]
