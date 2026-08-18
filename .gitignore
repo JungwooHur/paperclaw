@@ -75,3 +75,7 @@ papers_queue.json
 .nanoclaw/
 
 agents-sdk-docs
+
+# Python bytecode caches (py_compile leaves these next to any script we run)
+__pycache__/
+*.pyc
