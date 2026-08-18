@@ -696,6 +696,23 @@ def main() -> int:
                       f"its body were emitted as one heading block; split them",
         })
 
+    # 1b1e. SKIPPED_TRANSLATION for a page that HAS a heading or two but no real
+    # body. The no-headings case is caught at the early return above; a page left
+    # with just an abstract still slips past it, and the figures the healer injected
+    # make it look populated — one page carried 10 images against 1,290 characters
+    # and passed clean. Figures come from the Paper URL alone, so they are never
+    # evidence that the text arrived.
+    _img = sum(1 for b in blocks if b["type"] == "image")
+    _txt = sum(len(aq._block_text(b)) for b in blocks if b["type"] != "image")
+    if _img >= 3 and _txt < 4000 and len(sections) <= 4:
+        findings.append({
+            "type": "SKIPPED_TRANSLATION", "section": None,
+            "block_count": _img, "chars": _txt,
+            "detail": f"{_img} figures and {len(sections)} section(s) but only {_txt} "
+                      f"chars of text — the paper was only partly translated; "
+                      f"re-process into this page",
+        })
+
     # 1b2. BARE_MATH (no source needed): un-delimited LaTeX left in a TEXT span
     # renders as raw source and needs manual Ctrl+Shift+E. NotebookLM emits math
     # undelimited ~half the time and build_answer_blocks only converts delimited
