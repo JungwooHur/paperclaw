@@ -68,6 +68,14 @@ BODY_TYPES = ("paragraph", "bulleted_list_item", "numbered_list_item",
 #   arabic "2" / "2.1" / "3.4.1", and appendix letters "A" / "B" / "C".
 # The trailing lookahead keeps it from biting the first word of an unlabeled
 # heading ("Score (...)" -> no key, not "S").
+# "Appendix B Pre-training Data" is a section; the bare-letter rule below cannot
+# key it, because the letter is followed by a SPACE (that guard exists so an
+# unlabeled heading like "A New Approach" is not mistaken for appendix A). Strip an
+# explicit "Appendix " prefix first — a page whose appendices are written that way
+# had them counted as no section at all, so the section BEFORE them absorbed their
+# whole span and was reported summarized at ratio 0.15.
+_APPENDIX_PREFIX = re.compile(r"^\s*(?:appendix|부록)\s+(?=[A-Z]\b)", re.I)
+
 _KEY_RE = re.compile(
     r"^\s*("
     r"[IVXLC]+(?:-[A-Z])?"        # I, IV, III-A
@@ -123,7 +131,13 @@ def _echo_norm(s: str) -> str:
 
 def section_key(heading_text: str):
     """'2.1 The Robot-Native Regime (2.1 ...)' -> '2.1'. None if no label."""
-    m = _KEY_RE.match(heading_text or "")
+    text = _APPENDIX_PREFIX.sub("", heading_text or "")
+    m = _KEY_RE.match(text)
+    if m:
+        return m.group(1)
+    # "Appendix B Pre-training Data" -> "B": the prefix made the label explicit, so
+    # the bare letter no longer needs punctuation after it to be unambiguous.
+    m = re.match(r"^\s*([A-Z])\b", text) if text is not heading_text else None
     return m.group(1) if m else None
 
 
@@ -427,7 +441,33 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
             last = mm
         if last:
             found.append((key, last.start()))
-    found.sort(key=lambda t: t[1])
+    # A span is trustworthy only when BOTH ends are known. Using "the next located
+    # heading" let an unlocated section hand its text to the one before it: on one
+    # paper 4.1 measured 15,449 chars because 4.2-4.5 could not be found, and the
+    # complete section was reported at ratio 0.09. Walk the page's OWN order and
+    # measure a section only when the section that follows it was located too.
+    pos = dict(found)
+    keys_in_order = [k for k, _ in ordered_sections]
+    out = {key: None for key, _ in ordered_sections}
+    for i, key in enumerate(keys_in_order):
+        if key not in pos:
+            continue
+        nxt_key = keys_in_order[i + 1] if i + 1 < len(keys_in_order) else None
+        if nxt_key is None:
+            end = len(body)                      # the last section runs to the end
+        elif nxt_key in pos and pos[nxt_key] > pos[key]:
+            end = pos[nxt_key]
+        else:
+            continue                             # unknown end -> unmeasurable
+        span = _prose_chars(body[pos[key]:min(end, _next_source_heading(body, pos[key], end))])
+        # A "section" of a couple of hundred characters means the headings located
+        # inside a nested list, not in the body — report nothing rather than a
+        # ratio computed against a table of contents entry.
+        out[key] = span if span >= 200 else None
+    return out
+
+
+def _unused_legacy_span(found, body, ordered_sections):
     out = {key: None for key, _ in ordered_sections}
     for n, (key, idx) in enumerate(found):
         nxt = found[n + 1][1] if n + 1 < len(found) else len(body)
