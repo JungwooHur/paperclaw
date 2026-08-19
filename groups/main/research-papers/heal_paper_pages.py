@@ -122,9 +122,39 @@ def query_recent_pages(hours):
             return out
 
 
+SKIP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heal_skip.txt")
+
+
+def _skipped_pages() -> set:
+    """Page ids the healer must leave completely alone.
+
+    A page someone is arranging BY HAND has no defence otherwise: their own edits
+    keep it inside the `--since-hours` window, so the healer revisits it every five
+    minutes and re-applies its idea of the right figure placement over theirs. The
+    healer is right about a machine-built page and wrong about a hand-built one,
+    and it cannot tell them apart — so this is the owner's switch, not a heuristic.
+    Ids are compared dash-insensitively, since Notion prints both forms.
+    """
+    try:
+        with open(SKIP_FILE) as fh:
+            lines = fh.readlines()
+    except OSError:
+        return set()
+    out = set()
+    for ln in lines:
+        tok = ln.split("#", 1)[0].strip().replace("-", "")
+        if tok:
+            out.add(tok)
+    return out
+
+
 def heal(pages, apply):
     healed = 0
+    skip = _skipped_pages()
     for pid in pages:
+        if pid.replace("-", "") in skip:
+            print(f"  {pid}: SKIPPED (listed in heal_skip.txt)")
+            continue
         try:
             # Furniture FIRST: leaked arxiv chrome can carry a heading like
             # "Acknowledgments <url>", and back-matter stripping keyed on that cut

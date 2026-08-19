@@ -81,6 +81,7 @@ _BARRIER_MIN_LINES = 2
 _BARRIER_FULL_FRAC = 0.85    # a "full-measure" line is this much of the block width
 _BARRIER_FULL_SHARE = 0.6    # ...and this share of lines must be full-measure
 _HEADING_SIZE_DELTA = 0.6    # a block this much larger than body text is a heading
+_BARRIER_MIN_SIZE_FRAC = 0.75  # prose is set at body size; small print is figure furniture
 
 # Page furniture: running heads/feet, and the rotated arxiv stamp in the margin.
 _FURNITURE_SAMPLE = 24       # pages sampled to learn the running head/foot
@@ -148,6 +149,16 @@ def _is_barrier(block, body_size: float) -> bool:
     sizes = [round(s.get("size", 0), 1) for s in _spans(block)]
     if sizes and max(sizes) >= body_size + _HEADING_SIZE_DELTA:
         return True
+    # The measure test below is relative to the block's OWN width, so it is blind
+    # to scale: a prompt bubble drawn inside a figure is a narrow wrapped
+    # paragraph whose lines are flush to its own little box, and it reads as body
+    # prose just as strongly as a real column does. Size is the signal that is not
+    # scale-free — body prose is set at the page's dominant size by definition,
+    # while figure furniture is set much smaller. Without this, two bubbles inside
+    # a teaser figure ended the upward walk two thirds of the way up and the
+    # figure shipped with its top third cut off.
+    if sizes and max(sizes) < body_size * _BARRIER_MIN_SIZE_FRAC:
+        return False
     if len(lines) < _BARRIER_MIN_LINES:
         return False
     x0, _, x1, _ = block["bbox"]

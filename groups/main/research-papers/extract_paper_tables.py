@@ -45,6 +45,11 @@ _ROMAN = {"i":1,"ii":2,"iii":3,"iv":4,"v":5,"vi":6,"vii":7,"viii":8,"ix":9,"x":1
           "xi":11,"xii":12,"xiii":13,"xiv":14,"xv":15}
 
 
+def _cap_key(cap: str) -> str:
+    """Normalised caption text — the label-agnostic identity of a placed float."""
+    return re.sub(r"\s+", " ", (cap or "")).strip().lower()[:80]
+
+
 def caption_number(cap: str):
     """The table number a caption states, arabic or ROMAN.
 
@@ -262,21 +267,42 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     # Per-NUMBER idempotency: an agent (or an earlier run) may have imaged SOME
     # tables and left the rest as text. Skip only the numbers already imaged (by
     # their "Table N" caption), inject the missing ones — not all-or-nothing.
-    existing = set()
+    # Identity is the CAPTION TEXT first, the parsed number second. We copy the
+    # source caption onto the image verbatim, so the text is an exact key that
+    # survives any labelling scheme — while the number does not: this paper's
+    # appendix tables are labelled `Table A:`/`Table D:`, `caption_number` returns
+    # None for a letter, and the injector therefore could not see its OWN output.
+    # It re-injected those 7 tables on every 5-minute cycle for days: 750 copies of
+    # each, 5,278 images on one page. A number that fails to parse must never read
+    # as "not placed yet".
+    existing, existing_caps, cap_hist = set(), set(), {}
     for b in blocks:
         if b["type"] == "image":
             cap = "".join(c.get("plain_text", "") for c in
                           ((b.get("image") or {}).get("caption") or []))
+            key = _cap_key(cap)
+            if key:
+                existing_caps.add(key)
+                cap_hist[key] = cap_hist.get(key, 0) + 1
             n = caption_number(cap)
             if n is not None:
                 existing.add(n)
+    # Backstop for the next variant of the same fault: one image per caption is the
+    # only correct state, so a repeated caption means the idempotency key has failed
+    # again. Refuse rather than add to the pile.
+    dup = max(cap_hist.values(), default=0)
+    if dup > 1:
+        rep["error"] = f"runaway: a caption already appears {dup}x on this page"
+        return rep
 
     html_text, html_src = ef.fetch_html(arxiv_id)
     if not html_text:
         rep["error"] = "no HTML source"
         return rep
     all_tables = parse_tables(html_text)
-    tables = [t for t in all_tables if force or t["num"] not in existing]
+    tables = [t for t in all_tables
+              if force or (t["num"] not in existing
+                           and _cap_key(t["caption"]) not in existing_caps)]
     rep["found"] = len(all_tables)
     if not tables:
         rep["skipped_existing"] = True

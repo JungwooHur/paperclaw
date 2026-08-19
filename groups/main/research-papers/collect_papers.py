@@ -514,6 +514,71 @@ def _block_count(page_id):
     return total
 
 
+def _page_text_len(page_id) -> int:
+    """Characters of PROSE on a page — images excluded.
+
+    `_block_count` counts blocks, and an image is a block. That makes a page's
+    rank depend on how many pictures it carries: a page holding 5,278 re-injected
+    figure copies and not one word outranks a fully translated one. Content is
+    text; pictures are placed from the Paper URL alone and prove nothing.
+    """
+    api = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+    chars, cursor = 0, None
+    try:
+        while True:
+            u = api + (f"&start_cursor={cursor}" if cursor else "")
+            req = urllib.request.Request(u, headers=_notion_headers())
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+                d = json.loads(r.read())
+            for b in d.get("results", []):
+                t = b.get("type")
+                if t == "image":
+                    continue
+                payload = b.get(t) or {}
+                if isinstance(payload, dict):
+                    chars += sum(len(x.get("plain_text", ""))
+                                 for x in payload.get("rich_text", []))
+                    if t == "equation":
+                        chars += len(payload.get("expression") or "")
+            if not d.get("has_more"):
+                return chars
+            cursor = d.get("next_cursor")
+    except Exception:
+        return chars
+
+
+_BOT_ID = []
+
+
+def _me_id():
+    """This integration's own user id, so its edits can be told from a person's."""
+    if not _BOT_ID:
+        try:
+            req = urllib.request.Request("https://api.notion.com/v1/users/me",
+                                         headers=_notion_headers())
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+                # The integration's own user id is the TOP-LEVEL `id`; `bot.owner`
+                # is the human who installed it, which is not what we compare to.
+                _BOT_ID.append(json.loads(r.read()).get("id"))
+        except Exception:
+            _BOT_ID.append(None)
+    return _BOT_ID[0]
+
+
+def _edited_by_human(page) -> bool:
+    """True when the LAST edit to this page did not come from this integration.
+
+    The one signal that separates a machine-made duplicate from a page somebody is
+    working in. Unknown counts as human: a page we cannot attribute must not be
+    destroyed on a guess.
+    """
+    who = (page.get("last_edited_by") or {}).get("id")
+    me = _me_id()
+    if not who or not me:
+        return True
+    return who != me
+
+
 def _dedup_keys(page):
     """EVERY identity key a page carries: its arxiv id AND its normalized title.
 
@@ -592,10 +657,11 @@ def dedupe_notion(dry_run=False):
         # Keep the richest page (most blocks), tie-broken by most-recent edit.
         ranked = sorted(
             grp,
-            key=lambda p: (_block_count(p["id"]), p.get("last_edited_time", "")),
+            key=lambda p: (_page_text_len(p["id"]), p.get("last_edited_time", "")),
             reverse=True,
         )
         keeper, losers = ranked[0], ranked[1:]
+        keeper_text = _page_text_len(keeper["id"])
         title = _page_title(keeper)[:60]
         # Backfill a missing URL onto the keeper from a loser that has one.
         if not _page_url(keeper):
@@ -607,6 +673,25 @@ def dedupe_notion(dry_run=False):
                         _patch_page(keeper["id"], {"properties": {"Paper URL": {"url": lu}}})
                     break
         for l in losers:
+            # Two refusals. Archiving is destructive and this healer exists to clear
+            # STUBS left by a double-create — not to adjudicate between two pages
+            # that both hold work.
+            #
+            # A page went to the trash under this rule while its owner was arranging
+            # it by hand: the duplicate was ranked on block count, the copy with more
+            # blocks won, and a page with a full translation on it disappeared. The
+            # owner restored it and the healer then re-placed every figure over their
+            # arrangement. Nothing in the log said "a person is working here" —
+            # nothing was looking.
+            if _edited_by_human(l):
+                print(f"KEEP-HUMAN dup={l['id']} keep={keeper['id']} key={k} "
+                      f"title={title!r} (last edit was not this integration's)")
+                continue
+            l_text = _page_text_len(l["id"])
+            if l_text > 500 and l_text > keeper_text:
+                print(f"KEEP-RICHER dup={l['id']} keep={keeper['id']} key={k} "
+                      f"title={title!r} ({l_text} chars vs keeper {keeper_text})")
+                continue
             print(f"{'WOULD-ARCHIVE' if dry_run else 'ARCHIVE'} dup={l['id']} "
                   f"keep={keeper['id']} key={k} title={title!r}")
             if not dry_run:
