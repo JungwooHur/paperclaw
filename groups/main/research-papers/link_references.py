@@ -127,8 +127,60 @@ def _find_refs_heading(blocks: list):
     return None
 
 
-def _link(page_id: str, block_id: str) -> str:
-    return (f"https://www.notion.so/{page_id.replace('-', '')}"
+_LABEL = re.compile(r"^.*?\[\d{4}[a-z]?\]\s*")
+_CONNECTOR = {"and", "others", "et", "al", "van", "von", "de", "der", "den", "di",
+              "da", "el", "bin", "ibn", "jr", "sr", "the"}
+
+
+def _is_author_list(seg: str) -> bool:
+    """Is this sentence the entry's author list rather than its title?
+
+    Every word is either capitalised or a name connector. A title fails this on
+    its very first ordinary word — "High-resolution image synthesis…",
+    "Gpt-4 technical report", "Attention is all you need" — while an author list
+    of any length passes, single-author entries ("Qiang Liu") included. Counting
+    commas does not work: a one-author entry has none.
+    """
+    words = [w for w in re.split(r"[\s,]+", seg.strip()) if w]
+    if not words:
+        return False
+    # A SHARE, not "every word". Requiring all of them failed on two things that
+    # are everywhere in a bibliography: the `et al.` that ends a long author list,
+    # and names LaTeXML splits mid-ligature (`Ł ukasz` -> a stray lowercase word).
+    # Titles are nowhere near the threshold — "Attention is all you need" scores
+    # 0.2 and "Gpt-4 technical report" 0.33, against 0.93+ for an author list.
+    # No length cap either: author lists here run to hundreds of names.
+    named = sum(1 for w in words if w[0].isupper() or w.lower().strip(".") in _CONNECTOR)
+    return named >= 0.85 * len(words)
+
+
+def title_slug(entry: str) -> str:
+    """The cited paper's TITLE, as a URL slug.
+
+    Notion has no way to give a link a tooltip — hovering shows the raw URL, and
+    the API cannot say otherwise: `link_mention` and `link_preview` mentions are
+    read-only (creating one returns 400, and the error enumerates the only
+    creatable kinds: user, date, page, database, template_mention, custom_emoji),
+    while `plain_text` is computed and silently ignored on write.
+
+    But a Notion address is `notion.so/<slug>-<32-hex-id>` and the slug is
+    decorative — it is how every Notion URL carries its page name. Putting the
+    paper's title there makes the hover text READ as the title while the link
+    still resolves to the same block. A bibliography entry opens with its
+    `Author et al. [YEAR]` label, then the full author list, then the title.
+    """
+    text = _LABEL.sub("", entry or "").strip()
+    parts = text.split(". ")
+    # At most two leading segments, so a mis-read can never eat a whole entry.
+    for _ in range(2):
+        if len(parts) > 1 and _is_author_list(parts[0]):
+            parts = parts[1:]
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", ". ".join(parts)).strip("-")[:70].strip("-")
+    return slug or "reference"
+
+
+def _link(page_id: str, block_id: str, entry: str = "") -> str:
+    return (f"https://www.notion.so/{title_slug(entry)}-{page_id.replace('-', '')}"
             f"#{block_id.replace('-', '')}")
 
 
@@ -156,7 +208,8 @@ def inject_references(page_id: str, entries: list, apply: bool) -> dict:
     return ids
 
 
-def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict) -> list:
+def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
+                   entries: dict = None) -> list:
     """New rich_text for `block`, consuming `mapping` (true numbers, in order).
 
     Splits only TEXT spans. An equation span is left untouched — its `plain_text`
@@ -181,7 +234,8 @@ def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict) -> l
                 if j:
                     out.append(_clone(sp, ", "))
                 out.append(_clone(sp, str(n),
-                                  link=_link(page_id, ref_ids[n]) if n in ref_ids else None))
+                                  link=(_link(page_id, ref_ids[n], (entries or {}).get(n, ""))
+                                        if n in ref_ids else None)))
             out.append(_clone(sp, "]"))
             pos = m.end()
         if pos < len(text):
@@ -267,7 +321,8 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
             blk = next((x for x in blocks if x["id"] == bid), None)
             if not blk:
                 continue
-            rich = _rewrite_block(blk, list(mapping), page_id, ref_ids)
+            rich = _rewrite_block(blk, list(mapping), page_id, ref_ids,
+                                  {e["num"]: e["text"] for e in entries})
             try:
                 notion("PATCH", f"/blocks/{bid}",
                        {blk["type"]: {"rich_text": rich}})
