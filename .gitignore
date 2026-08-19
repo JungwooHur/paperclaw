@@ -43,6 +43,9 @@ groups/main/research-papers/*
 !groups/main/research-papers/extract_paper_figures.py
 !groups/main/research-papers/extract_paper_tables.py
 !groups/main/research-papers/extract_pdf_media.py
+!groups/main/research-papers/link_references.py
+!groups/main/research-papers/reference_section.py
+!groups/main/research-papers/resolve_paper.py
 !groups/main/research-papers/heal_verify.py
 !groups/main/research-papers/sweep_batch_queue.py
 !groups/main/research-papers/systemd/

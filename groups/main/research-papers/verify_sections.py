@@ -154,6 +154,9 @@ def english_title(heading_text: str) -> str:
     return re.sub(r"\s+", " ", text).strip(" .:-")
 
 
+import reference_section  # noqa: E402
+
+
 def fetch_blocks(page_id: str) -> list:
     """All top-level children of the page (paginated)."""
     blocks, cursor = [], None
@@ -556,7 +559,10 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    blocks = fetch_blocks(args.page)
+    # The injected English reference list is apparatus, not body: scanning it
+    # reports the paper's own bibliography as BACKMATTER to delete and its LaTeX
+    # as BARE_MATH to rewrite. See reference_section.
+    blocks = reference_section.body_blocks(fetch_blocks(args.page))
     sections = group_sections(blocks)
     if not sections:
         # `--json` is a CONTRACT: callers parse stdout as JSON no matter the exit

@@ -41,6 +41,9 @@ def _headers():
             "Content-Type": "application/json"}
 
 
+import reference_section  # noqa: E402
+
+
 def _api(method, path, body=None, tries=8):
     last = None
     for a in range(tries):
@@ -103,6 +106,15 @@ def strip_backmatter(page_id, apply=False):
         # chrome (a TOC entry), which strip_furniture removes — never a section
         # boundary to cut the page at.
         if "http://" in text or "https://" in text:
+            continue
+        # The reference list `link_references.py` injects is the ONE back-matter
+        # section that must survive: it is the source's own English bibliography,
+        # deliberately placed at the tail, and the body's citation links point INTO
+        # it. Recognised by its body rather than its title — every entry opens with
+        # `[N] ` and carries no Korean, which a translated bibliography (the thing
+        # this tool exists to remove) never does.
+        if reference_section.looks_like_list(
+                [x for x in blocks[i + 1:] if x['type'] == 'paragraph']):
             continue
         start = i
         break
