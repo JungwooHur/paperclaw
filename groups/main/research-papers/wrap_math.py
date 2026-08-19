@@ -171,11 +171,14 @@ def _reconstruct(b: dict) -> str:
 
 def wrap_math_page(page_id: str, apply: bool = False) -> dict:
     import time
-    import verify_sections as vs                      # lazy: break import cycle
+    import verify_sections as vs
+    import reference_section
     from translate_fulltext import notion
     from save_qa_callout import _inline_rich_text
 
-    blocks = vs.fetch_blocks(page_id)
+    # Never rewrite the injected English reference list — its entries carry real
+    # LaTeX (`\pi_{0.6} model card`) and are meant to stay verbatim.
+    blocks = reference_section.body_blocks(vs.fetch_blocks(page_id))
     rep = {"page": page_id, "scanned": len(blocks), "edited": 0}
     for b in blocks:
         t = b["type"]

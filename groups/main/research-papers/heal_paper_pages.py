@@ -76,6 +76,7 @@ from extract_paper_figures import heal_figures
 from extract_paper_tables import heal_tables
 from extract_pdf_media import heal_pdf_media
 from heal_verify import heal_verify
+from link_references import heal_references
 
 
 def _post_retry(path, body, tries=5):
@@ -207,6 +208,20 @@ def heal(pages, apply):
         except Exception as e:
             print(f"  {pid}: pdf-media-heal error {type(e).__name__}: {e}",
                   file=sys.stderr)
+        # The source's own English bibliography, placed at the tail, with every
+        # citation the alignment could PROVE turned into a link into it. Gated to
+        # recently-created pages: this was asked for on new papers, and back-filling
+        # the whole DB is a separate, explicit decision.
+        n_ref = 0
+        try:
+            _rf = heal_references(pid, apply=apply)
+            n_ref = _rf.get("slots_linked") or 0
+            if str(_rf.get("refs", "")).startswith(("injected", "would inject")):
+                print(f"  {pid}: REFERENCES {_rf['refs']} entries, "
+                      f"{_rf.get('sections_linked', 0)} section(s) linked")
+        except Exception as e:
+            print(f"  {pid}: reference-heal error {type(e).__name__}: {e}",
+                  file=sys.stderr)
         # Structural audit (verify_sections): auto-dedup duplicate sections and,
         # crucially, LOUDLY flag dropped/short/summarized sections that the agent's
         # hand-rolled Notion assembly leaves behind — so a broken page never ships
@@ -223,11 +238,11 @@ def heal(pages, apply):
         # a math fence was counted as untouched and never printed a line, so that
         # work was invisible in the journal.
         if (n_bm or n_url or n_math or n_eq or n_mm or n_mf or n_fur or n_fig
-                or n_tbl or n_pdf or n_dedup):
+                or n_tbl or n_pdf or n_dedup or n_ref):
             healed += 1
             print(f"  {pid}: back-matter={n_bm} url={n_url} math={n_math} eq={n_eq} mangled={n_mm} "
                   f"fences={n_mf} furniture={n_fur} figures={n_fig} tables={n_tbl} "
-                  f"pdf-media={n_pdf} dedup={n_dedup}")
+                  f"pdf-media={n_pdf} dedup={n_dedup} refs={n_ref}")
     print(f"healed {healed}/{len(pages)} paper page(s)"
           f"{' (dry-run)' if not apply else ''}")
 

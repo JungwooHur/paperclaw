@@ -77,8 +77,32 @@ def fetch_arxiv_html(arxiv_id):
     return fallback
 
 
+import reference_section  # noqa: E402
+
+
 def classify_bibliography(html):
-    """('numeric', max_n) or ('author-year', None) or ('unknown', None)."""
+    """('numeric', max_n) or ('author-year', None) or ('unknown', None).
+
+    Decided by what the BODY prints, not by how the bibliography labels itself.
+
+    Those are different things and conflating them was wrong in the way that costs
+    most: a paper can list its entries as `Achiam et al. [2023] Josh Achiam, …`
+    (a natbib author-year label) while its body cites numerically —
+    `<a href="#bib.bib21">21</a>`, i.e. the reader sees `[21]`. The old check read
+    the entry labels, found no `[N]` tags, matched the author-year shape and
+    concluded the paper has no numeric citations at all. Every numeric marker on
+    the page was then reported FABRICATED, and `--apply` on an author-year verdict
+    STRIPS them: on three real pages that verdict covered 94, 113 and 35 correct
+    markers. The inline anchor is the reader-visible citation, so it decides.
+    """
+    inline = re.findall(r'href="#bib\.bib\d+"[^>]*>\s*([^<]{1,24})<', html)
+    if len(inline) >= 5:
+        numeric = sum(1 for t in inline if t.strip().isdigit())
+        if numeric >= 0.8 * len(inline):
+            entries = re.findall(r'id="bib\.bib(\d+)"', html)
+            return "numeric", max(int(n) for n in entries) if entries else None
+        if numeric <= 0.2 * len(inline):
+            return "author-year", None
     nums = [int(n) for n in re.findall(r'ltx_tag_bibitem">\s*\[(\d+)\]', html)]
     if len(nums) >= 5:
         return "numeric", max(nums)
@@ -187,6 +211,7 @@ def main():
         sys.exit("bibliography style unrecognized; aborting (no safe audit)")
 
     blocks = all_blocks(args.page)
+    blocks = reference_section.body_blocks(blocks)
     seq, total, out_of_range, fabricated_blocks = [], 0, [], []
     for b in blocks:
         text = block_text(b)
