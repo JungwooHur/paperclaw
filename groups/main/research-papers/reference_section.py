@@ -60,8 +60,17 @@ def start_index(blocks: list):
     for i, b in enumerate(blocks):
         if not str(b.get("type", "")).startswith("heading"):
             continue
-        paras = [x for x in blocks[i + 1:] if x.get("type") == "paragraph"]
-        if looks_like_list(paras):
+        # Only up to the NEXT heading. Collecting every paragraph to the end of the
+        # page made any heading that merely PRECEDES the bibliography match it: on
+        # one page the last appendix heading was reported as the start of the
+        # reference list, so "everything after it" swept in that appendix's body.
+        run = []
+        for x in blocks[i + 1:]:
+            if str(x.get("type", "")).startswith("heading"):
+                break
+            if x.get("type") == "paragraph":
+                run.append(x)
+        if looks_like_list(run):
             return i
     return None
 
@@ -70,3 +79,17 @@ def body_blocks(blocks: list) -> list:
     """The page WITHOUT its injected reference list."""
     i = start_index(blocks)
     return blocks if i is None else blocks[:i]
+
+
+def body_end_anchor(blocks: list):
+    """Block id to append AFTER so new content lands at the end of the BODY.
+
+    Appending to a page's children with no `after` puts the block at the very end
+    — which, once the reference list is there, is *below the bibliography*. Four
+    tables shipped that way on one page: the healer injected the references and
+    the tables in the same cycle, and every table whose number the body never
+    mentions fell past them. Returns None when the page has no reference list, so
+    the caller keeps its old plain-append behaviour.
+    """
+    i = start_index(blocks)
+    return blocks[i - 1]["id"] if i else None

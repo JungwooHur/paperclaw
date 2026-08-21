@@ -101,6 +101,31 @@ def _post_retry(path, body, tries=5):
     raise last
 
 
+# A page the agent is still writing must be left alone. Every healer here appends
+# or rearranges relative to what it can see, and mid-build it cannot see the rest:
+# one paper had its reference list injected while the translation was still
+# uploading, so the appendix that arrived afterwards was appended BELOW the
+# bibliography — and the figure whose only mention lived in that appendix then
+# anchored below it too. Nothing was wrong with any single healer; they simply ran
+# against half a page.
+#
+# Quiescence is the signal. At a five-minute cadence, waiting for a page to stop
+# changing costs one or two cycles and removes the whole class of race.
+QUIESCENT_MINUTES = 10.0
+
+
+def _is_quiescent(page, minutes=QUIESCENT_MINUTES) -> bool:
+    stamp = page.get("last_edited_time")
+    if not stamp:
+        return True
+    try:
+        edited = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    age = datetime.datetime.now(datetime.timezone.utc) - edited
+    return age.total_seconds() >= minutes * 60
+
+
 def query_recent_pages(hours):
     db = os.environ.get("NOTION_RESEARCH_DB")
     if not db:
@@ -116,7 +141,7 @@ def query_recent_pages(hours):
         if cur:
             body["start_cursor"] = cur
         d = _post_retry(f"/databases/{db}/query", body)
-        out.extend(p["id"] for p in d["results"])
+        out.extend(p["id"] for p in d["results"] if _is_quiescent(p))
         if d.get("has_more"):
             cur = d["next_cursor"]
         else:
