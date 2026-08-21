@@ -58,7 +58,25 @@ REFS_HEADING = "References"
 # Deliberately NOT matching `[0,1]`-style intervals (no spaces around a comma is
 # ambiguous, so a group must be either a single number or comma-separated with the
 # same shape the translator emits).
-_CITE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+_CITE = re.compile(r"\[\s*(\d+(?:\s*[-\u2013,]\s*\d+)*)\s*\]")
+
+
+def expand(group: str) -> list:
+    """`1-5` -> [1,2,3,4,5]; `5, 7, 10` -> [5,7,10].
+
+    A range is not a formatting variant, it is N citations. Reading only the
+    comma form matched `[1-5]` not at all, so a section written in ranges counted
+    ZERO markers, never equalled the source's count, and was skipped every time —
+    which is why an introduction citing 25 works had none of them linked.
+    """
+    out = []
+    for part in re.split(r"\s*,\s*", group):
+        m = re.match(r"(\d+)\s*[-\u2013]\s*(\d+)$", part.strip())
+        if m and int(m.group(1)) <= int(m.group(2)):
+            out += list(range(int(m.group(1)), int(m.group(2)) + 1))
+        elif part.strip().isdigit():
+            out.append(int(part.strip()))
+    return out
 
 _BIB_ITEM = re.compile(r'<li[^>]+id="bib\.bib(\d+)"[^>]*>(.*?)</li>', re.S | re.I)
 _SECTION = re.compile(r'<section[^>]+id="(S\d+)"[^>]*>.*?<h2[^>]*>(.*?)</h2>', re.S | re.I)
@@ -104,8 +122,8 @@ def page_citation_slots(blocks: list) -> dict:
         if cur is None or b["type"] not in vs.BODY_TYPES:
             continue
         for m in _CITE.finditer(block_text(b)):
-            for tok in m.group(1).split(","):
-                out.setdefault(cur, []).append((b["id"], int(tok.strip())))
+            for num in expand(m.group(1)):
+                out.setdefault(cur, []).append((b["id"], num))
     return out
 
 
@@ -223,10 +241,10 @@ def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
             continue
         text, pos = sp["text"]["content"], 0
         for m in _CITE.finditer(text):
-            toks = [t.strip() for t in m.group(1).split(",")]
-            true = [mapping.pop(0) for _ in toks if mapping]
-            if len(true) != len(toks):
+            toks = expand(m.group(1))
+            if len(mapping) < len(toks):
                 continue                       # ran out: leave the rest untouched
+            true = [mapping.pop(0) for _ in toks]
             if pos < m.start():
                 out.append(_clone(sp, text[pos:m.start()]))
             out.append(_clone(sp, "["))
@@ -244,15 +262,28 @@ def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
 
 
 def _clone(span: dict, content: str, link=None) -> dict:
+    """A copy of `span` carrying `content`, keeping its formatting AND its link.
+
+    Carrying the link matters more than it looks. A rewrite rebuilds every span in
+    the block, so dropping it silently unlinked everything the previous pass had
+    linked — and once a citation IS linked its number sits in its own span, so
+    `[49]` no longer appears whole inside any single span and the rewriter cannot
+    even see it to re-link. Two sections then took turns: each run linked one and
+    stripped the other, forever.
+    """
     new = {"type": "text", "text": {"content": content[:2000]},
            "annotations": dict(span.get("annotations") or {})}
+    keep = (span.get("text") or {}).get("link") or (
+        {"url": span["href"]} if span.get("href") else None)
     if link:
         new["text"]["link"] = {"url": link}
+    elif keep:
+        new["text"]["link"] = dict(keep)
     return new
 
 
 def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
-              force: bool = False) -> dict:
+              force: bool = False, relink: bool = False) -> dict:
     rep = {"page": page_id, "entries": 0, "sections_linked": 0,
            "sections_skipped": 0, "slots_linked": 0, "refs": "kept"}
     # Cheap exit FIRST. This runs on the 5-minute healer against every recently
@@ -260,7 +291,9 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
     # would put a network round-trip on each of them, every cycle. The reference
     # list is written once, with its links, so its presence means the work is done.
     blocks = vs.fetch_blocks(page_id)
-    if not force and _find_refs_heading(blocks):
+    # `relink` re-runs the citation pass over an existing reference list, which is
+    # how an improvement to the alignment reaches pages that were already built.
+    if not force and not relink and _find_refs_heading(blocks):
         rep["refs"] = "already present"
         return rep
     arxiv_id = arxiv_id or ef.arxiv_id_from_page(page_id)
@@ -306,7 +339,24 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
         if not want or len(want) != len(page_slots):
             rep["sections_skipped"] += 1
             continue
-        plan[key] = (page_slots, want)
+        # Equal counts are necessary, not sufficient. The translation renumbers a
+        # section 1..N, so a number that recurs must resolve to the SAME source
+        # reference every time — and where it does not, the alignment has slipped
+        # and everything past that point is guesswork. One introduction matched on
+        # count (25 = 25) while its closing group mapped [5] to two different
+        # works. So take the longest PREFIX over which the map stays a function,
+        # and leave the rest of the section untouched.
+        seen, cut = {}, len(page_slots)
+        for i, ((_bid, num), true) in enumerate(zip(page_slots, want)):
+            if seen.setdefault(num, true) != true:
+                cut = i
+                break
+        if not cut:
+            rep["sections_skipped"] += 1
+            continue
+        if cut < len(page_slots):
+            rep.setdefault("partial", {})[key] = f"{cut}/{len(page_slots)}"
+        plan[key] = (page_slots[:cut], want[:cut])
     rep["sections_linked"] = len(plan)
 
     if not apply or not ref_ids:
@@ -365,10 +415,13 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="rebuild an existing reference section")
+    ap.add_argument("--relink", action="store_true",
+                    help="keep the reference list, re-run the citation linking")
     a = ap.parse_args()
     import json
     print(json.dumps(link_page(a.page, a.arxiv, apply=not a.dry_run,
-                               force=a.force), ensure_ascii=False, indent=1))
+                               force=a.force, relink=a.relink),
+                     ensure_ascii=False, indent=1))
     return 0
 
 
