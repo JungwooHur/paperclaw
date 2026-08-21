@@ -810,7 +810,11 @@ def _anchor_for(kind: str, num: int, blocks: list):
     # word character, so every such mention was invisible and the figure was appended
     # at the page end instead of beside the text citing it. Reject only a LONGER
     # NUMBER, which is the thing that actually matters here.
-    ref = re.compile(rf"(?:{words})\s*0*{num}(?![0-9])")
+    # Case-insensitively: the translated body writes "fig. 5" and "[fig. 6]" as
+    # often as "Fig. 5", and matching only the capitalised form made those mentions
+    # invisible — the figure then fell to the end-of-body fallback while the text
+    # citing it sat chapters earlier.
+    ref = re.compile(rf"(?:{words})\s*0*{num}(?![0-9])", re.I)
     for b in blocks:
         if b["type"] in ef.TEXT_TYPES and ref.search(ef._block_text(b)):
             return b["id"]
