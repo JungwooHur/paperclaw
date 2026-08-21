@@ -67,6 +67,8 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import reference_section  # noqa: E402
+
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120 Safari/537.36")
 
@@ -621,8 +623,11 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
         rep["placed"] += len(children)
         if apply:
             body = {"children": children}
+            end_of_body = reference_section.body_end_anchor(blocks)
             if key != "__end__":
                 body["after"] = key
+            elif end_of_body:
+                body["after"] = end_of_body
             notion("PATCH", f"/blocks/{page_id}/children", body)
             time.sleep(0.34)
 

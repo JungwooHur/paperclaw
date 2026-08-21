@@ -32,6 +32,8 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import reference_section  # noqa: E402
 import extract_paper_figures as ef   # fetch_html, _clean, _block_text, _image_block
 
 _TNUM = re.compile(r"T(\d+)")
@@ -253,6 +255,35 @@ def render_tables(arxiv_id: str, tables: list, outdir: str,
             for n, pth in sorted(out.items())]
 
 
+
+# A page with no body cannot be placed into. Anchoring means "after the paragraph
+# that first mentions this number", so on a page whose text has not been uploaded
+# yet EVERY anchor misses and every float falls to the page-end fallback — which,
+# on a page that is still empty, is the TOP. One paper shipped with all eleven of
+# its figures stacked above the first heading, in a pile, because the agent
+# injected them in the same minute it created the page and appended the
+# translation underneath afterwards. Nothing could repair it later either: the
+# next healer cycle sees images present and skips.
+#
+# Refusing is safe and self-healing — the healer retries every five minutes, and
+# the moment the text lands the anchors work.
+MIN_BODY_CHARS_TO_ANCHOR = 1000
+
+
+def _has_body_to_anchor(blocks) -> bool:
+    # The injected reference list is NOT body: it is English apparatus appended at
+    # the tail, it anchors nothing, and counting it made a never-translated page
+    # carrying 77 reference entries read as 43k characters of body.
+    chars = 0
+    for b in reference_section.body_blocks(blocks):
+        if b.get("type") == "image":
+            continue
+        payload = b.get(b.get("type")) or {}
+        if isinstance(payload, dict):
+            chars += sum(len(s.get("plain_text", "")) for s in payload.get("rich_text", []))
+    return chars >= MIN_BODY_CHARS_TO_ANCHOR
+
+
 def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
                   force: bool = False, keep_text: bool = False) -> dict:
     import time
@@ -263,6 +294,9 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     blocks = vs.fetch_blocks(page_id)
     rep = {"page": page_id, "found": 0, "placed": 0, "archived": 0,
            "skipped_existing": False}
+    if not _has_body_to_anchor(blocks):
+        rep["deferred"] = "no body text to anchor against"
+        return rep
 
     # Per-NUMBER idempotency: an agent (or an earlier run) may have imaged SOME
     # tables and left the rest as text. Skip only the numbers already imaged (by
@@ -341,8 +375,11 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         if not children:
             continue
         body = {"children": children}
+        end_of_body = reference_section.body_end_anchor(blocks)
         if key != "__end__":
             body["after"] = key
+        elif end_of_body:
+            body["after"] = end_of_body
         notion("PATCH", f"/blocks/{page_id}/children", body)
         rep["placed"] += len(children)
         time.sleep(0.34)

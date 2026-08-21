@@ -34,6 +34,8 @@ from urllib.parse import urljoin
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import reference_section  # noqa: E402
+
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 _FIG = re.compile(r'<figure[^>]*\bid="([^"]+)"[^>]*>(.*?)</figure>', re.DOTALL | re.I)
 _IMG = re.compile(r'<img[^>]+\bsrc="([^"]+)"', re.I)
@@ -228,6 +230,35 @@ def _image_block(fid: str, caption: str) -> dict:
     return {"object": "block", "type": "image", "image": img}
 
 
+
+# A page with no body cannot be placed into. Anchoring means "after the paragraph
+# that first mentions this number", so on a page whose text has not been uploaded
+# yet EVERY anchor misses and every float falls to the page-end fallback — which,
+# on a page that is still empty, is the TOP. One paper shipped with all eleven of
+# its figures stacked above the first heading, in a pile, because the agent
+# injected them in the same minute it created the page and appended the
+# translation underneath afterwards. Nothing could repair it later either: the
+# next healer cycle sees images present and skips.
+#
+# Refusing is safe and self-healing — the healer retries every five minutes, and
+# the moment the text lands the anchors work.
+MIN_BODY_CHARS_TO_ANCHOR = 1000
+
+
+def _has_body_to_anchor(blocks) -> bool:
+    # The injected reference list is NOT body: it is English apparatus appended at
+    # the tail, it anchors nothing, and counting it made a never-translated page
+    # carrying 77 reference entries read as 43k characters of body.
+    chars = 0
+    for b in reference_section.body_blocks(blocks):
+        if b.get("type") == "image":
+            continue
+        payload = b.get(b.get("type")) or {}
+        if isinstance(payload, dict):
+            chars += sum(len(s.get("plain_text", "")) for s in payload.get("rich_text", []))
+    return chars >= MIN_BODY_CHARS_TO_ANCHOR
+
+
 def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
                    force: bool = False) -> dict:
     import time
@@ -253,6 +284,9 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     have_imgs = len(page_imgs)
     rep = {"page": page_id, "existing_images": have_imgs, "replaced": 0,
            "found": 0, "placed": 0, "skipped_existing": False}
+    if not _has_body_to_anchor(blocks):
+        rep["deferred"] = "no body text to anchor against"
+        return rep
     if have_imgs and not force:
         rep["skipped_existing"] = True          # idempotent: don't duplicate
         return rep
@@ -339,8 +373,11 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
         rep["placed"] += len(children)
         if apply:
             body = {"children": children}
+            end_of_body = reference_section.body_end_anchor(blocks)
             if key != "__end__":
                 body["after"] = key
+            elif end_of_body:
+                body["after"] = end_of_body
             notion("PATCH", f"/blocks/{page_id}/children", body)
             time.sleep(0.34)
 
