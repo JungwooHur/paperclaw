@@ -144,13 +144,58 @@ def load_paper_pages() -> list[dict]:
     return out
 
 
+# A model named with a Greek letter is written one way in the title and another
+# by the person asking about it: the page says "\u03c00", the question says "pi0".
+# Nobody types \u03c0 on a phone. Transliterating both sides makes the model name a
+# normal token again — and it is the most distinctive token a title has.
+_GREEK = {
+    "\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma", "\u03b4": "delta",
+    "\u03b5": "epsilon", "\u03b6": "zeta", "\u03b7": "eta", "\u03b8": "theta",
+    "\u03b9": "iota", "\u03ba": "kappa", "\u03bb": "lambda", "\u03bc": "mu",
+    "\u03bd": "nu", "\u03be": "xi", "\u03c0": "pi", "\u03c1": "rho",
+    "\u03c3": "sigma", "\u03c4": "tau", "\u03c6": "phi", "\u03c7": "chi",
+    "\u03c8": "psi", "\u03c9": "omega",
+    "\u0391": "Alpha", "\u0392": "Beta", "\u0393": "Gamma", "\u0394": "Delta",
+    "\u039b": "Lambda", "\u03a0": "Pi", "\u03a3": "Sigma", "\u03a6": "Phi",
+    "\u03a8": "Psi", "\u03a9": "Omega",
+}
+
+
+# A model name is also typeset with SUBSCRIPT digits — "\u03c0\u2080.\u2087" — which no
+# keyboard produces either, and a star between the letter and the number
+# ("\u03c0*0.6") splits the token in two. Both are decoration on the same name.
+_SUBDIGIT = str.maketrans("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089"
+                          "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079",
+                          "01234567890123456789")
+
+
+def latinize(text: str) -> str:
+    """Greek letters spelled out, so a title and a phone keyboard can meet."""
+    if not text:
+        return ""
+    for g, name in _GREEK.items():
+        if g in text:
+            text = text.replace(g, name)
+    text = text.translate(_SUBDIGIT)
+    return re.sub(r"(?<=[A-Za-z])\*(?=[0-9])", "", text)
+
+
 def extract_title_keywords(title: str) -> list[str]:
     """Distinctive tokens from a paper title — drop common words and
     too-short tokens. Title fragments are matched case-insensitively.
 
     Dedupe case-insensitively so a title like "... Space: An Action Space"
-    doesn't double-count "Space" in the distinct-kw score."""
-    words = re.findall(r"[A-Za-z가-힣][A-Za-z0-9가-힣\-]{3,}", title)
+    doesn't double-count "Space" in the distinct-kw score.
+
+    A token of 3 characters is kept when it carries a DIGIT: `pi0`, `rt2`, `gr2`
+    are model names, as title-unique as a token gets, while a 3-letter English
+    word is the opposite. Without that, the one word identifying the paper was
+    dropped and scoring fell back to generic title words, which is how a question
+    naming its paper outright was attributed to a different one.
+    """
+    title = latinize(title)
+    words = re.findall(r"[A-Za-z가-힣][A-Za-z0-9가-힣\-]{3,}"
+                       r"|[A-Za-z]{1,3}[0-9][0-9.]*", title)
     seen: set[str] = set()
     out: list[str] = []
     for w in words:
@@ -277,6 +322,7 @@ def _weighted_kw(text: str, kws: list[str]) -> float:
 def _has_paper_reference(text: str, kws: list[str]) -> bool:
     """Explicit '[keyword] 논문' / '[keyword] paper' — very strong signal
     that this paper is the topic under discussion."""
+    text = latinize(text)
     for kw in kws:
         if re.search(r"\b" + re.escape(kw) + r"\b[^.\n]{0,30}?(?:논문|paper\b)",
                      text, re.I):
@@ -365,16 +411,24 @@ def active_paper_at(window: list[dict], papers: list[dict],
 
     # Tier 1 — explicit paper reference in current pair with ≥2 distinct kws.
     # Rank the candidates instead of taking the first one the DB happens to list.
-    tier1 = []
-    for text in (bot_reply, user_question):
+    # The USER's question decides; the bot's reply is only a fallback. Ranking both
+    # together let the ANSWER win, and an answer is the wrong thing to score: it is
+    # a technical explanation, so its vocabulary matches any paper whose title
+    # happens to share a rare word with the topic. A question that named its paper
+    # outright was filed under an unrelated one twice over — the explanation of the
+    # method scored 1.07 on words like "interpolation" and "smoothing" against 0.64
+    # for the paper the user actually asked about. This is the same rule Tier 0
+    # already follows, applied here too.
+    for text in (user_question, bot_reply):
+        tier1 = []
         for p in papers:
             if (_has_paper_reference(text, p["keywords"])
                     and _distinct_kw(text, p["keywords"]) >= 2):
                 tier1.append((_weighted_kw(text, p["keywords"]),
                               _distinct_kw(text, p["keywords"]), p))
-    if tier1:
-        tier1.sort(key=lambda x: (-x[0], -x[1]))
-        return tier1[0][2]
+        if tier1:
+            tier1.sort(key=lambda x: (-x[0], -x[1]))
+            return tier1[0][2]
 
     # Tier 2 — an EXPLICIT "X 논문" statement earlier in the thread, when the
     # current pair is consistent with it. This now outranks the keyword score
