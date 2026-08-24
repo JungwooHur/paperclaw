@@ -283,7 +283,7 @@ def _count_kw(text: str, kws: list[str]) -> int:
     """Total keyword occurrences (same keyword counted multiple times)."""
     n = 0
     for kw in kws:
-        n += len(re.findall(r"\b" + re.escape(kw) + r"\b", text, re.I))
+        n += len(re.findall(_kw_pattern(kw), text, re.I))
     return n
 
 
@@ -291,7 +291,7 @@ def _distinct_kw(text: str, kws: list[str]) -> int:
     """Count of distinct keywords that appear (better signal than raw count
     — a GAN answer mentions 'Adversarial' 20× but that's one keyword)."""
     return sum(1 for kw in kws
-               if re.search(r"\b" + re.escape(kw) + r"\b", text, re.I))
+               if re.search(_kw_pattern(kw), text, re.I))
 
 
 # Populated lazily by load_paper_pages() — keyword → number of paper titles
@@ -309,7 +309,7 @@ def _weighted_kw(text: str, kws: list[str]) -> float:
     filter is still _distinct_kw ≥ 2."""
     score = 0.0
     for kw in kws:
-        if re.search(r"\b" + re.escape(kw) + r"\b", text, re.I):
+        if re.search(_kw_pattern(kw), text, re.I):
             df = _KW_DF.get(kw.lower(), 1)
             # idf(x) = 1 / df — rare kws weigh more. Use 1/df rather than
             # log(N/df) so the difference between df=1 and df=20 is very
@@ -319,15 +319,24 @@ def _weighted_kw(text: str, kws: list[str]) -> float:
     return score
 
 
+# `\b` does not hold between a latin word and a Korean particle: in "FAST논문에서"
+# both `T` and `논` are word characters, so `\bFAST\b` does not match and the paper
+# the user NAMED becomes invisible. The same trap has now been fixed three times
+# in this repo — section labels, figure anchors, and here. Reject only a longer
+# token in the SAME script, which is the thing a boundary actually needs to do.
+def _kw_pattern(kw: str) -> str:
+    return r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])"
+
+
 def _has_paper_reference(text: str, kws: list[str]) -> bool:
     """Explicit '[keyword] 논문' / '[keyword] paper' — very strong signal
     that this paper is the topic under discussion."""
     text = latinize(text)
     for kw in kws:
-        if re.search(r"\b" + re.escape(kw) + r"\b[^.\n]{0,30}?(?:논문|paper\b)",
+        if re.search(_kw_pattern(kw) + r"[^.\n]{0,30}?(?:논문|paper\b)",
                      text, re.I):
             return True
-        if re.search(r"(?:논문|paper)[^.\n]{0,10}?\b" + re.escape(kw) + r"\b",
+        if re.search(r"(?:논문|paper)[^.\n]{0,10}?" + _kw_pattern(kw),
                      text, re.I):
             return True
     return False
@@ -346,6 +355,22 @@ def _norm_for_title(text: str) -> str:
 def _arxiv_id_of(paper: dict) -> str:
     m = re.search(r"\b(\d{4}\.\d{4,5})\b", paper.get("url") or "")
     return m.group(1) if m else ""
+
+
+# A title that opens with an all-caps acronym — "FAST: Efficient Action
+# Tokenization…" — carries a name people actually use: they write "FAST논문에서",
+# not the full title. That name is title-unique in practice (of 57 such papers in
+# the live DB, only one acronym is shared), and it is the ONLY distinctive token
+# such a question contains — so it can never clear the "two distinct keywords"
+# bar below, and the pair loses to a paper matching two generic words instead.
+# Measured: a question naming this paper outright was about to be filed under an
+# unrelated one whose title merely contains the word "fast".
+_ACRONYM = re.compile(r"^([A-Z][A-Z0-9]{1,9}(?:-[A-Z0-9]+)?)\s*[:\u2014-]")
+
+
+def title_acronym(title: str) -> str | None:
+    m = _ACRONYM.match((title or "").strip())
+    return m.group(1) if m else None
 
 
 def active_paper_at(window: list[dict], papers: list[dict],
@@ -408,6 +433,24 @@ def active_paper_at(window: list[dict], papers: list[dict],
         if named:
             named.sort(key=lambda x: -x[0])   # arxiv id, else longest title match
             return named[0][1]
+
+    # Tier 0.5 — the question names the paper by its acronym. Case-SENSITIVE: the
+    # acronym is what makes it a name, and a lowercase "fast" is just a word. An
+    # acronym shared by more than one paper is not evidence, so it is skipped.
+    by_acr: dict[str, list[dict]] = {}
+    for p in papers:
+        a = title_acronym(p.get("title", ""))
+        if a:
+            by_acr.setdefault(a, []).append(p)
+    for acr, owners in by_acr.items():
+        if len(owners) != 1:
+            continue
+        near = (r"(?<![A-Za-z0-9])" + re.escape(acr) + r"(?![A-Za-z0-9])"
+                r"[^.\n]{0,20}?(?:논문|paper\b)")
+        if re.search(near, user_question) or re.search(
+                r"(?:논문|paper)[^.\n]{0,10}?(?<![A-Za-z0-9])" + re.escape(acr)
+                + r"(?![A-Za-z0-9])", user_question):
+            return owners[0]
 
     # Tier 1 — explicit paper reference in current pair with ≥2 distinct kws.
     # Rank the candidates instead of taking the first one the DB happens to list.
@@ -556,7 +599,7 @@ def bot_mentions_paper(content: str, paper: dict) -> bool:
     if re.search(r"\b(?:Eq(?:uation)?|Fig(?:ure)?|Section|Sec\.)\s*\d", content):
         return True
     for kw in paper["keywords"]:
-        if re.search(r"\b" + re.escape(kw) + r"\b", content, re.I):
+        if re.search(_kw_pattern(kw), content, re.I):
             return True
     return False
 
