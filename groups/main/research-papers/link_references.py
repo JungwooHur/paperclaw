@@ -145,7 +145,7 @@ def _find_refs_heading(blocks: list):
     return None
 
 
-_LABEL = re.compile(r"^.*?\[\d{4}[a-z]?\]\s*")
+_LABEL = re.compile(r"^.*?[\[(]\d{4}[a-z]?[\])]\s*")
 _CONNECTOR = {"and", "others", "et", "al", "van", "von", "de", "der", "den", "di",
               "da", "el", "bin", "ibn", "jr", "sr", "the"}
 
@@ -359,8 +359,11 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
         plan[key] = (page_slots[:cut], want[:cut])
     rep["sections_linked"] = len(plan)
 
+    entries_by_num = {e["num"]: e["text"] for e in entries}
+    ay_index = author_year_index(entries)
     if not apply or not ref_ids:
         rep["would_link"] = {k: len(v[1]) for k, v in plan.items()}
+        rep["author_year_index"] = len(ay_index)
         return rep
 
     for key, (page_slots, want) in plan.items():
@@ -380,6 +383,10 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
             except Exception as e:
                 rep.setdefault("errors", []).append(f"{bid}: {type(e).__name__}")
             time.sleep(0.2)
+    # An author-year paper has no numeric markers to align at all; its citations
+    # are linked by name, exactly.
+    rep["author_year_linked"] = link_author_year(page_id, vs.fetch_blocks(page_id),
+                                                 ay_index, ref_ids, entries_by_num, apply)
     return rep
 
 
@@ -387,6 +394,81 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
 # owner asked for it on NEW papers; back-filling 770 existing pages is a separate,
 # explicit decision (run the CLI on a page to do one by hand).
 HEAL_MAX_AGE_DAYS = 7
+
+
+
+# --- author-year papers -------------------------------------------------------
+# Half the papers here do not cite by number at all: the body says
+# "(Brohan et al. 2022)" and the reference list is labelled "Brohan et al. [2022]".
+# The numeric path above can do nothing with that, so those pages got a reference
+# list and not one working link — on one of them, 73 citations.
+#
+# This needs no alignment and makes no assumption: the label IS the citation. Name
+# plus year identifies one entry outright, and the year's `a`/`b` suffix is what
+# separates an author's two papers in the same year, so it is part of the key.
+# The label is bracketed in one paper and parenthesised in the next —
+# "Belkhale et al. (2024)" and "Achiam et al. [2023]" are the same thing.
+_AY_LABEL = re.compile(r"^(.+?)\s*[\[(](\d{4}[a-z]?)[\])]")
+_AY_CITE = re.compile(
+    r"([A-Z][\w.\-']*(?:\s+(?:and|&)\s+[A-Z][\w.\-']*)?(?:\s+et\s+al\.?)?)"
+    r"[\s,]+(\d{4}[a-z]?)(?![\d])")
+
+
+def _ay_key(name: str, year: str) -> tuple:
+    return (re.sub(r"[^a-z0-9 ]", "", name.lower()).strip(), year)
+
+
+def author_year_index(entries: list) -> dict:
+    """{(normalised name, year): reference number} from the bibliography labels."""
+    out = {}
+    for e in entries:
+        m = _AY_LABEL.match(e["text"] or "")
+        if m:
+            out[_ay_key(m.group(1), m.group(2))] = e["num"]
+    return out
+
+
+def link_author_year(page_id: str, blocks: list, index: dict, ref_ids: dict,
+                     entries_by_num: dict, apply: bool) -> int:
+    """Link every `Author et al. YEAR` in the body to its reference block."""
+    linked = 0
+    for b in body_blocks_of(blocks):
+        kind = b["type"]
+        spans = (b.get(kind) or {}).get("rich_text")
+        if not spans:
+            continue
+        out, hits = [], 0
+        for sp in spans:
+            if sp.get("type") != "text" or sp.get("href"):
+                out.append(sp); continue
+            text, pos = sp["text"]["content"], 0
+            for m in _AY_CITE.finditer(text):
+                num = index.get(_ay_key(m.group(1), m.group(2)))
+                if num is None or num not in ref_ids:
+                    continue
+                if pos < m.start():
+                    out.append(_clone(sp, text[pos:m.start()]))
+                out.append(_clone(sp, m.group(0),
+                                  link=_link(page_id, ref_ids[num],
+                                             entries_by_num.get(num, ""))))
+                pos = m.end(); hits += 1
+            if pos < len(text):
+                out.append(_clone(sp, text[pos:]))
+        if not hits:
+            continue
+        before = "".join(s.get("plain_text", "") for s in spans)
+        after = "".join(o["text"]["content"] if o.get("type") == "text"
+                        else o.get("plain_text", "") for o in out)
+        assert before == after, f"text changed in {b['id']}"   # link only
+        linked += hits
+        if apply:
+            notion("PATCH", f"/blocks/{b['id']}", {kind: {"rich_text": out}})
+            time.sleep(0.2)
+    return linked
+
+
+def body_blocks_of(blocks: list) -> list:
+    return reference_section.body_blocks(blocks)
 
 
 def heal_references(page_id: str, apply: bool = False, created_time: str = None) -> dict:
