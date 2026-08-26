@@ -226,6 +226,33 @@ def inject_references(page_id: str, entries: list, apply: bool) -> dict:
     return ids
 
 
+MAX_SPANS = 100
+
+
+def coalesce(spans: list) -> list:
+    """Merge adjacent unlinked text spans that share formatting.
+
+    Linking a citation splits a paragraph into `[`, the number, `]` and the prose
+    on either side — three extra spans per marker. Notion caps a block at 100
+    rich_text spans, so a citation-dense paragraph blew past it: one had 32
+    markers and produced 131 spans, and the PATCH failed with a 400 that aborted
+    the whole run. The brackets carry no link, so they belong with the prose
+    beside them; merging brings that paragraph to 65.
+    """
+    out = []
+    for sp in spans:
+        if (out and sp.get("type") == "text" and out[-1].get("type") == "text"
+                and not (sp.get("text") or {}).get("link")
+                and not (out[-1].get("text") or {}).get("link")
+                and (sp.get("annotations") or {}) == (out[-1].get("annotations") or {})):
+            out[-1] = dict(out[-1])
+            out[-1]["text"] = dict(out[-1]["text"])
+            out[-1]["text"]["content"] += sp["text"]["content"]
+            continue
+        out.append(sp)
+    return out
+
+
 def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
                    entries: dict = None) -> list:
     """New rich_text for `block`, consuming `mapping` (true numbers, in order).
@@ -258,6 +285,9 @@ def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
             pos = m.end()
         if pos < len(text):
             out.append(_clone(sp, text[pos:]))
+    out = coalesce(out)
+    if len(out) > MAX_SPANS:
+        raise ValueError(f"{len(out)} spans exceeds Notion's limit of {MAX_SPANS}")
     return out
 
 
