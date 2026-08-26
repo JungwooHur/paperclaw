@@ -365,12 +365,47 @@ def _arxiv_id_of(paper: dict) -> str:
 # bar below, and the pair loses to a paper matching two generic words instead.
 # Measured: a question naming this paper outright was about to be filed under an
 # unrelated one whose title merely contains the word "fast".
-_ACRONYM = re.compile(r"^([A-Z][A-Z0-9]{1,9}(?:-[A-Z0-9]+)?)\s*[:\u2014-]")
+# The paper's NAME is the token its title opens with, before the colon: an
+# all-caps acronym, or a model number like the Greek-lettered ones (latinized
+# first, so "\u03c00.5:" reads as "pi0.5:"). Document frequency cannot stand in for
+# this — "fast" occurs in 14 titles, yet only one paper is NAMED FAST.
+_NAME = re.compile(r"^([A-Za-z][A-Za-z0-9]{0,9}(?:[-.][A-Za-z0-9]+)*)\s*[:\u2014-]")
 
 
 def title_acronym(title: str) -> str | None:
-    m = _ACRONYM.match((title or "").strip())
-    return m.group(1) if m else None
+    """The paper's leading name token, or None if the title does not open with one."""
+    m = _NAME.match(latinize(title or "").strip())
+    if not m:
+        return None
+    tok = m.group(1)
+    if tok.isupper() and len(tok) >= 2:
+        return tok                     # FAST, GUAPO, D2RL
+    if any(c.isdigit() for c in tok):
+        return tok                     # pi0.5, GR-2
+    return None
+
+
+_TEXT_CACHE: dict[str, bool] = {}
+
+
+def _page_has_text(page_id: str, min_chars: int = 2000) -> bool:
+    """Does this page carry a translation? Cached — a name collision is rare."""
+    if page_id in _TEXT_CACHE:
+        return _TEXT_CACHE[page_id]
+    chars = 0
+    try:
+        d = api_get(f"/blocks/{page_id}/children?page_size=100")
+        for b in d.get("results", []):
+            if b.get("type") == "image":
+                continue
+            payload = b.get(b.get("type")) or {}
+            if isinstance(payload, dict):
+                chars += sum(len(x.get("plain_text", ""))
+                             for x in payload.get("rich_text", []))
+    except Exception:
+        chars = min_chars              # unknown beats "empty"
+    _TEXT_CACHE[page_id] = chars >= min_chars
+    return _TEXT_CACHE[page_id]
 
 
 def active_paper_at(window: list[dict], papers: list[dict],
@@ -434,23 +469,48 @@ def active_paper_at(window: list[dict], papers: list[dict],
             named.sort(key=lambda x: -x[0])   # arxiv id, else longest title match
             return named[0][1]
 
-    # Tier 0.5 — the question names the paper by its acronym. Case-SENSITIVE: the
-    # acronym is what makes it a name, and a lowercase "fast" is just a word. An
-    # acronym shared by more than one paper is not evidence, so it is skipped.
-    by_acr: dict[str, list[dict]] = {}
+    # Tier 0.5 — the question names the paper by a TITLE-UNIQUE word, right next to
+    # "논문"/"paper". That is naming, not keyword overlap, and it is decisive.
+    #
+    # It has to sit above the "≥2 distinct keywords" bar rather than inside it,
+    # because a paper known by one name — an acronym, or a model number like the
+    # Greek-lettered ones — offers exactly ONE distinctive token, and a question
+    # about it contains nothing else to count. It therefore always lost to some
+    # unrelated paper matching two generic words. Seen twice, on two different
+    # papers, each filed under something that merely shared a common word.
+    #
+    # Uniqueness is measured, not assumed: only a keyword whose document frequency
+    # across the whole DB is 1 qualifies. An acronym is checked case-SENSITIVELY —
+    # the capitals are what make it a name, a lowercase spelling is just a word —
+    # while a model number has no case to speak of.
+    by_name: dict[str, list[dict]] = {}
     for p in papers:
-        a = title_acronym(p.get("title", ""))
-        if a:
-            by_acr.setdefault(a, []).append(p)
-    for acr, owners in by_acr.items():
-        if len(owners) != 1:
+        nm = title_acronym(p.get("title", ""))
+        if nm:
+            by_name.setdefault(nm.lower(), []).append(p)
+    hits = []
+    for nm, owners in by_name.items():
+        # Several DIFFERENT papers sharing a name is ambiguous; several copies of
+        # the SAME paper is not — duplicates are common here, and refusing on them
+        # would throw away the clearest evidence a question can carry.
+        # Several papers can open with the same name for two reasons: they are
+        # copies of one paper, or one of them is a stub the collector added under a
+        # shortened title. Neither is real ambiguity — the paper the reader means is
+        # the one that HAS the paper on it. Only when more than one owner carries
+        # content is the name genuinely shared, and then it decides nothing.
+        withtext = [o for o in owners if _page_has_text(o["id"])] or owners
+        if len({_norm_for_title(o.get("title", "")) for o in withtext}) > 1:
             continue
-        near = (r"(?<![A-Za-z0-9])" + re.escape(acr) + r"(?![A-Za-z0-9])"
-                r"[^.\n]{0,20}?(?:논문|paper\b)")
-        if re.search(near, user_question) or re.search(
-                r"(?:논문|paper)[^.\n]{0,10}?(?<![A-Za-z0-9])" + re.escape(acr)
-                + r"(?![A-Za-z0-9])", user_question):
-            return owners[0]
+        owner = max(withtext, key=lambda o: o.get("last_edited_time", ""))
+        pat = r"(?<![A-Za-z0-9])" + re.escape(nm) + r"(?![A-Za-z0-9])"
+        q = latinize(user_question)
+        if re.search(pat + r"[^.\n]{0,20}?(?:논문|paper\b)", q, re.I) \
+           or re.search(r"(?:논문|paper)[^.\n]{0,10}?" + pat, q, re.I):
+            hits.append((len(nm), owner))
+    if hits:
+        hits.sort(key=lambda x: -x[0])        # the longest name is the most specific
+        if len(hits) == 1 or hits[0][0] > hits[1][0]:
+            return hits[0][1]
 
     # Tier 1 — explicit paper reference in current pair with ≥2 distinct kws.
     # Rank the candidates instead of taking the first one the DB happens to list.
