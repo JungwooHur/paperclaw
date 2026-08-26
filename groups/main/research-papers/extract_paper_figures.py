@@ -68,6 +68,28 @@ def fetch_html(arxiv_id: str):
     return None, None
 
 
+_CAP_OWN = re.compile(r"^\s*(?:fig\.?|figure|그림)\s*[0-9A-Z]", re.I)
+
+
+def _figure_caption(body: str) -> str:
+    """The figure's OWN caption, not a sub-panel's.
+
+    A composite figure nests one `<figcaption>` per panel — "(a) Example
+    rollouts." — and the figure's real caption, the one that carries its NUMBER,
+    comes after them. Taking the first match therefore captioned the whole figure
+    with a panel label, and since the number lives in that caption, the figure lost
+    its number: on one page three figures appeared with no "Fig. N" at all, and one
+    of them was additionally mislabelled from its id because the caption fallback
+    had nothing to read. Prefer the caption that opens with a figure label; fall
+    back to the first, which is right for a simple figure.
+    """
+    caps = [_clean(c) for c in _CAP.findall(body)]
+    for c in caps:
+        if _CAP_OWN.match(c):
+            return c
+    return caps[0] if caps else ""
+
+
 def parse_figures(html_text: str, source_url: str) -> list:
     """Ordered list of {id, num, img_url, caption}, one per figure image,
     deduped by image URL (composite figures expose one img per subfigure)."""
@@ -88,16 +110,13 @@ def parse_figures(html_text: str, source_url: str) -> list:
             # while an appendix figure sat in that slot, and nothing reported it.
             if ".T" in fid:
                 continue        # a <figure class="ltx_table"> — extract_paper_tables owns it
-            cap = _CAP.search(body)
-            no_image.append(figure_label(fid, _clean(cap.group(1)) if cap else "")
-                            or fid)
+            no_image.append(figure_label(fid, _figure_caption(body)) or fid)
             continue
         url = urljoin(base, _html.unescape(img.group(1)))
         if url in seen:
             continue
         seen.add(url)
-        cap = _CAP.search(body)
-        caption = _clean(cap.group(1))[:1900] if cap else ""
+        caption = _figure_caption(body)[:1900]
         out.append({"id": fid,
                     "num": figure_label(fid, caption),
                     "img_url": url,
@@ -474,6 +493,53 @@ def ensure_arxiv_id(page_id: str, apply: bool = False):
     return hit["arxiv_id"]
 
 
+
+def recaption_page(page_id: str, arxiv_id: str = None, apply: bool = False) -> dict:
+    """Fix images captioned with a sub-panel label, WITHOUT moving anything.
+
+    The composite-figure bug above shipped before it was found, so pages already
+    carry panel captions like "(a) Example rollouts." — and their figure number is
+    simply absent. Re-running the injector would repair them but also re-place
+    every figure, which is destructive on a page somebody has arranged by hand.
+    This edits captions only: it finds the source figure whose markup CONTAINS the
+    panel caption now on the page, and writes that figure's own caption instead.
+    """
+    import time
+    import verify_sections as vs
+    from translate_fulltext import notion
+
+    rep = {"page": page_id, "recaptioned": 0, "unmatched": []}
+    arxiv_id = arxiv_id or arxiv_id_from_page(page_id)
+    if not arxiv_id:
+        rep["error"] = "no arxiv id"
+        return rep
+    html_text, src = fetch_html(arxiv_id)
+    if not html_text:
+        rep["error"] = "no HTML source"
+        return rep
+    bodies = {fid: body for fid, body in _iter_figures(html_text)}
+    good = {f["id"]: f["caption"] for f in parse_figures(html_text, src)}
+    for b in vs.fetch_blocks(page_id):
+        if b["type"] != "image":
+            continue
+        cap = "".join(c.get("plain_text", "") for c in
+                      ((b.get("image") or {}).get("caption") or []))
+        if not re.match(r"\s*\([a-z]\)\s", cap):
+            continue                     # already carries a real caption
+        probe = _clean(cap)[:40]
+        owner = next((fid for fid, body in bodies.items()
+                      if probe and probe in _clean(body)), None)
+        if not owner or not good.get(owner):
+            rep["unmatched"].append(cap[:40])
+            continue
+        rep["recaptioned"] += 1
+        if apply:
+            notion("PATCH", f"/blocks/{b['id']}",
+                   {"image": {"caption": [{"type": "text",
+                                           "text": {"content": good[owner][:1900]}}]}})
+            time.sleep(0.3)
+    return rep
+
 def heal_figures(page_id: str, apply: bool = False) -> dict:
     r"""Healer entry: inject figures when the page has none — or when the ones it
     has clearly did not come from this injector — and its Paper URL resolves to an
@@ -541,10 +607,13 @@ def main() -> int:
     ap.add_argument("--page", required=True)
     ap.add_argument("--arxiv", required=True, help="arxiv id (NNNN.NNNNN)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--recaption", action="store_true",
+                    help="fix sub-panel captions only; never moves a block")
     ap.add_argument("--force", action="store_true",
                     help="inject even if the page already has image blocks")
     a = ap.parse_args()
-    rep = inject_figures(a.page, a.arxiv, apply=not a.dry_run, force=a.force)
+    rep = (recaption_page(a.page, a.arxiv, apply=not a.dry_run) if a.recaption
+           else inject_figures(a.page, a.arxiv, apply=not a.dry_run, force=a.force))
     import json
     print(json.dumps(rep, ensure_ascii=False, indent=1))
     return 0
