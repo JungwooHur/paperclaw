@@ -27,6 +27,7 @@ Usage: python3 auto_save_qa.py [--dry-run] [--hours N] [--chat JID]
 from __future__ import annotations
 import argparse, json, os, re, sqlite3, subprocess, sys, time
 import urllib.request, urllib.error
+from typing import Callable
 
 API = "https://api.notion.com/v1"
 
@@ -408,6 +409,100 @@ def _page_has_text(page_id: str, min_chars: int = 2000) -> bool:
     return _TEXT_CACHE[page_id]
 
 
+# The name only counts as naming when it stands next to the word for a paper.
+# "ZQNK" on its own is a token in a sentence; "ZQNK논문에서" is a reader telling
+# you which page they mean.
+_NAME_THEN_PAPER = r"[^.\n]{0,20}?(?i:논문|paper\b)"
+_PAPER_THEN_NAME = r"(?i:논문|paper)[^.\n]{0,10}?"
+
+
+def _names_the_paper(text: str, name: str) -> bool:
+    """Does this text call a paper by `name`?
+
+    An acronym is matched case-SENSITIVELY — the capitals are what make it a
+    name, and a lowercase spelling is just an English word ("fast" occurs in
+    plenty of titles, exactly one paper is named FAST). A name carrying a digit
+    is a model number, which has no case to speak of: it is written pi0.5 in one
+    place and PI0.5 in another, and neither spelling is an English word, so it
+    matches either way.
+
+    Args:
+      text: Message text, already latinized.
+      name: The leading name token of a title, as `title_acronym` returns it.
+
+    Returns:
+      True when the text names a paper by that token.
+    """
+    flags = re.I if any(c.isdigit() for c in name) else 0
+    pat = _kw_pattern(name)
+    return bool(re.search(pat + _NAME_THEN_PAPER, text, flags)
+                or re.search(_PAPER_THEN_NAME + pat, text, flags))
+
+
+def named_paper(text: str, papers: list[dict],
+                has_text: Callable[[str], bool] | None = None) -> dict | None:
+    """The paper this text NAMES, or None when nothing is named unambiguously.
+
+    A paper known by one name — an acronym, or a model number like the
+    Greek-lettered ones — offers exactly ONE distinctive token, and a question
+    about it contains nothing else to count. So it can never clear a "two
+    distinct keywords" bar, and loses to whatever paper matches two generic
+    words instead. Naming is not keyword overlap: it is the reader stating
+    which page they mean, and it has to be read on its own, above any scoring.
+
+    Both callers ask this one function. The backstop that files a Q&A
+    retroactively had it inline; the resolver has its own tiering and therefore
+    used to refuse a message the backstop attributed confidently.
+
+    Args:
+      text: The reader's message.
+      papers: Paper pages, as `load_paper_pages` returns them.
+      has_text: Page-body test, for injecting one that fetches nothing.
+        Defaults to `_page_has_text`.
+
+    Returns:
+      The named paper, or None when no name is present or several papers
+      answer to the one that is.
+    """
+    has_text = has_text or _page_has_text
+    text = latinize(text or "")
+    by_name: dict[str, list[dict]] = {}
+    spellings: dict[str, set[str]] = {}
+    for p in papers:
+        nm = title_acronym(p.get("title", ""))
+        if not nm:
+            continue
+        by_name.setdefault(nm.lower(), []).append(p)
+        spellings.setdefault(nm.lower(), set()).add(nm)
+
+    hits: list[tuple[int, dict]] = []
+    for name, owners in by_name.items():
+        # Read the text BEFORE asking who owns the name: ownership costs a page
+        # fetch per candidate, and all but one of several hundred names is
+        # absent from any given message.
+        if not any(_names_the_paper(text, nm) for nm in spellings[name]):
+            continue
+        # Several DIFFERENT papers sharing a name is ambiguous; several copies of
+        # the SAME paper is not — duplicates are common here, and refusing on them
+        # would throw away the clearest evidence a question can carry.
+        # Several papers can open with the same name for two reasons: they are
+        # copies of one paper, or one of them is a stub the collector added under a
+        # shortened title. Neither is real ambiguity — the paper the reader means is
+        # the one that HAS the paper on it. Only when more than one owner carries
+        # content is the name genuinely shared, and then it decides nothing.
+        withtext = [o for o in owners if has_text(o["id"])] or owners
+        if len({_norm_for_title(o.get("title", "")) for o in withtext}) > 1:
+            continue
+        owner = max(withtext, key=lambda o: o.get("last_edited_time", ""))
+        hits.append((len(name), owner))
+    if not hits:
+        return None
+    hits.sort(key=lambda x: -x[0])        # the longest name is the most specific
+    if len(hits) == 1 or hits[0][0] > hits[1][0]:
+        return hits[0][1]
+    return None
+
+
 def active_paper_at(window: list[dict], papers: list[dict],
                     bot_reply: str, user_question: str) -> dict | None:
     """Pick the paper for this Q&A pair.
@@ -469,48 +564,14 @@ def active_paper_at(window: list[dict], papers: list[dict],
             named.sort(key=lambda x: -x[0])   # arxiv id, else longest title match
             return named[0][1]
 
-    # Tier 0.5 — the question names the paper by a TITLE-UNIQUE word, right next to
-    # "논문"/"paper". That is naming, not keyword overlap, and it is decisive.
-    #
-    # It has to sit above the "≥2 distinct keywords" bar rather than inside it,
-    # because a paper known by one name — an acronym, or a model number like the
-    # Greek-lettered ones — offers exactly ONE distinctive token, and a question
-    # about it contains nothing else to count. It therefore always lost to some
-    # unrelated paper matching two generic words. Seen twice, on two different
-    # papers, each filed under something that merely shared a common word.
-    #
-    # Uniqueness is measured, not assumed: only a keyword whose document frequency
-    # across the whole DB is 1 qualifies. An acronym is checked case-SENSITIVELY —
-    # the capitals are what make it a name, a lowercase spelling is just a word —
-    # while a model number has no case to speak of.
-    by_name: dict[str, list[dict]] = {}
-    for p in papers:
-        nm = title_acronym(p.get("title", ""))
-        if nm:
-            by_name.setdefault(nm.lower(), []).append(p)
-    hits = []
-    for nm, owners in by_name.items():
-        # Several DIFFERENT papers sharing a name is ambiguous; several copies of
-        # the SAME paper is not — duplicates are common here, and refusing on them
-        # would throw away the clearest evidence a question can carry.
-        # Several papers can open with the same name for two reasons: they are
-        # copies of one paper, or one of them is a stub the collector added under a
-        # shortened title. Neither is real ambiguity — the paper the reader means is
-        # the one that HAS the paper on it. Only when more than one owner carries
-        # content is the name genuinely shared, and then it decides nothing.
-        withtext = [o for o in owners if _page_has_text(o["id"])] or owners
-        if len({_norm_for_title(o.get("title", "")) for o in withtext}) > 1:
-            continue
-        owner = max(withtext, key=lambda o: o.get("last_edited_time", ""))
-        pat = r"(?<![A-Za-z0-9])" + re.escape(nm) + r"(?![A-Za-z0-9])"
-        q = latinize(user_question)
-        if re.search(pat + r"[^.\n]{0,20}?(?:논문|paper\b)", q, re.I) \
-           or re.search(r"(?:논문|paper)[^.\n]{0,10}?" + pat, q, re.I):
-            hits.append((len(nm), owner))
-    if hits:
-        hits.sort(key=lambda x: -x[0])        # the longest name is the most specific
-        if len(hits) == 1 or hits[0][0] > hits[1][0]:
-            return hits[0][1]
+    # Tier 0.5 — the question names the paper by its acronym or model number,
+    # right next to "논문"/"paper". That is naming, not keyword overlap, and it is
+    # decisive, so it sits above the "≥2 distinct keywords" bar rather than
+    # inside it. Seen twice, on two different papers, each filed under something
+    # that merely shared a common word. See `named_paper`.
+    named = named_paper(user_question, papers)
+    if named:
+        return named
 
     # Tier 1 — explicit paper reference in current pair with ≥2 distinct kws.
     # Rank the candidates instead of taking the first one the DB happens to list.
