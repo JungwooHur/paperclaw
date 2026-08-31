@@ -148,3 +148,48 @@ class TestDepthSummary:
     def test_a_malformed_state_reports_rather_than_raises(self):
         assert descent.format_depth({"version": 1}) == []
         assert descent.format_depth("not a state") == []
+
+
+class TestBranchLifecycle:
+    """The shape of the descent, not just the layers that passed.
+
+    A branch noticed once and never pulled is the part worth keeping, and a
+    branch that ended should say WHY it ended — already known, nothing below it,
+    or the subject changed. Those read differently to a reader coming back.
+    """
+
+    def test_offering_branches_puts_them_on_the_frontier(self):
+        state = descent.offer(a_state(), "n0", [
+            {"axis": "composition", "label": "그건 무엇으로 되어 있나"}])
+        added = [n for n in state["nodes"] if n.get("label") == "그건 무엇으로 되어 있나"]
+        assert added and added[0]["status"] == "frontier"
+        assert added[0]["parent"] == "n0"
+
+    def test_picking_a_branch_makes_it_current(self):
+        assert descent.pick(a_state(), "n1")["current"] == "n1"
+
+    def test_closing_a_branch_returns_current_to_its_parent(self):
+        state = descent.close(a_state(), "n1", "owned")
+        node = [n for n in state["nodes"] if n["id"] == "n1"][0]
+        assert node["status"] == "closed"
+        assert node["exit"] == "owned"
+        assert state["current"] == "n0"
+
+    def test_the_three_ways_a_branch_ends_render_distinguishably(self):
+        marks = set()
+        for kind in ("owned", "floor", "boundary"):
+            state = descent.close(a_state(), "n1", kind)
+            marks.add(" ".join(text_of(b)
+                               for b in flatten(descent.render_blocks(state))))
+        assert len(marks) == 3
+
+    def test_ending_the_descent_clears_current_and_keeps_the_record(self):
+        state = descent.end(a_state())
+        assert state["current"] is None
+        assert len(state["nodes"]) == 2
+
+    def test_a_transition_does_not_mutate_the_state_it_was_given(self):
+        original = a_state()
+        descent.close(original, "n1", "floor")
+        assert original["nodes"][1]["status"] == "frontier"
+        assert original["current"] == "n1"

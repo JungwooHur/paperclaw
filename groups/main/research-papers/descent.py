@@ -21,6 +21,7 @@ and overwriting them would defeat it.
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -109,6 +110,90 @@ def record_start(blocks: list) -> int | None:
         if _text_of(blocks[i]).strip() == HEADING:
             return i
     return anchor
+
+
+# How a branch ended. Each is a complete answer, not a failure: the reader
+# already owned it, there is no mechanism under it, or the next layer leaves the
+# paper's subject. They read differently, so they are marked differently.
+EXIT_MARKS = {'owned': '◆', 'floor': '∅', 'boundary': '⇢'}
+
+
+def _copy(state: dict) -> dict:
+    """A state that can be edited without touching the caller's."""
+    return copy.deepcopy(state)
+
+
+def offer(state: dict, parent: str, branches: list) -> dict:
+    """Record the ways down from a layer that just passed.
+
+    The branches not taken are the point. A thread noticed once and never pulled
+    is exactly what is lost today, so they are stored the moment they are
+    offered rather than when one is chosen.
+
+    Args:
+        state: The current state.
+        parent: Id of the node the branches hang from.
+        branches: Dicts carrying at least `label`, usually `axis`.
+
+    Returns:
+        A new state with the branches added as open children.
+    """
+    new = _copy(state)
+    taken = {n.get('id') for n in new['nodes']}
+    for i, branch in enumerate(branches):
+        node_id = branch.get('id') or '%s.%d' % (parent, i + 1)
+        while node_id in taken:
+            node_id += "'"
+        taken.add(node_id)
+        new['nodes'].append({'id': node_id, 'parent': parent,
+                             'status': 'frontier', **branch})
+    return new
+
+
+def pick(state: dict, node_id: str) -> dict:
+    """Descend into a branch: it becomes the node a restatement is expected for."""
+    new = _copy(state)
+    new['current'] = node_id
+    return new
+
+
+def close(state: dict, node_id: str, exit_kind: str) -> dict:
+    """End a branch, recording WHY it ended, and step back to its parent.
+
+    Args:
+        state: The current state.
+        node_id: The branch that is ending.
+        exit_kind: One of `EXIT_MARKS` — owned, floor, or boundary.
+
+    Returns:
+        A new state with the branch closed and the current node moved up.
+
+    Raises:
+        ValueError: If `exit_kind` is not one of the three ways a branch ends.
+    """
+    if exit_kind not in EXIT_MARKS:
+        raise ValueError('unknown exit %r; expected one of %s'
+                         % (exit_kind, sorted(EXIT_MARKS)))
+    new = _copy(state)
+    for node in new['nodes']:
+        if node.get('id') == node_id:
+            node['status'] = 'closed'
+            node['exit'] = exit_kind
+            new['current'] = node.get('parent')
+            break
+    return new
+
+
+def end(state: dict) -> dict:
+    """Close the descent itself.
+
+    Only ever explicit. A record that expired on its own would change what the
+    next question is answered against while nobody was looking, and state that
+    moves unobserved is a failure this project has paid for more than once.
+    """
+    new = _copy(state)
+    new['current'] = None
+    return new
 
 
 def format_depth(state) -> list:
@@ -262,6 +347,11 @@ def render_blocks(state: dict) -> list:
     if open_branches:
         blocks.append(_paragraph('아직 안 판 가지'))
         blocks += [_bullet(_frontier_line(n)) for n in open_branches]
+    closed = [n for n in nodes if n.get('status') == 'closed']
+    if closed:
+        blocks.append(_paragraph('닫힌 가지'))
+        blocks += [_bullet('%s %s' % (EXIT_MARKS.get(n.get('exit'), '·'),
+                                      _frontier_line(n))) for n in closed]
     blocks.append(_state_block(state))
     return blocks
 
