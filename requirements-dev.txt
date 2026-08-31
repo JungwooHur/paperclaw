@@ -1,0 +1,5 @@
+# Test-only dependencies for the paper-processing scripts.
+# The scripts themselves run inside the agent container and depend on the
+# standard library plus what the image already installs; nothing here is
+# needed at runtime.
+pytest==8.3.4
