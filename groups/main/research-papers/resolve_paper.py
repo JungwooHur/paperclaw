@@ -10,12 +10,17 @@ can't tell the agent which paper to use. This script does.
 It anchors on concrete evidence in the message, in priority order:
 
   1. arxiv id / Notion page URL in the text      -> exact page          (CONFIDENT)
-  2. distinctive paper-title keywords             -> title match, clear  (CONFIDENT)
+  2. the paper's NAME — the acronym or model      -> named paper         (CONFIDENT)
+     number its title opens with, beside "논문"
+     (a reader who writes "XYZ논문에서 …" has already said which page
+      they mean; that name is one token, so it can never clear the
+      two-keyword bar below and used to be answered with "which paper?")
+  3. distinctive paper-title keywords             -> title match, clear  (CONFIDENT)
      winner only
-  3. pasted body excerpt vs candidate page bodies -> substring match     (CONFIDENT)
+  4. pasted body excerpt vs candidate page bodies -> substring match     (CONFIDENT)
      (handles a pasted 번역본 with no title/link: the passage exists
       verbatim in exactly one page body)
-  4. nothing conclusive                           -> ASK_USER
+  5. nothing conclusive                           -> ASK_USER
 
 It NEVER guesses when the evidence is weak — for a Q&A save, asking the user
 "which paper?" is strictly better than silently writing to the wrong one. That
@@ -23,7 +28,7 @@ weak-evidence case is also the original-bug case (a bare follow-up like "그럼
 online이야?" with no paper signal): there is no honest answer except to ask.
 
 Output (stdout), one of:
-  CONFIDENT <page_id>\t<title>\t<how>      # how = arxiv|url|title|body
+  CONFIDENT <page_id>\t<title>\t<how>      # how = arxiv|url|name|title|body
   ASK_USER                                  # followed by "  - <title>" candidate lines
 Body-grep only runs over candidates pre-narrowed by title-token overlap (the DB
 has ~500 papers; fetching every body per question is not viable), so a pure
@@ -140,7 +145,19 @@ def resolve(text: str) -> tuple[str, list[dict]]:
 
     papers = aq.load_paper_pages()  # also populates aq._KW_DF
 
-    # ---- 2. distinctive title-keyword match, clear winner only ----------
+    # ---- 2. the paper's own name ---------------------------------------
+    # Above the keyword score because naming is evidence and a score is a
+    # guess: a paper known by one name offers exactly ONE distinctive token,
+    # so a question about it can never clear the two-keyword bar below and
+    # was answered with "which paper?" even though the reader had said which.
+    # Below the id tier, which is the one signal stronger than a name.
+    # The same function the retroactive backstop attributes with, so the two
+    # paths cannot disagree about what naming a paper means.
+    named = aq.named_paper(text, papers)
+    if named:
+        return "CONFIDENT", [{"how": "name", **named}]
+
+    # ---- 3. distinctive title-keyword match, clear winner only ----------
     scored = []
     for p in papers:
         n = aq._distinct_kw(text, p["keywords"])
@@ -156,7 +173,7 @@ def resolve(text: str) -> tuple[str, list[dict]]:
         if top_w >= 0.5 and (second_w == 0.0 or top_w >= 2 * second_w):
             return "CONFIDENT", [{"how": "title", **top_p}]
 
-    # ---- 3. pasted-body substring match over narrowed candidates --------
+    # ---- 4. pasted-body substring match over narrowed candidates --------
     cands: list[dict] = []
     wins = body_windows(text)
     if wins:
@@ -175,7 +192,7 @@ def resolve(text: str) -> tuple[str, list[dict]]:
         if best and best[0] >= 2:
             return "CONFIDENT", [{"how": "body", **best[1]}]
 
-    # ---- 4. give up honestly -------------------------------------------
+    # ---- 5. give up honestly -------------------------------------------
     top = [p for _, _, p in scored[:5]] or cands[:5]
     return "ASK_USER", top
 
