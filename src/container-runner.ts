@@ -20,6 +20,11 @@ import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  inspectSkillDir,
+  resolveExtraSkillDirs,
+  syncSkillDirs,
+} from './skill-sync.js';
+import {
   CONTAINER_RUNTIME_BIN,
   readonlyMountArgs,
   stopContainer,
@@ -184,17 +189,20 @@ function buildVolumeMounts(
     );
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  // Sync skills from container/skills/ into each group's .claude/skills/,
+  // then from any directories configured through EXTRA_SKILLS_DIRS. Configured
+  // ones come last so a private skill can override a built-in of the same name.
+  // Copying on every run is what keeps the installed copy from drifting — the
+  // same reason the service units here are symlinks rather than copies.
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
-    }
-  }
+  const skillSources = [path.join(process.cwd(), 'container', 'skills')];
+  const extra = resolveExtraSkillDirs(
+    process.env.EXTRA_SKILLS_DIRS,
+    inspectSkillDir,
+  );
+  for (const warning of extra.warnings) logger.warn(warning);
+  skillSources.push(...extra.dirs);
+  syncSkillDirs(skillSources, skillsDst);
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
