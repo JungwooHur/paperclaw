@@ -180,6 +180,29 @@ def resolve(text: str) -> tuple[str, list[dict]]:
     return "ASK_USER", top
 
 
+def _depth_lines(page_id: str) -> list:
+    """How far this paper has already been taken, or nothing.
+
+    Attached here rather than exposed as a separate command on purpose: this is
+    the one call that already runs before any paper question, so the depth
+    arrives without anybody having to remember a second step. Every rule in this
+    project that depended on remembering an extra call has eventually been
+    skipped.
+
+    Errors are swallowed deliberately — this is an isolation point. A caller
+    that only wanted to know which paper is being discussed must not fail
+    because the record on that page is unreadable or Notion is briefly down.
+    """
+    try:
+        import descent
+        import verify_sections
+        return descent.format_depth(
+            descent.parse_state(verify_sections.fetch_blocks(page_id)))
+    except Exception as e:  # pylint: disable=broad-except  (isolation point)
+        print(f"  (depth unavailable: {type(e).__name__})", file=sys.stderr)
+        return []
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
@@ -192,6 +215,8 @@ def main() -> None:
     if verdict == "CONFIDENT":
         p = items[0]
         print(f"CONFIDENT\t{p['id']}\t{p['title']}\t{p['how']}")
+        for line in _depth_lines(p["id"]):
+            print(line)
     else:
         print("ASK_USER")
         for p in items:
