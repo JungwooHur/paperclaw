@@ -24,6 +24,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -184,6 +185,38 @@ def close(state: dict, node_id: str, exit_kind: str) -> dict:
     return new
 
 
+def note(state: dict, block_id: str, source: str, says: str) -> dict:
+    """Record a mismatch between what the page says and what the source says.
+
+    Reading a paper down to its mechanisms turns up defects no automated check
+    here catches: a claim the translation carries that the source does not
+    support, a step asserted with no mechanism, a figure the body never
+    explains. Every audit in this repository passes those pages. They are found
+    by a person reading, and until now they existed only in a chat that scrolls
+    away.
+
+    Nothing is corrected. The reader is editing the page while the descent runs,
+    and rewriting the body mid-session moves the ground under a layer just
+    explained. Separating discovery from repair is the point: the list is what
+    makes a later repair pass possible at all.
+
+    Args:
+        state: The current state.
+        block_id: The block on the page the finding is about.
+        source: Where in the source the contradiction is — a section, a figure
+          number, a page.
+        says: One line on what the source actually says.
+
+    Returns:
+        A new state with the finding appended. Findings are only ever appended,
+        so the order they were found in is the order they keep.
+    """
+    new = _copy(state)
+    new.setdefault('findings', []).append(
+        {'block': block_id, 'source': source, 'says': says})
+    return new
+
+
 def end(state: dict) -> dict:
     """Close the descent itself.
 
@@ -281,6 +314,13 @@ def format_depth(state) -> list:
     lines += ['  ✓ %s' % n.get('thesis', '') for n in passed]
     lines += ['  · %s' % _frontier_line(n) for n in open_branches]
     return lines
+
+
+# Findings link to the block they are about. Notion ignores the slug in front
+# of the page id, but a reader hovering the link reads it, so the paper's title
+# goes there when the record knows it — otherwise the hover is a bare uuid.
+_PAGE_URL = 'https://www.notion.so/'
+_SLUG_STRIP = re.compile(r'[^A-Za-z0-9]+')
 
 
 def _paragraph(text: str) -> dict:
@@ -381,6 +421,20 @@ def _frontier_line(node: dict) -> str:
     return '%s — %s' % (axis, label) if axis else label
 
 
+def _finding_line(state: dict, finding: dict) -> dict:
+    """One finding as a bullet whose source reference opens the block."""
+    target = state.get('target') or {}
+    slug = _SLUG_STRIP.sub('-', target.get('title') or '').strip('-')
+    url = '%s%s%s#%s' % (_PAGE_URL, slug + '-' if slug else '',
+                         str(target.get('page_id', '')).replace('-', ''),
+                         str(finding.get('block', '')).replace('-', ''))
+    return {'type': 'bulleted_list_item', 'bulleted_list_item': {'rich_text': [
+        {'type': 'text',
+         'text': {'content': finding.get('source', ''), 'link': {'url': url}}},
+        {'type': 'text', 'text': {'content': ' — ' + finding.get('says', '')}},
+    ]}}
+
+
 def render_blocks(state: dict) -> list:
     """The blocks that carry this state on a page.
 
@@ -407,6 +461,13 @@ def render_blocks(state: dict) -> list:
         blocks.append(_paragraph('닫힌 가지'))
         blocks += [_bullet('%s %s' % (EXIT_MARKS.get(n.get('exit'), '·'),
                                       _frontier_line(n))) for n in closed]
+    findings = state.get('findings') or []
+    if findings:
+        # Deliberately not toggles: a layer section is one, so keeping findings
+        # a flat list means nothing reading the page back can mistake a finding
+        # for something the reader passed.
+        blocks.append(_paragraph('원문과 어긋나는 곳'))
+        blocks += [_finding_line(state, f) for f in findings]
     blocks.append(_state_block(state))
     return blocks
 

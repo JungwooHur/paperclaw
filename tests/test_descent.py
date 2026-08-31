@@ -243,3 +243,103 @@ class TestAbsorbingPageEdits:
         toggle["toggle"]["children"] = []
         absorbed, _ = descent.absorb(state, blocks)
         assert absorbed["nodes"][0]["restatement"] == state["nodes"][0]["restatement"]
+
+
+def links_in(block):
+    """Every URL carried by a block's spans, in order."""
+    payload = block.get(block.get("type")) or {}
+    return [sp["text"]["link"]["url"]
+            for sp in payload.get("rich_text", [])
+            if (sp.get("text") or {}).get("link")]
+
+
+class TestFindings:
+    """What deep reading turns up that no automated check here catches.
+
+    A claim the translation carries that the source does not support, a step
+    asserted with no mechanism, a figure the body never explains. Every audit in
+    this repository passes those pages; they are found by a person reading, and
+    today they exist only in a chat that scrolls away.
+    """
+
+    def test_a_mismatch_records_where_what_and_why(self):
+        state = descent.note(a_state(), block_id="block-id", source="3.2",
+                             says="원문은 두 조건에서만 성립한다고 말합니다.")
+        assert state["findings"] == [{"block": "block-id", "source": "3.2",
+                                      "says": "원문은 두 조건에서만 성립한다고 "
+                                              "말합니다."}]
+
+    def test_recording_one_leaves_the_state_it_was_given_alone(self):
+        before = a_state()
+        descent.note(before, block_id="block-id", source="3.2", says="…")
+        assert before["findings"] == []
+
+    def test_recording_one_changes_no_layer(self):
+        before = a_state()
+        after = descent.note(before, block_id="block-id", source="3.2",
+                             says="…")
+        assert after["nodes"] == before["nodes"]
+
+    def test_findings_render_as_their_own_list(self):
+        state = descent.note(a_state(), block_id="block-id", source="3.2",
+                             says="원문과 어긋납니다.")
+        blocks = flatten(descent.render_blocks(state))
+        # The state block carries every finding too, as JSON. This is about the
+        # half a person reads.
+        carrying = [b for b in blocks
+                    if b.get("type") != "code"
+                    and "원문과 어긋납니다." in text_of(b)]
+        assert len(carrying) == 1
+        # A layer section is a toggle; a finding is not one, so the two lists
+        # cannot be mistaken for each other by anything reading the page back.
+        assert carrying[0]["type"] != "toggle"
+
+    def test_a_finding_points_at_the_block_it_is_about(self):
+        state = descent.note(a_state(), block_id="block-id", source="3.2",
+                             says="원문과 어긋납니다.")
+        blocks = flatten(descent.render_blocks(state))
+        carrying = next(b for b in blocks
+                        if b.get("type") != "code"
+                        and "원문과 어긋납니다." in text_of(b))
+        assert any(url.endswith("#blockid") for url in links_in(carrying))
+
+    def test_a_record_with_no_findings_renders_no_list(self):
+        rendered = descent.render_blocks(a_state())
+        assert not any("어긋" in text_of(b) for b in flatten(rendered))
+
+    def test_findings_keep_the_order_they_were_found_in(self):
+        state = a_state()
+        for i in range(3):
+            state = descent.note(state, block_id="b%d" % i, source="%d.1" % i,
+                                 says="발견 %d" % i)
+        read_back = descent.parse_state(descent.render_blocks(state))
+        assert [f["says"] for f in read_back["findings"]] == [
+            "발견 0", "발견 1", "발견 2"]
+
+    def test_absorbing_page_edits_leaves_findings_untouched(self):
+        state = descent.note(a_state(), block_id="block-id", source="3.2",
+                             says="원문과 어긋납니다.")
+        absorbed, _ = descent.absorb(state, descent.render_blocks(state))
+        assert absorbed["findings"] == state["findings"]
+
+    def test_a_findings_link_reads_as_the_paper_on_hover(self):
+        # Notion ignores the slug before the id, but a reader hovering the link
+        # sees it. Without one they get a bare uuid.
+        state = a_state()
+        state["target"]["title"] = "Hierarchical Models"
+        state = descent.note(state, block_id="block-id", source="3.2",
+                             says="원문과 어긋납니다.")
+        blocks = flatten(descent.render_blocks(state))
+        carrying = next(b for b in blocks
+                        if b.get("type") != "code"
+                        and "원문과 어긋납니다." in text_of(b))
+        assert "Hierarchical-Models" in links_in(carrying)[0]
+
+    def test_a_link_still_works_when_the_title_is_not_stored(self):
+        state = descent.note(a_state(), block_id="block-id", source="3.2",
+                             says="원문과 어긋납니다.")
+        blocks = flatten(descent.render_blocks(state))
+        carrying = next(b for b in blocks
+                        if b.get("type") != "code"
+                        and "원문과 어긋납니다." in text_of(b))
+        assert links_in(carrying)[0].endswith("pageid#blockid")
