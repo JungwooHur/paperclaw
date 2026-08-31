@@ -193,3 +193,53 @@ class TestBranchLifecycle:
         descent.close(original, "n1", "floor")
         assert original["nodes"][1]["status"] == "frontier"
         assert original["current"] == "n1"
+
+
+class TestAbsorbingPageEdits:
+    """Text is owned by the page; structure is owned by the state.
+
+    The record exists because the sentences are the reader's. A writer that
+    overwrote them with what it stored last time would defeat the point — the
+    same reason this project protects a hand-curated page from its own healers.
+    """
+
+    def test_absorbing_what_we_just_rendered_changes_nothing(self):
+        state = a_state()
+        absorbed, missing = descent.absorb(state, descent.render_blocks(state))
+        assert absorbed == state
+        assert missing == []
+
+    def test_a_restatement_edited_on_the_page_wins(self):
+        state = a_state()
+        blocks = descent.render_blocks(state)
+        toggle = [b for b in blocks if b["type"] == "toggle"][0]
+        toggle["toggle"]["children"][0]["paragraph"]["rich_text"][0]["text"][
+            "content"] = "제가 고쳐 쓴 문장입니다."
+        absorbed, _ = descent.absorb(state, blocks)
+        assert absorbed["nodes"][0]["restatement"] == "제가 고쳐 쓴 문장입니다."
+
+    def test_editing_a_restatement_leaves_the_tree_alone(self):
+        state = a_state()
+        blocks = descent.render_blocks(state)
+        toggle = [b for b in blocks if b["type"] == "toggle"][0]
+        toggle["toggle"]["children"][0]["paragraph"]["rich_text"][0]["text"][
+            "content"] = "다른 문장"
+        absorbed, _ = descent.absorb(state, blocks)
+        assert absorbed["current"] == state["current"]
+        assert [n["id"] for n in absorbed["nodes"]] == [n["id"] for n in state["nodes"]]
+        assert absorbed["nodes"][1]["status"] == "frontier"
+
+    def test_a_section_deleted_by_the_reader_is_reported_not_recreated(self):
+        state = a_state()
+        blocks = [b for b in descent.render_blocks(state) if b["type"] != "toggle"]
+        absorbed, missing = descent.absorb(state, blocks)
+        assert missing == ["n0"]
+        assert absorbed["nodes"][0]["restatement"] == state["nodes"][0]["restatement"]
+
+    def test_an_empty_section_leaves_the_stored_sentence_alone(self):
+        state = a_state()
+        blocks = descent.render_blocks(state)
+        toggle = [b for b in blocks if b["type"] == "toggle"][0]
+        toggle["toggle"]["children"] = []
+        absorbed, _ = descent.absorb(state, blocks)
+        assert absorbed["nodes"][0]["restatement"] == state["nodes"][0]["restatement"]
