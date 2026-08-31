@@ -229,6 +229,32 @@ red build is caught before the push instead of a minute later on GitHub.
 Verified by staging deliberately mangled TypeScript: the file inside the resulting
 commit came out formatted.
 
+### …and it must stay off the repository it is running in
+
+Git exports `GIT_DIR`, `GIT_INDEX_FILE` and friends to every hook it launches,
+and **they override `cwd`**. Two test files build throwaway repositories with
+`execSync('git ...', { cwd: tempDir })`, so under `.husky/pre-push` those
+commands acted on the real repository instead. Reproduced directly: with
+`GIT_DIR` pointed at a scratch repo, the suite rewrote that repo's `user.name`
+to the fixture's placeholder name and its `user.email` to the fixture's
+placeholder address —
+and a bare `git init --bare` with no directory argument flips the pointed-at
+repo to `core.bare=true`.
+
+**The symptoms do not look like a test problem.** A repository that has been
+flipped bare answers `git status` with `fatal: this operation must be run in a
+work tree` while `git branch --show-current` still works, and the next commit is
+blocked by `check-sensitive.sh` for an author email nobody typed. Real incident:
+that plus a wiped index (hundreds of phantom staged deletions) after a push from
+a git worktree, diagnosed as three separate problems before the common cause.
+
+`vitest.setup.ts` now deletes those variables from `process.env` before any test
+file loads, wired through `setupFiles`. Central rather than per-spawn on
+purpose: the failure is silent, it only appears when the suite runs from a hook,
+and a helper every future git call must remember to use will eventually be
+forgotten. Verified both ways — with the setup file the scratch repo is
+untouched and all tests pass; without it the identity is overwritten.
+
 ### The test suite must stay offline
 
 `skills-engine/__tests__/fetch-upstream.test.ts` exercises a script that runs
