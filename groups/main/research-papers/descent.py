@@ -111,6 +111,38 @@ def record_start(blocks: list) -> int | None:
     return anchor
 
 
+def format_depth(state) -> list:
+    """Lines describing how far this paper has been taken, for a later question.
+
+    This rides along with the answer to "which paper is this?", so it has two
+    obligations beyond being correct. It says nothing when there is nothing to
+    say — most papers carry no record, and a permanently empty block is noise
+    that would teach the reader to skip the whole section. And it never raises:
+    a caller that only wanted to identify a paper must not fail because the
+    record on it is unreadable.
+
+    Args:
+        state: A descent state, or None, or anything at all.
+
+    Returns:
+        Lines to print, or an empty list when there is no usable record.
+    """
+    if not isinstance(state, dict):
+        return []
+    nodes = state.get('nodes')
+    if not isinstance(nodes, list) or not nodes:
+        return []
+    passed = [n for n in nodes
+              if isinstance(n, dict) and n.get('status') == 'passed']
+    open_branches = [n for n in nodes
+                     if isinstance(n, dict) and n.get('status') == 'frontier']
+    lines = ['DEPTH\tpassed=%d\topen=%d\tcurrent=%s'
+             % (len(passed), len(open_branches), state.get('current'))]
+    lines += ['  ✓ %s' % n.get('thesis', '') for n in passed]
+    lines += ['  · %s' % _frontier_line(n) for n in open_branches]
+    return lines
+
+
 def _paragraph(text: str) -> dict:
     return {
         'object': 'block',

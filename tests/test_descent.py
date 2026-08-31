@@ -116,3 +116,35 @@ class TestRecordBoundary:
                  "code": {"language": "json",
                           "rich_text": [{"plain_text": '{"a": 1}'}]}}]
         assert descent.record_start(page) is None
+
+
+class TestDepthSummary:
+    """What a later question is told about a paper already being descended.
+
+    It rides along with the resolver's answer, so it must be cheap, silent when
+    there is nothing to say, and incapable of stopping the caller.
+    """
+
+    def test_says_nothing_when_the_page_has_no_record(self):
+        assert descent.format_depth(None) == []
+
+    def test_reports_what_is_passed_open_and_current(self):
+        line = " ".join(descent.format_depth(a_state()))
+        assert "passed=1" in line
+        assert "open=1" in line
+        assert "current=n1" in line
+
+    def test_lists_each_passed_layer_by_its_thesis(self):
+        lines = descent.format_depth(a_state())
+        assert any("이 층의 한 문장" in ln for ln in lines)
+
+    def test_a_closed_branch_is_not_counted_as_open(self):
+        state = a_state()
+        state["nodes"][1]["status"] = "closed"
+        state["nodes"][1]["exit"] = "owned"
+        line = " ".join(descent.format_depth(state))
+        assert "open=0" in line
+
+    def test_a_malformed_state_reports_rather_than_raises(self):
+        assert descent.format_depth({"version": 1}) == []
+        assert descent.format_depth("not a state") == []
