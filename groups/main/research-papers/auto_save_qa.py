@@ -28,6 +28,8 @@ from __future__ import annotations
 import argparse, json, os, re, sqlite3, subprocess, sys, time
 import urllib.request, urllib.error
 
+import layer_format
+
 API = "https://api.notion.com/v1"
 
 # Resolve PaperClaw root relative to this script so the healer doesn't carry a
@@ -593,6 +595,12 @@ def is_substantive_answer(content: str, paper_context: bool = False) -> bool:
     is exactly the "질문이 자동으로 안 올라간다" complaint — the agent skipped Step 4
     and the backstop then declined to cover for it.
     """
+    # A layer explanation from the guided-reading loop is long, substantive and
+    # about a paper — everything this function looks for — but it is already
+    # being recorded, in the reader's own words rather than the assistant's.
+    # Filing it here would duplicate the material in the weaker shape.
+    if layer_format.is_layer(content):
+        return False
     floor = MIN_PAPER_ANSWER_CHARS if paper_context else MIN_ANSWER_CHARS
     if not content or len(content) < floor:
         return False
