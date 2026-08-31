@@ -196,6 +196,61 @@ def end(state: dict) -> dict:
     return new
 
 
+def _rendered_sections(blocks: list) -> dict:
+    """{thesis: restatement} for each layer section present on the page.
+
+    The thesis is the match key rather than a hidden id, because it is the one
+    thing a reader has no reason to retype: they came to edit the sentence
+    inside, not the label on the outside. When they do change the label the
+    match is lost, and that is reported rather than guessed — a mis-attached
+    restatement would put someone's words under the wrong layer.
+    """
+    found = {}
+    for block in blocks:
+        if block.get('type') != 'toggle':
+            continue
+        children = (block.get('toggle') or {}).get('children') or []
+        body = next((c for c in children if c.get('type') == 'paragraph'), None)
+        found[_text_of(block)] = _text_of(body) if body else ''
+    return found
+
+
+def absorb(state: dict, blocks: list) -> tuple:
+    """Fold the page's own sentences back into the state before rewriting it.
+
+    Text is owned by the page and structure by the state. A reader edits these
+    pages by hand — that is why there is a skip list for the healers, a refusal
+    to archive a human-edited duplicate, and a caption repair that moves no
+    blocks. A record whose entire purpose is to hold the reader's sentences must
+    not overwrite them with what was stored last time.
+
+    Args:
+        state: The stored state.
+        blocks: The record's blocks as they currently stand on the page, with
+          each section's children attached.
+
+    Returns:
+        A tuple `(state, missing)`: a new state carrying the page's text, and
+        the ids of passed layers whose section is no longer on the page. A
+        missing section is reported rather than silently recreated — the reader
+        may have deleted it on purpose.
+    """
+    rendered = _rendered_sections(blocks)
+    new = _copy(state)
+    missing = []
+    for node in new.get('nodes', []):
+        if node.get('status') != 'passed':
+            continue
+        thesis = node.get('thesis', '')
+        if thesis not in rendered:
+            missing.append(node.get('id'))
+            continue
+        text = rendered[thesis]
+        if text:                      # An empty section keeps the stored words.
+            node['restatement'] = text
+    return new, missing
+
+
 def format_depth(state) -> list:
     """Lines describing how far this paper has been taken, for a later question.
 
@@ -408,6 +463,22 @@ def write(page_id: str, state: dict, expect_title: str,
 
     start = record_start(blocks)
     doomed = blocks[start:] if start is not None else []
+    if doomed:
+        # The page has the last word on the sentences. Fetch each section's
+        # children so the reader's edits can be folded in before the rewrite
+        # replaces them; a top-level read alone would not see them.
+        attached = []
+        for block in doomed:
+            if block.get('type') == 'toggle':
+                block = dict(block)
+                kids = translate_fulltext.notion(
+                    'GET', '/blocks/%s/children' % block['id'])
+                block['toggle'] = dict(block['toggle'])
+                block['toggle']['children'] = kids.get('results', [])
+            attached.append(block)
+        state, missing = absorb(state, attached)
+        if missing:
+            report['missing_sections'] = missing
     new_blocks = render_blocks(state)
     report['archived'] = len(doomed)
     report['written'] = len(new_blocks)
