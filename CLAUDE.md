@@ -42,6 +42,19 @@ npm run build        # Compile TypeScript
 ./container/build.sh # Rebuild agent container
 ```
 
+The paper-processing scripts under `groups/main/research-papers/` are Python and
+have their own suite. CI runs it as its own step, after the TypeScript checks:
+
+```bash
+pip install -r requirements-dev.txt   # once
+pytest                                 # tests/ , offline, no Notion access
+```
+
+Tests live in `tests/` and reach the scripts through `tests/conftest.py`, which
+puts that directory on the path the same way the scripts reach each other. Only
+pure helpers are covered — anything that calls Notion is left to the dry-run
+flags the scripts already carry.
+
 Service management:
 ```bash
 # macOS (launchd)
