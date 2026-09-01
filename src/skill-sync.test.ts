@@ -123,6 +123,36 @@ describe('syncSkillDirs', () => {
     expect(fs.readdirSync(path.join(root, 'dst'))).toEqual(['browser']);
   });
 
+  it('follows a skill that is a symlink to somewhere else', () => {
+    // Managing skills from a dotfiles repository leaves ~/.claude/skills a tree
+    // of symlinks. Copying the link rather than what it points at puts a
+    // dangling link inside the container: the skill looks installed on the host
+    // and the command fails there for no visible reason.
+    const real = skill('elsewhere', 'private', 'private');
+    const src = path.join(root, 'linked');
+    fs.mkdirSync(src, { recursive: true });
+    fs.symlinkSync(path.join(real, 'private'), path.join(src, 'private'));
+
+    syncSkillDirs([src], path.join(root, 'dst'));
+
+    const at = path.join(root, 'dst', 'private');
+    expect(fs.lstatSync(at).isSymbolicLink()).toBe(false);
+    expect(installed('private')).toBe('private');
+  });
+
+  it('follows a symlink inside a skill too', () => {
+    const builtin = skill('builtin', 'browser', 'built-in');
+    const shared = path.join(root, 'shared.md');
+    fs.writeFileSync(shared, 'shared reference');
+    fs.symlinkSync(shared, path.join(builtin, 'browser', 'REFERENCE.md'));
+
+    syncSkillDirs([builtin], path.join(root, 'dst'));
+
+    const at = path.join(root, 'dst', 'browser', 'REFERENCE.md');
+    expect(fs.lstatSync(at).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(at, 'utf8')).toBe('shared reference');
+  });
+
   it('leaves the destination untouched when nothing is configured', () => {
     const dst = path.join(root, 'dst');
     fs.mkdirSync(dst, { recursive: true });
