@@ -31,6 +31,9 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verify_sections as vs
+import heading_bloat
+import list_markers
+import inline_emphasis
 from translate_fulltext import notion
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +77,34 @@ def _section_ranges(blocks):
     return ranges
 
 
+# How much richer a later copy must be to beat the one in its proper place.
+# Keep-richest exists to reject a copy cut short by a failed upload, and such a
+# copy is much smaller, not marginally so. Without this margin two re-uploads of
+# the same section are decided by a hair, which is how a page ended up with its
+# section 1.1 content living inside section 1.3: the later copy won by a few
+# characters and the correctly placed one was archived.
+RICHER_FACTOR = 1.5
+
+
+def choose_kept(occurrences):
+    """The copy of a duplicated section to keep, given them in document order.
+
+    Args:
+        occurrences: Section dicts as `verify_sections.group_sections` returns
+          them, in the order they appear on the page.
+
+    Returns:
+        The one to keep — the earliest, unless a later copy is substantially
+        richer, in which case the earlier one was truncated and losing it is the
+        point.
+    """
+    first = occurrences[0]
+    richest = max(occurrences, key=lambda s: s["chars"])
+    if richest["chars"] > first["chars"] * RICHER_FACTOR:
+        return richest
+    return first
+
+
 def dedupe_duplicates(page_id, blocks, apply):
     """Archive redundant duplicate sections keeping the richest copy. Scopes keys
     hierarchically (parent chain) exactly like verify_sections, so a subsection
@@ -99,7 +130,8 @@ def dedupe_duplicates(page_id, blocks, apply):
     for occ in scoped.values():
         if len(occ) < 2:
             continue
-        occ.sort(key=lambda s: s["chars"], reverse=True)   # keep the richest
+        keep = choose_kept(occ)                # position first, richness to break it
+        occ = [keep] + [o for o in occ if o is not keep]
         if not occ[0]["key"]:
             # Same rule the audit uses: an unlabelled title repeats legitimately,
             # so only archive a copy whose BODY matches the one being kept.
@@ -125,6 +157,71 @@ def dedupe_duplicates(page_id, blocks, apply):
     return len(to_archive)
 
 
+def apply_emphasis(page_id, findings, apply):
+    """Turn leftover markdown emphasis into an italic span."""
+    ids = [bid for f in findings if f.get("type") == "EMPHASIS_MARKER"
+           for bid in f.get("block_ids", [])]
+    fixed = 0
+    for bid in ids:
+        new = inline_emphasis.convert(notion("GET", f"/blocks/{bid}"))
+        if new is None:
+            continue
+        if apply:
+            notion("PATCH", f"/blocks/{bid}", {new["type"]: new[new["type"]]})
+            time.sleep(0.34)
+        fixed += 1
+    return fixed
+
+
+def strip_list_markers(page_id, findings, apply):
+    """Remove the bullet a list item kept from its markdown source."""
+    ids = [bid for f in findings if f.get("type") == "LIST_MARKER"
+           for bid in f.get("block_ids", [])]
+    fixed = 0
+    for bid in ids:
+        block = notion("GET", f"/blocks/{bid}")
+        new = list_markers.strip_marker(block)
+        if new is None:
+            continue
+        if apply:
+            kind = new["type"]
+            notion("PATCH", f"/blocks/{bid}", {kind: new[kind]})
+            time.sleep(0.34)
+        fixed += 1
+    return fixed
+
+
+def split_bloated_headings(page_id, findings, apply):
+    """Split headings that swallowed their paragraph, reporting how many moved.
+
+    Runs before the dedup on purpose. A heading carrying its body does not match
+    the same section's other copy, so while it stands the dedup cannot tell the
+    section was uploaded twice — the cosmetic defect is what hides the expensive
+    one. Splitting restores the heading text the other copy has, and the dedup
+    then sees a duplicate where it previously saw two different sections.
+
+    Blocks are inserted before the original is archived, so a failed insert
+    cannot leave the section empty.
+    """
+    ids = [bid for f in findings if f.get("type") == "HEADING_BLOAT"
+           for bid in f.get("block_ids", [])]
+    if not ids:
+        return 0
+    moved = 0
+    for bid in ids:
+        block = notion("GET", f"/blocks/{bid}")
+        pair = heading_bloat.split_block(block)
+        if pair is None:      # not a run-in title; the audit keeps reporting it
+            continue
+        if apply:
+            notion("PATCH", f"/blocks/{page_id}/children",
+                   {"children": list(pair), "after": bid})
+            notion("PATCH", f"/blocks/{bid}", {"archived": True})
+            time.sleep(0.34)
+        moved += 1
+    return moved
+
+
 def heal_verify(page_id: str, apply: bool = False) -> dict:
     from extract_paper_figures import arxiv_id_from_page
     arxiv = arxiv_id_from_page(page_id)
@@ -132,7 +229,18 @@ def heal_verify(page_id: str, apply: bool = False) -> dict:
     findings = result.get("findings", [])
     kinds = Counter(f.get("type") for f in findings)
     rep = {"page": page_id, "findings": dict(kinds), "deduped_blocks": 0,
-           "flags": []}
+           "split_headings": 0, "stripped_markers": 0, "emphasis_fixed": 0, "flags": []}
+    # Split first, then look again: a bloated heading hides its own section's
+    # duplicate from the dedup below, so the audit that ran before the split
+    # cannot be trusted to have reported one.
+    rep["split_headings"] = split_bloated_headings(page_id, findings, apply)
+    rep["stripped_markers"] = strip_list_markers(page_id, findings, apply)
+    rep["emphasis_fixed"] = apply_emphasis(page_id, findings, apply)
+    if rep["split_headings"] and apply:
+        result = audit(page_id, arxiv)
+        findings = result.get("findings", [])
+        kinds = Counter(f.get("type") for f in findings)
+        rep["findings"] = dict(kinds)
     # auto-repair DUPLICATE only, and only if the audit agrees one exists
     if kinds.get("DUPLICATE"):
         blocks = vs.fetch_blocks(page_id)

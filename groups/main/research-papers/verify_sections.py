@@ -155,6 +155,9 @@ def english_title(heading_text: str) -> str:
 
 
 import reference_section  # noqa: E402
+import heading_bloat  # noqa: E402  (threshold shared with the repair)
+import list_markers  # noqa: E402  (predicate shared with the repair)
+import inline_emphasis  # noqa: E402  (same, for markdown emphasis)
 
 
 def fetch_blocks(page_id: str) -> list:
@@ -692,8 +695,28 @@ def main() -> int:
     # The assembler sometimes emits a subsection title and its body as ONE heading
     # block, which renders as a wall of bold text and hides the section boundary
     # from every check that reads headings.
-    bloated = [b["id"] for b in blocks
-               if b["type"] in HEADING_TYPES and len(aq._block_text(b)) > 160]
+    bloated = [b["id"] for b in blocks if heading_bloat.is_bloated(b)]
+    # 1b1d. LIST_MARKER (no source needed): a list item that kept the bullet its
+    # markdown source wrote, so Notion's own bullet renders beside it.
+    marked = [b["id"] for b in blocks if list_markers.has_marker(b)]
+    # 1b1e. EMPHASIS_MARKER: markdown emphasis written as characters. Only blocks
+    # the repair can convert safely are reported, so the finding never names
+    # something nothing will act on.
+    starred = [b["id"] for b in blocks if inline_emphasis.convert(b) is not None]
+    if starred:
+        findings.append({
+            "type": "EMPHASIS_MARKER", "section": None,
+            "block_count": len(starred), "block_ids": starred[:50],
+            "detail": f"{len(starred)} block(s) show markdown emphasis as "
+                      f"asterisks instead of italics",
+        })
+    if marked:
+        findings.append({
+            "type": "LIST_MARKER", "section": None,
+            "block_count": len(marked), "block_ids": marked[:50],
+            "detail": f"{len(marked)} list item(s) still carry the bullet from "
+                      f"their source, so each line shows two",
+        })
     if bloated:
         findings.append({
             "type": "HEADING_BLOAT", "section": None,
