@@ -6,6 +6,7 @@ every healer out. Structure is owned by a machine-readable state block; the
 rendered sections are what a person reads.
 """
 import descent
+import reference_section
 
 
 def passed_node(node_id, thesis, restatement, parent=None):
@@ -343,3 +344,63 @@ class TestFindings:
                         if b.get("type") != "code"
                         and "원문과 어긋납니다." in text_of(b))
         assert links_in(carrying)[0].endswith("pageid#blockid")
+
+
+def a_page_with_a_record():
+    """A page shaped like the real thing: body, injected bibliography, record."""
+    def para(text):
+        return {"id": "b%d" % abs(hash(text)), "type": "paragraph",
+                "paragraph": {"rich_text": [{"plain_text": text,
+                                             "text": {"content": text}}]}}
+
+    def heading(text):
+        return {"id": "h%d" % abs(hash(text)), "type": "heading_1",
+                "heading_1": {"rich_text": [{"plain_text": text,
+                                             "text": {"content": text}}]}}
+
+    body = [heading("서론"), para("본문 문단입니다."),
+            heading("방법"), para("또 다른 본문 문단입니다.")]
+    bibliography = [heading("References"),
+                    para("[1] A. Author. A title. In Venue, 2020."),
+                    para("[2] B. Author. Another title. In Venue, 2021."),
+                    para("[3] C. Author. A third title. In Venue, 2022.")]
+    record = descent.render_blocks(a_state())
+    for i, block in enumerate(record):
+        block.setdefault("id", "r%d" % i)
+    return body, bibliography, record
+
+
+class TestTheRecordIsOutsideTheBody:
+    """Why the record can hold the reader's own sentences at all.
+
+    Every healer here works on `reference_section.body_blocks`. The record sits
+    past the injected bibliography, so none of them scan it: the maths healer
+    does not rewrite it, back-matter stripping does not archive it, and the
+    figure and table injectors anchor before it. If that ever stopped holding,
+    the healers would start rewriting the reader's own words on a five-minute
+    timer — silently, because every one of them would think it was doing its job.
+    """
+
+    def test_no_block_of_the_record_is_part_of_the_body(self):
+        body, bibliography, record = a_page_with_a_record()
+        blocks = body + bibliography + record
+
+        kept = {b["id"] for b in reference_section.body_blocks(blocks)}
+
+        assert not kept & {b["id"] for b in record}
+
+    def test_the_body_itself_survives(self):
+        body, bibliography, record = a_page_with_a_record()
+        blocks = body + bibliography + record
+
+        kept = [b["id"] for b in reference_section.body_blocks(blocks)]
+
+        assert kept == [b["id"] for b in body]
+
+    def test_new_content_is_anchored_before_the_bibliography(self):
+        body, bibliography, record = a_page_with_a_record()
+        blocks = body + bibliography + record
+
+        anchor = reference_section.body_end_anchor(blocks)
+
+        assert anchor == body[-1]["id"]

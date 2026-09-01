@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 
 import {
+  EXTRA_SKILLS_DIRS_ENV,
   SkillDirState,
   resolveExtraSkillDirs,
   syncSkillDirs,
@@ -160,5 +161,18 @@ describe('syncSkillDirs', () => {
     syncSkillDirs([], dst);
 
     expect(fs.readdirSync(dst)).toEqual([]);
+  });
+});
+
+describe('the documented environment variable', () => {
+  // .env.example is where an operator learns the name exists, and it cannot see
+  // the code. A rename on either side is silent: the sync finds nothing
+  // configured, and warns about nothing, because from its side nothing was.
+  it('is the one the code actually reads', () => {
+    const example = fs.readFileSync(
+      path.join(__dirname, '..', '.env.example'),
+      'utf8',
+    );
+    expect(example).toContain(`${EXTRA_SKILLS_DIRS_ENV}=`);
   });
 });

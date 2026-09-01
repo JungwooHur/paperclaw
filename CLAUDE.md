@@ -72,6 +72,27 @@ systemctl --user restart paperclaw
 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
 
+## A restart does NOT pick up merged code (the service runs `dist/`)
+
+`paperclaw.service` runs `node dist/index.js`, and nothing rebuilds it. So
+`systemctl --user restart paperclaw` after a merge relaunches the OLD compiled
+code, reports `active`, logs a clean startup, and looks in every way like the
+change took effect.
+
+Hit for real while turning on external skill loading: the feature's module did
+not exist in `dist/` at all, so the restart was a no-op and the skill silently
+never installed. `ls -l dist/<the new module>.js` is the direct check — a missing
+file, or an mtime older than the merge, means the running process does not have
+the change.
+
+**Always `npm run build` before restarting after a merge.**
+
+This is ungated. Unlike the healer units, `paperclaw.service` is a plain file in
+`~/.config/systemd/user/` with no copy in this repository, so there is nowhere to
+add an `ExecStartPre=` that would survive. Bringing it into `systemd/` as a
+symlinked unit with a build step is the fix; until then the rule is prose and
+prose is not a mechanism.
+
 ## systemd unit staleness (paper healer)
 
 The paper-page healers (back-matter, source-URL, math, furniture, figure, table cleanup) run **on the host** from `paperclaw-qa-heal.service` — NOT in the container. The installed unit lives at `~/.config/systemd/user/paperclaw-qa-heal.service`; the source of truth is `groups/main/research-papers/systemd/paperclaw-qa-heal.service`.
