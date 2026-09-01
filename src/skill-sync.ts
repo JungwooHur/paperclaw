@@ -10,6 +10,16 @@
 import fs from 'fs';
 import path from 'path';
 
+/**
+ * The environment variable that names extra skill sources.
+ *
+ * Declared once because it has two readers that cannot see each other: the code
+ * below, and `.env.example`, which is where an operator learns the name exists.
+ * A rename in one of them is silent — the sync simply finds nothing configured
+ * and warns about nothing, because from its side nothing was configured.
+ */
+export const EXTRA_SKILLS_DIRS_ENV = 'EXTRA_SKILLS_DIRS';
+
 /** What a configured skill directory turned out to be. */
 export type SkillDirState = 'ok' | 'missing' | 'empty';
 

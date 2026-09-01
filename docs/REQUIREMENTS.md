@@ -134,6 +134,50 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ---
 
+### Guided Reading (descent records)
+
+Decided while building the reading loop; kept here because none of it can be
+read off the code.
+
+- **The record lives on the paper page, not in a file.** The skill that drives
+  the reading writes an HTML file by default. A container's filesystem does not
+  survive the run, so a record written there is gone by the next question — and
+  the page is the thing the reader already returns to. The skill's own
+  precedence rule hands this choice to the project.
+- **It sits after the injected bibliography.** That placement is the whole
+  reason it is cheap: every healer works on the body, which by definition ends
+  where the reference list begins, so none of them scan the record. Gated by
+  `tests/test_descent.py::TestTheRecordIsOutsideTheBody` — if it ever stopped
+  holding, healers would rewrite the reader's own sentences on a timer.
+- **Structure is owned by the state, text by the page.** A restatement edited in
+  Notion wins over the stored one. The record exists to hold the reader's
+  sentences, so overwriting them would defeat it. Sections are matched by their
+  thesis, not by a hidden id, because the thesis is the one thing a reader has no
+  reason to retype.
+- **Discovery is separated from repair.** Mismatches between translation and
+  source are recorded, never corrected. The reader is editing the page while the
+  loop runs, and rewriting the body mid-session moves the ground under a layer
+  just explained.
+- **The teaching skill stays outside this public repository.** Only the field
+  labels of its layer format are declared here (`layer_format.py`), because the
+  build has to be able to check them. The skill is installed from a directory
+  named by `EXTRA_SKILLS_DIRS` and is invoked by slash command only — verified:
+  invoking it by name in prose does not load it, and the model answers in its own
+  way instead.
+
+### Terms
+
+- **Layer** — one step down the chain of whys, closed by the reader restating it
+  without the new words.
+- **Frontier** — a branch that was offered and not yet taken. Stored when
+  offered, not when chosen: a thread noticed once and never pulled is what
+  otherwise gets lost.
+- **Exit** — how a branch ended, and always one of three: *owned* (the reader
+  already had it), *floor* (nothing underneath), *boundary* (the next layer
+  leaves the paper's subject). Each is a complete answer, not a failure.
+- **Finding** — a mismatch between what the page says and what the source says,
+  recorded with the block it is about and left uncorrected.
+
 ## Integration Points
 
 ### WhatsApp

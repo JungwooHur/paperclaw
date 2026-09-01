@@ -20,6 +20,7 @@ import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  EXTRA_SKILLS_DIRS_ENV,
   inspectSkillDir,
   resolveExtraSkillDirs,
   syncSkillDirs,
@@ -197,7 +198,7 @@ function buildVolumeMounts(
   const skillsDst = path.join(groupSessionsDir, 'skills');
   const skillSources = [path.join(process.cwd(), 'container', 'skills')];
   const extra = resolveExtraSkillDirs(
-    process.env.EXTRA_SKILLS_DIRS,
+    process.env[EXTRA_SKILLS_DIRS_ENV],
     inspectSkillDir,
   );
   for (const warning of extra.warnings) logger.warn(warning);
