@@ -278,3 +278,59 @@ describe('stripSaveOffer', () => {
     expect(stripSaveOffer(t)).toBe(t.trim());
   });
 });
+
+// --- slash commands ---
+
+describe('formatMessages with a slash command', () => {
+  // A skill marked `disable-model-invocation` can only be reached by the user
+  // typing its slash command, and the runtime only expands one at the very start
+  // of the prompt. Wrapping it in <messages> moves it off position zero, so the
+  // skill silently never loads and the model answers in its own way instead —
+  // measured as a 5k-token difference in what reaches the model.
+  it('sends the command as the prompt itself', () => {
+    const result = formatMessages([
+      makeMsg({ content: '/first-principles x' }),
+    ]);
+    expect(result).toBe('/first-principles x');
+  });
+
+  it('ignores leading whitespace before the command', () => {
+    const result = formatMessages([makeMsg({ content: '  /skill arg' })]);
+    expect(result).toBe('/skill arg');
+  });
+
+  it('drops a trigger prefix so a group that needs one still works', () => {
+    const result = formatMessages([
+      makeMsg({ content: '@Claude Paper Reviewer /skill arg' }),
+    ]);
+    expect(result).toBe('/skill arg');
+  });
+
+  it('uses the newest command when several messages arrive together', () => {
+    const result = formatMessages([
+      makeMsg({ id: '1', content: 'earlier chatter' }),
+      makeMsg({ id: '2', content: '/skill arg' }),
+    ]);
+    expect(result).toBe('/skill arg');
+  });
+
+  it('leaves a message that merely contains a slash alone', () => {
+    const result = formatMessages([makeMsg({ content: 'see src/index.ts' })]);
+    expect(result).toContain('<messages>');
+  });
+
+  it('leaves a path typed at the start alone', () => {
+    const result = formatMessages([
+      makeMsg({ content: '/home/jw is my home' }),
+    ]);
+    expect(result).toContain('<messages>');
+  });
+
+  it('is not fooled by an older command once real chat follows', () => {
+    const result = formatMessages([
+      makeMsg({ id: '1', content: '/skill arg' }),
+      makeMsg({ id: '2', content: '그건 무슨 뜻이야?' }),
+    ]);
+    expect(result).toContain('<messages>');
+  });
+});
