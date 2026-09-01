@@ -78,18 +78,58 @@ def expand(group: str) -> list:
             out.append(int(part.strip()))
     return out
 
-_BIB_ITEM = re.compile(r'<li[^>]+id="bib\.bib(\d+)"[^>]*>(.*?)</li>', re.S | re.I)
+# arXiv numbers a bibliography's ids `bib.bib7` when entries are cited by number
+# and `bib.bibx7` when they are cited by an author-initials label. The `x` is the
+# only structural difference between the two, and missing it made every
+# alphabetically-cited paper report "no bibliography in source" — which reads as
+# a paper without references rather than as a parser that could not see them.
+_BIB_ITEM = re.compile(r'<li[^>]+id="bib\.bibx?(\d+)"[^>]*>(.*?)</li>',
+                       re.S | re.I)
+# The label the body actually cites: `[7]` in a numeric list, `[ACDE12]` in an
+# alphabetic one. It is stripped from the entry text, because it is written back
+# as the entry's own marker and would otherwise appear twice.
+_BIB_TAG_OPEN = re.compile(
+    r'<span[^>]*class="[^"]*ltx_tag_bibitem[^"]*"[^>]*>', re.I)
+_SPAN_EDGE = re.compile(r'<span\b|</span>', re.I)
+
+
+def _tag_span(body: str):
+    """(inner_html, start, end) of the label's span, or None.
+
+    Walked rather than matched: a label like `[DGV+18]` puts its `+` in a
+    superscript that contains a span of its own, so stopping at the first
+    closing tag reads the label as `DGV+` and leaves `18]` stranded at the head
+    of the entry text — where it then looks like part of the citation.
+    """
+    open_tag = _BIB_TAG_OPEN.search(body)
+    if not open_tag:
+        return None
+    depth, at = 1, open_tag.end()
+    while depth:
+        edge = _SPAN_EDGE.search(body, at)
+        if not edge:
+            return None
+        depth += 1 if edge.group(0).lower().startswith('<span') else -1
+        at = edge.end()
+    return body[open_tag.end():at - len('</span>')], open_tag.start(), at
 _SECTION = re.compile(r'<section[^>]+id="(S\d+)"[^>]*>.*?<h2[^>]*>(.*?)</h2>', re.S | re.I)
-_ANCHOR = re.compile(r'href="#bib\.bib(\d+)"')
+_ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)"')
 
 
 def parse_bibliography(html: str) -> list:
     """[{num, text}] for every entry in the source's reference list, in order."""
     out = []
     for m in _BIB_ITEM.finditer(html):
-        text = ef._clean(m.group(2))
+        body = m.group(2)
+        tag = _tag_span(body)
+        label = ef._clean(tag[0]).strip() if tag else ""
+        if tag:
+            body = body[:tag[1]] + body[tag[2]:]
+        text = ef._clean(body)
         if text:
-            out.append({"num": int(m.group(1)), "text": text})
+            out.append({"num": int(m.group(1)),
+                        "label": label.strip("[]").strip() or m.group(1),
+                        "text": text})
     out.sort(key=lambda e: e["num"])
     return out
 
@@ -212,7 +252,8 @@ def inject_references(page_id: str, entries: list, apply: bool) -> dict:
         blocks.append({"object": "block", "type": "paragraph",
                        "paragraph": {"rich_text": [
                            {"type": "text",
-                            "text": {"content": f"[{e['num']}] {e['text']}"[:2000]}}]}})
+                            "text": {"content":
+                                f"[{e.get('label') or e['num']}] {e['text']}"[:2000]}}]}})
     if not apply:
         return {}
     made = []
@@ -342,12 +383,9 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
 
     found = _find_refs_heading(blocks)
     if found and not force:
-        ref_ids = {}
-        for bid in found[1]:
-            blk = next((x for x in blocks if x["id"] == bid), None)
-            m = blk and re.match(r"\s*\[(\d+)\]", block_text(blk))
-            if m:
-                ref_ids[int(m.group(1))] = bid
+        by_id = {x["id"]: block_text(x) for x in blocks}
+        ref_ids = ref_ids_from_texts({bid: by_id.get(bid, "") for bid in found[1]},
+                                     entries)
         rep["refs"] = f"already present ({len(ref_ids)})"
     else:
         if found and force and apply:
@@ -415,6 +453,8 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
             time.sleep(0.2)
     # An author-year paper has no numeric markers to align at all; its citations
     # are linked by name, exactly.
+    rep["label_linked"] = link_labels(page_id, vs.fetch_blocks(page_id),
+                                      entries, ref_ids, apply)
     rep["author_year_linked"] = link_author_year(page_id, vs.fetch_blocks(page_id),
                                                  ay_index, ref_ids, entries_by_num, apply)
     return rep
@@ -442,6 +482,32 @@ _AY_LABEL = re.compile(r"^(.+?)\s*[\[(](\d{4}[a-z]?)[\])]")
 _AY_CITE = re.compile(
     r"([A-Z][\w.\-']*(?:\s+(?:and|&)\s+[A-Z][\w.\-']*)?(?:\s+et\s+al\.?)?)"
     r"[\s,]+(\d{4}[a-z]?)(?![\d])")
+
+
+def label_pattern(labels: list):
+    """A regex matching any of these citation labels where the body cites one.
+
+    An alphabetic bibliography labels its entries `[ACDE12]`, and the body cites
+    exactly that string, so the mapping is EXACT — none of the alignment
+    guessing the numeric path needs. What varies is only spacing: the
+    translation writes `[VSP+17]`, `[VSP + 17]` and `[ [RNSS18] ]` for the same
+    citation, so whitespace inside the label is matched loosely while the label
+    itself must match in full.
+
+    Args:
+        labels: The labels the bibliography defines.
+
+    Returns:
+        A compiled pattern whose group 1 is the label as the body wrote it. With
+        no labels it matches nothing, rather than matching everything.
+    """
+    if not labels:
+        return re.compile(r'(?!x)x')
+    # Longest first, so `[VSP17]` cannot be claimed by a label that is a prefix
+    # of it. The brackets around the group anchor both ends of the label.
+    parts = [r'\s*'.join(re.escape(t) for t in label.split())
+             for label in sorted(labels, key=len, reverse=True)]
+    return re.compile(r'\[\s*(' + '|'.join(parts) + r')\s*\]')
 
 
 def _ay_key(name: str, year: str) -> tuple:
@@ -490,6 +556,111 @@ def link_author_year(page_id: str, blocks: list, index: dict, ref_ids: dict,
         after = "".join(o["text"]["content"] if o.get("type") == "text"
                         else o.get("plain_text", "") for o in out)
         assert before == after, f"text changed in {b['id']}"   # link only
+        linked += hits
+        if apply:
+            notion("PATCH", f"/blocks/{b['id']}", {kind: {"rich_text": out}})
+            time.sleep(0.2)
+    return linked
+
+
+def ref_ids_from_texts(texts: dict, entries: list) -> dict:
+    """{entry number: block id} for reference blocks already on the page.
+
+    Keyed on the marker each block opens with, because that is what the block
+    has: matching on the number alone worked only for numeric bibliographies and
+    silently found nothing for a paper whose entries are labelled by author
+    initials — which read as "no references present" and rebuilt the list.
+
+    Args:
+        texts: {block id: the block's text}.
+        entries: The bibliography as parsed from the source.
+
+    Returns:
+        The mapping, skipping any block whose marker no entry claims.
+    """
+    # Whitespace is dropped entirely on both sides: the source writes
+    # `[VSP + 17]` and the translated body writes `[VSP+17]` for the same entry.
+    tight = lambda text: re.sub(r"\s+", "", text)
+    by_label = {tight(e["label"]): e["num"] for e in entries if e.get("label")}
+    found = {}
+    for bid, text in texts.items():
+        head = re.match(r"\s*\[([^\]]{1,32})\]", text or "")
+        if not head:
+            continue
+        num = by_label.get(tight(head.group(1)))
+        if num is not None:
+            found[num] = bid
+    return found
+
+
+def is_stale_marker(span: dict, labels) -> bool:
+    """Is this span a citation marker whose link needs re-pointing?
+
+    Rebuilding the reference list gives every entry a new block, so the links
+    already in the body point at blocks that are about to be archived. A linker
+    that skips anything already linked would leave the whole body pointing at
+    nothing — which reads exactly like the links working, until one is clicked.
+
+    Only a span that IS the marker qualifies. A link someone put on ordinary
+    prose is theirs and is left alone.
+    """
+    if span.get("type") != "text":
+        return False
+    linked = span.get("href") or (span.get("text") or {}).get("link")
+    if not linked:
+        return False
+    text = (span.get("text") or {}).get("content", "").strip()
+    return bool(text.startswith("[") and text.endswith("]")
+                and " ".join(text[1:-1].split()) in labels)
+
+
+def link_labels(page_id: str, blocks: list, entries: list, ref_ids: dict,
+                apply: bool) -> int:
+    """Link every `[ACDE12]` in the body to the entry that defines it.
+
+    Only alphabetic labels go through here. A numeric bibliography is cited as
+    `[7]`, which the numeric path already aligns section by section; a label is
+    unique text, so it needs no alignment at all and cannot be mapped wrong.
+    """
+    by_label = {e["label"]: e for e in entries
+                if e.get("label") and not e["label"].isdigit()}
+    pattern = label_pattern(list(by_label))
+    linked = 0
+    for b in body_blocks_of(blocks):
+        kind = b["type"]
+        spans = (b.get(kind) or {}).get("rich_text")
+        if not spans:
+            continue
+        out, hits = [], 0
+        for sp in spans:
+            stale = is_stale_marker(sp, set(by_label))
+            if sp.get("type") != "text" or (sp.get("href") and not stale):
+                out.append(sp)
+                continue
+            if stale:                      # drop the old target before relinking
+                sp = dict(sp, href=None,
+                          text=dict(sp.get("text") or {}, link=None))
+            text, pos = sp["text"]["content"], 0
+            for m in pattern.finditer(text):
+                entry = by_label.get(" ".join(m.group(1).split()))
+                if entry is None or entry["num"] not in ref_ids:
+                    continue
+                if pos < m.start():
+                    out.append(_clone(sp, text[pos:m.start()]))
+                out.append(_clone(sp, m.group(0),
+                                  link=_link(page_id, ref_ids[entry["num"]],
+                                             entry["text"])))
+                pos = m.end()
+                hits += 1
+            if pos < len(text):
+                out.append(_clone(sp, text[pos:]))
+        if not hits:
+            continue
+        before = "".join(s.get("plain_text", "") for s in spans)
+        after = "".join(o["text"]["content"] if o.get("type") == "text"
+                        else o.get("plain_text", "") for o in out)
+        assert before == after, f"text changed in {b['id']}"   # link only
+        out = coalesce(out)
         linked += hits
         if apply:
             notion("PATCH", f"/blocks/{b['id']}", {kind: {"rich_text": out}})

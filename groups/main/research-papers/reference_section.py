@@ -26,7 +26,23 @@ the other healers target — is full of Korean.
 """
 import re
 
-_ENTRY = re.compile(r"\s*\[\d+\]\s")
+# An entry opens with the label the paper cites it by. Numeric styles write
+# `[7]`; author-initials styles write `[ACDE12]` or `[VSP + 17]`. Both have to
+# be recognised, because everything downstream depends on this boundary: a
+# bibliography it cannot see is body, and back-matter stripping cuts from the
+# References heading to the end of the page.
+#
+# A label either carries a number — a year or an index, possibly with a
+# disambiguating letter after it (`[RRBS19a]`) — or is a short bare tag for a
+# corporate author (`[Fou]`). Requiring one of those keeps an ordinary
+# sentence that opens with a bracketed aside ("[see below] for the
+# derivation") from being read as an entry, which is the false positive that
+# would move the boundary into the body.
+_LABEL = (r"\[(?:"
+          r"[A-Za-z0-9+. ]*\d[A-Za-z0-9+.]*"   # carries a year or an index
+          r"|[A-Za-z]{1,6}"                     # or is a short bare tag
+          r")\]")
+_ENTRY = re.compile(r"\s*" + _LABEL + r"\s")
 _KOREAN = re.compile(r"[가-힣]")
 MIN_ENTRIES = 3
 ENTRY_SHARE = 0.8
