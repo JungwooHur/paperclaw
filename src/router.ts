@@ -1,4 +1,5 @@
 import { Channel, NewMessage } from './types.js';
+import { TRIGGER_PATTERN } from './config.js';
 
 export function escapeXml(s: string): string {
   if (!s) return '';
@@ -9,7 +10,35 @@ export function escapeXml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
+// A slash command names a skill, and a skill marked `disable-model-invocation`
+// can be reached NO other way — the model is not allowed to invoke it, so if the
+// command does not expand, nothing happens and the model answers in its own way
+// instead. The runtime only expands one at the very start of the prompt, and the
+// <messages> wrapper below moves it off position zero. Measured: the same
+// command reached the model with 5k fewer tokens wrapped than unwrapped, exactly
+// the size of the skill body that failed to load.
+//
+// The first token must be a bare command name. `/home/jw is my home` opens with
+// a slash and is a path, not a command, so the token may not itself contain one.
+const SLASH_COMMAND = /^\/[a-z][a-z0-9_-]*(\s|$)/i;
+
+/** The command a message carries, with any trigger prefix removed, or null. */
+function slashCommandIn(message: NewMessage): string | null {
+  const text = message.content.replace(TRIGGER_PATTERN, '').trim();
+  return SLASH_COMMAND.test(text) ? text : null;
+}
+
 export function formatMessages(messages: NewMessage[]): string {
+  // Only the newest message counts. An older command followed by ordinary chat
+  // is a conversation that has moved on, and re-invoking the skill there would
+  // restart something the user is in the middle of.
+  const newest = messages[messages.length - 1];
+  const command = newest ? slashCommandIn(newest) : null;
+  if (command) {
+    // Sender and timestamp are dropped for this one turn. The session is
+    // resumed, so the conversation around it is already in context.
+    return command;
+  }
   const lines = messages.map(
     (m) =>
       `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`,
