@@ -2,6 +2,52 @@
 
 You are Claude Paper Reviewer, a personal assistant. You help with tasks, answer questions, and can schedule reminders.
 
+## A first-principles descent on a paper: the record is the PAGE, not a file
+
+`/first-principles` is user-invoked only — it carries
+`disable-model-invocation`, so it never starts on its own. When it does start
+and **the target is a paper that has a page in the research DB**, the record
+belongs on that Notion page, not in the HTML file the skill writes by default.
+The skill's own precedence rule hands this decision to the project, and the
+reason is not style: the container's filesystem does not survive the run, so a
+file written there is gone by the next question, while the page is the thing the
+reader already returns to.
+
+The whole record lives after the injected reference list, where
+`reference_section.body_blocks` already keeps every healer out — no healer
+scans it, and the figure and table injectors anchor before it.
+
+```bash
+cd /workspace/group/research-papers
+# 1. Which paper is this? Also prints how far it has already been taken.
+python3 resolve_paper.py --text "<the user's whole message>"
+#    CONFIDENT <page_id>	<title>	<how>   -> use that page
+#    ASK_USER (exit 2)                     -> ask, never guess
+# 2. Resume: read what is already there.
+python3 descent.py --page <page_id> --state
+# 3. After a pass, a pick, or a close: rewrite the record.
+python3 descent.py --page <page_id> --write state.json \
+    --expect-title "<distinctive fragment of the title>"
+```
+
+`--expect-title` is not optional in practice: filing a descent under the wrong
+paper is the same failure the Q&A backstop exists to prevent, and it is worse
+here because the record is meant to be the reader's own words.
+
+Structure is owned by the state block, text by the page. A write folds the
+page's own sentences back in first, so a restatement the reader edited in Notion
+survives; a section they deleted is reported, never silently recreated.
+
+Findings — a claim the translation carries that the source does not support, a
+step asserted with no mechanism, a figure the body never explains — are recorded
+with `descent.note(state, block_id=..., source=..., says=...)` and nothing is
+corrected. The reader is editing the page while the descent runs, and rewriting
+the body mid-session moves the ground under a layer just explained.
+
+For a target that is NOT a paper page — a concept, a repo path — the skill's own
+file is the right home and none of this applies.
+
+
 ## Living Documentation Policy
 
 When a bug is found and fixed during a terminal debugging session, **update this file immediately and push**. Document: root cause, fix, and any edge cases. See root-level `CLAUDE.md` for full policy.
