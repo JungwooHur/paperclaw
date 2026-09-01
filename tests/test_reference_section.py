@@ -72,3 +72,50 @@ class TestBodyEndAnchor:
     def test_is_none_when_the_page_has_no_reference_list(self):
         blocks = [heading("1 Introduction"), para("본문.")]
         assert rs.body_end_anchor(blocks) is None
+
+
+class TestAnAlphabeticBibliography:
+    """Not every paper numbers its references.
+
+    An author-initials style writes `[ACDE12]` where a numeric one writes `[1]`.
+    The boundary has to recognise both, because everything downstream depends on
+    it: a bibliography the boundary cannot see is body, and back-matter
+    stripping cuts from the `References` heading to the end of the page.
+    """
+
+    def test_an_alphabetic_entry_is_an_entry(self):
+        assert rs.is_entry(para("[ACDE12] A. Author. A title."))
+
+    def test_a_label_with_spaces_is_too(self):
+        assert rs.is_entry(para("[VSP + 17] D. Fourth et al."))
+
+    def test_a_numeric_entry_still_is(self):
+        assert rs.is_entry(para("[1] A. Author. A title."))
+
+    def test_a_translated_entry_is_still_rejected(self):
+        # A Korean bibliography is the thing the healers exist to remove; only
+        # the injected English one is protected.
+        assert not rs.is_entry(
+            para("[ACDE12] 저자. 어떤 제목. 학회, 2012."))
+
+    def test_a_sentence_opening_with_a_bracket_is_not_an_entry(self):
+        assert not rs.is_entry(
+            para("[see below] for the derivation of this bound"))
+
+    def test_a_list_of_alphabetic_entries_looks_like_one(self):
+        items = [para("[ACDE12] A. Author. A title."),
+                 para("[BXY13] B. Second. Another."),
+                 para("[CZW14] C. Third. A third.")]
+        assert rs.looks_like_list(items)
+
+    def test_a_label_with_a_disambiguating_letter_is_an_entry(self):
+        assert rs.is_entry(para("[RRBS19a] J. Third. A paper. 2019."))
+
+    def test_a_label_with_no_year_is_an_entry(self):
+        assert rs.is_entry(para("[Fou] The Common Crawl Foundation. Common crawl."))
+
+    def test_a_superscript_style_label_is_an_entry(self):
+        assert rs.is_entry(para("[DGV+18] M. First, S. Second, et al. A title."))
+
+    def test_a_bracketed_english_aside_is_still_not_an_entry(self):
+        assert not rs.is_entry(para("[see below] for the derivation of this bound"))
