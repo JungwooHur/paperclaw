@@ -98,17 +98,38 @@ _STAMP_MARGIN_FRAC = 0.10    # ...entirely within this much of the outer margin
 _BACKGROUND_AREA_FRAC = 0.8  # a box this big is a page background, not content
 
 
-def _caption_re(kind: str, num: int):
-    """Matches a `Figure 7:` / `Fig. 7:` / `Table 3.` caption opener for one number.
+# The sweep that enumerates every caption on a page. It has to agree with
+# `caption_opener` above, which matches one known number: when only one of the
+# two learned that `Fig.` is as common as `Figure`, the other kept the whole PDF
+# path at zero, and the identical split happened again over the separator. Both
+# now allow it to be absent.
+ANY_CAPTION = re.compile(r"\s*(Fig\.?|Figure|Table|TABLE)\s*0*(\d+)(?!\d)\s*[:.]?",
+                         re.I)
 
-    IEEE-style papers write `Fig. 7:`, and accepting only the long form made
-    `crop_box` return None for EVERY caption on such a PDF — 15 of 15 — so the whole
-    PDF figure path found nothing while reporting no error. The same long-form-only
-    assumption existed in the caption scan in `render_media`; both are fixed, and
-    both are needed: one finds the caption, the other locates its box.
+
+def caption_opener(kind: str, num: int):
+    """Matches the opening of the caption for one figure or table number.
+
+    Every difference in how a paper punctuates this has cost a silent zero, and
+    the failure always looks the same from outside: the PDF path finds nothing,
+    reports no error, and the page simply comes out without figures.
+
+    Two are known. IEEE-style papers write `Fig. 7:` where only `Figure 7:` was
+    accepted — 15 of 15 captions unmatched. And a paper may write no separator at
+    all, running the caption straight into its text (`Figure 1 Language modeling
+    performance improves…`) — 24 of 24 unmatched, which is what a whole paper
+    with no figures looks like.
+
+    So the separator is optional, and what keeps `Figure 1` from claiming
+    `Figure 12` is the digit boundary rather than the punctuation that used to
+    follow. Leading zeros are allowed because some PDFs pad the number.
     """
     word = r"(?:Fig\.?|Figure)" if kind == "figure" else r"(?:Table|TABLE)"
-    return re.compile(rf"^\s*{word}\s*0*{num}\s*[:.]", re.I)
+    return re.compile(rf"^\s*{word}\s*0*{num}(?!\d)\s*[:.]?", re.I)
+
+
+# The old name, kept because several call sites read better with it.
+_caption_re = caption_opener
 
 
 def _spans(block):
@@ -478,11 +499,7 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
             blocks = [b for b in page.get_text("dict")["blocks"]
                       if b.get("type") == 0]
             for b in blocks:
-                # `Fig. 4:` is as common as `Figure 4:` in IEEE-style papers, and
-                # requiring the long form matched ZERO captions on one such PDF —
-                # so every PDF-side figure path silently found nothing there.
-                m = re.match(r"\s*(Fig\.?|Figure|Table|TABLE)\s*0*(\d+)\s*[:.]",
-                             _block_text(b), re.I)
+                m = ANY_CAPTION.match(_block_text(b))
                 if m and only is not None and int(m.group(2)) not in only:
                     continue
                 if not m:
@@ -816,7 +833,15 @@ def _anchor_for(kind: str, num: int, blocks: list):
     # citing it sat chapters earlier.
     ref = re.compile(rf"(?:{words})\s*0*{num}(?![0-9])", re.I)
     for b in blocks:
-        if b["type"] in ef.TEXT_TYPES and ref.search(ef._block_text(b)):
+        if b["type"] not in ef.TEXT_TYPES:
+            continue
+        text = ef._block_text(b)
+        # Another float's caption mentioning this number is a cross-reference.
+        # Anchoring to it puts the figure under an unrelated one — see
+        # `extract_paper_figures.caption_number`.
+        if ef._is_other_caption(text, kind, num):
+            continue
+        if ref.search(text):
             return b["id"]
     return None
 

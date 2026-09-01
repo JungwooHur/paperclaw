@@ -209,6 +209,46 @@ def _block_text(b: dict) -> str:
                    for x in (b.get(t) or {}).get("rich_text", []))
 
 
+# A block that OPENS with a float's own label is that float's caption. The
+# separator is required here — on the page a caption is written `Figure 1: …`,
+# while a body sentence runs straight on ("Figure 13에서 우리는 …") and is exactly
+# the mention a figure should be anchored to.
+_CAPTION_OPENER = re.compile(
+    r"^\s*(그림|Figure|Fig\.?|표|Table)\s*0*(\d+)\s*[:.]", re.I)
+
+
+def caption_number(text: str):
+    """`(kind, number)` if this text opens as a float's caption, else None.
+
+    Captions cross-reference each other — one figure's caption saying "compare
+    with Figure 13" is a mention of 13, and it is the FIRST one on the page. The
+    anchor rule then put Figure 13 directly under Figure 1, chapters from the
+    text that discusses it. Knowing which block is whose caption is what lets
+    the scan step over that.
+    """
+    found = _CAPTION_OPENER.match(text or "")
+    if not found:
+        return None
+    word = found.group(1).lower()
+    kind = "table" if word in ("표", "table") else "figure"
+    return kind, int(found.group(2))
+
+
+def _is_other_caption(text: str, kind: str, num) -> bool:
+    """Is this block the caption of a DIFFERENT float than the one being placed?"""
+    own = caption_number(text)
+    if own is None:
+        return False
+    return own != (kind, num if isinstance(num, int) else _as_int(num))
+
+
+def _as_int(num):
+    try:
+        return int(str(num))
+    except (TypeError, ValueError):
+        return None
+
+
 def _anchor_for(num, blocks: list):
     """Block id to insert a figure `num` after: first body mention of the figure
     number, else the section heading whose number matches, else None (page end)."""
@@ -224,7 +264,12 @@ def _anchor_for(num, blocks: list):
     # there while the text that cites them sat chapters earlier.
     ref = re.compile(rf"(?:그림|Figure|Fig\.?)\s*0*{re.escape(str(num))}(?![0-9]|\.[0-9])")
     for b in blocks:
-        if b["type"] in TEXT_TYPES and ref.search(_block_text(b)):
+        if b["type"] not in TEXT_TYPES:
+            continue
+        text = _block_text(b)
+        if _is_other_caption(text, "figure", num):
+            continue          # a cross-reference, not where this figure belongs
+        if ref.search(text):
             return b["id"]
     letter = re.match(r"([A-Za-z])\.", str(num))
     if letter:
