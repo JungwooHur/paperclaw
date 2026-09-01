@@ -44,6 +44,23 @@ with `descent.note(state, block_id=..., source=..., says=...)` and nothing is
 corrected. The reader is editing the page while the descent runs, and rewriting
 the body mid-session moves the ground under a layer just explained.
 
+### While a descent is open, the default reading of a message changes
+
+`resolve_paper.py` prints `current=<node>` when a descent on that paper is still
+open. That line is the mode signal, and it exists because the alternative —
+remembering across container restarts — is not available: a container exits
+between messages, and the next one starts from the page, not from memory.
+
+While it is present, an incoming message is a **restatement** by default and a
+question only when it is clearly one. Getting this backwards is not a small
+error: a restatement answered as a question skips the gate the whole method
+rests on, and the reader is told nothing — they simply get an explanation back
+where they expected to be let through or held.
+
+A descent ends only when the reader says so. There is no expiry, deliberately:
+state that moves while nobody is looking is a failure this project has already
+paid for more than once.
+
 For a target that is NOT a paper page — a concept, a repo path — the skill's own
 file is the right home and none of this applies.
 
