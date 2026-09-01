@@ -65,12 +65,41 @@ export function resolveExtraSkillDirs(
 }
 
 /**
+ * Copies a tree, resolving every symlink on the way rather than copying links.
+ *
+ * `fs.cpSync`'s own `dereference` only applies to the top of the copy, so a
+ * symlink nested inside a skill still arrives as a link. Written out here
+ * because the difference is invisible until it matters: the host resolves those
+ * links fine, and only the container — where the path they point at does not
+ * exist — finds nothing.
+ */
+function copyResolved(src: string, dst: string): void {
+  // statSync follows symlinks, so this is the resolved thing at every level.
+  if (fs.statSync(src).isDirectory()) {
+    fs.mkdirSync(dst, { recursive: true });
+    for (const entry of fs.readdirSync(src)) {
+      copyResolved(path.join(src, entry), path.join(dst, entry));
+    }
+    return;
+  }
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  fs.copyFileSync(src, dst);
+}
+
+/**
  * Copies every skill in `sources` into `dst`, in order.
  *
  * Later sources overwrite earlier ones, so a configured directory can replace a
  * built-in skill of the same name. Only directories are copied: a README sitting
  * beside the skills is not a skill, and installing it would put a file into the
  * agent's skill list that no command can load.
+ *
+ * Symlinks are resolved rather than copied as links. Managing skills from a
+ * dotfiles repository leaves the skill directory a tree of symlinks into that
+ * repository, and those paths do not exist inside the container — so copying the
+ * link installs a dangling one. It reads correctly on the host, which is what
+ * makes it worth spelling out: the skill looks present everywhere you would
+ * check, and only the agent finds nothing there.
  */
 export function syncSkillDirs(sources: string[], dst: string): void {
   for (const src of sources) {
@@ -78,7 +107,7 @@ export function syncSkillDirs(sources: string[], dst: string): void {
     for (const entry of fs.readdirSync(src)) {
       const srcDir = path.join(src, entry);
       if (!fs.statSync(srcDir).isDirectory()) continue;
-      fs.cpSync(srcDir, path.join(dst, entry), { recursive: true });
+      copyResolved(srcDir, path.join(dst, entry));
     }
   }
 }
