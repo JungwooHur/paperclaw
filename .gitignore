@@ -46,6 +46,9 @@ groups/main/research-papers/*
 !groups/main/research-papers/link_references.py
 !groups/main/research-papers/reference_section.py
 !groups/main/research-papers/layer_format.py
+!groups/main/research-papers/heading_bloat.py
+!groups/main/research-papers/list_markers.py
+!groups/main/research-papers/inline_emphasis.py
 !groups/main/research-papers/descent.py
 !groups/main/research-papers/resolve_paper.py
 !groups/main/research-papers/heal_verify.py
