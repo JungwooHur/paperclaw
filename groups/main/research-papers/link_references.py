@@ -152,6 +152,72 @@ def source_citation_sequence(html: str) -> dict:
     return out
 
 
+_TOP_SECTION = re.compile(r'<section[^>]+id="(S\d+)"[^>]*>', re.I)
+_LTX_PARA = re.compile(r'<p[^>]*class="[^"]*ltx_p[^"]*"[^>]*>(.*?)</p>', re.S | re.I)
+
+
+def source_citation_paragraphs(html: str) -> dict:
+    """{section_key: [[numbers cited in each paragraph], ...]} from the source.
+
+    A finer reading of the same anchors `source_citation_sequence` uses. Some
+    translations renumber citations LOCALLY — the markers restart at `[1]` in
+    every paragraph — so the number carries no meaning across the section and a
+    whole-section alignment can verify nothing at all. What survives is the
+    order inside a paragraph, and a paragraph is small enough that equal counts
+    are evidence rather than coincidence.
+
+    Nested subsections belong to their parent: the page splits a section into
+    `IV-A`, `IV-B`, while the source's section IS the whole thing.
+
+    Paragraphs with no citation are dropped from both sides, since they cannot
+    be aligned against anything and keeping them would throw the two sequences
+    out of step.
+    """
+    marks = [(m.start(), m.group(1)) for m in _TOP_SECTION.finditer(html)]
+    bounds = [m[0] for m in marks] + [len(html)]
+    out = {}
+    for i, (pos, sid) in enumerate(marks):
+        body = html[pos:bounds[i + 1]]
+        title = re.search(r'<h2[^>]*>(.*?)</h2>', body, re.S | re.I)
+        key = vs.section_key(ef._clean(title.group(1))) if title else None
+        if not key:
+            continue
+        paras = []
+        for para in _LTX_PARA.findall(body):
+            nums = [int(x) for x in _ANCHOR.findall(para)]
+            if nums:
+                paras.append(nums)
+        if paras:
+            out.setdefault(key, []).extend(paras)
+    return out
+
+
+def align_paragraphs(page_paras: list, source_paras: list) -> list:
+    """Map each page paragraph's citations onto the source's, or give up on it.
+
+    Args:
+        page_paras: Per paragraph, the `(block id, number)` slots as the page
+          writes them.
+        source_paras: Per paragraph, the reference numbers the source cites.
+
+    Returns:
+        Per page paragraph, the slots rewritten to the source's numbers — empty
+        for a paragraph whose count does not match, and empty overall when the
+        two sides do not even have the same number of paragraphs, since one
+        paragraph split or merged in translation puts everything after it out of
+        step and a count that then matches matches by accident.
+    """
+    if not page_paras or len(page_paras) != len(source_paras):
+        return []
+    mapped = []
+    for slots, want in zip(page_paras, source_paras):
+        if len(slots) != len(want):
+            mapped.append([])
+            continue
+        mapped.append([(bid, true) for (bid, _old), true in zip(slots, want)])
+    return mapped
+
+
 def page_citation_slots(blocks: list) -> dict:
     """{section_key: [(block, span_index, group_text) ...]} in reading order."""
     out, cur = {}, None
@@ -164,6 +230,71 @@ def page_citation_slots(blocks: list) -> dict:
         for m in _CITE.finditer(block_text(b)):
             for num in expand(m.group(1)):
                 out.setdefault(cur, []).append((b["id"], num))
+    return out
+
+
+def source_key_for(key: str, source_keys):
+    """The source section this page section belongs to, or None.
+
+    The source numbers its sections at the top level — `IV` — while the
+    translated page carries the subsections it is made of: `IV-A`, `IV-B`. Pairing
+    on the exact key alone therefore matched nothing on such a paper, and every
+    section was skipped: the reference list went in and not one citation was
+    linked.
+
+    Args:
+        key: A section key as it appears on the page.
+        source_keys: The keys the source provides.
+
+    Returns:
+        The matching source key, trying the key itself first and then dropping
+        one trailing component at a time, or None when nothing matches.
+    """
+    while key:
+        if key in source_keys:
+            return key
+        cut = max(key.rfind('-'), key.rfind('.'))
+        if cut <= 0:
+            return None
+        key = key[:cut]
+    return None
+
+
+def fold_slots(slots: dict, source_keys) -> dict:
+    """Regroup a page's citation slots under the source sections they belong to.
+
+    Subsections are contiguous and in reading order, so a parent's citation
+    sequence is simply its own slots followed by its subsections' — which is
+    exactly what the source records for that section. A page section the source
+    does not have at all is dropped rather than kept: it could never be paired,
+    and carrying it would only report a skip that means nothing.
+    """
+    folded = {}
+    for key, page_slots in slots.items():
+        owner = source_key_for(key, source_keys)
+        if owner is None:
+            continue
+        folded.setdefault(owner, []).extend(page_slots)
+    return folded
+
+
+def page_citation_paragraphs(blocks: list) -> dict:
+    """{section_key: [[(block id, number), ...] per paragraph]} in reading order.
+
+    The paragraph-level twin of `page_citation_slots`. Subsections fold into
+    their parent, because that is the unit the source records.
+    """
+    out, cur = {}, None
+    for b in blocks:
+        if HEADING_LEVEL.get(b["type"]):
+            cur = vs.section_key(block_text(b))
+            continue
+        if cur is None or b["type"] not in vs.BODY_TYPES:
+            continue
+        slots = [(b["id"], num) for m in _CITE.finditer(block_text(b))
+                 for num in expand(m.group(1))]
+        if slots:
+            out.setdefault(cur, []).append(slots)
     return out
 
 
@@ -400,11 +531,24 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
         rep["refs"] = f"{'injected' if apply else 'would inject'} {len(entries)}"
 
     src = source_citation_sequence(html)
-    slots = page_citation_slots(blocks)
+    slots = fold_slots(page_citation_slots(blocks), set(src))
+    # The paragraph-level reading is the fallback for a section the whole-section
+    # alignment cannot verify — which is every section of a paper whose citations
+    # were renumbered per paragraph, and those pages currently get nothing.
+    src_paras = source_citation_paragraphs(html)
+    page_paras = fold_slots(page_citation_paragraphs(blocks), set(src_paras))
     plan = {}
     for key, page_slots in slots.items():
         want = src.get(key)
         if not want or len(want) != len(page_slots):
+            by_para = align_paragraphs(page_paras.get(key, []),
+                                       src_paras.get(key, []))
+            recovered = [pair for para in by_para for pair in para]
+            if recovered:
+                plan[key] = ([(bid, 0) for bid, _ in recovered],
+                             [true for _, true in recovered])
+                rep.setdefault("by_paragraph", {})[key] = len(recovered)
+                continue
             rep["sections_skipped"] += 1
             continue
         # Equal counts are necessary, not sufficient. The translation renumbers a
