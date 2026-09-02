@@ -1,4 +1,6 @@
 import fs from 'fs';
+import { spawn } from 'child_process';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -42,6 +44,7 @@ import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { qaFollowupCommand, worthFilingCheck } from './qa-followup.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -55,6 +58,30 @@ let messageLoopRunning = false;
 let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+/**
+ * Files a paper Q&A right after the answer goes out, so it does not wait for the
+ * five-minute backstop. Deliberately fire-and-forget: the reply has already been
+ * sent, the timer is still the safety net, and a failure here must never turn
+ * into a failed message.
+ */
+function fileAnsweredQa(chatJid: string, reply: string): void {
+  if (!worthFilingCheck(reply)) return;
+  const { cmd, args } = qaFollowupCommand({
+    projectRoot: process.cwd(),
+    chatJid,
+    lockFile: path.join(os.tmpdir(), 'paperclaw-auto-save-qa.lock'),
+  });
+  try {
+    const child = spawn(cmd, args, { detached: true, stdio: 'ignore' });
+    child.on('error', (err: Error) =>
+      logger.warn({ err: err.message }, 'qa follow-up could not start'),
+    );
+    child.unref();
+  } catch (err) {
+    logger.warn({ err: String(err) }, 'qa follow-up could not start');
+  }
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -208,6 +235,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (text) {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
+        fileAnsweredQa(chatJid, text);
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
