@@ -58,25 +58,36 @@ REFS_HEADING = "References"
 # Deliberately NOT matching `[0,1]`-style intervals (no spaces around a comma is
 # ambiguous, so a group must be either a single number or comma-separated with the
 # same shape the translator emits).
-_CITE = re.compile(r"\[\s*(\d+(?:\s*[-\u2013,]\s*\d+)*)\s*\]")
+# A citation group. Numbers are the published form; a translation sourced from
+# NotebookLM's indexed text carries the LaTeX keys instead, unresolved —
+# `[ luo2024precise, rl100]` where the published HTML reads `[3, 7]`. A key
+# has no spaces inside it, which is what keeps `[see below]` out, and must
+# carry a letter, which keeps an arxiv id out.
+_KEY = r"[A-Za-z][A-Za-z0-9_+\-]*"
+_CITE = re.compile(
+    r"\[\s*(\d+(?:\s*[-\u2013,]\s*\d+)*"
+    r"|" + _KEY + r"(?:\s*,\s*" + _KEY + r")*)\s*\]")
 
 
 def expand(group: str) -> list:
-    """`1-5` -> [1,2,3,4,5]; `5, 7, 10` -> [5,7,10].
+    """The references a citation group names.
 
-    A range is not a formatting variant, it is N citations. Reading only the
-    comma form matched `[1-5]` not at all, so a section written in ranges counted
-    ZERO markers, never equalled the source's count, and was skipped every time —
-    which is why an introduction citing 25 works had none of them linked.
+    Numbers expand, including ranges (`1-3`). Keys are returned as they
+    are: they name an entry directly and there is nothing between two of
+    them to fill in.
     """
+    parts = [p.strip() for p in re.split(r"\s*,\s*", group.strip()) if p.strip()]
+    if parts and not parts[0][0].isdigit():
+        return parts
     out = []
-    for part in re.split(r"\s*,\s*", group):
-        m = re.match(r"(\d+)\s*[-\u2013]\s*(\d+)$", part.strip())
-        if m and int(m.group(1)) <= int(m.group(2)):
-            out += list(range(int(m.group(1)), int(m.group(2)) + 1))
-        elif part.strip().isdigit():
-            out.append(int(part.strip()))
+    for part in parts:
+        span = re.match(r"(\d+)\s*[-\u2013]\s*(\d+)$", part)
+        if span:
+            out.extend(range(int(span.group(1)), int(span.group(2)) + 1))
+        elif part.isdigit():
+            out.append(int(part))
     return out
+
 
 # arXiv numbers a bibliography's ids `bib.bib7` when entries are cited by number
 # and `bib.bibx7` when they are cited by an author-initials label. The `x` is the
@@ -127,11 +138,24 @@ def parse_bibliography(html: str) -> list:
             body = body[:tag[1]] + body[tag[2]:]
         text = ef._clean(body)
         if text:
-            out.append({"num": int(m.group(1)),
-                        "label": label.strip("[]").strip() or m.group(1),
+            mark = label.strip("[]").strip() or m.group(1)
+            # The id is the bibliography's internal order and need not be the
+            # number the paper cites the entry by: `bib.bib15` can be `[1]`.
+            # Keying on the id numbered the injected list 15, 20, 3 and compared
+            # the page's `[1]` against a different work entirely. The visible
+            # label is what the body writes, so that is the number; the id is
+            # kept only to resolve the source's own anchors.
+            out.append({"num": int(mark) if mark.isdigit() else int(m.group(1)),
+                        "id_num": int(m.group(1)),
+                        "label": mark,
                         "text": text})
     out.sort(key=lambda e: e["num"])
     return out
+
+
+def anchor_numbers(html: str) -> dict:
+    """{anchor id number: the number the paper cites it by}."""
+    return {e["id_num"]: e["num"] for e in parse_bibliography(html)}
 
 
 def source_citation_sequence(html: str) -> dict:
@@ -140,6 +164,7 @@ def source_citation_sequence(html: str) -> dict:
     Read off the source's own anchors, so this is the paper's truth rather than a
     reconstruction: each `<a href="#bib.bibN">` inside a section is one citation.
     """
+    by_id = anchor_numbers(html)
     secs = [(m.start(), ef._clean(m.group(2))) for m in _SECTION.finditer(html)]
     bounds = [s[0] for s in secs] + [len(html)]
     out = {}
@@ -147,7 +172,8 @@ def source_citation_sequence(html: str) -> dict:
         key = vs.section_key(title)
         if not key:
             continue
-        nums = [int(x) for x in _ANCHOR.findall(html[pos:bounds[i + 1]])]
+        nums = [by_id.get(int(x), int(x))
+                for x in _ANCHOR.findall(html[pos:bounds[i + 1]])]
         out.setdefault(key, []).extend(nums)
     return out
 
@@ -173,6 +199,7 @@ def source_citation_paragraphs(html: str) -> dict:
     be aligned against anything and keeping them would throw the two sequences
     out of step.
     """
+    by_id = anchor_numbers(html)
     marks = [(m.start(), m.group(1)) for m in _TOP_SECTION.finditer(html)]
     bounds = [m[0] for m in marks] + [len(html)]
     out = {}
@@ -184,7 +211,7 @@ def source_citation_paragraphs(html: str) -> dict:
             continue
         paras = []
         for para in _LTX_PARA.findall(body):
-            nums = [int(x) for x in _ANCHOR.findall(para)]
+            nums = [by_id.get(int(x), int(x)) for x in _ANCHOR.findall(para)]
             if nums:
                 paras.append(nums)
         if paras:
@@ -439,6 +466,34 @@ def coalesce(spans: list) -> list:
     return out
 
 
+# The pieces this pass itself emits around a citation: the brackets, the number,
+# and the separator inside a group. Nothing else in a paper looks like this.
+_OUR_PIECE = re.compile(r"^(?:\[|\]|,\s*|\d+)$")
+
+
+def clear_citation_links(spans: list) -> list:
+    """Drop links from the citation pieces this pass wrote, keeping everyone
+    else's.
+
+    Rebuilding the reference list gives every entry a new block, so the links
+    already in the body point at blocks that were just archived — which looks
+    exactly like working links until one is clicked. The numeric path skipped
+    any span that already carried a link, so a relink could never repair them.
+
+    A link someone put on a phrase by hand is left alone: only a span that IS
+    one of our own pieces is cleared.
+    """
+    out = []
+    for span in spans or ():
+        text = (span.get("text") or {}).get("content", "")
+        if span.get("type") == "text" and _OUR_PIECE.match(text) and (
+                span.get("href") or (span.get("text") or {}).get("link")):
+            span = dict(span, href=None,
+                        text=dict(span.get("text") or {}, link=None))
+        out.append(span)
+    return out
+
+
 def _link_spans(block: dict, mapping: list, page_id: str, ref_ids: dict,
                    entries: dict = None) -> list:
     """New rich_text for `block`, consuming `mapping` (true numbers, in order).
@@ -488,6 +543,15 @@ def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
     text they already were. The text itself is never touched — this pass links,
     it does not rewrite what the paper says.
     """
+    kind = block.get("type")
+    payload = dict(block.get(kind) or {})
+    # Clearing the links is not enough: the previous pass left the marker
+    # split across `[`, the number and `]`, and the citation pattern is
+    # matched WITHIN a span — so a split marker is invisible and a relink
+    # finds nothing to do. Merging them back is what makes it visible.
+    payload["rich_text"] = coalesce(
+        clear_citation_links(payload.get("rich_text")))
+    block = dict(block, **{kind: payload})
     allowed = len(mapping)
     while True:
         out = _link_spans(block, list(mapping[:allowed]), page_id, ref_ids,
@@ -517,6 +581,34 @@ def same_text(before: list, after: list) -> bool:
     pieces are expected to differ; only the characters must not.
     """
     return _spans_text(before) == _spans_text(after)
+
+
+# Every citation group, whatever numbers are inside it. The numeric path
+# rewrites those numbers on purpose, so they are the one thing it may change.
+_CITE_GROUP = _CITE
+
+
+def same_prose(before: list, after: list) -> bool:
+    """Is everything except the citation numbers unchanged?
+
+    The numeric path does not only link: it REWRITES each citation to the
+    source's number, which is the repair a translation with renumbered citations
+    needs. So "the text is identical" is the wrong invariant there — it would
+    refuse the pass's own purpose. What must hold is that nothing else moved,
+    and that a citation is still a citation.
+    """
+    blank = lambda spans: _CITE_GROUP.sub("[#]", _spans_text(spans))
+    return blank(before) == blank(after)
+
+
+def check_prose_only(before: list, after: list, block_id: str) -> None:
+    """Refuse a rewrite that changed anything but the citation numbers.
+
+    Raises:
+        ValueError: If the prose around the citations differs.
+    """
+    if not same_prose(before, after):
+        raise ValueError(f"prose changed in {block_id}; refusing to write")
 
 
 def check_link_only(before: list, after: list, block_id: str) -> None:
@@ -662,8 +754,8 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
                 continue
             rich = _rewrite_block(blk, list(mapping), page_id, ref_ids,
                                   {e["num"]: e["text"] for e in entries})
-            check_link_only((blk.get(blk["type"]) or {}).get("rich_text"),
-                            rich, bid)
+            check_prose_only((blk.get(blk["type"]) or {}).get("rich_text"),
+                             rich, bid)
             try:
                 notion("PATCH", f"/blocks/{bid}",
                        {blk["type"]: {"rich_text": rich}})

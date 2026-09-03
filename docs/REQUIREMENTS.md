@@ -167,11 +167,29 @@ read off the code.
 
 ### Citation linking
 
-- **This pass links; it never rewrites.** Every span in a block is rebuilt to
-  attach links, so a bug there would silently change what the paper says — on a
-  page a person is reading and editing. All three linking paths now refuse to
-  write a rebuild whose characters differ from the original, through one shared
-  check rather than a copy each.
+- **The numbered path renumbers on purpose; nothing else may move.** A
+  translation routinely renumbers its citations, so `[1]` on the page and `[1]`
+  in the reference list can be different works. Rewriting each marker to the
+  source's number is the repair, not a side effect — it is the whole reason the
+  alignment exists. What must never change is the prose around it, and a
+  citation must still be a citation.
+
+  (An earlier note here claimed this pass "never rewrites" and that all three
+  paths refused any character change. That was simply wrong about the numbered
+  path, and enforcing it would have refused the pass's own purpose. The two
+  key-based paths — author-year and label — do only link, because a name is not
+  a number and there is nothing to renumber.)
+- **A citation's number is the label the paper prints, never the HTML id.**
+  LaTeXML numbers `<li id="bib.bibN">` from the bibliography's internal order,
+  which need not be the order the paper cites by: `bib.bib15` can be `[1]`. The
+  id survives only to resolve the source's own anchors.
+- **A citation may arrive as a LaTeX key.** The translation source is
+  NotebookLM's indexed text, which leaves `\cite{key}` unresolved, so the body
+  can read `[ author2024method, shortkey]` where the published HTML reads `[3, 7]`.
+  Those are citations and are renumbered like any other.
+- **Rebuilding the reference list orphans every link already in the body.** The
+  pass therefore clears the markers it wrote before relinking. A link someone
+  put on prose by hand is left alone.
 - **Partial is better than nothing.** Where a block cannot carry links for all
   of its citations, or a section's numbering cannot be verified, the provable
   part is linked and the rest is left as plain text. A citation pointing at the
