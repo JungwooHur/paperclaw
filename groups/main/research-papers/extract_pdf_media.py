@@ -615,10 +615,32 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
                 time.sleep(0.2)
             blocks = vs.fetch_blocks(page_id)
 
+    # Resolve every anchor first, then fill the gaps: a figure the body never
+    # cites belongs beside its neighbours, not at the end of the page. Shared
+    # with the HTML path so the two cannot drift.
+    import extract_paper_figures as _ef
+    resolved = {key: _anchor_for(key[0], key[1], blocks) for key in media}
+    for kind_ in {k for k, _n in media}:
+        nums = [n for k, n in media if k == kind_]
+        filled = _ef.fill_anchor_gaps(nums, {n: resolved[(kind_, n)] for n in nums})
+        for n in nums:
+            resolved[(kind_, n)] = filled.get(n)
+    # Then the figures already on the page, which are the only neighbours when a
+    # run is injecting just the missing numbers.
+    placed = _placed_figures(blocks)
+    for (kind_, n), anchor in list(resolved.items()):
+        if anchor or kind_ != "figure":
+            continue
+        spot = _ef.neighbour_spot(n, placed)
+        if spot is None:
+            continue
+        at, side = spot
+        at = at if side == "after" else max(at - 1, 0)
+        resolved[(kind_, n)] = blocks[at]["id"]
     groups, order = {}, []
     for (kind, num) in sorted(media, key=lambda k: (k[0], k[1])):
         item = media[(kind, num)]
-        anchor = _anchor_for(kind, num, blocks) or "__end__"
+        anchor = resolved.get((kind, num)) or "__end__"
         if anchor not in groups:
             groups[anchor] = []
             order.append(anchor)
@@ -816,6 +838,22 @@ def _archive_flattened_tables(page_id: str, blocks: list, apply: bool) -> int:
             notion("PATCH", f"/blocks/{bid}", {"archived": True})
             time.sleep(0.2)
     return len(doomed)
+
+
+def _placed_figures(blocks: list) -> dict:
+    """{figure number: index of its image block} for figures already on the page."""
+    import extract_paper_figures as ef
+
+    found = {}
+    for i, b in enumerate(blocks):
+        if b.get("type") != "image":
+            continue
+        caption = "".join(s.get("plain_text", "") for s in
+                          ((b.get("image") or {}).get("caption") or []))
+        seen = ef.caption_number(caption) or ef.caption_number(caption + ":")
+        if seen and seen[0] == "figure":
+            found[seen[1]] = i
+    return found
 
 
 def _anchor_for(kind: str, num: int, blocks: list):

@@ -249,6 +249,80 @@ def _as_int(num):
         return None
 
 
+def _series_key(num):
+    """(series letter, index) for a figure number, so `A.1` and `1` stay apart."""
+    found = re.match(r"([A-Za-z]*)\.?(\d+)", str(num or ""))
+    return (found.group(1) or "", int(found.group(2))) if found else ("", 0)
+
+
+def fill_anchor_gaps(nums: list, resolved: dict) -> dict:
+    """Give every figure the body never cites a place beside its neighbours.
+
+    A figure's anchor is the first mention of its number. One the text never
+    cites — a teaser, or one whose citation the translation dropped — has none,
+    and falling to the end of the page puts it in the appendix while the figures
+    around it sit chapters earlier.
+
+    It joins the nearest placed figure BEFORE it, and when there is none — which
+    is exactly the case of a teaser numbered 1 — the nearest placed figure AFTER
+    it instead. Sharing an anchor is enough to order them correctly, because
+    figures are written out in numeric order within an anchor.
+
+    Args:
+        nums: Every figure number, in the order they should appear.
+        resolved: {number: anchor block id or None}.
+
+    Returns:
+        A new mapping with the gaps filled where a neighbour exists. A figure
+        with no placed neighbour at all keeps None — the page end stays the last
+        resort, and inventing a position would be worse than admitting there is
+        none.
+    """
+    ordered = sorted(nums, key=_series_key)
+    filled = dict(resolved)
+    for i, num in enumerate(ordered):
+        if filled.get(num):
+            continue
+        series = _series_key(num)[0]
+        before = [n for n in ordered[:i]
+                  if filled.get(n) and _series_key(n)[0] == series]
+        if before:
+            filled[num] = filled[before[-1]]
+            continue
+        after = [n for n in ordered[i + 1:]
+                 if resolved.get(n) and _series_key(n)[0] == series]
+        if after:
+            filled[num] = resolved[after[0]]
+    return filled
+
+
+def neighbour_spot(num, placed: dict):
+    """Where a figure belongs among the ones already on the page, or None.
+
+    When only the missing figures are being injected, the ones already placed are
+    the only neighbours there are — looking at the batch alone leaves a single
+    uncited figure with nobody to sit beside, and it falls to the end of the
+    page, which is the appendix.
+
+    Args:
+        num: The figure number being placed.
+        placed: {figure number: index of its image block on the page}.
+
+    Returns:
+        `(index, "after")` for the nearest lower-numbered figure, or
+        `(index, "before")` for the nearest higher one when nothing is lower —
+        which is the case of a teaser numbered 1. None when the number is
+        already placed, or nothing is.
+    """
+    if num in placed or not placed:
+        return None
+    lower = [n for n in placed if n < num]
+    if lower:
+        return placed[max(lower)], "after"
+    higher = [n for n in placed if n > num]
+    return (placed[min(higher)], "before") if higher else None
+
+
 def _anchor_for(num, blocks: list):
     """Block id to insert a figure `num` after: first body mention of the figure
     number, else the section heading whose number matches, else None (page end)."""
@@ -396,21 +470,11 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     # the figures around it sat chapters earlier. Anchoring it to the nearest
     # lower-numbered figure that IS placed keeps the sequence readable; the page end
     # remains the last resort, for a figure with no placed neighbour at all.
-    def _sort_key(f):
-        m = re.match(r"([A-Za-z]*)\.?(\d+)", str(f["num"] or ""))
-        return (m.group(1) or "", int(m.group(2))) if m else ("", 0)
-
-    resolved = {}
-    for f in figs:
-        resolved[id(f)] = _anchor_for(f["num"], blocks)
+    _sort_key = lambda f: _series_key(f["num"])
+    by_num = {f["num"]: _anchor_for(f["num"], blocks) for f in figs}
+    by_num = fill_anchor_gaps([f["num"] for f in figs], by_num)
+    resolved = {id(f): by_num.get(f["num"]) for f in figs}
     ordered_figs = sorted(figs, key=_sort_key)
-    for i, f in enumerate(ordered_figs):
-        if resolved[id(f)]:
-            continue
-        for prev in reversed(ordered_figs[:i]):
-            if resolved[id(prev)] and _sort_key(prev)[0] == _sort_key(f)[0]:
-                resolved[id(f)] = resolved[id(prev)]
-                break
 
     groups, order = {}, []
     for f in ordered_figs:
