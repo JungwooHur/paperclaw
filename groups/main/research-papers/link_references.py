@@ -339,6 +339,35 @@ def citation_shortfall(slots: dict, source_count: int):
     return f"body has no citations ({source_count} in source)"
 
 
+def reference_headings(blocks: list) -> list:
+    """Ids of every heading this tool wrote to open a reference list.
+
+    Matched on the heading text ALONE, deliberately. `_find_refs_heading` below
+    also inspects the body, which is right for locating the boundary and wrong
+    for deciding whether one already exists: recognition of the entries is the
+    fragile half, and when it fails the tool cannot see its own work.
+    """
+    want = REFS_HEADING.strip().lower()
+    return [b["id"] for b in blocks
+            if HEADING_LEVEL.get(b["type"])
+            and block_text(b).strip().lower() == want]
+
+
+def may_inject_references(blocks: list) -> bool:
+    """Is it safe to append a reference list to this page?
+
+    Only when there is not one already. The injector used to refuse only when it
+    RECOGNISED its own list — heading text plus a body that parses as entries —
+    so a single unfamiliar label style made it blind to its own work and it
+    appended another copy on every healer cycle. One page reached thirty-seven
+    copies of its bibliography and nothing else.
+
+    This answer does not depend on parsing the entries at all, so no future
+    label style can bring the runaway back.
+    """
+    return not reference_headings(blocks)
+
+
 def _find_refs_heading(blocks: list):
     """The id of a References heading this tool wrote, or None.
 
@@ -682,6 +711,13 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
                                      entries)
         rep["refs"] = f"already present ({len(ref_ids)})"
     else:
+        if not may_inject_references(blocks) and not force:
+            # A list is already there even if its entries did not parse. Appending
+            # a second one is how a page runs away; refuse and say so.
+            rep["refs"] = "already present (unparsed)"
+            rep["warning"] = ("a reference heading is already on the page but its "
+                              "entries were not recognised; refusing to append")
+            return rep
         if found and force and apply:
             for bid in [found[0]] + found[1]:
                 try:

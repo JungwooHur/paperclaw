@@ -38,11 +38,22 @@ import re
 # sentence that opens with a bracketed aside ("[see below] for the
 # derivation") from being read as an entry, which is the false positive that
 # would move the boundary into the body.
-_LABEL = (r"\[(?:"
-          r"[A-Za-z0-9+. ]*\d[A-Za-z0-9+.]*"   # carries a year or an index
-          r"|[A-Za-z]{1,6}"                     # or is a short bare tag
-          r")\]")
+# A label is SHORT and identifies one work. Three styles are in use: a number
+# (`[7]`), author initials with a year (`[ACDE12]`, `[DGV+18]`), and author names
+# with a year (`[Agrawal et al. (2016)]`). The last one broke this: it carries
+# dots, parentheses and ampersands, so the boundary could not see a list written
+# in that style — and the healer, unable to recognise the list it had just
+# written, appended a fresh copy every five minutes until one page held
+# thirty-seven copies of its own bibliography and nothing else.
+#
+# So the label may hold anything but a bracket, and is pinned down by two rules
+# instead: it is short, and it carries a digit — every style ends its label with
+# a year or an index. A corporate tag with no digit (`[Fou]`) is allowed only
+# when it is a single short word, which keeps a bracketed clause of prose out.
+MAX_LABEL_CHARS = 40
+_LABEL = r"\[([^\[\]\n]{1,%d})\]" % MAX_LABEL_CHARS
 _ENTRY = re.compile(r"\s*" + _LABEL + r"\s")
+_BARE_TAG = re.compile(r"^[^\W\d_]{1,6}$", re.UNICODE)
 _KOREAN = re.compile(r"[가-힣]")
 MIN_ENTRIES = 3
 ENTRY_SHARE = 0.8
@@ -57,8 +68,18 @@ def block_text(block: dict) -> str:
 
 
 def is_entry(block: dict) -> bool:
+    """Does this block open with a reference label, in English?
+
+    A translated bibliography is what the healers exist to remove; only the
+    injected English one is protected, so Korean anywhere in the block rules it
+    out.
+    """
     text = block_text(block)
-    return bool(_ENTRY.match(text)) and not _KOREAN.search(text)
+    found = _ENTRY.match(text)
+    if not found or _KOREAN.search(text):
+        return False
+    label = found.group(1).strip()
+    return any(c.isdigit() for c in label) or bool(_BARE_TAG.match(label))
 
 
 def looks_like_list(paragraphs: list) -> bool:

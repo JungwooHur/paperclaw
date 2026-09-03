@@ -190,6 +190,12 @@ read off the code.
 - **Rebuilding the reference list orphans every link already in the body.** The
   pass therefore clears the markers it wrote before relinking. A link someone
   put on prose by hand is left alone.
+- **A page may hold at most one reference list, and the heading decides.**
+  Whether one already exists is answered from the heading text alone, never by
+  parsing the entries. Recognising entries is the part that fails on an
+  unfamiliar label style, and when it failed the tool appended a second list on
+  every healer cycle. A guard that cannot be defeated by a parsing failure is
+  worth more here than a better parser.
 - **Partial is better than nothing.** Where a block cannot carry links for all
   of its citations, or a section's numbering cannot be verified, the provable
   part is linked and the rest is left as plain text. A citation pointing at the

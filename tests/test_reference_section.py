@@ -119,3 +119,49 @@ class TestAnAlphabeticBibliography:
 
     def test_a_bracketed_english_aside_is_still_not_an_entry(self):
         assert not rs.is_entry(para("[see below] for the derivation of this bound"))
+
+
+class TestAnAuthorYearBibliography:
+    """A third label style, and the one that made a page run away.
+
+    Some papers label entries `[Agrawal et al. (2016)]`. The boundary did not
+    recognise those, so the tool could not see the list it had just written —
+    and the five-minute healer appended a fresh copy on every cycle. One page
+    reached thirty-seven copies of its own bibliography and nothing else.
+    """
+
+    def test_an_author_year_entry_is_an_entry(self):
+        assert rs.is_entry(para("[Agrawal et al. (2016)] Pulkit Agrawal, "
+                                "Ashvin V Nair. Learning to poke. 2016."))
+
+    def test_an_ampersand_between_authors_is_fine(self):
+        assert rs.is_entry(para("[Allgöwer & Zheng (2012)] Frank Allgöwer and "
+                                "Alex Zheng. Nonlinear control. 2012."))
+
+    def test_a_non_ascii_name_is_fine(self):
+        assert rs.is_entry(para("[Bergström (2019)] Anna Bergström. A title."))
+
+    def test_the_earlier_styles_still_work(self):
+        assert rs.is_entry(para("[7] A. Author. A title. 2020."))
+        assert rs.is_entry(para("[ACDE12] A. Author. A title. 2012."))
+        assert rs.is_entry(para("[Fou] The Common Crawl Foundation."))
+
+    def test_a_translated_entry_is_still_rejected(self):
+        assert not rs.is_entry(para("[Agrawal et al. (2016)] 저자. 어떤 제목."))
+
+    def test_a_bracketed_aside_without_a_number_is_not_an_entry(self):
+        assert not rs.is_entry(para("[see the appendix] for the derivation"))
+
+    def test_a_long_bracketed_phrase_is_not_an_entry(self):
+        # A label is short. A sentence that opens with a long bracketed clause
+        # containing a year is prose, and treating it as an entry would move the
+        # boundary into the body.
+        assert not rs.is_entry(para(
+            "[as the authors of the 2016 study on poking eventually conceded] "
+            "the result did not replicate"))
+
+    def test_a_list_of_them_is_a_reference_list(self):
+        items = [para("[Agrawal et al. (2016)] P. Agrawal. A title."),
+                 para("[Bakhtin et al. (2019)] A. Bakhtin. Another."),
+                 para("[Watters et al. (2017)] N. Watters. A third.")]
+        assert rs.looks_like_list(items)
