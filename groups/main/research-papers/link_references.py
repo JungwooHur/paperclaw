@@ -298,6 +298,20 @@ def page_citation_paragraphs(blocks: list) -> dict:
     return out
 
 
+def citation_shortfall(slots: dict, source_count: int):
+    """A sentence for a page whose body lost the citations the source has.
+
+    `slots_linked: 0` reads as "the linker failed". On one paper it meant the
+    opposite: the translation had dropped every citation marker, so there was
+    nothing to link and no amount of alignment would have helped. The report has
+    to tell those two apart, because the fix for one is a code change and the fix
+    for the other is a re-translation.
+    """
+    if slots or not source_count:
+        return None
+    return f"body has no citations ({source_count} in source)"
+
+
 def _find_refs_heading(blocks: list):
     """The id of a References heading this tool wrote, or None.
 
@@ -425,7 +439,7 @@ def coalesce(spans: list) -> list:
     return out
 
 
-def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
+def _link_spans(block: dict, mapping: list, page_id: str, ref_ids: dict,
                    entries: dict = None) -> list:
     """New rich_text for `block`, consuming `mapping` (true numbers, in order).
 
@@ -457,10 +471,67 @@ def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
             pos = m.end()
         if pos < len(text):
             out.append(_clone(sp, text[pos:]))
-    out = coalesce(out)
-    if len(out) > MAX_SPANS:
-        raise ValueError(f"{len(out)} spans exceeds Notion's limit of {MAX_SPANS}")
-    return out
+    return coalesce(out)
+
+
+def _rewrite_block(block: dict, mapping: list, page_id: str, ref_ids: dict,
+                   entries: dict = None) -> list:
+    """The block's spans with its citations linked, within Notion's span limit.
+
+    A block holds at most `MAX_SPANS` rich_text pieces and linking one citation
+    costs several, so a related-work paragraph citing fifty works cannot have all
+    of them linked however the spans are merged. Raising on it aborted the entire
+    page: every other paragraph lost its links too, over one paragraph nobody
+    could have linked anyway.
+
+    It now links as many as fit, earliest first, and leaves the rest as the plain
+    text they already were. The text itself is never touched — this pass links,
+    it does not rewrite what the paper says.
+    """
+    allowed = len(mapping)
+    while True:
+        out = _link_spans(block, list(mapping[:allowed]), page_id, ref_ids,
+                          entries)
+        if len(out) <= MAX_SPANS or allowed <= 0:
+            return out
+        allowed -= 1
+
+
+def _spans_text(spans: list) -> str:
+    """Every character a rich_text list renders, links and formatting aside."""
+    out = []
+    for span in spans or ():
+        if span.get("type") == "equation":
+            out.append(span.get("plain_text")
+                       or (span.get("equation") or {}).get("expression", ""))
+        else:
+            out.append(span.get("plain_text")
+                       or (span.get("text") or {}).get("content", ""))
+    return "".join(out)
+
+
+def same_text(before: list, after: list) -> bool:
+    """Do these two rich_text lists render the same characters?
+
+    Splitting a span to link part of it is the whole point of this pass, so the
+    pieces are expected to differ; only the characters must not.
+    """
+    return _spans_text(before) == _spans_text(after)
+
+
+def check_link_only(before: list, after: list, block_id: str) -> None:
+    """Refuse to write a rebuild that changed the text.
+
+    This pass rebuilds every span in a block to attach links, so a bug there
+    rewrites the paper silently — and it writes to a page a person is reading and
+    editing. Two of the three linking paths already refused; the numeric one,
+    which runs on most papers, wrote whatever it built.
+
+    Raises:
+        ValueError: If the rebuilt spans do not render the original text.
+    """
+    if not same_text(before, after):
+        raise ValueError(f"text changed in {block_id}; refusing to write")
 
 
 def _clone(span: dict, content: str, link=None) -> dict:
@@ -537,6 +608,9 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
     # were renumbered per paragraph, and those pages currently get nothing.
     src_paras = source_citation_paragraphs(html)
     page_paras = fold_slots(page_citation_paragraphs(blocks), set(src_paras))
+    shortfall = citation_shortfall(slots, sum(len(v) for v in src.values()))
+    if shortfall:
+        rep["warning"] = shortfall
     plan = {}
     for key, page_slots in slots.items():
         want = src.get(key)
@@ -588,6 +662,8 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
                 continue
             rich = _rewrite_block(blk, list(mapping), page_id, ref_ids,
                                   {e["num"]: e["text"] for e in entries})
+            check_link_only((blk.get(blk["type"]) or {}).get("rich_text"),
+                            rich, bid)
             try:
                 notion("PATCH", f"/blocks/{bid}",
                        {blk["type"]: {"rich_text": rich}})
@@ -696,10 +772,7 @@ def link_author_year(page_id: str, blocks: list, index: dict, ref_ids: dict,
                 out.append(_clone(sp, text[pos:]))
         if not hits:
             continue
-        before = "".join(s.get("plain_text", "") for s in spans)
-        after = "".join(o["text"]["content"] if o.get("type") == "text"
-                        else o.get("plain_text", "") for o in out)
-        assert before == after, f"text changed in {b['id']}"   # link only
+        check_link_only(spans, out, b["id"])
         linked += hits
         if apply:
             notion("PATCH", f"/blocks/{b['id']}", {kind: {"rich_text": out}})
@@ -800,10 +873,7 @@ def link_labels(page_id: str, blocks: list, entries: list, ref_ids: dict,
                 out.append(_clone(sp, text[pos:]))
         if not hits:
             continue
-        before = "".join(s.get("plain_text", "") for s in spans)
-        after = "".join(o["text"]["content"] if o.get("type") == "text"
-                        else o.get("plain_text", "") for o in out)
-        assert before == after, f"text changed in {b['id']}"   # link only
+        check_link_only(spans, out, b["id"])
         out = coalesce(out)
         linked += hits
         if apply:

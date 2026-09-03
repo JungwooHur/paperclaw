@@ -165,6 +165,18 @@ read off the code.
   invoking it by name in prose does not load it, and the model answers in its own
   way instead.
 
+### Citation linking
+
+- **This pass links; it never rewrites.** Every span in a block is rebuilt to
+  attach links, so a bug there would silently change what the paper says — on a
+  page a person is reading and editing. All three linking paths now refuse to
+  write a rebuild whose characters differ from the original, through one shared
+  check rather than a copy each.
+- **Partial is better than nothing.** Where a block cannot carry links for all
+  of its citations, or a section's numbering cannot be verified, the provable
+  part is linked and the rest is left as plain text. A citation pointing at the
+  wrong paper is worse than one pointing nowhere.
+
 ### Terms
 
 - **Layer** — one step down the chain of whys, closed by the reader restating it
