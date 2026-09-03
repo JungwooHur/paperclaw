@@ -194,3 +194,45 @@ class TestFindingTheEntriesAlreadyOnThePage:
 
     def test_an_unknown_marker_is_ignored(self):
         assert lr.ref_ids_from_texts({"b9": "[ZZ99] Someone."}, self.ENTRIES) == {}
+
+
+RENUMBERED = '''
+<ul class="ltx_biblist">
+<li id="bib.bib15" class="ltx_bibitem"><span class="ltx_tag ltx_bib_key ltx_role_refnum ltx_tag_bibitem">[1]</span>
+<span class="ltx_bibblock">H. Li et al. A first work.</span></li>
+<li id="bib.bib20" class="ltx_bibitem"><span class="ltx_tag ltx_bib_key ltx_role_refnum ltx_tag_bibitem">[2]</span>
+<span class="ltx_bibblock">Y. Zuo et al. A second work.</span></li>
+<li id="bib.bib3" class="ltx_bibitem"><span class="ltx_tag ltx_bib_key ltx_role_refnum ltx_tag_bibitem">[3]</span>
+<span class="ltx_bibblock">J. Yu et al. A third work.</span></li>
+</ul>
+'''
+
+
+class TestWhenTheIdIsNotTheCitationNumber:
+    """LaTeXML gives each entry an id from the bibliography's internal order,
+    which need not be the number the paper cites it by: `bib.bib15` can be
+    `[1]`. Keying entries on the id then numbers the injected list 15, 20, 3 —
+    and compares the page's `[1]` against the wrong entry entirely."""
+
+    def test_entries_are_numbered_as_the_paper_cites_them(self):
+        entries = lr.parse_bibliography(RENUMBERED)
+        assert [e["num"] for e in entries] == [1, 2, 3]
+
+    def test_they_come_out_in_citation_order(self):
+        entries = lr.parse_bibliography(RENUMBERED)
+        assert "first" in entries[0]["text"] and "third" in entries[2]["text"]
+
+    def test_the_id_is_kept_so_anchors_can_be_resolved(self):
+        entries = lr.parse_bibliography(RENUMBERED)
+        assert {e["id_num"] for e in entries} == {15, 20, 3}
+
+    def test_an_anchor_reads_as_the_citation_number(self):
+        html = ('<section id="S1"><h2>1 Intro</h2>'
+                '<a href="#bib.bib15">1</a><a href="#bib.bib20">2</a></section>'
+                + RENUMBERED)
+        assert lr.source_citation_sequence(html) == {"1": [1, 2]}
+
+    def test_a_plain_bibliography_is_unchanged(self):
+        entries = lr.parse_bibliography(NUMERIC)
+        assert [e["num"] for e in entries] == [1, 2]
+        assert [e["id_num"] for e in entries] == [1, 2]
