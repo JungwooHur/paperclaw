@@ -32,6 +32,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verify_sections as vs
 import heading_bloat
+import paragraph_headings
 import list_markers
 import inline_emphasis
 from translate_fulltext import notion
@@ -157,6 +158,34 @@ def dedupe_duplicates(page_id, blocks, apply):
     return len(to_archive)
 
 
+def promote_paragraph_headings(page_id, findings, apply):
+    """Turn section titles the assembler left as paragraphs into headings.
+
+    Runs before everything else: with no headings a page has no sections, so the
+    audit that ran first could not have reported a duplicate, a bloated heading
+    or anything else that reads structure.
+    """
+    ids = [bid for f in findings if f.get("type") == "HEADINGS_AS_PARAGRAPHS"
+           for bid in f.get("block_ids", [])]
+    fixed = 0
+    for bid in ids:
+        block = notion("GET", f"/blocks/{bid}")
+        new = paragraph_headings.promote(block)
+        if new is None:
+            continue
+        if apply:
+            kind = new["type"]
+            # A block's type cannot be changed in place, so the heading is
+            # inserted after the paragraph before the paragraph is archived —
+            # a failed insert can then never empty the section.
+            notion("PATCH", f"/blocks/{page_id}/children",
+                   {"children": [new], "after": bid})
+            notion("PATCH", f"/blocks/{bid}", {"archived": True})
+            time.sleep(0.34)
+        fixed += 1
+    return fixed
+
+
 def apply_emphasis(page_id, findings, apply):
     """Turn leftover markdown emphasis into an italic span."""
     ids = [bid for f in findings if f.get("type") == "EMPHASIS_MARKER"
@@ -229,14 +258,15 @@ def heal_verify(page_id: str, apply: bool = False) -> dict:
     findings = result.get("findings", [])
     kinds = Counter(f.get("type") for f in findings)
     rep = {"page": page_id, "findings": dict(kinds), "deduped_blocks": 0,
-           "split_headings": 0, "stripped_markers": 0, "emphasis_fixed": 0, "flags": []}
+           "promoted_headings": 0, "split_headings": 0, "stripped_markers": 0, "emphasis_fixed": 0, "flags": []}
     # Split first, then look again: a bloated heading hides its own section's
     # duplicate from the dedup below, so the audit that ran before the split
     # cannot be trusted to have reported one.
+    rep["promoted_headings"] = promote_paragraph_headings(page_id, findings, apply)
     rep["split_headings"] = split_bloated_headings(page_id, findings, apply)
     rep["stripped_markers"] = strip_list_markers(page_id, findings, apply)
     rep["emphasis_fixed"] = apply_emphasis(page_id, findings, apply)
-    if rep["split_headings"] and apply:
+    if (rep["split_headings"] or rep["promoted_headings"]) and apply:
         result = audit(page_id, arxiv)
         findings = result.get("findings", [])
         kinds = Counter(f.get("type") for f in findings)
@@ -249,7 +279,8 @@ def heal_verify(page_id: str, apply: bool = False) -> dict:
     # sections) — these are the silent breakage the agent's assembly produces
     for f in findings:
         if f.get("type") in ("MISSING", "CONTENT_LOSS", "SUMMARIZED",
-                              "DUPLICATE", "PARA_DUP", "SKIPPED_TRANSLATION"):
+                              "DUPLICATE", "PARA_DUP", "SKIPPED_TRANSLATION",
+                              "HEADINGS_AS_PARAGRAPHS"):
             rep["flags"].append(f"{f['type']}({f.get('section') or ''}): "
                                 f"{(f.get('detail') or '')[:70]}")
     return rep
