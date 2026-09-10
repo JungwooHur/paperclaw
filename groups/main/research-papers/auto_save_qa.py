@@ -30,6 +30,7 @@ import urllib.request, urllib.error
 from typing import Callable
 
 import layer_format
+import notion_retry
 
 API = "https://api.notion.com/v1"
 
@@ -89,17 +90,28 @@ def headers() -> dict:
     }
 
 
+def _call(req):
+    """Open a Notion request, retrying the failures that are worth retrying."""
+    for attempt in range(1, notion_retry.MAX_RETRIES + 1):
+        try:
+            return json.loads(
+                urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+        except urllib.error.HTTPError as err:
+            if not notion_retry.should_retry(err, attempt):
+                raise
+            time.sleep(notion_retry.retry_delay(err, attempt))
+    raise RuntimeError("unreachable")          # the loop either returns or raises
+
+
 def api_get(path: str) -> dict:
-    req = urllib.request.Request(API + path, headers=headers())
-    return json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+    return _call(urllib.request.Request(API + path, headers=headers()))
 
 
 def api_post(path: str, body: dict) -> dict:
-    req = urllib.request.Request(
+    return _call(urllib.request.Request(
         API + path, method="POST",
         data=json.dumps(body).encode(), headers=headers(),
-    )
-    return json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+    ))
 
 
 # ---- Notion ---------------------------------------------------------------

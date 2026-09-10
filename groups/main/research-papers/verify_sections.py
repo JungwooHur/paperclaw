@@ -156,6 +156,7 @@ def english_title(heading_text: str) -> str:
 
 import reference_section  # noqa: E402
 import heading_bloat  # noqa: E402  (threshold shared with the repair)
+import paragraph_headings  # noqa: E402  (same, for promoted titles)
 import list_markers  # noqa: E402  (predicate shared with the repair)
 import inline_emphasis  # noqa: E402  (same, for markdown emphasis)
 
@@ -581,9 +582,17 @@ def main() -> int:
         # the paper has been sitting here long enough to be healed while its text
         # never arrived — the signature of a dedup check that saw the row and
         # skipped the translation. That one is worth shouting about.
+        # ...and a page whose titles came out as PARAGRAPHS is not untranslated
+        # either. It has no headings, so it looks identical from here — while one
+        # is a page waiting for its text and the other is a fully translated page
+        # that every structural check is skipping. One sat that way holding forty
+        # thousand characters and a duplicated half nobody could see.
+        kind, demoted = paragraph_headings.no_heading_finding(blocks)
         imgs = sum(1 for b in blocks if b["type"] == "image")
-        kind = "SKIPPED_TRANSLATION" if imgs >= 3 else "NOT_TRANSLATED"
-        msg = ("No headings on page — nothing translated yet, or wrong page id."
+        msg = (f"{len(demoted)} section title(s) are paragraphs, so this page "
+               f"has no sections and every structural check skips it"
+               if kind == "HEADINGS_AS_PARAGRAPHS" else
+               "No headings on page — nothing translated yet, or wrong page id."
                if kind == "NOT_TRANSLATED" else
                f"{imgs} figures but no text at all — the paper was never translated "
                f"(a dedup check saw the page and skipped it); re-process into it")
@@ -591,7 +600,8 @@ def main() -> int:
             print(json.dumps({"page": args.page, "title": page_title(args.page),
                               "section_count": 0, "sections": [],
                               "findings": [{"type": kind, "section": None,
-                                            "block_count": len(blocks), "block_ids": [],
+                                            "block_count": len(demoted) or len(blocks),
+                                            "block_ids": demoted[:50],
                                             "detail": msg}]},
                              ensure_ascii=False, indent=2))
         else:
@@ -699,6 +709,19 @@ def main() -> int:
     # 1b1d. LIST_MARKER (no source needed): a list item that kept the bullet its
     # markdown source wrote, so Notion's own bullet renders beside it.
     marked = [b["id"] for b in blocks if list_markers.has_marker(b)]
+    # 1b1f. HEADINGS_AS_PARAGRAPHS: section titles the assembler emitted as
+    # paragraphs. Reported separately from NOT_TRANSLATED because the two look
+    # identical from here — no headings — while one is a page waiting to be
+    # translated and the other is a translated page every check is skipping.
+    demoted = [b["id"] for b in blocks
+               if paragraph_headings.heading_level(b) is not None]
+    if demoted:
+        findings.append({
+            "type": "HEADINGS_AS_PARAGRAPHS", "section": None,
+            "block_count": len(demoted), "block_ids": demoted[:50],
+            "detail": f"{len(demoted)} section title(s) are paragraphs, so this "
+                      f"page has no sections and every structural check skips it",
+        })
     # 1b1e. EMPHASIS_MARKER: markdown emphasis written as characters. Only blocks
     # the repair can convert safely are reported, so the finding never names
     # something nothing will act on.

@@ -201,6 +201,17 @@ read off the code.
   part is linked and the rest is left as plain text. A citation pointing at the
   wrong paper is worse than one pointing nowhere.
 
+### Page structure
+
+- **Headings are the structure.** The audit groups sections by them, the
+  duplicate healer keys on them, the citation alignment splits on them. A page
+  without them has no sections at all, so every one of those checks silently
+  does nothing — which makes "no headings" the single most expensive state a
+  page can be in, and worth telling apart from the normal one.
+- **A repair that reveals structure runs first, and the page is audited again.**
+  The audit that ran before it could not have reported what it had no sections
+  to see.
+
 ### Terms
 
 - **Layer** — one step down the chain of whys, closed by the reader restating it

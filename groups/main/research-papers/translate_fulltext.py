@@ -43,6 +43,8 @@ import time
 import urllib.error
 import urllib.request
 
+import notion_retry
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import save_qa_callout as sq
 import verify_sections as vs
@@ -67,8 +69,11 @@ def notion(method, path, body=None, tries=12):
                 return json.load(resp)
         except urllib.error.HTTPError as e:
             last = e
-            if e.code == 429:
-                time.sleep(float(e.headers.get("Retry-After", 5)) + 2 * a)
+            # One policy, in `notion_retry`, so this and the read path in
+            # `auto_save_qa` cannot drift into two different ideas of what is
+            # worth repeating and for how long.
+            if notion_retry.should_retry(e, a + 1, max_retries=tries):
+                time.sleep(notion_retry.retry_delay(e, a + 1))
                 continue
             # Notion says exactly which block is invalid and why, in the response
             # BODY — "body.children[37].equation.expression should be not empty".
