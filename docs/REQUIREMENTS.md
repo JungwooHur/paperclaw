@@ -212,6 +212,18 @@ read off the code.
   The audit that ran before it could not have reported what it had no sections
   to see.
 
+### Healers
+
+- **Every repair must be idempotent.** Running it twice has to equal running it
+  once. A repair that reports a change it did not make rewrites the same block
+  on every cycle; the content never moves, so nothing looks wrong, while the
+  page's last-edited time keeps it inside the healer's window and every other
+  healer keeps re-running on it. One page did this for weeks.
+- **"It matched" is not "I changed it".** A detector that matches bare words
+  fires on prose that merely names the thing — a paper listing its training data
+  writes `arXiv.org` in a sentence. Only a comparison of the content before and
+  after can answer whether anything happened.
+
 ### Terms
 
 - **Layer** — one step down the chain of whys, closed by the reader restating it

@@ -85,6 +85,16 @@ def _clean_runs(rich_text):
             out.append(r)
             continue
         cleaned = _clean_text(content)
+        if cleaned == content:
+            # The detector matches bare words, so it fires on prose that merely
+            # NAMES a source — a paper listing its training data writes
+            # "arXiv.org" in a sentence. Reporting that as a change rewrote the
+            # block with identical content every five minutes, forever: the text
+            # never moved, but each write bumped the page's last-edited time,
+            # which kept it inside the healer's window and kept every other
+            # healer re-running on it too.
+            out.append(r)
+            continue
         changed = True
         if not cleaned.strip():
             continue                              # whole run was URL noise
