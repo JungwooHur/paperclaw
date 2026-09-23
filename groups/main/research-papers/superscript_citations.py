@@ -111,3 +111,23 @@ def heal_page(page_id: str, max_ref: int, apply: bool = False) -> dict:
             notion("PATCH", f"/blocks/{block['id']}", {kind: {"rich_text": out}})
             time.sleep(0.25)
     return rep
+
+
+def main() -> int:
+    """Run by hand: this edits body text, so it is never put on a timer."""
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--page", required=True)
+    parser.add_argument("--max-ref", type=int, required=True,
+                        help="highest number the page's bibliography defines")
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    print(json.dumps(heal_page(args.page, args.max_ref, apply=args.apply),
+                     ensure_ascii=False, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

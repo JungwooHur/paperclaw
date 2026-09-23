@@ -125,3 +125,22 @@ def link_page(page_id: str, url: str, apply: bool = False) -> dict:
         rep["slots_linked"] += len(mapping)
         time.sleep(0.2)
     return rep
+
+
+def main() -> int:
+    """Run by hand: the numbering cannot be verified, so a person decides."""
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--page", required=True)
+    parser.add_argument("--url", required=True, help="the article page")
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    print(json.dumps(link_page(args.page, args.url, apply=args.apply),
+                     ensure_ascii=False, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
