@@ -30,6 +30,7 @@ import urllib.request, urllib.error
 from typing import Callable
 
 import layer_format
+import question_shape
 import notion_retry
 
 API = "https://api.notion.com/v1"
@@ -703,35 +704,7 @@ def is_substantive_answer(content: str, paper_context: bool = False) -> bool:
     return score >= 2
 
 
-def is_question_like(content: str) -> bool:
-    """Filter out imperative commands (추가해, 정리하자, 번역해, 찾아줘, ...)
-    which aren't Q&A-worthy. Questions typically: end with '?', contain
-    '뭐/무엇/왜/어떻게/어디', or ask for an explanation."""
-    if not content: return False
-    c = content.strip()
-    if len(c) < 10: return False
-    # Imperative paper-management commands — skip
-    imperative_tails = [
-        "정리하자", "정리해", "정리해줘", "추가해", "추가해줘",
-        "찾아줘", "찾아봐", "번역해", "번역해줘", "올려줘", "저장해",
-    ]
-    cl = c.lower()
-    if any(cl.endswith(t) for t in imperative_tails):
-        return False
-    if "?" in c:
-        return True
-    # A sentence that CLOSES like a statement is a remark, not a question. One such
-    # ("…그 결과를 보여준다.") was filed as a Q&A, so the callout asked nothing.
-    if re.search(r"(다|네|군|구나|음|임|죠|네요|습니다)\.?$", c):
-        return False
-    # Explicit "I want this explained" markers. The old rule ended here with
-    # `len(c) >= 60 and "해" not in c[-4:]`, which rejected a real question purely
-    # because it happened to end on a syllable containing 해 ("…까지는 이해했어") —
-    # a question about the paper then never reached Notion at all.
-    if re.search(r"(왜|뭐야|무엇|어떻게|어디|누구|언제|얼마|차이|의미|설명해|알려줘|뜻이야"
-                 r"|이해가 안|이해 안|모르겠|헷갈|궁금|무슨|어느|은지|는지|을까|ㄹ까)", c):
-        return True
-    return len(c) >= 60
+is_question_like = question_shape.is_question_like
 
 
 def bot_mentions_paper(content: str, paper: dict) -> bool:

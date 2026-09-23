@@ -102,3 +102,97 @@ class TestTellingTheTwoStatesApart:
                   para("2 Background (2 배경)")]
         kind, _ = ph.no_heading_finding(blocks)
         assert kind == "HEADINGS_AS_PARAGRAPHS"
+
+
+class TestARunInTitle:
+    """Journals that run their Methods headings into the paragraph.
+
+    Nature sets a Methods subsection as `Domain knowledge` in bold followed
+    immediately by the text. The translation keeps the words and loses the bold,
+    so the title becomes the first few words of an ordinary paragraph and the
+    whole Methods section reads as one undifferentiated block — fifteen thousand
+    characters of it on one page.
+
+    The convention that makes this recognisable is the translation's own: a
+    heading is written `English Title (한글 제목)`, and what follows a title is a
+    new sentence, while what follows a term gloss is a Korean particle glued to
+    the bracket.
+    """
+
+    def test_a_run_in_title_is_split(self):
+        block = para("Domain knowledge (도메인 지식) 이 시스템은 규칙만 사용합니다.")
+        assert ph.split_run_in(block) is not None
+
+    def test_the_title_becomes_the_heading(self):
+        head, _ = ph.split_run_in(
+            para("Domain knowledge (도메인 지식) 이 시스템은 규칙만 사용합니다."))
+        assert ph.text_of(head) == "Domain knowledge (도메인 지식)"
+
+    def test_the_rest_stays_a_paragraph(self):
+        _, body = ph.split_run_in(
+            para("Domain knowledge (도메인 지식) 이 시스템은 규칙만 사용합니다."))
+        assert body["type"] == "paragraph"
+        assert ph.text_of(body) == "이 시스템은 규칙만 사용합니다."
+
+    def test_nothing_of_the_text_is_lost(self):
+        text = "Optimization (최적화) 각 모듈은 여러 워커로 학습됩니다."
+        head, body = ph.split_run_in(para(text))
+        assert ph.text_of(head) + " " + ph.text_of(body) == text
+
+    def test_a_term_gloss_is_not_a_title(self):
+        # The particle 는 is glued to the bracket: this is prose explaining a
+        # term, and splitting it would cut a sentence in half.
+        assert ph.split_run_in(
+            para("탐색 기법 (약어)는 가치를 추정합니다.")) is None
+
+    def test_a_gloss_in_the_middle_is_not_a_title(self):
+        assert ph.split_run_in(
+            para("우리는 policy network (정책 네트워크) 를 학습시킵니다.")) is None
+
+    def test_an_english_gloss_is_not_a_title(self):
+        # A title's gloss is the Korean translation of it.
+        assert ph.split_run_in(
+            para("Some method (an acronym) estimates the value.")) is None
+
+    def test_a_long_first_phrase_is_not_a_title(self):
+        assert ph.split_run_in(para(
+            "We compare three different versions of the program in this work "
+            "and describe each (세 가지 버전) 아래에서 자세히 설명합니다.")) is None
+
+    def test_a_paragraph_with_no_bracket_is_left_alone(self):
+        assert ph.split_run_in(para("평범한 본문 문단입니다.")) is None
+
+    def test_a_heading_is_not_touched(self):
+        block = para("Domain knowledge (도메인 지식) 본문")
+        block["type"] = "heading_1"
+        block["heading_1"] = block.pop("paragraph")
+        assert ph.split_run_in(block) is None
+
+    def test_an_equation_in_the_body_survives_as_an_equation(self):
+        # Slicing a span means slicing its characters, and an equation has none
+        # to slice — writing text into one is rejected by Notion outright.
+        block = para("")
+        block["paragraph"]["rich_text"] = [
+            {"type": "text", "text": {"content": "Optimization (최적화) 각 모듈 "},
+             "plain_text": "Optimization (최적화) 각 모듈 "},
+            {"type": "equation", "equation": {"expression": "\\alpha_{\\theta}"},
+             "plain_text": "\\alpha_{\\theta}"},
+            {"type": "text", "text": {"content": " 를 학습합니다."},
+             "plain_text": " 를 학습합니다."},
+        ]
+        head, body = ph.split_run_in(block)
+        kinds = [s["type"] for s in body["paragraph"]["rich_text"]]
+        assert "equation" in kinds
+        assert all("text" not in s for s in body["paragraph"]["rich_text"]
+                   if s["type"] == "equation")
+
+    def test_a_title_that_would_cut_an_equation_is_refused(self):
+        block = para("")
+        block["paragraph"]["rich_text"] = [
+            {"type": "text", "text": {"content": "Optimization (최적"},
+             "plain_text": "Optimization (최적"},
+            {"type": "equation", "equation": {"expression": "x"}, "plain_text": "x"},
+            {"type": "text", "text": {"content": ") 본문입니다."},
+             "plain_text": ") 본문입니다."},
+        ]
+        assert ph.split_run_in(block) is None

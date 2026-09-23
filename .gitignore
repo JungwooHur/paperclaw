@@ -51,6 +51,9 @@ groups/main/research-papers/*
 !groups/main/research-papers/inline_emphasis.py
 !groups/main/research-papers/paragraph_headings.py
 !groups/main/research-papers/notion_retry.py
+!groups/main/research-papers/question_shape.py
+!groups/main/research-papers/nature_source.py
+!groups/main/research-papers/superscript_citations.py
 !groups/main/research-papers/descent.py
 !groups/main/research-papers/resolve_paper.py
 !groups/main/research-papers/heal_verify.py
