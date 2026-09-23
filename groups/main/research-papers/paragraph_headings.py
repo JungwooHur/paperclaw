@@ -170,3 +170,47 @@ def promote(block: dict):
     kind = 'heading_%d' % level
     spans = (block.get('paragraph') or {}).get('rich_text') or []
     return {'object': 'block', 'type': kind, kind: {'rich_text': spans}}
+
+
+def heal_run_in(page_id: str, apply: bool = False) -> dict:
+    """Split every run-in title on a page. Run by hand; see `main` below."""
+    import time
+
+    import reference_section
+    import verify_sections as vs
+    from translate_fulltext import notion
+
+    blocks = vs.fetch_blocks(page_id)
+    rep = {"page": page_id, "split": 0}
+    for block in reference_section.body_blocks(blocks):
+        pair = split_run_in(block)
+        if pair is None:
+            continue
+        head, body = pair
+        if text_of(head) + " " + text_of(body) != text_of(block).strip():
+            raise ValueError(f"text would change in {block['id']}; refusing")
+        rep["split"] += 1
+        if apply:
+            notion("PATCH", f"/blocks/{page_id}/children",
+                   {"children": [head, body], "after": block["id"]})
+            notion("PATCH", f"/blocks/{block['id']}", {"archived": True})
+            time.sleep(0.45)
+    return rep
+
+
+def main() -> int:
+    """Run by hand: journals differ, so a person checks the result."""
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--page", required=True)
+    parser.add_argument("--apply", action="store_true")
+    args = parser.parse_args()
+    print(json.dumps(heal_run_in(args.page, apply=args.apply),
+                     ensure_ascii=False, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
