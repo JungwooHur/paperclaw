@@ -26,10 +26,13 @@ Usage: python3 auto_save_qa.py [--dry-run] [--hours N] [--chat JID]
 """
 from __future__ import annotations
 import argparse, json, os, re, sqlite3, subprocess, sys, time
+import tempfile
 import urllib.request, urllib.error
 from typing import Callable
 
 import layer_format
+import backstop_timing
+import run_lock
 import question_shape
 import notion_retry
 
@@ -264,7 +267,8 @@ def fetch_top_callouts(page_id: str) -> list[dict]:
                                for r in b["callout"]["rich_text"])
             body_parts = [_block_text(bb) for bb in k]
         body = "\n".join(p for p in body_parts if p).strip()
-        results.append({"question": question, "body": body})
+        results.append({"question": question, "body": body,
+                        "created": b.get("created_time", "")})
     return results
 
 
@@ -852,6 +856,23 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
+    # Two invocations exist — the five-minute timer and the trigger that fires
+    # when a reply goes out — and the healer is saturated often enough that they
+    # overlap. Two copies each read a page, each see no callout for a pair, and
+    # each file one. The lock lives here rather than in whatever started the
+    # run, because a lock on only one of the two cannot prevent that.
+    held = run_lock.acquire(os.path.join(tempfile.gettempdir(),
+                                         "paperclaw-auto-save-qa.lock"))
+    if held is None:
+        print("another scan is already running — leaving this one to it")
+        return
+    try:
+        _scan(args)
+    finally:
+        run_lock.release(held)
+
+
+def _scan(args) -> None:
     papers = load_paper_pages()
     msgs = fetch_recent_messages(args.hours, args.chat)
     chats = group_by_chat(msgs)
@@ -947,6 +968,19 @@ def main() -> None:
                         unknown = True
                         break
                     q_cache[pid] = existing
+                # The agent writes a SHORTER answer onto the page than it
+                # sends to the chat, so the two never look alike enough —
+                # measured, a duplicate pair's bodies overlapped 0.19 while
+                # genuinely different questions on one page reach 0.26. Wording
+                # alone cannot separate them, and timing alone would bury an
+                # answer the agent forgot while saving a different one in the
+                # same minutes. Both together decide.
+                if backstop_timing.saved_during_exchange(
+                        existing, user_msg["timestamp"], m["timestamp"],
+                        question):
+                    print(f"  skip (agent saved it during this exchange): "
+                          f"{question[:48]}")
+                    continue
                 if already_saved(question, answer_md, existing):
                     if pid != paper["id"]:
                         print(f"  skip (already on different paper page "

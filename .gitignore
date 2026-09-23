@@ -52,6 +52,8 @@ groups/main/research-papers/*
 !groups/main/research-papers/paragraph_headings.py
 !groups/main/research-papers/notion_retry.py
 !groups/main/research-papers/question_shape.py
+!groups/main/research-papers/backstop_timing.py
+!groups/main/research-papers/run_lock.py
 !groups/main/research-papers/nature_source.py
 !groups/main/research-papers/superscript_citations.py
 !groups/main/research-papers/descent.py
