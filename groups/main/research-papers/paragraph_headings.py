@@ -68,6 +68,76 @@ def heading_level(block: dict):
 MIN_ORPHAN_FIGURES = 3
 
 
+# A title the journal set in bold and the translation flattened into the text:
+# `Domain knowledge (도메인 지식) 이 시스템은 …`. What makes it recognisable is
+# the translation's own convention — every heading on these pages is written
+# `English Title (한글 제목)` — plus the space after the bracket. A term gloss in
+# running prose has a Korean particle glued straight onto it ("(약어)는"), and a
+# title does not.
+MAX_RUN_IN_TITLE = 60
+
+_RUN_IN = re.compile(
+    r"^([A-Z][A-Za-z0-9 ,:'\-\u2013]{2,%d}?)\s*\(([^)]*[가-힣][^)]*)\)\s+(?=\S)"
+    % MAX_RUN_IN_TITLE)
+
+
+def split_run_in(block: dict):
+    """A paragraph opening with a run-in title, as `(heading, paragraph)`.
+
+    Returns None when the paragraph does not open with one — which includes
+    every term gloss, because splitting one would cut a sentence in half.
+    """
+    if block.get('type') != 'paragraph':
+        return None
+    spans = (block.get('paragraph') or {}).get('rich_text') or []
+    text = text_of(block)
+    found = _RUN_IN.match(text.strip())
+    if not found:
+        return None
+    # The offset is measured on the stripped text, so leading space is counted.
+    lead = len(text) - len(text.lstrip())
+    cut = lead + found.end()
+    title_len = lead + len(found.group(0).rstrip())
+    head = _slice_spans(spans, 0, title_len)
+    body = _slice_spans(spans, cut, None)
+    # A title is plain words. Anything else reaching into it — an equation, a
+    # mention — means the phrase is part of a sentence rather than a heading.
+    if any(span.get('type') != 'text' for span in head):
+        return None
+    if not head or not body:
+        return None
+    return ({'object': 'block', 'type': 'heading_3',
+             'heading_3': {'rich_text': head}},
+            {'object': 'block', 'type': 'paragraph',
+             'paragraph': {'rich_text': body}})
+
+
+def _slice_spans(spans: list, start: int, end):
+    """The rich_text covering `[start, end)` characters, annotations kept."""
+    out, seen = [], 0
+    for span in spans:
+        body = (span.get('text') or {}).get('content', '') or span.get(
+            'plain_text', '')
+        first, last = seen, seen + len(body)
+        seen = last
+        lo = max(first, start)
+        hi = last if end is None else min(last, end)
+        if lo >= hi:
+            continue
+        if span.get('type') != 'text':
+            # An equation carries an expression, not characters, so it cannot be
+            # cut — writing text into one is rejected by Notion outright. It
+            # passes through whole. A cut that would land inside one always puts
+            # it in the title, which the plain-text rule below then refuses.
+            out.append(span)
+            continue
+        piece = body[lo - first:hi - first]
+        out.append(dict(span,
+                        text=dict(span.get('text') or {}, content=piece),
+                        plain_text=piece))
+    return out
+
+
 def no_heading_finding(blocks: list):
     """What a page with no headings actually is: `(finding kind, block ids)`.
 

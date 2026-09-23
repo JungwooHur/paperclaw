@@ -224,6 +224,20 @@ read off the code.
   writes `arXiv.org` in a sentence. Only a comparison of the content before and
   after can answer whether anything happened.
 
+### What may be written onto a paper page
+
+- **A request is not a question.** The single writer every Q&A goes through
+  decides this, not its callers. A guard at the one place everything passes is
+  worth more than a rule that each caller is asked to remember.
+- **A repair that edits body text inserts; it does not replace.** Where a repair
+  must touch the words a reader is reading, the invariant is checkable — remove
+  what was inserted and the original returns — and it is checked against the
+  real text before each write, not assumed from the tests.
+- **A source that cannot be aligned against is used only for what it proves.**
+  A bibliography read from a publisher's page is enough to inject a list and
+  link a numbering that is already the paper's own. It is not enough to correct
+  a numbering, and nothing pretends otherwise.
+
 ### Terms
 
 - **Layer** — one step down the chain of whys, closed by the reader restating it

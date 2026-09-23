@@ -31,6 +31,7 @@ chars per paragraph rich_text block.
 from __future__ import annotations
 import argparse, json, os, re, sys, time, urllib.request, urllib.error
 
+import question_shape
 from wrap_math import wrap_math_text  # Prevent: auto-wrap bare LaTeX -> equations
 
 API = "https://api.notion.com/v1"
@@ -559,6 +560,21 @@ def build_callout(question: str, answer_md: str) -> dict:
     }
 
 
+def acceptable_question(question: str) -> bool:
+    """Is this worth writing onto a paper page as a Q&A?
+
+    This writer is the single entry point every Q&A goes through, by rule — and
+    it validated nothing, so the rule protected nothing. A message asking for the
+    paper to be PROCESSED ("정리해", with the PDF attached) was written onto that
+    paper as though it were a question about it, under a heading of its own.
+
+    The `Q: ` prefix the caller adds is not evidence of anything; what is asked
+    after it is.
+    """
+    body = re.sub(r"^\s*Q\s*[:.]\s*", "", question or "", flags=re.I)
+    return question_shape.is_question_like(body)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--page", required=True, help="Notion page ID")
@@ -597,6 +613,9 @@ def main() -> None:
         if after_id is None:
             sys.exit(f"section not found: '{args.section}' (no top-level heading matched)")
 
+    if not acceptable_question(args.question):
+        sys.exit(f"refusing to save: {args.question.strip()[:60]!r} is a request, "
+                 f"not a question about the paper")
     body: dict = {"children": [build_callout(args.question, answer_md)]}
     if after_id:
         body["after"] = after_id
