@@ -93,3 +93,33 @@ class TestTheQuestionMustMatchToo:
     def test_a_question_too_short_to_judge_is_refused(self):
         assert not bt.saved_during_exchange(
             [callout("2026-09-23T11:31:00.000Z", "왜?")], ASKED, REPLIED, "왜?")
+
+
+class TestSpellingThatHidesTheSameWords:
+    """The agent files the question in its own words: the paper's own symbol
+    where the reader typed its name, a particle of its choosing glued onto the
+    same term. A real pair filed twice measured 0.375 — the words it shared
+    were counted as different because `pi_ref는` and `π_ref` are different
+    strings, and so are `2를` and `2에서`."""
+
+    ASKED = "model-x의 pi_ref는 뭐야? figure 2를 기준으로 설명해."
+    FILED = ("Q: Model-X의 π_ref (reference policy)는 무엇이고, "
+             "Figure 2에서 어떤 역할을 하나요?")
+
+    def test_the_agent_s_filing_of_the_same_question_counts(self):
+        assert bt.saved_during_exchange(
+            [callout("2026-09-23T11:31:00.000Z", self.FILED)],
+            ASKED, REPLIED, self.ASKED)
+
+    def test_a_greek_letter_and_its_name_are_one_word(self):
+        assert bt._tokens("π_ref") == bt._tokens("pi_ref")
+
+    def test_a_particle_does_not_make_a_new_word(self):
+        assert "pi_ref" in bt._tokens("pi_ref는 무엇")
+        assert "figure" in bt._tokens("figure를 보면")
+
+    def test_a_different_question_on_the_same_symbols_does_not(self):
+        other = "Q: Model-X에서 KL 계수를 0.001로 정한 이유는 무엇인가요?"
+        assert not bt.saved_during_exchange(
+            [callout("2026-09-23T11:31:00.000Z", other)],
+            ASKED, REPLIED, self.ASKED)

@@ -31,6 +31,7 @@ chars per paragraph rich_text block.
 from __future__ import annotations
 import argparse, json, os, re, sys, time, urllib.request, urllib.error
 
+import notion_retry
 import question_shape
 from wrap_math import wrap_math_text  # Prevent: auto-wrap bare LaTeX -> equations
 
@@ -48,9 +49,24 @@ def headers() -> dict:
     }
 
 
+def _read(req) -> bytes:
+    """Open a request that changes nothing, retrying what is worth retrying.
+
+    Reads only. The insert is NOT retried here: a 5xx can arrive after Notion
+    applied the write, and repeating it would be the duplicate this avoids.
+    """
+    for attempt in range(1, notion_retry.MAX_RETRIES + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=30).read()
+        except urllib.error.HTTPError as err:
+            if not notion_retry.should_retry(err, attempt):
+                raise
+            time.sleep(notion_retry.retry_delay(err, attempt))
+    raise RuntimeError("unreachable")          # the loop either returns or raises
+
+
 def api_get(path: str) -> dict:
-    req = urllib.request.Request(API + path, headers=headers())
-    return json.loads(urllib.request.urlopen(req).read())
+    return json.loads(_read(urllib.request.Request(API + path, headers=headers())))
 
 
 def api_patch(path: str, body: dict) -> dict:
@@ -68,7 +84,7 @@ def api_delete(block_id: str) -> None:
     req = urllib.request.Request(
         f"{API}/blocks/{block_id}", method="DELETE", headers=headers()
     )
-    urllib.request.urlopen(req).read()
+    _read(req)
 
 
 def fetch_page_identity(page_id: str) -> tuple[str, str]:
@@ -121,6 +137,35 @@ def strip_q_prefix(question: str) -> str:
     dedup comparison that keeps a question from being filed twice.
     """
     return _QPREFIX.sub("", question or "").strip()
+
+
+def _question_key(question: str) -> str:
+    return " ".join(strip_q_prefix(question).split()).lower()
+
+
+def already_saved(questions_on_page: list[str], question: str) -> bool:
+    """Is this exact question already filed on the page?
+
+    Makes the save safe to repeat. A caller that sees a failure retries, and a
+    failure can come AFTER the write succeeded — which is how one answer was
+    filed twice, a minute apart. A rephrased question is a different call and is
+    not caught here; the backstop's own check handles those.
+    """
+    key = _question_key(question)
+    return any(_question_key(q) == key for q in questions_on_page)
+
+
+def callout_questions(top: list[dict]) -> list[str]:
+    """The question of every top-level Q&A callout (the toggle's label)."""
+    out = []
+    for b in top:
+        if b.get("type") != "callout" or not b.get("has_children"):
+            continue
+        for child in api_get(f"/blocks/{b['id']}/children?page_size=10")["results"]:
+            if child.get("type") == "toggle":
+                out.append(block_text(child))
+                break
+    return out
 
 
 def find_after_for_section(blocks: list[dict], section_query: str) -> str | None:
@@ -616,6 +661,9 @@ def main() -> None:
     if not acceptable_question(args.question):
         sys.exit(f"refusing to save: {args.question.strip()[:60]!r} is a request, "
                  f"not a question about the paper")
+    if already_saved(callout_questions(top), args.question):
+        print("OK: already saved — this question is on the page; nothing written")
+        return
     body: dict = {"children": [build_callout(args.question, answer_md)]}
     if after_id:
         body["after"] = after_id

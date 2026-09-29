@@ -15,14 +15,15 @@ wording alone could justify. Neither signal decides on its own — a callout in
 the window may belong to a different question asked in the same minutes, and a
 loose question match may be two questions about one subject — and skipping on
 either alone would bury an answer the agent genuinely forgot, which is the one
-thing this exists to prevent. Together they are decisive: measured across real
-pages, different questions on one page overlap 0.14 at the 95th percentile,
-while the duplicate pair measured 0.67.
+thing this exists to prevent. Together they are decisive; the measurement
+behind the question bar is at MIN_QUESTION_MATCH.
 
-Imports nothing but the standard library.
+Imports the standard library and `latin`.
 """
 import datetime
 import re
+
+from latin import latinize
 
 # How long after the reply the agent may still be writing. Generous, because the
 # cost of waiting is one delayed save and the cost of being wrong is a duplicate
@@ -30,10 +31,13 @@ import re
 GRACE = datetime.timedelta(minutes=10)
 
 
-# Far below the wording check's own bar, because timing is carrying most of the
-# weight here. Chosen from measurement: different questions on one page reach
-# 0.14 at the 95th percentile and the duplicate pair reached 0.67.
-MIN_QUESTION_MATCH = 0.40
+# Below the wording check's own bar, because timing carries most of the weight
+# here. Measured over every distinct pair of questions filed on the same page
+# (361 pairs, 2026-09-29): the three known duplicates score 0.55-0.83 under this
+# tokenizer, and 5 pairs of genuinely different questions reach 0.50 — the same
+# count the old tokenizer had at 0.45, and fewer than its 9 at the old 0.40,
+# which caught only two of the three duplicates.
+MIN_QUESTION_MATCH = 0.50
 
 # Shorter than this and containment means nothing — a three-word question is
 # swallowed by anything.
@@ -41,9 +45,17 @@ MIN_TOKENS = 4
 
 
 def _tokens(text: str) -> set:
-    """Words worth comparing, with the marker the writer adds removed."""
+    """Words worth comparing, with the marker the writer adds removed.
+
+    Latin and Hangul are split into separate runs, because a Korean particle
+    glues straight onto the term before it: `pi_ref는` and `figure를` must count
+    as `pi_ref` and `figure`, or the same question filed with a different
+    particle shares none of its key terms. Greek is spelled out first, since the
+    agent writes the paper's symbol (`π_ref`) where the reader typed its name.
+    """
     body = re.sub(r"^\s*Q\s*[:.]\s*", "", text or "", flags=re.I)
-    return {w for w in re.findall(r"[\w가-힣]+", body.lower()) if len(w) > 1}
+    runs = re.findall(r"[a-z0-9_]+|[가-힣]+", latinize(body).lower())
+    return {w for w in runs if len(w) > 1}
 
 
 def _same_question(one: str, other: str) -> bool:

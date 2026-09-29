@@ -34,6 +34,7 @@ import layer_format
 import backstop_timing
 import run_lock
 import question_shape
+from latin import latinize
 import notion_retry
 
 API = "https://api.notion.com/v1"
@@ -161,42 +162,6 @@ def load_paper_pages() -> list[dict]:
         for kw in set(w.lower() for w in p["keywords"]):
             _KW_DF[kw] = _KW_DF.get(kw, 0) + 1
     return out
-
-
-# A model named with a Greek letter is written one way in the title and another
-# by the person asking about it: the page says "\u03c00", the question says "pi0".
-# Nobody types \u03c0 on a phone. Transliterating both sides makes the model name a
-# normal token again — and it is the most distinctive token a title has.
-_GREEK = {
-    "\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma", "\u03b4": "delta",
-    "\u03b5": "epsilon", "\u03b6": "zeta", "\u03b7": "eta", "\u03b8": "theta",
-    "\u03b9": "iota", "\u03ba": "kappa", "\u03bb": "lambda", "\u03bc": "mu",
-    "\u03bd": "nu", "\u03be": "xi", "\u03c0": "pi", "\u03c1": "rho",
-    "\u03c3": "sigma", "\u03c4": "tau", "\u03c6": "phi", "\u03c7": "chi",
-    "\u03c8": "psi", "\u03c9": "omega",
-    "\u0391": "Alpha", "\u0392": "Beta", "\u0393": "Gamma", "\u0394": "Delta",
-    "\u039b": "Lambda", "\u03a0": "Pi", "\u03a3": "Sigma", "\u03a6": "Phi",
-    "\u03a8": "Psi", "\u03a9": "Omega",
-}
-
-
-# A model name is also typeset with SUBSCRIPT digits — "\u03c0\u2080.\u2087" — which no
-# keyboard produces either, and a star between the letter and the number
-# ("\u03c0*0.6") splits the token in two. Both are decoration on the same name.
-_SUBDIGIT = str.maketrans("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089"
-                          "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079",
-                          "01234567890123456789")
-
-
-def latinize(text: str) -> str:
-    """Greek letters spelled out, so a title and a phone keyboard can meet."""
-    if not text:
-        return ""
-    for g, name in _GREEK.items():
-        if g in text:
-            text = text.replace(g, name)
-    text = text.translate(_SUBDIGIT)
-    return re.sub(r"(?<=[A-Za-z])\*(?=[0-9])", "", text)
 
 
 def extract_title_keywords(title: str) -> list[str]:
@@ -849,6 +814,65 @@ def save_callout(page_id: str, question: str, answer_md: str,
 
 # ---- Main -----------------------------------------------------------------
 
+def find_saved_copy(candidate_ids, cache: dict, fetch, own_page: str,
+                    asked_at: str, replied_at: str, question: str,
+                    answer_md: str) -> str:
+    """Is this exchange already filed on any page it could plausibly be on?
+
+    Returns "saved", "missing", or "unknown" (a page could not be read — the
+    pair is deferred to the next cycle rather than filed on a guess).
+
+    A pair counts as saved when ANY candidate page carries it, by either test.
+    This was once written inline, and a timing match printed "skip" and then
+    `continue`d to the next CANDIDATE page instead of ending the search — so the
+    pair was filed anyway, and the wording test on that page, which would have
+    recognised the backstop's own earlier copy, never ran. Every healer cycle
+    filed the same exchange again until it aged out of the look-back window:
+    three pages collected over nine hundred copies in two days.
+
+    Args:
+        candidate_ids: Pages the exchange could be filed on.
+        cache: page id -> callouts already fetched this run; filled in here.
+        fetch: page id -> that page's callouts, as `fetch_top_callouts` returns.
+        own_page: The page the exchange would be filed on.
+        asked_at: When the question arrived.
+        replied_at: When the answer was sent.
+        question: The question as it would be filed.
+        answer_md: The answer as it would be filed.
+    """
+    for pid in candidate_ids:
+        existing = cache.get(pid)
+        if existing is None:
+            try:
+                existing = fetch(pid)
+            except Exception as e:
+                # FAIL CLOSED. This used to fall back to `existing = []`, i.e.
+                # "the page has no Q&A" — so a transient 429 turned the dedup off
+                # and the pair was filed again. A duplicate callout is permanent;
+                # a save deferred to the next cycle is not.
+                print(f"  fetch {pid} failed: {e} — deferring this pair",
+                      file=sys.stderr)
+                return "unknown"
+            cache[pid] = existing
+        # The agent writes a SHORTER answer onto the page than it sends to the
+        # chat, so the two never look alike enough — measured, a duplicate
+        # pair's bodies overlapped 0.19 while genuinely different questions on
+        # one page reach 0.26. Wording alone cannot separate them, and timing
+        # alone would bury an answer the agent forgot while saving a different
+        # one in the same minutes. Both together decide.
+        if backstop_timing.saved_during_exchange(existing, asked_at, replied_at,
+                                                 question):
+            print(f"  skip (agent saved it during this exchange): "
+                  f"{question[:48]}")
+            return "saved"
+        if already_saved(question, answer_md, existing):
+            if pid != own_page:
+                print(f"  skip (already on different paper page "
+                      f"{pid[-12:]}): {question[:60]}", file=sys.stderr)
+            return "saved"
+    return "missing"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=int, default=DEFAULT_LOOKBACK_HOURS)
@@ -951,45 +975,10 @@ def _scan(args) -> None:
             # the rate limit, which now defers the pair instead of deduping it.
             candidate_ids.update(pid for _, pid in ctx[:8])
 
-            already = False
-            unknown = False
-            for pid in candidate_ids:
-                existing = q_cache.get(pid)
-                if existing is None:
-                    try:
-                        existing = fetch_top_callouts(pid)
-                    except Exception as e:
-                        # FAIL CLOSED. This used to fall back to `existing = []`,
-                        # i.e. "the page has no Q&A" — so a transient 429 turned the
-                        # dedup off and the pair was filed again. A duplicate callout
-                        # is permanent; a save deferred to the next cycle is not.
-                        print(f"  fetch {pid} failed: {e} — deferring this pair",
-                              file=sys.stderr)
-                        unknown = True
-                        break
-                    q_cache[pid] = existing
-                # The agent writes a SHORTER answer onto the page than it
-                # sends to the chat, so the two never look alike enough —
-                # measured, a duplicate pair's bodies overlapped 0.19 while
-                # genuinely different questions on one page reach 0.26. Wording
-                # alone cannot separate them, and timing alone would bury an
-                # answer the agent forgot while saving a different one in the
-                # same minutes. Both together decide.
-                if backstop_timing.saved_during_exchange(
-                        existing, user_msg["timestamp"], m["timestamp"],
-                        question):
-                    print(f"  skip (agent saved it during this exchange): "
-                          f"{question[:48]}")
-                    continue
-                if already_saved(question, answer_md, existing):
-                    if pid != paper["id"]:
-                        print(f"  skip (already on different paper page "
-                              f"{pid[-12:]}): {question[:60]}", file=sys.stderr)
-                    already = True
-                    break
-            if unknown:
-                continue
-            if already:
+            verdict = find_saved_copy(
+                candidate_ids, q_cache, fetch_top_callouts, paper["id"],
+                user_msg["timestamp"], m["timestamp"], question, answer_md)
+            if verdict != "missing":
                 continue
 
             print(f"[{chat_jid[:20]:20}] {m['timestamp']}: missing Q&A for "
