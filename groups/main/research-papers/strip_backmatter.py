@@ -11,7 +11,8 @@ entries fragment across blocks. References/Acknowledgements should never be
 translated.
 
 This finds the FIRST back-matter heading (References / Bibliography / 참고문헌 /
-Acknowledgements / Disclosure of Funding) and archives it plus everything after it.
+Acknowledgements / Disclosure of Funding) and archives it plus everything after
+it, up to the next body heading — a journal's Methods follow its references.
 
   strip_backmatter.py --page <id> [--apply]     # dry-run without --apply
 """
@@ -93,6 +94,25 @@ def _text(b):
 MAX_BACKMATTER_FRACTION = 0.5
 
 
+def backmatter_end(blocks, start):
+    """Index just past the back matter that starts at `blocks[start]`.
+
+    A journal article (Nature and its sister journals) prints its Methods, and
+    its data and code statements, AFTER the reference list. Those are body, so
+    the back matter ends at the next heading of the same or a higher level that
+    is not itself back matter. Cutting to the end of the page instead would
+    archive a paper's whole method.
+    """
+    level = int(blocks[start]["type"][-1])
+    for j in range(start + 1, len(blocks)):
+        kind = blocks[j]["type"]
+        if not kind.startswith("heading") or int(kind[-1]) > level:
+            continue
+        if not _BACKMATTER.match(_text(blocks[j]).strip()):
+            return j
+    return len(blocks)
+
+
 def strip_backmatter(page_id, apply=False):
     blocks = fetch_blocks(page_id)
     start = None
@@ -121,7 +141,7 @@ def strip_backmatter(page_id, apply=False):
     rep = {"page": page_id, "scanned": len(blocks), "backmatter_from": None, "archived": 0}
     if start is None:
         return rep
-    victims = blocks[start:]
+    victims = blocks[start:backmatter_end(blocks, start)]
     rep["backmatter_from"] = _text(blocks[start]).strip()[:60]
     rep["would_archive"] = len(victims)
     if blocks and len(victims) > len(blocks) * MAX_BACKMATTER_FRACTION:

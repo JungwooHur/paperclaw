@@ -22,17 +22,26 @@ import re
 import link_references as lr
 
 # Nature numbers each entry in the list item and puts the text in a paragraph of
-# its own: <li … data-counter="11"><p … id="ref-CR11">Kocsis, L. &amp; …</p></li>
+# its own: <li … data-counter="11."><p … id="ref-CR11">Kocsis, L. &amp; …</p></li>
+# The counter has been seen both with and without a trailing period.
 _ITEM = re.compile(
-    r'data-counter="(\d+)"\s*>\s*<p[^>]*>(.*?)</p>', re.S | re.I)
+    r'data-counter="(\d+)\.?"\s*>\s*<p[^>]*>(.*?)</p>', re.S | re.I)
 
 _ARTICLE = re.compile(r'^https?://(?:www\.)?nature\.com/articles/[\w.-]+', re.I)
 
+# A page usually records its source as the DOI. For Nature Portfolio (prefix
+# 10.1038) the DOI suffix is the article's own path segment.
+_NATURE_DOI = re.compile(r'^https?://(?:dx\.)?doi\.org/10\.1038/([\w.-]+)', re.I)
+
 
 def article_url(url: str):
-    """The Nature article URL in `url`, or None if it is not one."""
-    found = _ARTICLE.match((url or '').strip())
-    return found.group(0) if found else None
+    """The Nature article URL `url` names, or None if it names none."""
+    url = (url or '').strip()
+    found = _ARTICLE.match(url)
+    if found:
+        return found.group(0)
+    doi = _NATURE_DOI.match(url)
+    return f'https://www.nature.com/articles/{doi.group(1)}' if doi else None
 
 
 def _plain(markup: str) -> str:

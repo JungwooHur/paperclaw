@@ -183,6 +183,45 @@ def page_title(page_id: str) -> str:
     return ""
 
 
+def duplicate_groups(sections: list) -> dict:
+    """Sections grouped by what would make them copies of one another.
+
+    Keyed HIERARCHICALLY by the enclosing-heading chain. A paper commonly reuses
+    bare subsection letters (II has A/B/C/D, III has A/B); those are different
+    subsections under different parents, NOT duplicates. Scoping by the parent
+    chain ("II>A" vs "III>A") avoids that, while two real copies of the same
+    section under the same parent still collide.
+
+    An UNLABELLED heading repeats legitimately across a paper ("Tasks" in the
+    body and again under an appendix), so it is compared only inside the SAME
+    parent, by its whole normalised title. Skipping such headings entirely hid 8
+    duplicated subsections on one page. Keying them by a PREFIX of the title
+    made siblings that merely start alike ("Settings for model A" / "Settings
+    for model B") into copies of each other.
+
+    The audit and the healer both group through here: a second copy of this
+    rule is how the two came to disagree before.
+
+    Returns:
+        {scope: [section, ...]} in page order; every section gets `_dupkey`.
+        A group of two or more is only a CANDIDATE when unlabelled — confirm
+        with `dup_confirmed`.
+    """
+    groups, stack = {}, []  # stack: (level, scope)
+    for s in sections:
+        while stack and stack[-1][0] >= s["level"]:
+            stack.pop()
+        parent = stack[-1][1] if stack else ""
+        if s["key"]:
+            scope = f"{parent}>{s['key']}"
+        else:
+            scope = f"{parent}>~{_echo_norm(s['heading'])}"
+        s["_dupkey"] = scope
+        groups.setdefault(scope, []).append(s)
+        stack.append((s["level"], scope))
+    return groups
+
+
 def dup_confirmed(a: dict, b: dict) -> bool:
     """Are these two same-titled sections really the SAME section, duplicated?
 
@@ -389,6 +428,29 @@ def load_source_text(source: str | None, arxiv: str | None):
         except Exception:
             return None
     return None
+
+
+# A Methods heading on a line of its own. Journals set it after the reference
+# list; "Online Methods" is the older name for the same section.
+_METHODS_LINE = re.compile(r"^\s*(?:online\s+)?methods\s*$", re.I | re.M)
+
+
+def methods_missing(full_text: str, headings: list) -> bool:
+    """Does the source have a Methods section that the page does not?
+
+    A journal article prints Methods after its references, where a rule written
+    for arXiv papers ("everything past References is back matter") drops them
+    from the page. The method is the part a reader most needs, so a page
+    without it is incomplete however well the rest reads.
+
+    Args:
+        full_text: the source's text, with its line breaks.
+        headings: the page's heading texts.
+    """
+    if not _METHODS_LINE.search(full_text or ""):
+        return False
+    names = ("method", "online method", "materials and method")
+    return not any(english_title(h).lower().startswith(names) for h in headings)
 
 
 def source_section_chars(full_text: str, ordered_sections: list) -> dict:
@@ -616,27 +678,7 @@ def main() -> int:
     # subsections under different parents, NOT duplicates. Scoping by the parent
     # chain ("II>A" vs "III>A") avoids that false positive, while two real
     # copies of the same section under the same parent still collide.
-    dup_keys = {}
-    stack = []  # (level, scope_token)
-    for s in sections:
-        lvl = s["level"]
-        while stack and stack[-1][0] >= lvl:
-            stack.pop()
-        parent = stack[-1][1] if stack else ""
-        if s["key"]:
-            scope = f"{parent}>{s['key']}"
-            s["_dupkey"] = scope
-            dup_keys.setdefault(scope, []).append(s)
-        else:
-            # An UNLABELLED heading repeats legitimately across the paper ("Tasks"
-            # in the body and again under an appendix), so it can only be compared
-            # inside the SAME parent — where a second copy really is the re-append
-            # this check exists for. Skipping them entirely hid 8 duplicated
-            # subsections on one page, several carrying near-identical bodies.
-            scope = f"{parent}>~{_echo_norm(s['heading'])[:16]}"
-            s["_dupkey"] = scope
-            dup_keys.setdefault(scope, []).append(s)
-        stack.append((lvl, scope))
+    dup_keys = duplicate_groups(sections)
     for scope, occ in dup_keys.items():
         key = occ[0]["key"] or occ[0]["heading"][:40]
         if not occ[0]["key"]:
@@ -1025,6 +1067,15 @@ def main() -> int:
         findings.append({"type": "WARN", "section": None,
                          "detail": "source given but could not be parsed; "
                                    "summarization/completeness checks skipped"})
+
+    # 3b. A journal's Methods, printed after its references (needs source).
+    if src_text and methods_missing(
+            src_text, [s["heading"] for s in sections]):
+        findings.append({
+            "type": "MISSING", "section": "Methods",
+            "detail": "the source has a Methods section (after its reference "
+                      "list) and the page has none — translate it as body",
+        })
 
     # 4. MISSING (needs manifest).
     manifest = load_manifest(args.sections)
