@@ -110,22 +110,7 @@ def dedupe_duplicates(page_id, blocks, apply):
     """Archive redundant duplicate sections keeping the richest copy. Scopes keys
     hierarchically (parent chain) exactly like verify_sections, so a subsection
     letter reused under different parents (II>A vs III>A) is NOT a duplicate."""
-    sections = vs.group_sections(blocks)
-    scoped, stack = {}, []
-    for s in sections:
-        while stack and stack[-1][0] >= s["level"]:
-            stack.pop()
-        parent = stack[-1][1] if stack else ""
-        if s["key"]:
-            scope = f"{parent}>{s['key']}"
-            scoped.setdefault(scope, []).append(s)
-        else:
-            # Match verify_sections: an unlabelled heading IS dup-checked, but only
-            # within its own parent — otherwise the healer reports a duplicate the
-            # audit found and then archives nothing.
-            scope = f"{parent}>~{vs._echo_norm(s['heading'])[:16]}"
-            scoped.setdefault(scope, []).append(s)
-        stack.append((s["level"], scope))
+    scoped = vs.duplicate_groups(vs.group_sections(blocks))
     ranges = _section_ranges(blocks)
     seen, to_archive = set(), []
     for occ in scoped.values():

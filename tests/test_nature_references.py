@@ -42,6 +42,15 @@ class TestReadingTheList:
     def test_the_label_is_the_number(self):
         assert [e["label"] for e in ns.parse_bibliography(PAGE)] == ["1", "2", "11"]
 
+    def test_a_counter_written_with_a_period_is_still_read(self):
+        # Nature's current markup writes `data-counter="1."`. Expecting bare
+        # digits read a real 36-entry list as empty, so the page got no
+        # bibliography and every marker stayed unlinked.
+        dotted = PAGE.replace('data-counter="1"', 'data-counter="1."') \
+                     .replace('data-counter="2"', 'data-counter="2."') \
+                     .replace('data-counter="11"', 'data-counter="11."')
+        assert [e["num"] for e in ns.parse_bibliography(dotted)] == [1, 2, 11]
+
     def test_a_page_without_a_bibliography_yields_nothing(self):
         assert ns.parse_bibliography("<p>본문뿐입니다</p>") == []
 
@@ -53,6 +62,14 @@ class TestRecognisingTheSource:
 
     def test_the_http_form_too(self):
         assert ns.article_url("http://nature.com/articles/yyyyyyyyy")
+
+    def test_a_nature_doi_is_one(self):
+        # A page records its source as the DOI, not the article URL.
+        assert (ns.article_url("https://doi.org/10.1038/s00000-000-00000-x")
+                == "https://www.nature.com/articles/s00000-000-00000-x")
+
+    def test_a_doi_from_another_publisher_is_not(self):
+        assert ns.article_url("https://doi.org/10.1145/0000000.0000000") is None
 
     def test_another_publisher_is_not(self):
         assert ns.article_url("https://example.org/abs/paper") is None
