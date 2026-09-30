@@ -38,6 +38,13 @@ RUN npm install -g agent-browser @anthropic-ai/claude-code
 COPY vendor/notebooklm-py /tmp/notebooklm-py
 RUN pip install --break-system-packages /tmp/notebooklm-py && rm -rf /tmp/notebooklm-py \
  && mv "$(command -v notebooklm)" /usr/local/lib/notebooklm-real
+# PyMuPDF: the paper scripts read PDFs with it — the structural audit against a
+# PDF source, and rendering figures and tables from one. Without it the audit
+# printed "PyMuPDF not installed; cannot read PDF source" and every source check
+# was skipped, and a PDF-only paper could not get a single figure from here.
+# Same version as the host healer and CI, so a crop is the same crop everywhere.
+RUN pip install --break-system-packages pymupdf==1.27.2.2
+
 # Serialize concurrent `notebooklm` calls (single shared ~/.notebooklm browser
 # profile can't be driven by two processes at once). Wrapper flocks then execs the
 # real CLI, so parallel paper subagents queue their asks instead of colliding.

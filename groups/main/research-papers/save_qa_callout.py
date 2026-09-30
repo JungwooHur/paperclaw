@@ -233,6 +233,30 @@ def chunks(text: str, limit: int = 1900) -> list[str]:
     return out
 
 
+# The notebooklm CLI's own status output, which a non-JSON call interleaves with
+# the answer on stdout.
+_CLI_FURNITURE = (
+    re.compile(r"(?:Continuing|Resumed|New) conversation[^\n]*\n?", re.I),
+    re.compile(r"Conversation:\s*[0-9a-f-]{8,}[^\n]*\n?", re.I),
+    re.compile(r"^\s*Answer:\s*"),
+)
+
+
+def strip_cli_furniture(text: str) -> str:
+    """A NotebookLM answer with the CLI's status lines removed, and nothing else.
+
+    This replaced a snippet the workflow document had the agent paste, which
+    also deleted every `$` and `**`. Those are content: `$` is how
+    `build_answer_blocks` finds maths, and `**` is how NotebookLM marks a
+    subsection title, so pages built through the snippet shipped with bare
+    LaTeX and their section titles flattened into paragraphs. Line wrapping and
+    spacing are `build_answer_blocks`' job and are left to it.
+    """
+    for pattern in _CLI_FURNITURE:
+        text = pattern.sub("", text)
+    return text
+
+
 def sanitize(t: str) -> str:
     """Prose sanitizer: collapse single \\n. NEVER apply to code blocks — newlines
     inside triple-backtick fences must be preserved verbatim.

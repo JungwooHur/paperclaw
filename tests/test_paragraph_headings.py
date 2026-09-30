@@ -48,6 +48,45 @@ class TestRecognisingASectionTitle:
         assert ph.heading_level(para("Figure 2: The Transformer architecture")) is None
 
 
+class TestAJournalTitleHasNoNumber:
+    """Journals do not number their sections, so a title that came out as a
+    paragraph reads `Related work (관련 연구)` — which the numbered rule never
+    matched. A whole Methods section stayed as paragraphs on one page, and the
+    audit reported nothing because the rule it uses could not see them."""
+
+    def test_an_unnumbered_title_is_one(self):
+        assert ph.heading_level(para("Related work (관련 연구)")) == 2
+
+    def test_a_title_glossed_with_itself_is_one(self):
+        assert ph.heading_level(para("Prover agent (Prover agent)")) == 2
+
+    def test_a_title_with_digits_is_one(self):
+        assert ph.heading_level(para(
+            "IMO 2024 evaluation protocol and methods (IMO 2024 평가 프로토콜 및 방법)")) == 2
+
+    def test_a_term_gloss_in_a_sentence_is_not(self):
+        assert ph.heading_level(para("Prover agent (증명 에이전트)는 search를 수행합니다.")) is None
+
+    def test_a_sentence_ending_in_a_reference_is_not(self):
+        assert ph.heading_level(para("우리는 이 방법을 사용합니다 (Fig. 2)")) is None
+
+    def test_an_english_parenthetical_that_differs_is_not(self):
+        assert ph.heading_level(para("Results are shown below (see Table 3)")) is None
+
+    def test_a_sentence_introducing_a_list_is_not(self):
+        assert ph.heading_level(para(
+            "Our contributions are summarized as follows: (우리의 기여는 다음과 같이 요약된다:)")) is None
+
+    def test_back_matter_is_not_promoted(self):
+        # Promoting it would hand strip_backmatter a boundary to cut at; that
+        # decision is not this rule's to make.
+        assert ph.heading_level(para("Acknowledgments (사사)")) is None
+        assert ph.heading_level(para("Bibliography (참고문헌)")) is None
+
+    def test_a_caption_is_still_not(self):
+        assert ph.heading_level(para("Figure 2 (그림 2)")) is None
+
+
 class TestPromoting:
 
     def test_the_text_is_carried_over_unchanged(self):

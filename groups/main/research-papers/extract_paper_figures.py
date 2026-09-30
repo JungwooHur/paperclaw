@@ -583,6 +583,12 @@ def ensure_arxiv_id(page_id: str, apply: bool = False):
     from translate_fulltext import notion
 
     pg = notion("GET", f"/pages/{page_id}")
+    # Only an EMPTY Paper URL is filled in. A page carrying a publisher URL is a
+    # journal paper; resolving its title would overwrite that URL with the
+    # preprint's and illustrate the page from a different version of itself.
+    if any(p.get("type") == "url" and p.get("url")
+           for p in (pg.get("properties") or {}).values()):
+        return None
     title = _page_title(pg).strip()
     if len(title) < 12:
         return None

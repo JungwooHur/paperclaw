@@ -37,6 +37,11 @@ _GLUED = re.compile(
 # number belongs to a measurement, not to the bibliography.
 _MEASUREMENT = re.compile(r"\d\s*[a-zA-Z×]$")
 
+# `P1`, `Q2`: a lone capital glued to a number is a label — a competition
+# problem, a question number — not a citation. One page had thirty problem
+# labels bracketed. A capital ending a longer word (`AlphaZero2`) still counts.
+_LABEL = re.compile(r"(?:^|[^A-Za-z])[A-Z]$")
+
 
 def convert(text: str, max_ref: int) -> str:
     """Bracket every glued citation in `text`, leaving everything else alone.
@@ -53,7 +58,8 @@ def convert(text: str, max_ref: int) -> str:
     """
     def replace(found):
         group = found.group(1)
-        if _MEASUREMENT.search(text[:found.start()][-4:]):
+        before = text[:found.start()][-4:]
+        if _MEASUREMENT.search(before) or _LABEL.search(before):
             return group
         numbers = [int(n) for n in re.findall(r"\d+", group)]
         if not numbers or not all(1 <= n <= max_ref for n in numbers):
