@@ -118,10 +118,11 @@ def dedupe_duplicates(page_id, blocks, apply):
             continue
         keep = choose_kept(occ)                # position first, richness to break it
         occ = [keep] + [o for o in occ if o is not keep]
-        if not occ[0]["key"]:
-            # Same rule the audit uses: an unlabelled title repeats legitimately,
-            # so only archive a copy whose BODY matches the one being kept.
-            occ = [occ[0]] + [o for o in occ[1:] if vs.dup_confirmed(occ[0], o)]
+        # Same rule the audit uses: only archive a copy whose BODY matches the
+        # one being kept. Unlabelled titles repeat legitimately, and a label can
+        # be mis-read — `A-A` … `A-G` were once all keyed `A`, and trusting the
+        # key archived six real subsections.
+        occ = [occ[0]] + [o for o in occ[1:] if vs.dup_confirmed(occ[0], o)]
         for d in occ[1:]:
             for bid in ranges.get(d["heading_id"], []):
                 if bid not in seen:            # overlapping parent/child dup ranges
