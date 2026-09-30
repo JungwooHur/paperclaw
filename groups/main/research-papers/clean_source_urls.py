@@ -26,6 +26,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from translate_fulltext import strip_source_urls, notion
+import reference_section
 import verify_sections as vs
 
 # block types whose `.rich_text` holds translated body text
@@ -108,10 +109,16 @@ def _clean_runs(rich_text):
     return out, changed
 
 
-def clean_page(page_id, apply=False):
-    blocks = vs.fetch_blocks(page_id)
-    rep = {"page": page_id, "scanned": len(blocks), "edited": 0, "archived": 0}
-    for b in blocks:
+def plan_edits(blocks):
+    """[(block, new rich_text)] for every body block carrying a leaked URL.
+
+    An empty rich_text means the block was nothing but URL noise. The injected
+    reference list is left out: its entries carry their arXiv and DOI links on
+    purpose, and scanning it stripped "Preprint at https://… (2024)" down to
+    "Preprint at (2024)" on every new page that had one.
+    """
+    out = []
+    for b in reference_section.body_blocks(blocks):
         t = b["type"]
         if t not in _TEXT_TYPES:
             continue
@@ -119,8 +126,16 @@ def clean_page(page_id, apply=False):
         if not any(_has_junk(r.get("text", {}).get("content", "")) for r in rt):
             continue
         new_rt, changed = _clean_runs(rt)
-        if not changed:
-            continue
+        if changed:
+            out.append((b, new_rt))
+    return out
+
+
+def clean_page(page_id, apply=False):
+    blocks = vs.fetch_blocks(page_id)
+    rep = {"page": page_id, "scanned": len(blocks), "edited": 0, "archived": 0}
+    for b, new_rt in plan_edits(blocks):
+        t = b["type"]
         if not new_rt:                            # nothing left -> remove block
             rep["archived"] += 1
             if apply:
