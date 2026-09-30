@@ -73,7 +73,11 @@ _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120 Safari/537.36")
 
 # Crop geometry, in PDF points (1/72").
-_CLAMP = 40.0      # never crop outside this margin of the page
+# Never crop outside this margin of the page. It was 40 pt, which is an arXiv
+# margin: a journal's text block runs to about 32 pt from the edge, and a figure
+# spanning the column lost its right-most box to the clamp. What the clamp is for
+# — the margin stamp — is excluded as furniture before anything reaches it.
+_CLAMP = 8.0
 _PAD = 6.0         # breathing room around the collected content
 _CAP_GAP = 26.0    # max vertical gap when a caption spills into more blocks
 _DPI = 250         # render resolution; ~3.5x, matches the old snippet
@@ -107,6 +111,36 @@ ANY_CAPTION = re.compile(r"\s*(Fig\.?|Figure|Table|TABLE)\s*0*(\d+)(?!\d)\s*[:.]
                          re.I)
 
 
+# A journal's Extended Data figures and tables. Their numbers restart at 1, so
+# they are kinds of their own — `ed_figure`, `ed_table` — never the main ones.
+ED_CAPTION = re.compile(
+    r"\s*Extended\s+Data\s+(Fig\.?|Figure|Table)\s*0*(\d+)(?!\d)\s*[:.|]?", re.I)
+
+ED_PREFIX = "ed_"
+
+# A caption line that marks ANOTHER float's boundary must carry its separator.
+_PUNCTUATED = re.compile(
+    r"^\s*(?:Extended\s+Data\s+)?(?:Fig\.?|Figure|Table|TABLE)\s*0*\d+\s*[:.|]", re.I)
+
+
+def base_kind(kind: str) -> str:
+    """`figure` or `table`, whether or not the kind is an Extended Data one."""
+    return kind[len(ED_PREFIX):] if kind.startswith(ED_PREFIX) else kind
+
+
+def caption_kind(text: str):
+    """(kind, number) of the caption this text opens, or None."""
+    found = ED_CAPTION.match(text)
+    if found:
+        kind = "table" if found.group(1).lower().startswith("tab") else "figure"
+        return ED_PREFIX + kind, int(found.group(2))
+    found = ANY_CAPTION.match(text)
+    if found:
+        kind = "table" if found.group(1).lower().startswith("tab") else "figure"
+        return kind, int(found.group(2))
+    return None
+
+
 def caption_opener(kind: str, num: int):
     """Matches the opening of the caption for one figure or table number.
 
@@ -124,8 +158,10 @@ def caption_opener(kind: str, num: int):
     `Figure 12` is the digit boundary rather than the punctuation that used to
     follow. Leading zeros are allowed because some PDFs pad the number.
     """
-    word = r"(?:Fig\.?|Figure)" if kind == "figure" else r"(?:Table|TABLE)"
-    return re.compile(rf"^\s*{word}\s*0*{num}(?!\d)\s*[:.]?", re.I)
+    word = (r"(?:Fig\.?|Figure)" if base_kind(kind) == "figure"
+            else r"(?:Table|TABLE)")
+    lead = r"Extended\s+Data\s+" if kind.startswith(ED_PREFIX) else ""
+    return re.compile(rf"^\s*{lead}{word}\s*0*{num}(?!\d)\s*[:.|]?", re.I)
 
 
 # The old name, kept because several call sites read better with it.
@@ -315,7 +351,15 @@ def _is_stamp(box, page_rect) -> bool:
 
 
 def _too_big(box, page_rect) -> bool:
-    """A background rectangle covering the page — never figure content."""
+    """A background rectangle covering the page — never figure content.
+
+    Also anything reaching well past the page edge: a clip region or a bleed
+    drawn behind a figure. The 40 pt margin clamp used to hide these; with the
+    clamp narrowed for journal margins, one stretched a crop to the full page.
+    """
+    if (box[0] < -2 or box[1] < -2 or box[2] > page_rect.width + 2
+            or box[3] > page_rect.height + 2):
+        return True
     area = max(box[2] - box[0], 0) * max(box[3] - box[1], 0)
     return area >= _BACKGROUND_AREA_FRAC * page_rect.width * page_rect.height
 
@@ -438,12 +482,14 @@ def crop_box(page, kind: str, num: int, band=(float("-inf"), float("inf"))):
     # them, so the region kept growing: one crop swallowed the table AND the figure
     # above the one being rendered. Whatever sits beyond another caption belongs to
     # that float, never to this one.
-    other_cap = re.compile(r"^\s*(?:Fig\.?|Figure|Table|TABLE)\s*0*(\d+)\s*[:.]", re.I)
+    # Punctuated only: "Figure 15 shows …" opens a body paragraph, and treating
+    # it as a caption walled the figure off from its own upper half.
     for b in blocks:
         if b.get("type") != 0:
             continue
-        m = other_cap.match(_block_text(b))
-        if not m or int(m.group(1)) == num:
+        text = _block_text(b)
+        other = caption_kind(text)
+        if other is None or other == (kind, num) or not _PUNCTUATED.match(text):
             continue
         box = tuple(b["bbox"])
         barriers.append(box)
@@ -451,11 +497,14 @@ def crop_box(page, kind: str, num: int, band=(float("-inf"), float("inf"))):
         # sub-caption), and the walk steps over elements — so adding it as a
         # barrier is not enough while it is still on the element list.
         elements = [e for e in elements if not _overlaps(e, box)]
-    upward = kind == "figure"
+    upward = base_kind(kind) == "figure"
     edge = _grow(caption_box, barriers, elements, upward=upward)
-    top = edge if upward else caption_box[1]
-    bottom = caption_box[3] if upward else edge
-    if bottom - top <= (caption_box[3] - caption_box[1]) + 2:
+    # The caption is NOT part of the image: the image block carries it as text,
+    # so including it showed it twice, and a caption set in two columns under a
+    # full-width figure was cut down the middle by the crop.
+    top = edge if upward else caption_box[3]
+    bottom = caption_box[1] if upward else edge
+    if bottom - top <= 2:
         return None                        # a caption with no body isn't a hit
 
     # Everything that lies in the band the walk delimited — NOT just the boxes it
@@ -466,12 +515,18 @@ def crop_box(page, kind: str, num: int, band=(float("-inf"), float("inf"))):
     inside = [e for e in elements
               if e[3] > top + 0.5 and e[1] < bottom - 0.5
               and not _too_big(e, page.rect)]
-    boxes = inside + [caption_box]
+    boxes = inside
+    if not boxes:
+        return None
+    # Padding never reaches back into the caption the crop just left out.
+    top_limit = _CLAMP if upward else max(_CLAMP, caption_box[3])
+    bottom_limit = (min(page.rect.height - _CLAMP, caption_box[1]) if upward
+                    else page.rect.height - _CLAMP)
     rect = fitz.Rect(
         max(min(b[0] for b in boxes) - _PAD, _CLAMP),
-        max(top - _PAD, _CLAMP),
+        max(top - _PAD, top_limit),
         min(max(b[2] for b in boxes) + _PAD, page.rect.width - _CLAMP),
-        min(bottom + _PAD, page.rect.height - _CLAMP))
+        min(bottom + _PAD, bottom_limit))
     return rect if rect.width > 40 and rect.height > 20 else None
 
 
@@ -499,14 +554,13 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
             blocks = [b for b in page.get_text("dict")["blocks"]
                       if b.get("type") == 0]
             for b in blocks:
-                m = ANY_CAPTION.match(_block_text(b))
-                if m and only is not None and int(m.group(2)) not in only:
+                seen = caption_kind(_block_text(b))
+                if seen is None:
                     continue
-                if not m:
+                kind, num = seen
+                if only is not None and (kind != "figure" or num not in only):
                     continue
-                kind = "table" if m.group(1).lower().startswith("tab") else "figure"
-                num = int(m.group(2))
-                if kind not in kinds or (kind, num) in found:
+                if base_kind(kind) not in kinds or (kind, num) in found:
                     continue
                 rect = crop_box(page, kind, num, band)
                 if rect is None:
@@ -561,14 +615,18 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
                        ((b.get("image") or {}).get("caption") or [])).strip().lower()
 
     def _img_kind(b):
-        return "table" if _img_caption(b).startswith("table") else "figure"
+        # Extended Data is counted apart: a page holding the main figures says
+        # nothing about whether its Extended Data figures are there.
+        seen = caption_kind(_img_caption(b))
+        return seen[0] if seen else "figure"
 
     # Count/replace images ANYWHERE on the page, not just at top level — see
     # _all_image_blocks for why nested ones exist and what missing them costs.
     page_images = _all_image_blocks(blocks)
-    have = {"figure": 0, "table": 0}
+    full_kinds = [k for base in kinds for k in (base, ED_PREFIX + base)]
+    have = {k: 0 for k in full_kinds}
     for b in page_images:
-        have[_img_kind(b)] += 1
+        have[_img_kind(b)] = have.get(_img_kind(b), 0) + 1
     # `only` means "fill these specific numbers". Whether the page has OTHER
     # figures says nothing about whether figure 4 is present, so the blanket
     # "already has figures, skip" guard must not apply — it made the HTML-gap
@@ -588,7 +646,7 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
             return rep
         todo = tuple(k for k in kinds if k == "figure")
     else:
-        todo = tuple(k for k in kinds if force or not have[k])
+        todo = tuple(k for k in full_kinds if force or not have[k])
     rep = {"page": page_id, "existing": have, "kinds": list(todo),
            "found": 0, "placed": 0, "replaced": 0, "text_archived": 0}
     if not todo:
@@ -597,7 +655,9 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
 
     pdf = fetch_pdf(source)
     out_dir = tempfile.mkdtemp(prefix="pdfmedia_")
-    media = render_media(pdf, out_dir, kinds=todo, only=only)
+    media = render_media(pdf, out_dir,
+                         kinds=tuple({base_kind(k) for k in todo}), only=only)
+    media = {key: item for key, item in media.items() if key[0] in todo}
     rep["found"] = len(media)
     if not media:
         return rep
@@ -860,6 +920,8 @@ def _anchor_for(kind: str, num: int, blocks: list):
     """Block to insert after: the first body mention of this figure/table."""
     import extract_paper_figures as ef
 
+    if kind.startswith(ED_PREFIX):
+        return _extended_data_anchor(base_kind(kind), num, blocks)
     words = (r"그림|Figure|Fig\.?") if kind == "figure" else (r"표|Table")
     # `\b` does not hold before a Korean particle — "Fig. 10에서" — because 에 is a
     # word character, so every such mention was invisible and the figure was appended
@@ -869,7 +931,9 @@ def _anchor_for(kind: str, num: int, blocks: list):
     # often as "Fig. 5", and matching only the capitalised form made those mentions
     # invisible — the figure then fell to the end-of-body fallback while the text
     # citing it sat chapters earlier.
-    ref = re.compile(rf"(?:{words})\s*0*{num}(?![0-9])", re.I)
+    # Not an Extended Data mention: "Extended Data Fig. 3" names a different
+    # figure than "Fig. 3", and anchoring on it put the main one in the wrong place.
+    ref = re.compile(rf"(?<!Data )(?:{words})\s*0*{num}(?![0-9])", re.I)
     for b in blocks:
         if b["type"] not in ef.TEXT_TYPES:
             continue
@@ -884,10 +948,87 @@ def _anchor_for(kind: str, num: int, blocks: list):
     return None
 
 
+# "Extended Data Fig. 3", "Extended Data Figs. 7–9", "Extended Data Table 1".
+_ED_MENTION = re.compile(
+    r"Extended\s+Data\s+(Figs?\.?|Figures?|그림|Tables?|표)\s*"
+    r"(\d+)(?:\s*[–—-]\s*(\d+))?", re.I)
+
+
+def _extended_data_anchor(kind: str, num: int, blocks: list):
+    """The first body block that mentions this Extended Data figure or table."""
+    import extract_paper_figures as ef
+
+    for b in blocks:
+        if b["type"] not in ef.TEXT_TYPES:
+            continue
+        for found in _ED_MENTION.finditer(ef._block_text(b)):
+            word = found.group(1).lower()
+            is_table = word.startswith(("tab", "표"))
+            if is_table != (kind == "table"):
+                continue
+            low = int(found.group(2))
+            high = int(found.group(3) or low)
+            if low <= num <= high:
+                return b["id"]
+    return None
+
+
+# Where the WhatsApp channel saves a document the reader sends.
+ATTACHMENTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           os.pardir, "attachments")
+
+# Shorter than this, a title is a phrase that any paper might print.
+_MIN_TITLE_KEY = 24
+
+
+def _title_key(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", (text or "").lower())
+
+
+def attachment_for(title: str, directory: str = ATTACHMENTS):
+    """The reader's own PDF of this paper, found by the title on its first pages.
+
+    Nothing ties an attachment to the page it was processed into — it is saved
+    under the id of the message that carried it — so a paper sent WITH its PDF
+    still had no figure source, and came out with none.
+    """
+    key = _title_key(title)
+    if len(key) < _MIN_TITLE_KEY or not os.path.isdir(directory):
+        return None
+    import fitz
+
+    names = sorted(n for n in os.listdir(directory) if n.lower().endswith(".pdf"))
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            with fitz.open(path) as doc:
+                text = "".join(doc[i].get_text() for i in range(min(2, doc.page_count)))
+        except Exception:
+            continue                        # not a readable PDF
+        if key in _title_key(text):
+            return path
+    return None
+
+
+def journal_pdf_url(paper_url: str):
+    """The publisher's PDF for a paper outside arXiv, where we know the form."""
+    import nature_source
+
+    article = nature_source.article_url(paper_url)
+    return f"{article}.pdf" if article else None
+
+
+def pdf_source_for(title: str, paper_url: str, directory: str = ATTACHMENTS):
+    """The PDF to render a non-arXiv paper from: the reader's own, else the
+    publisher's. The reader's comes first because it is the version they read."""
+    return attachment_for(title, directory) or journal_pdf_url(paper_url)
+
+
 def heal_pdf_media(page_id: str, apply: bool = False) -> dict:
     """Healer entry: only acts on a paper with no usable LaTeXML HTML.
 
-    A paper that HAS arxiv/ar5iv HTML is left to `heal_figures` / `heal_tables`,
+    A paper outside arXiv is rendered from the reader's own PDF or, failing
+    that, the publisher's (see `pdf_source_for`). A paper that HAS arxiv/ar5iv HTML is left to `heal_figures` / `heal_tables`,
     which render the real HTML and are strictly better. This covers the gap those
     two silently no-op on.
     """
@@ -895,7 +1036,17 @@ def heal_pdf_media(page_id: str, apply: bool = False) -> dict:
 
     aid = ef.ensure_arxiv_id(page_id, apply=apply)
     if not aid:
-        return {"page": page_id, "arxiv": None, "placed": 0}
+        from translate_fulltext import notion
+
+        page = notion("GET", f"/pages/{page_id}")
+        paper_url = next((p.get("url") for p in (page.get("properties") or {}).values()
+                          if p.get("type") == "url" and p.get("url")), "")
+        source = pdf_source_for(ef._page_title(page), paper_url)
+        if not source:
+            return {"page": page_id, "arxiv": None, "placed": 0}
+        rep = inject(page_id, source, apply=apply)
+        rep["source"] = "attachment" if os.path.exists(source) else source
+        return rep
     html_text, _ = ef.fetch_html(aid)
     if html_text:
         return {"page": page_id, "arxiv": aid, "html": True, "placed": 0}

@@ -11,7 +11,9 @@ thousand characters of translation and a duplicated half nobody could see.
 Recognition is deliberately narrow, because promoting a sentence would cut the
 section it sits in. A title carries a section number, opens its words in the
 Latin script the source uses, and is short. A sentence that merely begins with a
-number ("3.5 배의 속도 향상을 …") fails on the words that follow it.
+number ("3.5 배의 속도 향상을 …") fails on the words that follow it. A journal
+does not number its sections, so there the whole block must be the title in the
+translation's own form — `Related work (관련 연구)` — and nothing more.
 
 Imports nothing but `re`, like `reference_section`, so a healer can never fail to
 load because of it.
@@ -48,9 +50,10 @@ def heading_level(block: dict):
         block: A Notion block, as the API returns it.
 
     Returns:
-        1 for a top-level section and 3 for anything deeper — the levels the
-        assembler uses when it gets this right — or None when the block is not a
-        paragraph carrying a section title.
+        1 for a top-level numbered section and 3 for anything deeper — the
+        levels the assembler uses when it gets this right — 2 for a journal's
+        unnumbered title, or None when the block is not a paragraph carrying a
+        section title.
     """
     if block.get('type') != 'paragraph':
         return None
@@ -58,9 +61,9 @@ def heading_level(block: dict):
     if not text or len(text) > MAX_TITLE_CHARS:
         return None
     found = _TITLE.match(text)
-    if not found:
-        return None
-    return 1 if '.' not in found.group(1) else 3
+    if found:
+        return 1 if '.' not in found.group(1) else 3
+    return 2 if _is_unnumbered_title(text) else None
 
 
 # Three figures with no text at all is the signature of a page whose row was
@@ -79,6 +82,30 @@ MAX_RUN_IN_TITLE = 60
 _RUN_IN = re.compile(
     r"^([A-Z][A-Za-z0-9 ,:'\-\u2013]{2,%d}?)\s*\(([^)]*[가-힣][^)]*)\)\s+(?=\S)"
     % MAX_RUN_IN_TITLE)
+
+
+# A journal's section title, as the translation writes it: `Related work (관련
+# 연구)`, or glossed with itself when the term is kept — `Prover agent (Prover
+# agent)`. The WHOLE block must be the title; a gloss inside a sentence has more
+# after the bracket.
+_UNNUMBERED = re.compile(r"^([A-Z][A-Za-z0-9 ,:'\-\u2013/]{1,%d}?)\s*\(([^()]+)\)$"
+                         % MAX_RUN_IN_TITLE)
+_BACK_MATTER = re.compile(
+    r"^(?:references|bibliography|acknowledge?ments?|disclosure of funding)\b", re.I)
+_NOT_A_TITLE = re.compile(r"^(?:Fig\.?|Figure|Table|Eq\.?|Equation|See)\b", re.I)
+
+
+def _is_unnumbered_title(text: str) -> bool:
+    found = _UNNUMBERED.match(text)
+    if not found or _NOT_A_TITLE.match(text):
+        return False
+    title, gloss = found.group(1).strip(), found.group(2).strip()
+    # A title does not end in a colon — that is a sentence introducing a list.
+    # And back matter is left as it is: promoting it would give strip_backmatter
+    # a boundary to cut at, which is not this rule's decision to make.
+    if title.endswith(":") or _BACK_MATTER.match(title):
+        return False
+    return bool(re.search(r"[가-힣]", gloss)) or gloss.lower() == title.lower()
 
 
 def split_run_in(block: dict):

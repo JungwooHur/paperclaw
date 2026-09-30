@@ -63,6 +63,15 @@ class TestWhatItRefuses:
     def test_something_already_bracketed(self):
         assert sc.convert("이전 연구 [13] 와", 62) == "이전 연구 [13] 와"
 
+    def test_a_one_letter_label(self):
+        # Competition problems are P1..P6: a lone capital glued to a number is a
+        # label. One page had thirty of them bracketed as citations.
+        text = "문제 P1, P2와 P6(P1은 대수)를 풀었습니다."
+        assert sc.convert(text, 80) == text
+
+    def test_a_word_ending_in_a_capital_still_counts(self):
+        assert sc.convert("AlphaZero2를 따릅니다", 80) == "AlphaZero [2]를 따릅니다"
+
     def test_an_identifier_with_a_trailing_number(self):
         # `conv2d` and the like: a letter follows the digits.
         assert sc.convert("우리는 conv2d를 썼다", 62) == "우리는 conv2d를 썼다"

@@ -1,5 +1,6 @@
 # Test-only dependencies for the paper-processing scripts.
 # The scripts themselves run inside the agent container and depend on the
-# standard library plus what the image already installs; nothing here is
-# needed at runtime.
+# standard library plus what the image already installs (container/Dockerfile).
 pytest==8.3.4
+# The PDF crop tests render real PDFs; keep in step with container/Dockerfile.
+pymupdf==1.27.2.2
