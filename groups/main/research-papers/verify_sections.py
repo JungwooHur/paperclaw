@@ -79,6 +79,7 @@ _APPENDIX_PREFIX = re.compile(r"^\s*(?:appendix|부록)\s+(?=[A-Z]\b)", re.I)
 _KEY_RE = re.compile(
     r"^\s*("
     r"[IVXLC]+(?:-[A-Z])?"        # I, IV, III-A
+    r"|[A-Z]-[A-Z]"               # appendix subsection A-A, A-B (each its own)
     r"|\d+(?:\.\d+)*(?:-[A-Z])?"  # 2, 2.1, 3-A
     r"|[A-Z](?:[.-]\d+)+"         # appendix subsection A.1, B-2 (unique key each)
     r"|[A-Z](?=[.:)\-])"          # appendix letter A./B. — must be followed by
@@ -681,8 +682,10 @@ def main() -> int:
     dup_keys = duplicate_groups(sections)
     for scope, occ in dup_keys.items():
         key = occ[0]["key"] or occ[0]["heading"][:40]
-        if not occ[0]["key"]:
-            occ = [occ[0]] + [o for o in occ[1:] if dup_confirmed(occ[0], o)]
+        # Numbered or not, a copy must repeat its body. Trusting the key alone
+        # let a mis-read label (`A-A` … `A-G` all read as `A`) archive six real
+        # subsections.
+        occ = [occ[0]] + [o for o in occ[1:] if dup_confirmed(occ[0], o)]
         if len(occ) > 1:
             extra_ids = [o["heading_id"] for o in occ[1:]]
             findings.append({
