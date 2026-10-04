@@ -75,6 +75,7 @@ from strip_furniture import strip_furniture
 from extract_paper_figures import heal_figures
 from extract_paper_tables import heal_tables
 from extract_pdf_media import heal_pdf_media
+import page_kind
 from heal_verify import heal_verify
 from link_references import heal_references
 
@@ -174,12 +175,27 @@ def _skipped_pages() -> set:
     return out
 
 
+def _page(pid):
+    from translate_fulltext import notion
+    return notion("GET", f"/pages/{pid}")
+
+
 def heal(pages, apply):
     healed = 0
     skip = _skipped_pages()
     for pid in pages:
         if pid.replace("-", "") in skip:
             print(f"  {pid}: SKIPPED (listed in heal_skip.txt)")
+            continue
+        # A lecture page shares the DB with the papers; every repair below
+        # assumes a paper, and on one of those it is damage.
+        try:
+            kind = _page(pid)
+        except Exception as e:
+            print(f"  {pid}: page read error {type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        if not page_kind.is_paper(kind):
+            print(f"  {pid}: SKIPPED (not a paper: {page_kind.venue(kind)})")
             continue
         try:
             # Furniture FIRST: leaked arxiv chrome can carry a heading like
