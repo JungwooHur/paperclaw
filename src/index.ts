@@ -45,6 +45,11 @@ import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 import { qaFollowupCommand, worthFilingCheck } from './qa-followup.js';
+import {
+  isUsageLimit,
+  recordUsageLimit,
+  usageLimitHeldUntil,
+} from './usage-limit.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -58,6 +63,10 @@ let messageLoopRunning = false;
 let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+let usageLimitRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+// Per group with a message container running: the cursor at the end of each
+// prompt it has been given and not yet finished a turn on, oldest first.
+const openPrompts: Record<string, string[]> = {};
 
 /**
  * Files a paper Q&A right after the answer goes out, so it does not wait for the
@@ -154,6 +163,11 @@ export function _setRegisteredGroups(
   registeredGroups = groups;
 }
 
+/** @internal - exported for testing */
+export function _setChannels(list: Channel[]): void {
+  channels.splice(0, channels.length, ...list);
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -187,6 +201,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
+  // A usage-limit window is open: leave the messages pending rather than start
+  // a container the limit would refuse. They run when the window closes.
+  const heldUntil = usageLimitHeldUntil();
+  if (heldUntil) {
+    logger.info(
+      { group: group.name, messageCount: missedMessages.length, heldUntil },
+      'Usage limit window open, holding messages',
+    );
+    resumeAfterUsageLimit(heldUntil);
+    return true;
+  }
+
   const prompt = formatMessages(missedMessages);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
@@ -218,6 +244,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let usageLimited = false;
+  // The cursor at the end of the last prompt a turn finished on: a usage limit
+  // after it puts back only the messages that came later. Not the cursor at
+  // the time, which a follow-up piped in mid-answer has already moved on.
+  let answeredCursor = previousCursor;
+  openPrompts[chatJid] = [lastAgentTimestamp[chatJid]];
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -226,12 +258,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
+      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+      const limit = recordUsageLimit(raw);
+      if (limit) {
+        // The CLI's refusal, not an answer: hold the request for the reset.
+        usageLimited = true;
+        if (limit.notice) await channel.sendMessage(chatJid, limit.notice);
+        queue.closeStdin(chatJid);
+        const resumeAt = usageLimitHeldUntil();
+        if (resumeAt) resumeAfterUsageLimit(resumeAt);
+        return;
+      }
+      // A result ends a turn, and turns take prompts in the order they were
+      // given. A turn answered only through send_message counts too.
+      const settled = openPrompts[chatJid]?.shift();
+      if (settled !== undefined) answeredCursor = settled;
       // Single outbound path: formatOutbound strips <internal> blocks AND the
       // trailing "shall I save this to Notion?" offer. This used to inline only
       // the <internal> strip, so the offer-stripping rule silently did not apply
       // to the agent's main reply — the one place it matters most.
       const text = formatOutbound(raw);
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
@@ -249,9 +295,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       hadError = true;
     }
   });
+  delete openPrompts[chatJid];
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  if (usageLimited) {
+    // Put the unanswered messages back. No retry: it would hit the same limit;
+    // they run when the window closes.
+    lastAgentTimestamp[chatJid] = answeredCursor;
+    saveState();
+    logger.warn(
+      { group: group.name },
+      'Usage limit reached, messages held until the reset',
+    );
+    return true;
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -314,9 +373,15 @@ async function runAgent(
   // Skip when status === 'error' — the agent-runner echoes back the (broken)
   // input sessionId on error, persisting it creates an infinite resume-fail
   // loop where claude can't load a non-existent session and keeps crashing.
+  // Skip too once the run hit the usage limit: that session holds nothing but
+  // the refused request, and the group keeps the one it had.
+  let usageLimited = false;
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
-        if (output.newSessionId && output.status !== 'error') {
+        if (typeof output.result === 'string' && isUsageLimit(output.result)) {
+          usageLimited = true;
+        }
+        if (output.newSessionId && output.status !== 'error' && !usageLimited) {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
@@ -340,14 +405,16 @@ async function runAgent(
       wrappedOnOutput,
     );
 
-    if (output.newSessionId && output.status !== 'error') {
+    if (output.newSessionId && output.status !== 'error' && !usageLimited) {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
-    } else if (output.status === 'error') {
+    } else if (output.status === 'error' && !usageLimited) {
       // Drop the stored session ID so the next message starts fresh.
       // Without this, a single bad session (e.g. claude failed to resume
       // because projects/<id>/ was removed) infinitely repeats: orchestrator
       // resends old ID → claude crashes → agent echoes the same ID back.
+      // Not after a refusal: the CLI exits 1 after an error result once stdin
+      // closes, which is no sign of a bad session, and the group keeps its own.
       delete sessions[group.folder];
       deleteSession(group.folder);
     }
@@ -435,23 +502,8 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
 
-          if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
-          } else {
+          if (!pipeToActiveContainer(chatJid, channel, messagesToSend)) {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
           }
@@ -465,10 +517,55 @@ async function startMessageLoop(): Promise<void> {
 }
 
 /**
+ * Hands messages to the group's running container, if it has one, and moves
+ * the cursor past them. Returns false when no container is running.
+ */
+function pipeToActiveContainer(
+  chatJid: string,
+  channel: Channel,
+  messages: NewMessage[],
+): boolean {
+  if (!queue.sendMessage(chatJid, formatMessages(messages))) return false;
+  logger.debug(
+    { chatJid, count: messages.length },
+    'Piped messages to active container',
+  );
+  lastAgentTimestamp[chatJid] = messages[messages.length - 1].timestamp;
+  saveState();
+  openPrompts[chatJid]?.push(lastAgentTimestamp[chatJid]);
+  // Show typing indicator while the container processes the piped message
+  channel
+    .setTyping?.(chatJid, true)
+    ?.catch((err) =>
+      logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+    );
+  return true;
+}
+
+/** Runs recovery again once a usage-limit window has closed. */
+function resumeAfterUsageLimit(heldUntil: Date): void {
+  if (usageLimitRecoveryTimer) clearTimeout(usageLimitRecoveryTimer);
+  // Capped to what setTimeout can hold; if it fires early, recovery re-arms.
+  const delay = Math.min(heldUntil.getTime() - Date.now(), 2 ** 31 - 1);
+  usageLimitRecoveryTimer = setTimeout(() => {
+    usageLimitRecoveryTimer = null;
+    recoverPendingMessages();
+  }, delay);
+}
+
+/**
  * Startup recovery: check for unprocessed messages in registered groups.
  * Handles crash between advancing lastTimestamp and processing messages.
+ * While a usage-limit window is open it only arms itself for the window's end,
+ * which is also how held messages get picked up after the reset.
  */
 function recoverPendingMessages(): void {
+  const heldUntil = usageLimitHeldUntil();
+  if (heldUntil) {
+    logger.info({ heldUntil }, 'Usage limit window open, recovery deferred');
+    resumeAfterUsageLimit(heldUntil);
+    return;
+  }
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
     const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
     const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
@@ -481,6 +578,14 @@ function recoverPendingMessages(): void {
     }
   }
 }
+
+/** @internal - exported for testing */
+export {
+  loadState as _loadState,
+  pipeToActiveContainer as _pipeToActiveContainer,
+  processGroupMessages as _processGroupMessages,
+  recoverPendingMessages as _recoverPendingMessages,
+};
 
 function ensureContainerSystemRunning(): void {
   ensureContainerRuntimeRunning();
