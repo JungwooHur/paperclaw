@@ -138,6 +138,64 @@ describe('GroupQueue', () => {
     // Messages would run after task completes
   });
 
+  // --- A running task is not queued again ---
+
+  it('does not queue a second run of a task that is already running', async () => {
+    // The scheduler polls every minute and a task stays due until its run
+    // finishes, so a run longer than one poll re-enqueues the same task id.
+    let resolveRun: () => void;
+    const firstRun = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRun = resolve;
+        }),
+    );
+    const repeatRun = vi.fn(async () => {});
+
+    queue.enqueueTask('group1@g.us', 'task-1', firstRun);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(firstRun).toHaveBeenCalledTimes(1);
+
+    // Next poll, while the first run is still going.
+    queue.enqueueTask('group1@g.us', 'task-1', repeatRun);
+
+    resolveRun!();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(repeatRun).not.toHaveBeenCalled();
+  });
+
+  it('still queues a different task while one is running', async () => {
+    let resolveRun: () => void;
+    const firstRun = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRun = resolve;
+        }),
+    );
+    const otherRun = vi.fn(async () => {});
+
+    queue.enqueueTask('group1@g.us', 'task-1', firstRun);
+    await vi.advanceTimersByTimeAsync(10);
+    queue.enqueueTask('group1@g.us', 'task-2', otherRun);
+
+    resolveRun!();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(otherRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs a task again once its previous run has finished', async () => {
+    const run = vi.fn(async () => {});
+
+    queue.enqueueTask('group1@g.us', 'task-1', run);
+    await vi.advanceTimersByTimeAsync(10);
+    queue.enqueueTask('group1@g.us', 'task-1', run);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
   // --- Retry with backoff on failure ---
 
   it('retries with exponential backoff on failure', async () => {
