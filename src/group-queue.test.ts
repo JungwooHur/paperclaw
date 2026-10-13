@@ -165,6 +165,44 @@ describe('GroupQueue', () => {
     expect(repeatRun).not.toHaveBeenCalled();
   });
 
+  it('does not run a task twice when it was queued behind a message container', async () => {
+    // The nightly path: a task comes due while the group's message container
+    // is up, waits in pendingTasks, and is then started by drainGroup.
+    let resolveMessages: () => void;
+    queue.setProcessMessagesFn(
+      vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            resolveMessages = () => resolve(true);
+          }),
+      ),
+    );
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    let resolveRun: () => void;
+    const queuedRun = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRun = resolve;
+        }),
+    );
+    const repeatRun = vi.fn(async () => {});
+
+    queue.enqueueTask('group1@g.us', 'task-1', queuedRun);
+    queue.enqueueTask('group1@g.us', 'task-1', repeatRun); // poll while queued
+
+    resolveMessages!();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(queuedRun).toHaveBeenCalledTimes(1);
+
+    queue.enqueueTask('group1@g.us', 'task-1', repeatRun); // poll while running
+    resolveRun!();
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(repeatRun).not.toHaveBeenCalled();
+  });
+
   it('still queues a different task while one is running', async () => {
     let resolveRun: () => void;
     const firstRun = vi.fn(

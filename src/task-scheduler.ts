@@ -40,9 +40,20 @@ export interface SchedulerDependencies {
 }
 
 async function runTask(
-  task: ScheduledTask,
+  queuedTask: ScheduledTask,
   deps: SchedulerDependencies,
 ): Promise<void> {
+  // The row was read when the task was enqueued. If the group's container was
+  // busy it waited in the queue, and may since have been paused or cancelled.
+  const task = getTaskById(queuedTask.id);
+  if (!task || task.status !== 'active') {
+    logger.info(
+      { taskId: queuedTask.id, status: task?.status ?? 'deleted' },
+      'Skipping queued task that is no longer active',
+    );
+    return;
+  }
+
   const startTime = Date.now();
   let groupDir: string;
   try {
