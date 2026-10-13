@@ -25,6 +25,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import { deferredTaskRun, recordUsageLimit } from './usage-limit.js';
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -112,6 +113,8 @@ async function runTask(
 
   let result: string | null = null;
   let error: string | null = null;
+  // Set when the run was refused by the usage limit rather than answered.
+  let limitResetsAt: Date | null = null;
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
@@ -148,9 +151,17 @@ async function runTask(
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
-          result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          const limit = recordUsageLimit(streamedOutput.result);
+          if (limit) {
+            // Not an answer: the work did not run. Hold it until the reset.
+            limitResetsAt = limit.resetsAt;
+            if (limit.notice)
+              await deps.sendMessage(task.chat_jid, limit.notice);
+          } else {
+            result = streamedOutput.result;
+            // Forward result to user (sendMessage handles formatting)
+            await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          }
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
@@ -182,6 +193,11 @@ async function runTask(
   }
 
   const durationMs = Date.now() - startTime;
+  const deferredTo = limitResetsAt ? deferredTaskRun(limitResetsAt) : null;
+  if (deferredTo) {
+    error = `Usage limit reached, deferred to ${deferredTo.toISOString()}`;
+    logger.warn({ taskId: task.id, deferredTo }, 'Task hit the usage limit');
+  }
 
   logTaskRun({
     task_id: task.id,
@@ -193,7 +209,11 @@ async function runTask(
   });
 
   let nextRun: string | null = null;
-  if (task.schedule_type === 'cron') {
+  if (deferredTo) {
+    // This run only: the one after it is computed from the schedule again.
+    // A 'once' task keeps a next_run, so it stays active instead of completing.
+    nextRun = deferredTo.toISOString();
+  } else if (task.schedule_type === 'cron') {
     const interval = CronExpressionParser.parse(task.schedule_value, {
       tz: TIMEZONE,
     });

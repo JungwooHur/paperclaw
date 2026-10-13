@@ -64,3 +64,10 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Language of the notices the host sends on its own (the agent gets the same
+// value through the container's secrets). Korean unless .env says otherwise.
+export const OUTPUT_LANGUAGE =
+  process.env.OUTPUT_LANGUAGE ||
+  readEnvFile(['OUTPUT_LANGUAGE']).OUTPUT_LANGUAGE ||
+  'ko';
