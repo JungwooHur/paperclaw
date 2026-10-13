@@ -48,12 +48,19 @@ export function redactSessionEntries(libsignal: unknown): boolean {
 }
 
 // Resolve libsignal from baileys' own location: that is the copy baileys
-// loads, whether or not npm hoisted it to the top of node_modules.
-const require = createRequire(import.meta.url);
-const libsignal = createRequire(require.resolve('@whiskeysockets/baileys'))(
-  'libsignal',
-);
-if (!redactSessionEntries(libsignal)) {
+// loads, whether or not npm hoisted it to the top of node_modules. A lookup
+// that fails only warns, like an unrecognised shape: the service imports this
+// before baileys, so a throw here would keep it from starting at all.
+let patched = false;
+try {
+  const require = createRequire(import.meta.url);
+  patched = redactSessionEntries(
+    createRequire(require.resolve('@whiskeysockets/baileys'))('libsignal'),
+  );
+} catch {
+  // baileys' exports or its libsignal dependency moved; warned below.
+}
+if (!patched) {
   console.warn(
     'libsignal-redact: SessionEntry not found; Signal session keys may reach the log',
   );

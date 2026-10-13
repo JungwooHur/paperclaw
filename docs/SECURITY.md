@@ -86,12 +86,12 @@ A `PreToolUse` hook in the agent runner prepends `unset ANTHROPIC_API_KEY CLAUDE
 
 ### 6. Logs
 
-`logs/paperclaw.log` is the service's stdout, so whatever a dependency prints with `console.*` lands there, not only what goes through the app logger.
+`logs/paperclaw.log` and `logs/paperclaw.error.log` are the service's stdout and stderr, so whatever a dependency prints with `console.*` lands in one of them, not only what goes through the app logger. libsignal's `console.info` lines go to the first, its `console.warn("Session already closed", …)` to the second.
 
 - **Signal session keys are redacted.** libsignal, under baileys, prints whole session objects (`Closing session:`, `Opening session:`, `Removing old closed session:`), and Node expands them down to the ratchet private key, the root key and the chain keys. `src/libsignal-redact.ts` gives those objects a one-line form, `SessionEntry <redacted closed=…>`. Every module that imports baileys loads it first (the service, `npm run auth`, the setup group sync); a test fails if one stops, or if a libsignal upgrade leaves the patch with nothing to attach to.
 - **baileys logs at `warn`** (`BAILEYS_LOG_LEVEL`), so its info lines, the account's phone number on every login among them, are not written by default.
 - **The agent cannot read it.** `logs/` is masked out of the main group's project mount (above). The log still carries phone numbers and chat JIDs from the app's own lines.
-- **Logs written before the redaction can still hold key dumps.** It only changes new output. Treat older `logs/paperclaw.log` content, and any copy or backup of it, as secret: do not share it or attach it to an issue, and truncate or delete it once it is no longer needed.
+- **Logs written before the redaction can still hold key dumps.** It only changes new output. Treat older `logs/paperclaw.log` and `logs/paperclaw.error.log` content, and any copy or backup of either, as secret: do not share it or attach it to an issue, and truncate or delete it once it is no longer needed.
 
 ## Privilege Comparison
 

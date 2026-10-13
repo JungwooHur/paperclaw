@@ -1,4 +1,7 @@
 import { EventEmitter } from 'events';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -87,7 +90,13 @@ async function connect(): Promise<Log> {
 const logged = (msg: string) => lines.some((line) => line.includes(msg));
 
 describe('baileys log level', () => {
+  // .env is read from the working directory; point it at an empty one so the
+  // checkout's own .env cannot change what these tests see.
+  let cwd: string;
+
   beforeEach(() => {
+    cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'paperclaw-baileys-level-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(cwd);
     lines.length = 0;
     ev.removeAllListeners();
     vi.mocked(makeWASocket).mockClear();
@@ -96,6 +105,8 @@ describe('baileys log level', () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    fs.rmSync(cwd, { recursive: true, force: true });
   });
 
   it("keeps baileys' info lines out, and the app's own in", async () => {
@@ -118,5 +129,28 @@ describe('baileys log level', () => {
     baileys.info('connection errored');
 
     expect(logged('connection errored')).toBe(true);
+  });
+
+  it('reads BAILEYS_LOG_LEVEL from .env, like the other runtime knobs', async () => {
+    vi.stubEnv('BAILEYS_LOG_LEVEL', '');
+    fs.writeFileSync(path.join(cwd, '.env'), 'BAILEYS_LOG_LEVEL=info\n');
+    const baileys = await connect();
+
+    baileys.info('connection errored');
+
+    expect(logged('connection errored')).toBe(true);
+  });
+
+  it('falls back to warn on a level pino does not know', async () => {
+    // pino throws on an unknown level; that must not take the connection down.
+    vi.stubEnv('BAILEYS_LOG_LEVEL', 'INFO');
+    const baileys = await connect();
+
+    baileys.info('connection errored');
+    baileys.warn('baileys warning');
+
+    expect(logged('connection errored')).toBe(false);
+    expect(logged('baileys warning')).toBe(true);
+    expect(logged('BAILEYS_LOG_LEVEL')).toBe(true);
   });
 });

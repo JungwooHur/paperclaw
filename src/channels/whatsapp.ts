@@ -14,6 +14,7 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
+import pino from 'pino';
 
 import {
   ASSISTANT_HAS_OWN_NUMBER,
@@ -27,6 +28,7 @@ import {
   markAuthRequired,
 } from '../auth-state.js';
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
+import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -36,6 +38,21 @@ import {
 } from '../types.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/**
+ * The level baileys logs at: BAILEYS_LOG_LEVEL from the environment or .env,
+ * else warn. A name pino does not know also gives warn, since pino throws on
+ * it and the connect would fail with it.
+ */
+function baileysLogLevel(): string {
+  const level =
+    process.env.BAILEYS_LOG_LEVEL ||
+    readEnvFile(['BAILEYS_LOG_LEVEL']).BAILEYS_LOG_LEVEL ||
+    'warn';
+  if (level === 'silent' || level in pino.levels.values) return level;
+  logger.warn({ level }, 'Unknown BAILEYS_LOG_LEVEL, logging baileys at warn');
+  return 'warn';
+}
 
 export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
@@ -84,7 +101,7 @@ export class WhatsAppChannel implements Channel {
     // are the app logger's own, which keeps LOG_LEVEL.
     const baileysLogger = logger.child(
       { module: 'baileys' },
-      { level: process.env.BAILEYS_LOG_LEVEL || 'warn' },
+      { level: baileysLogLevel() },
     );
     this.sock = makeWASocket({
       version,
