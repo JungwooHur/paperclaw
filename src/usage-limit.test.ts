@@ -229,6 +229,34 @@ describe('recordUsageLimit', () => {
     ).toBeNull();
   });
 
+  it('announces again when a later refusal moves the reset past the one announced', () => {
+    // 10:01 in Seoul, "resets 10am": read as the reset happening now, which
+    // the refusal itself disproves, so the hold is the guessed hour.
+    const early = new Date('2026-10-14T01:01:00.000Z');
+    const first = recordUsageLimit(WITHOUT_DATE, early, SEOUL, 'en');
+    expect(first?.notice).toContain('11:01');
+
+    // At 10:30 the same text can only be tomorrow's 10am. Without a second
+    // notice the user waits on 11:01 and hears nothing until tomorrow.
+    const later = new Date('2026-10-14T01:30:00.000Z');
+    const second = recordUsageLimit(WITHOUT_DATE, later, SEOUL, 'en');
+    expect(second?.resetsAt.toISOString()).toBe('2026-10-15T01:00:00.000Z');
+    expect(second?.notice).toContain('Oct 15');
+
+    // That corrected window is announced once, like any other.
+    const retry = new Date(later.getTime() + HOUR);
+    expect(
+      recordUsageLimit(WITHOUT_DATE, retry, SEOUL, 'en')?.notice,
+    ).toBeNull();
+  });
+
+  it('does not announce a guessed hold again because a later refusal restarted it', () => {
+    const text = "You've hit your limit"; // no reset to read: an hour's hold
+    expect(recordUsageLimit(text, now, SEOUL, 'en')?.notice).toBeTruthy();
+    const retry = new Date(now.getTime() + 40 * 60_000);
+    expect(recordUsageLimit(text, retry, SEOUL, 'en')?.notice).toBeNull();
+  });
+
   it('announces a next-year reset once, not every hour', () => {
     const now = new Date('2026-12-28T03:00:00.000Z');
     const text = "You've hit your limit · resets Jan 2, 2027, 1am (Asia/Seoul)";

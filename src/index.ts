@@ -408,11 +408,13 @@ async function runAgent(
     if (output.newSessionId && output.status !== 'error' && !usageLimited) {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
-    } else if (output.status === 'error') {
+    } else if (output.status === 'error' && !usageLimited) {
       // Drop the stored session ID so the next message starts fresh.
       // Without this, a single bad session (e.g. claude failed to resume
       // because projects/<id>/ was removed) infinitely repeats: orchestrator
       // resends old ID → claude crashes → agent echoes the same ID back.
+      // Not after a refusal: the CLI exits 1 after an error result once stdin
+      // closes, which is no sign of a bad session, and the group keeps its own.
       delete sessions[group.folder];
       deleteSession(group.folder);
     }

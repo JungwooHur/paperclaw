@@ -113,10 +113,15 @@ export function recordUsageLimit(
       : new Date(now.getTime() + UNKNOWN_RESET_HOLD_MS);
   setRouterState(LIMITED_UNTIL_KEY, resetsAt.toISOString());
 
+  // One notice per window. A refusal that moves the reset more than an hour
+  // past the announced one opens a new window, as far as the user can tell:
+  // without a word they wait on a time that has passed. A smaller move is the
+  // guessed hold starting again from a later refusal.
   const announced = readTime(ANNOUNCED_KEY);
   if (
     announced !== null &&
-    now.getTime() < announced + MESSAGE_RESUME_MARGIN_MS
+    now.getTime() < announced + MESSAGE_RESUME_MARGIN_MS &&
+    resetsAt.getTime() <= announced + UNKNOWN_RESET_HOLD_MS
   ) {
     return { resetsAt, notice: null };
   }

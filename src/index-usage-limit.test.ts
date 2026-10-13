@@ -144,6 +144,35 @@ describe('a message answered with the usage limit', () => {
     expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
   });
 
+  it('keeps the stored session when the container exits with an error after the refusal', async () => {
+    // The CLI ends print mode with exit code 1 after an error result, so once
+    // the host closes stdin the runner reports an error and exits non-zero.
+    userSays('m1', 'and section 3?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        await onOutput?.({
+          status: 'success',
+          result: LIMIT,
+          newSessionId: 'session-new',
+        });
+        await onOutput?.({
+          status: 'error',
+          result: null,
+          newSessionId: 'session-old',
+          error: 'Claude Code process exited with code 1',
+        });
+        return {
+          status: 'error',
+          result: null,
+          error: 'Container exited with code 1',
+        };
+      },
+    );
+
+    expect(await _processGroupMessages(CHAT)).toBe(true);
+    expect(getAllSessions()).toEqual({ main: 'session-old' });
+  });
+
   it('starts no container while the window is open, then picks the messages up', async () => {
     userSays('m1', 'translate the new paper', NOW - 60_000);
     agentReplies(LIMIT);
