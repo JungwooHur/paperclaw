@@ -55,6 +55,14 @@ Debug level shows:
 - Container command arguments
 - Real-time container stderr
 
+`LOG_LEVEL` does not reach baileys, the WhatsApp library: it logs at `warn`
+unless `BAILEYS_LOG_LEVEL` says otherwise, set the same way as `LOG_LEVEL`
+above. Raise it to `info` (or `debug`) when chasing a WhatsApp connection
+problem: that brings back its `connection errored` lines with stack traces and
+`logging in...`, which are otherwise left out because they made up most of the
+log. The app's own `Connected to WhatsApp` / `Connection closed` lines, which
+the watchdog reads, log at `LOG_LEVEL` either way.
+
 ## Common Issues
 
 ### 1. "Claude Code process exited with code 1"

@@ -6,6 +6,9 @@
  *
  * Usage: npx tsx src/whatsapp-auth.ts
  */
+// First, before baileys: keeps libsignal's session dumps out of the log.
+import './libsignal-redact.js';
+
 import fs from 'fs';
 import path from 'path';
 import pino from 'pino';

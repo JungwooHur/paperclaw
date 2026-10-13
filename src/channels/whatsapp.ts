@@ -1,3 +1,6 @@
+// First, before baileys: keeps libsignal's session dumps out of the log.
+import '../libsignal-redact.js';
+
 import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -75,14 +78,22 @@ export class WhatsAppChannel implements Channel {
       );
       return { version: undefined };
     });
+    // baileys logs at info on every reconnect, with a full stack trace, and
+    // prints the account's phone number on each login — most of the log. Its
+    // warnings and errors still come through. The lines the watchdog reads
+    // are the app logger's own, which keeps LOG_LEVEL.
+    const baileysLogger = logger.child(
+      { module: 'baileys' },
+      { level: process.env.BAILEYS_LOG_LEVEL || 'warn' },
+    );
     this.sock = makeWASocket({
       version,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
+        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
       },
       printQRInTerminal: false,
-      logger,
+      logger: baileysLogger,
       browser: Browsers.macOS('Chrome'),
       // Disable WhatsApp history sync. With the default (shouldSyncHistoryMessage
       // => true, syncFullHistory => true), every (re)connect enters baileys'

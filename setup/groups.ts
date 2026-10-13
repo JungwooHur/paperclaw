@@ -89,7 +89,10 @@ async function syncGroups(projectRoot: string): Promise<void> {
   logger.info('Fetching group metadata');
   let syncOk = false;
   try {
+    // dist/ was just built above. This script's stdout is logged below as
+    // "Sync output", so the redaction has to load here too, ahead of baileys.
     const syncScript = `
+import './dist/libsignal-redact.js';
 import makeWASocket, { useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import path from 'path';

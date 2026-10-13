@@ -92,6 +92,9 @@ function buildVolumeMounts(
     //   store/auth — Baileys WhatsApp session credentials. The agent has no
     //                legitimate reason to see these; if leaked they grant
     //                full account takeover on WhatsApp.
+    //   logs/      — the service log: phone numbers, chat JIDs, message
+    //                metadata, and in logs written before libsignal-redact
+    //                existed, dumps of live Signal session keys.
     //
     // The empty masks live under DATA_DIR (gitignored, outside the project
     // root mount), so an agent that escaped the .env mask still couldn't
@@ -114,6 +117,13 @@ function buildVolumeMounts(
       mounts.push({
         hostPath: emptyDir,
         containerPath: '/workspace/project/store/auth',
+        readonly: true,
+      });
+    }
+    if (fs.existsSync(path.join(projectRoot, 'logs'))) {
+      mounts.push({
+        hostPath: emptyDir,
+        containerPath: '/workspace/project/logs',
         readonly: true,
       });
     }
