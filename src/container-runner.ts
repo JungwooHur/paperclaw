@@ -8,6 +8,8 @@ import os from 'os';
 import path from 'path';
 
 import {
+  AGENT_MODEL,
+  AGENT_MODEL_ALIASES,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -281,6 +283,13 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Pin the model (see AGENT_MODEL). The environment outranks the per-group
+  // settings.json, which is written once and never refreshed.
+  args.push('-e', `ANTHROPIC_MODEL=${AGENT_MODEL}`);
+  for (const [alias, model] of Object.entries(AGENT_MODEL_ALIASES)) {
+    args.push('-e', `ANTHROPIC_DEFAULT_${alias}_MODEL=${model}`);
+  }
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),

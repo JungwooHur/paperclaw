@@ -233,14 +233,16 @@ Configure authentication in a `.env` file in the project root. Two options:
 ```bash
 CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 ```
-The token can be extracted from `~/.claude/.credentials.json` if you're logged in to Claude Code.
+Generate it with `claude setup-token` and pick the account in the browser. Do not copy the access token out of `~/.claude/.credentials.json`: that one is short-lived and refreshed by the CLI, so a copy stops working within hours.
 
 **Option 2: Pay-per-use API Key**
 ```bash
 ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
 
-Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and written to `data/env/env`, then mounted into the container at `/workspace/env-dir/env` and sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because some container runtimes lose `-e` environment variables when using `-i` (interactive mode with piped stdin).
+The host re-reads a fixed allowlist from `.env` on every spawn (`readSecrets()` in `src/container-runner.ts`: the two auth variables, `NOTION_TOKEN`, `NOTION_RESEARCH_DB`, `OUTPUT_LANGUAGE`) and passes it to the agent runner inside the JSON on stdin, so nothing is written to disk or mounted, and other `.env` variables are not exposed to the agent. Because it is read per spawn, a new token takes effect on the next container without a restart. See [SECURITY.md](SECURITY.md) for how the auth variables are kept from the agent's own subprocesses.
+
+**Model.** The container is started with `ANTHROPIC_MODEL` set to `AGENT_MODEL` (`.env`, default `claude-sonnet-5-5`), and the `sonnet`/`opus`/`haiku` aliases are remapped to the same family. Without that, the CLI bundled with the agent SDK uses the default model it shipped with, which an account may not be able to use.
 
 ### Changing the Assistant Name
 

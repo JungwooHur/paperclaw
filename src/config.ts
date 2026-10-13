@@ -6,7 +6,11 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets are NOT read here — they stay on disk and are loaded only
 // where needed (container-runner.ts) to avoid leaking to child processes.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'AGENT_MODEL',
+]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME ||
@@ -15,6 +19,20 @@ export const ASSISTANT_NAME =
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER ||
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+
+// The agent's model. Left unset, the CLI bundled with the agent SDK picks its
+// own default, which an account can lose access to: a token for a newer
+// account got "There's an issue with the selected model" on every request,
+// and that sentence went out over WhatsApp as the reply.
+export const AGENT_MODEL =
+  process.env.AGENT_MODEL || envConfig.AGENT_MODEL || 'claude-sonnet-5-5';
+// The bundled CLI also resolves the sonnet/opus/haiku aliases (a subagent's
+// `model`, `/model haiku`) to the models it shipped with, so map those too.
+export const AGENT_MODEL_ALIASES: Record<string, string> = {
+  SONNET: 'claude-sonnet-5-5',
+  OPUS: 'claude-opus-5-5',
+  HAIKU: 'claude-haiku-5-5',
+};
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 

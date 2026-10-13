@@ -8,6 +8,11 @@ const OUTPUT_END_MARKER = '---PAPERCLAW_OUTPUT_END---';
 
 // Mock config
 vi.mock('./config.js', () => ({
+  AGENT_MODEL: 'model-under-test',
+  AGENT_MODEL_ALIASES: {
+    SONNET: 'sonnet-under-test',
+    HAIKU: 'haiku-under-test',
+  },
   CONTAINER_IMAGE: 'paperclaw-agent:latest',
   CONTAINER_MAX_OUTPUT_SIZE: 10485760,
   CONTAINER_TIMEOUT: 1800000, // 30min
@@ -84,6 +89,8 @@ vi.mock('child_process', async () => {
     ),
   };
 });
+
+import { spawn } from 'child_process';
 
 import { runContainerAgent, ContainerOutput } from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
@@ -205,5 +212,34 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+describe('container-runner agent model', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('pins the configured model and its aliases in the container env', async () => {
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+
+    const args = vi.mocked(spawn).mock.calls[0][1] as string[];
+    const envs = args.filter((_, i) => args[i - 1] === '-e');
+    expect(envs).toContain('ANTHROPIC_MODEL=model-under-test');
+    expect(envs).toContain('ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet-under-test');
+    expect(envs).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku-under-test');
+    // Every -e must come before the image name, or docker passes it to the
+    // container's entrypoint as an argument instead of setting it.
+    const image = args.indexOf('paperclaw-agent:latest');
+    expect(args.lastIndexOf('-e')).toBeLessThan(image);
   });
 });
