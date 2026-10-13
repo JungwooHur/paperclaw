@@ -23,12 +23,13 @@ import {
 import { GroupQueue } from './group-queue.js';
 import {
   _loadState,
+  _pipeToActiveContainer,
   _processGroupMessages,
   _recoverPendingMessages,
   _setChannels,
   _setRegisteredGroups,
 } from './index.js';
-import { Channel, RegisteredGroup } from './types.js';
+import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { recordUsageLimit, usageLimitHeldUntil } from './usage-limit.js';
 
 const LIMIT = "You've hit your limit · resets Oct 14, 10am (Asia/Seoul)";
@@ -75,15 +76,17 @@ function agentReplies(...results: string[]): void {
   );
 }
 
-function userSays(id: string, content: string, at: number): void {
-  storeMessage({
+function userSays(id: string, content: string, at: number): NewMessage {
+  const message: NewMessage = {
     id,
     chat_jid: CHAT,
     sender: 'user@s.whatsapp.net',
     sender_name: 'User',
     content,
     timestamp: new Date(at).toISOString(),
-  });
+  };
+  storeMessage(message);
+  return message;
 }
 
 function sentTexts(): string[] {
@@ -180,6 +183,84 @@ describe('a message answered with the usage limit', () => {
     agentReplies('It describes the method.', LIMIT);
     await _processGroupMessages(CHAT);
     expect(sentTexts()).toContain('It describes the method.');
+
+    vi.setSystemTime(RESET + 10 * 60_000);
+    await _processGroupMessages(CHAT);
+    expect(runContainerAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a follow-up piped in during the answer pending when the limit refuses it', async () => {
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.spyOn(GroupQueue.prototype, 'sendMessage').mockReturnValue(true);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        // The follow-up arrives while the first answer is being written, and
+        // the message loop pipes it into this container.
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(true);
+        await onOutput?.({
+          status: 'success',
+          result: 'It describes the method.',
+          newSessionId: 'session-new',
+        });
+        // The follow-up's own turn is the one the limit refuses.
+        await onOutput?.({
+          status: 'success',
+          result: LIMIT,
+          newSessionId: 'session-new',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    expect(sentTexts()).toContain('It describes the method.');
+
+    await vi.advanceTimersByTimeAsync(RESET + 5 * 60_000 - Date.now());
+    expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
+    agentReplies('It covers the experiments.');
+    await _processGroupMessages(CHAT);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+    expect(promptOfRun(1)).toContain('and section 3?');
+    expect(promptOfRun(1)).not.toContain('what is section 2 about?');
+  });
+
+  it('puts back only the piped messages no turn has finished on', async () => {
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.spyOn(GroupQueue.prototype, 'sendMessage').mockReturnValue(true);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        const reply = (result: string) =>
+          onOutput?.({
+            status: 'success',
+            result,
+            newSessionId: 'session-new',
+          });
+        const m2 = userSays('m2', 'and section 3?', NOW - 40_000);
+        _pipeToActiveContainer(CHAT, channel, [m2]);
+        await reply('It describes the method.');
+        await reply('It covers the experiments.');
+        const m3 = userSays('m3', 'and the appendix?', NOW - 20_000);
+        _pipeToActiveContainer(CHAT, channel, [m3]);
+        await reply(LIMIT);
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+
+    vi.setSystemTime(RESET + 10 * 60_000);
+    agentReplies('It lists the proofs.');
+    await _processGroupMessages(CHAT);
+    expect(promptOfRun(1)).toContain('and the appendix?');
+    expect(promptOfRun(1)).not.toContain('and section 3?');
+    expect(promptOfRun(1)).not.toContain('what is section 2 about?');
+  });
+
+  it('does not re-run a request answered only through send_message', async () => {
+    // The paper dispatcher acks over IPC and ends its turn with an internal
+    // recap, so the turn's result carries no text for the user.
+    userSays('m1', 'translate the new paper', NOW - 60_000);
+    agentReplies('<internal>acked, translation dispatched</internal>', LIMIT);
+    await _processGroupMessages(CHAT);
 
     vi.setSystemTime(RESET + 10 * 60_000);
     await _processGroupMessages(CHAT);

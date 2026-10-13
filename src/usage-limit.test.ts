@@ -48,6 +48,14 @@ describe('classifyUsageLimit', () => {
     );
   });
 
+  it('reads a bare time minutes past as tomorrow, since the CLI only prints a future reset', () => {
+    // 10:05 in Seoul. The CLI drops the date only when the reset is at most a
+    // day ahead, so "10am" here is tomorrow's 10am, not five minutes ago.
+    expect(resetOf(WITHOUT_DATE, '2026-10-14T01:05:00.000Z')).toBe(
+      '2026-10-15T01:00:00.000Z',
+    );
+  });
+
   it('reads minutes and the 12 o’clock hours', () => {
     const now = '2026-10-13T10:00:00.000Z'; // 19:00 in Seoul
     expect(
@@ -61,14 +69,21 @@ describe('classifyUsageLimit', () => {
     ).toBe('2026-10-14T03:00:00.000Z');
   });
 
-  it('rolls a dated reset over the new year', () => {
-    // 21:00 on Dec 31 in Seoul.
+  it('reads the year the CLI adds to a reset in the next year', () => {
+    // 12:00 on Dec 28 in Seoul, a weekly reset five days on.
+    const now = '2026-12-28T03:00:00.000Z';
     expect(
       resetOf(
-        "You've hit your limit · resets Jan 1, 9am (Asia/Seoul)",
-        '2026-12-31T12:00:00.000Z',
+        "You've hit your limit · resets Jan 2, 2027, 1am (Asia/Seoul)",
+        now,
       ),
-    ).toBe('2027-01-01T00:00:00.000Z');
+    ).toBe('2027-01-01T16:00:00.000Z');
+    expect(
+      resetOf(
+        "You've hit your weekly limit · resets Jan 2, 2027, 1:30am (Asia/Seoul)",
+        now,
+      ),
+    ).toBe('2027-01-01T16:30:00.000Z');
   });
 
   it('prefers the zone in the text over the fallback', () => {
@@ -98,6 +113,44 @@ describe('classifyUsageLimit', () => {
     expect(resetOf("You've hit your limit · resets soon", now)).toBe(
       anHourLater,
     );
+  });
+
+  it('recognises every refusal the CLI words, not only the plain one', () => {
+    // 21:00 on Oct 13 in Seoul. These are the CLI's rejected-request sentences
+    // for the session, weekly and per-model limits and for spent extra usage.
+    const now = '2026-10-13T12:00:00.000Z';
+    const tonight = '2026-10-13T14:00:00.000Z';
+    const inThreeDays = '2026-10-16T14:00:00.000Z';
+    for (const [text, reset] of [
+      ["You've hit your session limit · resets 11pm (Asia/Seoul)", tonight],
+      [
+        "You've hit your weekly limit · resets Oct 16, 11pm (Asia/Seoul)",
+        inThreeDays,
+      ],
+      [
+        "You've hit your Opus limit · resets Oct 16, 11pm (Asia/Seoul)",
+        inThreeDays,
+      ],
+      [
+        "You've hit your Sonnet limit · resets Oct 16, 11pm (Asia/Seoul)",
+        inThreeDays,
+      ],
+      ["You've hit your usage limit · resets 11pm (Asia/Seoul)", tonight],
+      ["You're out of extra usage · resets 11pm (Asia/Seoul)", tonight],
+    ]) {
+      expect(resetOf(text, now), text).toBe(reset);
+    }
+  });
+
+  it('leaves the CLI warnings alone: the request behind them still runs', () => {
+    const now = '2026-10-13T12:00:00.000Z';
+    for (const text of [
+      "You've used 90% of your session limit · resets 11pm (Asia/Seoul)",
+      "You're close to your extra usage spending limit",
+      "You're now using extra usage · Your session limit resets 11pm (Asia/Seoul)",
+    ]) {
+      expect(resetOf(text, now), text).toBeNull();
+    }
   });
 
   it('leaves ordinary answers alone, including ones that quote the phrase', () => {
@@ -160,6 +213,30 @@ describe('recordUsageLimit', () => {
       'ko',
     );
     expect(third?.notice).toBeTruthy();
+  });
+
+  it('announces the right reset once when refused minutes after a bare time', () => {
+    // 10:05 in Seoul, "resets 10am": the window ends tomorrow at 10am, and a
+    // refusal an hour later is the same window, so it says nothing new.
+    const early = new Date('2026-10-14T01:05:00.000Z');
+    const first = recordUsageLimit(WITHOUT_DATE, early, SEOUL, 'en');
+    expect(first?.resetsAt.toISOString()).toBe('2026-10-15T01:00:00.000Z');
+    expect(first?.notice).toContain('Oct 15');
+
+    const later = new Date(early.getTime() + HOUR + 2 * 60_000);
+    expect(
+      recordUsageLimit(WITHOUT_DATE, later, SEOUL, 'en')?.notice,
+    ).toBeNull();
+  });
+
+  it('announces a next-year reset once, not every hour', () => {
+    const now = new Date('2026-12-28T03:00:00.000Z');
+    const text = "You've hit your limit · resets Jan 2, 2027, 1am (Asia/Seoul)";
+    expect(recordUsageLimit(text, now, SEOUL, 'en')?.notice).toContain('Jan 2');
+    for (let hour = 1; hour <= 3; hour++) {
+      const retry = new Date(now.getTime() + hour * HOUR + 2 * 60_000);
+      expect(recordUsageLimit(text, retry, SEOUL, 'en')?.notice).toBeNull();
+    }
   });
 
   it('holds work even when the stated reset has already passed', () => {

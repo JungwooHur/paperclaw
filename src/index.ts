@@ -64,6 +64,9 @@ let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 let usageLimitRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+// Per group with a message container running: the cursor at the end of each
+// prompt it has been given and not yet finished a turn on, oldest first.
+const openPrompts: Record<string, string[]> = {};
 
 /**
  * Files a paper Q&A right after the answer goes out, so it does not wait for the
@@ -242,9 +245,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
   let usageLimited = false;
-  // The cursor as of the last answer sent: a usage limit after it puts back
-  // only the messages that came later.
+  // The cursor at the end of the last prompt a turn finished on: a usage limit
+  // after it puts back only the messages that came later. Not the cursor at
+  // the time, which a follow-up piped in mid-answer has already moved on.
   let answeredCursor = previousCursor;
+  openPrompts[chatJid] = [lastAgentTimestamp[chatJid]];
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -264,6 +269,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (resumeAt) resumeAfterUsageLimit(resumeAt);
         return;
       }
+      // A result ends a turn, and turns take prompts in the order they were
+      // given. A turn answered only through send_message counts too.
+      const settled = openPrompts[chatJid]?.shift();
+      if (settled !== undefined) answeredCursor = settled;
       // Single outbound path: formatOutbound strips <internal> blocks AND the
       // trailing "shall I save this to Notion?" offer. This used to inline only
       // the <internal> strip, so the offer-stripping rule silently did not apply
@@ -272,7 +281,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (text) {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
-        answeredCursor = lastAgentTimestamp[chatJid] || '';
         fileAnsweredQa(chatJid, text);
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -287,6 +295,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       hadError = true;
     }
   });
+  delete openPrompts[chatJid];
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -491,23 +500,8 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
 
-          if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
-          } else {
+          if (!pipeToActiveContainer(chatJid, channel, messagesToSend)) {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
           }
@@ -518,6 +512,32 @@ async function startMessageLoop(): Promise<void> {
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
   }
+}
+
+/**
+ * Hands messages to the group's running container, if it has one, and moves
+ * the cursor past them. Returns false when no container is running.
+ */
+function pipeToActiveContainer(
+  chatJid: string,
+  channel: Channel,
+  messages: NewMessage[],
+): boolean {
+  if (!queue.sendMessage(chatJid, formatMessages(messages))) return false;
+  logger.debug(
+    { chatJid, count: messages.length },
+    'Piped messages to active container',
+  );
+  lastAgentTimestamp[chatJid] = messages[messages.length - 1].timestamp;
+  saveState();
+  openPrompts[chatJid]?.push(lastAgentTimestamp[chatJid]);
+  // Show typing indicator while the container processes the piped message
+  channel
+    .setTyping?.(chatJid, true)
+    ?.catch((err) =>
+      logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+    );
+  return true;
 }
 
 /** Runs recovery again once a usage-limit window has closed. */
@@ -560,6 +580,7 @@ function recoverPendingMessages(): void {
 /** @internal - exported for testing */
 export {
   loadState as _loadState,
+  pipeToActiveContainer as _pipeToActiveContainer,
   processGroupMessages as _processGroupMessages,
   recoverPendingMessages as _recoverPendingMessages,
 };

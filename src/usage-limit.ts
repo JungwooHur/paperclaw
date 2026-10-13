@@ -22,11 +22,16 @@ export interface UsageLimitHit extends UsageLimit {
 }
 
 // Anchored: the CLI's result is the sentence itself, while an answer that
-// merely mentions it must not be swallowed.
-const LIMIT_PATTERN = /^\s*you['’]ve hit your limit\b/i;
-// "resets Oct 14, 10am (Asia/Seoul)", "resets 10am (Asia/Seoul)", "resets 10:30pm".
+// merely mentions it must not be swallowed. These are the CLI's sentences for
+// a refused request, one per limit (plain when extra usage is also refused);
+// its warnings ("You've used 90% of…") leave the request running and are not.
+const LIMIT_PATTERN =
+  /^\s*(?:you['’]ve hit your (?:(?:session|weekly|opus|sonnet|usage)\s+)?limit|you['’]re out of extra usage)\b/i;
+// "resets Oct 14, 10am (Asia/Seoul)", "resets Jan 2, 2027, 1am (Asia/Seoul)",
+// "resets 10am (Asia/Seoul)", "resets 10:30pm". The CLI adds the date only
+// when the reset is more than a day ahead, and the year only when it differs.
 const RESET_PATTERN =
-  /\bresets\s+(?:([a-z]{3,9})\.?\s+(\d{1,2}),?\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([^)]+)\))?/i;
+  /\bresets\s+(?:([a-z]{3,9})\.?\s+(\d{1,2})(?:,\s*(\d{4}))?,?\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([^)]+)\))?/i;
 const MONTHS = [
   'jan',
   'feb',
@@ -46,11 +51,14 @@ const MINUTE_MS = 60 * 1000;
 /** How long to hold when the text gives no reset that can be trusted. */
 const UNKNOWN_RESET_HOLD_MS = 60 * MINUTE_MS;
 /**
- * A bare reset time this little in the past is the reset happening now, not
- * the same time tomorrow: otherwise a request refused seconds after 10am would
- * be held for a whole day.
+ * A bare reset time this little in the past is the reset happening now: the
+ * CLI drops the seconds, so a refusal just before a 10:00:45 reset reads
+ * "10am", and the result takes a moment to arrive. Anything further past is
+ * tomorrow's, because the CLI only prints a reset that is still ahead. A reset
+ * just under a day ahead reads the same as one happening now; taking it as now
+ * costs an hour's hold, where the other reading would cost a day.
  */
-const JUST_PASSED_MS = 15 * MINUTE_MS;
+const JUST_PASSED_MS = 2 * MINUTE_MS;
 /** Held messages are picked up again this long after the reset... */
 const MESSAGE_RESUME_MARGIN_MS = 2 * MINUTE_MS;
 /** ...and a deferred scheduled task runs a little after them. */
@@ -157,8 +165,16 @@ function parseReset(
   now: Date,
   fallbackTz: string,
 ): Date | null {
-  const [, monthName, dayText, hourText, minuteText, meridiem, zoneText] =
-    match;
+  const [
+    ,
+    monthName,
+    dayText,
+    yearText,
+    hourText,
+    minuteText,
+    meridiem,
+    zoneText,
+  ] = match;
   const hour12 = Number(hourText);
   const minute = minuteText ? Number(minuteText) : 0;
   if (hour12 < 1 || hour12 > 12 || minute > 59) return null;
@@ -171,6 +187,9 @@ function parseReset(
     const month = MONTHS.indexOf(monthName.slice(0, 3).toLowerCase());
     const day = Number(dayText);
     if (month < 0 || day < 1 || day > 31) return null;
+    if (yearText) {
+      return zonedTime(Number(yearText), month, day, hour, minute, zone);
+    }
     // No year in the text: take the one that puts the reset nearest to now,
     // so "Jan 1" on New Year's Eve is tomorrow, not eleven months ago.
     return [today.year - 1, today.year, today.year + 1]
