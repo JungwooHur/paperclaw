@@ -26,6 +26,8 @@ vi.mock('../logger.js', () => ({
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
+    // baileys gets a child logger; see whatsapp-log-level.test.ts.
+    child: vi.fn(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() })),
   },
 }));
 

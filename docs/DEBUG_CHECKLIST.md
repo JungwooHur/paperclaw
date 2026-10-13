@@ -28,6 +28,8 @@ container ls -a --format '{{.Names}} {{.Status}}' 2>/dev/null | grep paperclaw
 grep -E 'ERROR|WARN' logs/paperclaw.log | tail -20
 
 # 5. Is WhatsApp connected? (look for last connection event)
+# These lines are the app's own. baileys' lines ('connection errored' with its
+# stack trace, 'logging in...') are logged only with BAILEYS_LOG_LEVEL=info.
 grep -E 'Connected to WhatsApp|Connection closed|connection.*close' logs/paperclaw.log | tail -5
 
 # 6. Are groups loaded?

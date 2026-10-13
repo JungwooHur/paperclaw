@@ -70,9 +70,10 @@ Messages and task operations are verified against group identity:
 A subset of `.env` (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `NOTION_TOKEN`, `NOTION_RESEARCH_DB`, `OUTPUT_LANGUAGE`) is read by the host at spawn time and piped to the container over stdin. Secrets are never written to a mounted file and never set on the host `process.env`.
 
 **Masked Inside the Project Root Mount (main only):**
-The main group's project-root bind mount hides two paths by overlaying an empty replacement. Without this overlay the agent could `cat` the file off disk and trivially bypass the Bash PreToolUse hook below.
+The main group's project-root bind mount hides three paths by overlaying an empty replacement. Without this overlay the agent could `cat` the file off disk and trivially bypass the Bash PreToolUse hook below.
 - `/workspace/project/.env` → empty file. Would otherwise leak `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`.
 - `/workspace/project/store/auth` → empty directory. Would otherwise leak Baileys WhatsApp session credentials — full account takeover on WhatsApp.
+- `/workspace/project/logs` → empty directory. Would otherwise leak the service log (see Logs below).
 
 **NOT Mounted at All:**
 - Mount allowlist (`~/.config/paperclaw/mount-allowlist.json`) — external, agent cannot modify mount policy.
@@ -82,6 +83,15 @@ The main group's project-root bind mount hides two paths by overlaying an empty 
 A `PreToolUse` hook in the agent runner prepends `unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN` to every Bash invocation, so subprocesses the agent spawns cannot read Claude auth tokens from `printenv` even though the SDK itself needs them. Non-auth secrets (e.g. `NOTION_TOKEN`) stay visible — the agent calls Notion's API on the user's behalf.
 
 > **Residual risk:** the Claude Agent SDK still needs `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in its own process environment to authenticate, so an in-process exfil (e.g. an SDK extension that read `process.env` and posted it somewhere) would defeat the Bash hook. The mount masking + Bash hook combo only blocks the easy `cat .env` and `echo $ANTHROPIC_API_KEY` paths. **PRs welcome** for tighter in-process credential isolation.
+
+### 6. Logs
+
+`logs/paperclaw.log` and `logs/paperclaw.error.log` are the service's stdout and stderr, so whatever a dependency prints with `console.*` lands in one of them, not only what goes through the app logger. libsignal's `console.info` lines go to the first, its `console.warn("Session already closed", …)` to the second.
+
+- **Signal session keys are redacted.** libsignal, under baileys, prints whole session objects (`Closing session:`, `Opening session:`, `Removing old closed session:`), and Node expands them down to the ratchet private key, the root key and the chain keys. `src/libsignal-redact.ts` gives those objects a one-line form, `SessionEntry <redacted closed=…>`. Every module that imports baileys loads it first (the service, `npm run auth`, the setup group sync); a test fails if one stops, or if a libsignal upgrade leaves the patch with nothing to attach to.
+- **baileys logs at `warn`** (`BAILEYS_LOG_LEVEL`), so its info lines, the account's phone number on every login among them, are not written by default.
+- **The agent cannot read it.** `logs/` is masked out of the main group's project mount (above). The log still carries phone numbers and chat JIDs from the app's own lines.
+- **Logs written before the redaction can still hold key dumps.** It only changes new output. Treat older `logs/paperclaw.log` and `logs/paperclaw.error.log` content, and any copy or backup of either, as secret: do not share it or attach it to an issue, and truncate or delete it once it is no longer needed.
 
 ## Privilege Comparison
 
