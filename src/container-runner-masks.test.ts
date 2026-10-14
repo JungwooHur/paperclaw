@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The paths the main group's project-root mount must hide. Each one exists on
 // the host in this test (see the fs mock), so a missing mask is a real miss.
-const MASKED = ['.env', 'store/auth', 'logs'];
+const MASKED = ['.env', 'store', 'logs'];
 
 vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
@@ -21,7 +21,9 @@ vi.mock('./logger.js', () => ({
 vi.mock('fs', async () => {
   const actual = await vi.importActual<typeof import('fs')>('fs');
   const present = new Set(
-    ['.env', 'store/auth', 'logs'].map((p) => path.join(process.cwd(), p)),
+    ['.env', 'store', 'store/auth', 'logs'].map((p) =>
+      path.join(process.cwd(), p),
+    ),
   );
   return {
     ...actual,
@@ -109,5 +111,19 @@ describe('main group project mount', () => {
     const [host, , mode] = mount!.split(':');
     expect(host.startsWith('/tmp/paperclaw-test-data/masks/')).toBe(true);
     expect(mode).toBe('ro');
+  });
+
+  // A mount inside a directory mask lands in the shared empty mask directory:
+  // Docker has to create its mount point there, which a read-only mask refuses,
+  // and which otherwise leaves the "empty" directory no longer empty.
+  it('mounts nothing inside a masked directory', async () => {
+    const mounts = await mainGroupMounts();
+    const masked = MASKED.map((rel) =>
+      path.posix.join('/workspace/project', rel),
+    );
+    const nested = [...mounts.keys()].filter((c) =>
+      masked.some((m) => c.startsWith(`${m}/`)),
+    );
+    expect(nested).toEqual([]);
   });
 });

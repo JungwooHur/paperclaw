@@ -91,9 +91,14 @@ function buildVolumeMounts(
     //   .env       — contains CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY.
     //                Reading the file would bypass the PreToolUse Bash hook
     //                that strips those vars from subprocess env.
-    //   store/auth — Baileys WhatsApp session credentials. The agent has no
-    //                legitimate reason to see these; if leaked they grant
-    //                full account takeover on WhatsApp.
+    //   store/     — Baileys WhatsApp session credentials in auth/, and any
+    //                copies of them set aside next to it (a revoked session
+    //                is renamed, never deleted, and a backup may still be
+    //                live). Leaked, they grant full account takeover on
+    //                WhatsApp. Also messages.db, the full message history.
+    //                The whole directory, not just auth/, so a copy under a
+    //                new name is hidden too; the agent gets the group list
+    //                over IPC instead.
     //   logs/      — the service log: phone numbers, chat JIDs, message
     //                metadata, and in logs written before libsignal-redact
     //                existed, dumps of live Signal session keys.
@@ -115,10 +120,10 @@ function buildVolumeMounts(
         readonly: true,
       });
     }
-    if (fs.existsSync(path.join(projectRoot, 'store', 'auth'))) {
+    if (fs.existsSync(path.join(projectRoot, 'store'))) {
       mounts.push({
         hostPath: emptyDir,
-        containerPath: '/workspace/project/store/auth',
+        containerPath: '/workspace/project/store',
         readonly: true,
       });
     }
