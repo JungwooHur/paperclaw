@@ -44,7 +44,7 @@ const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
  * else warn. A name pino does not know also gives warn, since pino throws on
  * it and the connect would fail with it.
  */
-function baileysLogLevel(): string {
+export function baileysLogLevel(): string {
   const level =
     process.env.BAILEYS_LOG_LEVEL ||
     readEnvFile(['BAILEYS_LOG_LEVEL']).BAILEYS_LOG_LEVEL ||

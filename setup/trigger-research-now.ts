@@ -3,12 +3,13 @@
  * Run with: npx tsx setup/trigger-research-now.ts
  */
 import { initDatabase, createTask, deleteTask, getTasksForGroup } from '../src/db.js';
+import { MAIN_GROUP_FOLDER as GROUP_FOLDER } from '../src/config.js';
+import { readEnvFile } from '../src/env.js';
 
 initDatabase();
 
 const TASK_ID = 'research-papers-test-' + Date.now();
-const GROUP_FOLDER = process.env.MAIN_GROUP_FOLDER || 'main';
-const CHAT_JID = process.env.CHAT_JID;
+const CHAT_JID = process.env.CHAT_JID || readEnvFile(['CHAT_JID']).CHAT_JID;
 
 if (!CHAT_JID) {
   console.error('CHAT_JID env var is required (your WhatsApp JID, e.g. 821012345678@s.whatsapp.net)');

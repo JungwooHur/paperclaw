@@ -1,20 +1,22 @@
 import fs from 'fs';
 import path from 'path';
-import { logger } from './logger.js';
 
 /**
  * Parse the .env file and return values for the requested keys.
  * Does NOT load anything into process.env — callers decide what to
  * do with the values. This keeps secrets out of the process environment
  * so they don't leak to child processes.
+ *
+ * Imports nothing of this project's own: logger.ts reads LOG_LEVEL through it,
+ * so a logger import here would be a cycle.
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
   let content: string;
   try {
     content = fs.readFileSync(envFile, 'utf-8');
-  } catch (err) {
-    logger.debug({ err }, '.env file not found, using defaults');
+  } catch {
+    // No .env: every setting falls back to its default.
     return {};
   }
 
