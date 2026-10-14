@@ -436,14 +436,22 @@ async function runAgent(
   // input sessionId on error, persisting it creates an infinite resume-fail
   // loop where claude can't load a non-existent session and keeps crashing.
   // Skip too once the run hit the usage limit: that session holds nothing but
-  // the refused request, and the group keeps the one it had.
+  // the refused request, and the group keeps the one it had. And skip once the
+  // run has returned: a callback that outlived OUTPUT_SETTLE_TIMEOUT would
+  // overwrite the session a later run of the group has stored since.
   let usageLimited = false;
+  let returned = false;
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (typeof output.result === 'string' && isUsageLimit(output.result)) {
           usageLimited = true;
         }
-        if (output.newSessionId && output.status !== 'error' && !usageLimited) {
+        if (
+          output.newSessionId &&
+          output.status !== 'error' &&
+          !usageLimited &&
+          !returned
+        ) {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
@@ -465,7 +473,9 @@ async function runAgent(
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
-    );
+    ).finally(() => {
+      returned = true;
+    });
 
     if (output.newSessionId && output.status !== 'error' && !usageLimited) {
       sessions[group.folder] = output.newSessionId;

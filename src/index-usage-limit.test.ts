@@ -855,4 +855,69 @@ describe('a callback that runs after its run ended', () => {
     expect(closeStdin).not.toHaveBeenCalled();
     expect(getRouterState('last_agent_timestamp')).toBe(cursor);
   });
+
+  it('settles nothing from an answer that arrives after a refused run', async () => {
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    let late: ((output: ContainerOutput) => Promise<void>) | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        late = onOutput;
+        await onOutput?.({
+          status: 'success',
+          result: LIMIT,
+          newSessionId: 'session-new',
+        });
+        return {
+          status: 'error',
+          result: null,
+          error: 'Container exited with code 1',
+        };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    const cursor = getRouterState('last_agent_timestamp');
+    const held = getRouterState('usage_limit_refused_input');
+    const notifyIdle = vi.spyOn(GroupQueue.prototype, 'notifyIdle');
+
+    await late?.({
+      status: 'success',
+      result: 'It describes the method.',
+      newSessionId: 'session-new',
+    });
+
+    expect(sentTexts()).toContain('It describes the method.');
+    // Settling the refused prompt now would move the cursor past a message
+    // that recovery has to run after the reset.
+    expect(getRouterState('last_agent_timestamp')).toBe(cursor);
+    expect(getRouterState('usage_limit_refused_input')).toBe(held);
+    expect(notifyIdle).not.toHaveBeenCalled();
+  });
+
+  it("keeps the next run's session from an answer that arrives after its own run", async () => {
+    userSays('m1', 'what is section 2 about?', NOW - 120_000);
+    let late: ((output: ContainerOutput) => Promise<void>) | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        late = onOutput;
+        return { status: 'success', result: null, newSessionId: 'session-a' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+
+    userSays('m2', 'and section 3?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(async () => ({
+      status: 'success',
+      result: null,
+      newSessionId: 'session-b',
+    }));
+    await _processGroupMessages(CHAT);
+    expect(getAllSessions()).toEqual({ main: 'session-b' });
+
+    await late?.({
+      status: 'success',
+      result: 'It describes the method.',
+      newSessionId: 'session-a',
+    });
+    expect(getAllSessions()).toEqual({ main: 'session-b' });
+  });
 });
