@@ -85,8 +85,16 @@ run build` rebuilds on every start. The `-` lets a failed build through, so the
 bot still comes up on the previous `dist/` — and `src/build-freshness.ts` then
 logs **`dist/ is older than src/`** at startup, naming the stale files. **That
 WARN means the running code is not the checked-out code**: the build error is
-just above it in `logs/paperclaw.log`. node is an nvm install on no systemd
-PATH, so `scripts/paperclaw-node.sh` resolves it (nvm default, then PATH).
+just above it in `logs/paperclaw.log`. It depends on `noEmitOnError` in
+`tsconfig.json`: by default tsc writes every output despite a type error, so
+the bot would start on the NEW, failing code and the WARN would never fire.
+
+No systemd PATH has the right node, so `scripts/paperclaw-node.sh` resolves it:
+`PAPERCLAW_NODE` first, which setup writes into a drop-in beside the unit
+(`paperclaw.service.d/node.conf`, the node setup ran with, so the one that built
+the native modules), then nvm's default, then PATH. A drop-in keeps the linked
+unit a link. To change a setting, edit `.env` and restart; never edit the
+installed unit, which is this tracked file.
 
 The unit has no `EnvironmentFile=` on purpose: `.env` holds the secrets, and the
 process environment reaches every child, the container runtime included. The

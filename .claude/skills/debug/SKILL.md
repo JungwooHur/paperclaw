@@ -46,9 +46,17 @@ LOG_LEVEL=debug npm run dev
 # For launchd service (macOS), add to plist EnvironmentVariables:
 <key>LOG_LEVEL</key>
 <string>debug</string>
-# For systemd service (Linux), add to unit [Service] section:
-# Environment=LOG_LEVEL=debug
+# For the systemd service (Linux): set it in .env, then restart.
+# Do NOT edit the installed unit: it is a symlink to the tracked
+# systemd/paperclaw.service, so the edit would dirty the repo.
+LOG_LEVEL=debug        # in .env; then: systemctl --user restart paperclaw
+# A one-off override can go in a drop-in instead:
+#   systemctl --user edit paperclaw   →   [Service]
+#                                         Environment=LOG_LEVEL=debug
 ```
+
+An unknown level (`warning`, `DEBUG`) is not fatal: the bot logs at `info` and
+warns `Unknown LOG_LEVEL` at startup.
 
 Debug level shows:
 - Full mount configurations
