@@ -264,6 +264,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let answeredCursor = previousCursor;
   const prompts: OpenPrompt[] = [{ cursor: lastAgentTimestamp[chatJid] }];
   openPrompts[chatJid] = prompts;
+  // This container was never refused, whatever the last run left behind.
+  closingOnRefusal.delete(chatJid);
+  // Set once runAgent returns. The runner waits for these callbacks first, but
+  // only so long (OUTPUT_SETTLE_TIMEOUT), so one can still run after. By then
+  // the end below has settled the cursor and the held input, and the group's
+  // stdin, idle timer and pipes belong to its next container: a late callback
+  // delivers what it carries and writes none of them.
+  let runEnded = false;
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -273,36 +281,46 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           ? result.result
           : JSON.stringify(result.result);
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+      if (runEnded) {
+        logger.warn(
+          { group: group.name },
+          'Agent output after its run ended, delivered without state changes',
+        );
+      }
       const limit = recordUsageLimit(raw);
       if (limit) {
         // The CLI's refusal, not an answer: hold the request for the reset.
-        usageLimited = true;
-        // Put the unanswered messages back now, not when the container exits:
-        // the window is already persisted, so a restart in between would
-        // keep a cursor past messages nothing answered, and recovery after
-        // the reset would find nothing pending.
-        lastAgentTimestamp[chatJid] = answeredCursor;
-        saveState();
-        rememberRefusedInput(chatJid, prompts);
-        closingOnRefusal.add(chatJid);
-        queue.closeStdin(chatJid);
+        if (!runEnded) {
+          usageLimited = true;
+          // Put the unanswered messages back now, not when the container
+          // exits: the window is already persisted, so a restart in between
+          // would keep a cursor past messages nothing answered, and recovery
+          // after the reset would find nothing pending.
+          lastAgentTimestamp[chatJid] = answeredCursor;
+          saveState();
+          rememberRefusedInput(chatJid, prompts);
+          closingOnRefusal.add(chatJid);
+          queue.closeStdin(chatJid);
+        }
         if (limit.notice) await channel.sendMessage(chatJid, limit.notice);
         const resumeAt = usageLimitHeldUntil();
         if (resumeAt) resumeAfterUsageLimit(resumeAt);
         return;
       }
-      // A result ends a turn, and turns take prompts in the order they were
-      // given. A turn answered only through send_message counts too.
-      const settled = prompts.shift();
-      if (settled !== undefined) answeredCursor = settled.cursor;
-      if (usageLimited) {
-        // A turn after a refusal (extra usage, say): save what the exit will,
-        // so a restart before it leaves the same messages pending. Not an
-        // exact cursor: the turn settles the oldest open prompt, which is the
-        // refused one, whichever prompt it answered (#114).
-        lastAgentTimestamp[chatJid] = answeredCursor;
-        saveState();
-        rememberRefusedInput(chatJid, prompts);
+      if (!runEnded) {
+        // A result ends a turn, and turns take prompts in the order they were
+        // given. A turn answered only through send_message counts too.
+        const settled = prompts.shift();
+        if (settled !== undefined) answeredCursor = settled.cursor;
+        if (usageLimited) {
+          // A turn after a refusal (extra usage, say): save what the exit
+          // will, so a restart before it leaves the same messages pending.
+          // Not an exact cursor: the turn settles the oldest open prompt,
+          // which is the refused one, whichever prompt it answered (#114).
+          lastAgentTimestamp[chatJid] = answeredCursor;
+          saveState();
+          rememberRefusedInput(chatJid, prompts);
+        }
       }
       // Single outbound path: formatOutbound strips <internal> blocks AND the
       // trailing "shall I save this to Notion?" offer. This used to inline only
@@ -315,9 +333,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         fileAnsweredQa(chatJid, text);
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
+      if (!runEnded) resetIdleTimer();
     }
 
+    if (runEnded) return;
     if (result.status === 'success') {
       queue.notifyIdle(chatJid);
     }
@@ -326,6 +345,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       hadError = true;
     }
   });
+  runEnded = true;
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);

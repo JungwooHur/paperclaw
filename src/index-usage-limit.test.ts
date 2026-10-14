@@ -762,3 +762,97 @@ describe('a restart between a refusal and the container exit', () => {
     await exit();
   });
 });
+
+// The runner waits for a run's callbacks before it returns, but only so long,
+// and until that fix an error exit did not wait at all. Whatever runs late
+// must leave alone the state the run's end settled.
+describe('a callback that runs after its run ended', () => {
+  it('leaves the next container open to pipes and the held input as the exit left it', async () => {
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    // The window's notice is slow to send.
+    sendMessage.mockImplementationOnce(async () => {
+      await new Promise<void>((r) => setTimeout(r, 1500));
+    });
+    let callbacks: Promise<void> = Promise.resolve();
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(true);
+        // Both prompts were in the stream, so the CLI refuses twice, back to
+        // back. Each callback waits for the one before it; the container
+        // exits 1 once stdin closes, before the notice is out.
+        for (let i = 0; i < 2; i++) {
+          callbacks = callbacks.then(() =>
+            onOutput?.({
+              status: 'success',
+              result: LIMIT,
+              newSessionId: 'session-new',
+            }),
+          );
+        }
+        return {
+          status: 'error',
+          result: null,
+          error: 'Container exited with code 1',
+        };
+      },
+    );
+    expect(await _processGroupMessages(CHAT)).toBe(true);
+    const heldAtExit = getRouterState('usage_limit_refused_input');
+    const cursorAtExit = getRouterState('last_agent_timestamp');
+    closeStdin.mockClear();
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await callbacks;
+    expect(getRouterState('usage_limit_refused_input')).toBe(heldAtExit);
+    expect(getRouterState('last_agent_timestamp')).toBe(cursorAtExit);
+    expect(closeStdin).not.toHaveBeenCalled();
+
+    // After the reset, the group's first container takes follow-ups.
+    vi.setSystemTime(RESET + 10 * 60_000);
+    let piped: boolean | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, input, _onProcess, onOutput) => {
+        bootPrompts.push(startupPrompt(input.prompt));
+        const m3 = userSays('m3', 'and the appendix?', RESET + 11 * 60_000);
+        piped = _pipeToActiveContainer(CHAT, channel, [m3]);
+        await onOutput?.({
+          status: 'success',
+          result: 'All three are answered.',
+          newSessionId: 'session-new',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    expect(piped).toBe(true);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+  });
+
+  it('delivers a late answer without closing the next container on idle', async () => {
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    let late: ((output: ContainerOutput) => Promise<void>) | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        late = onOutput;
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    const cursor = getRouterState('last_agent_timestamp');
+
+    await late?.({
+      status: 'success',
+      result: 'It describes the method.',
+      newSessionId: 'session-new',
+    });
+    expect(sentTexts()).toContain('It describes the method.');
+
+    // Another container has the group by now; an idle timer armed by the old
+    // run would close it half an hour from here.
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+    expect(closeStdin).not.toHaveBeenCalled();
+    expect(getRouterState('last_agent_timestamp')).toBe(cursor);
+  });
+});
