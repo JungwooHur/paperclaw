@@ -157,6 +157,12 @@ systemctl --user restart paperclaw
 grep -c 'dist/ is older than src/' logs/paperclaw.log   # a new hit = the build failed
 ```
 
+Linking leaves the node drop-in (`~/.config/systemd/user/paperclaw.service.d/node.conf`,
+written by setup) alone. If the update switched node versions and rebuilt
+`node_modules`, re-run `npx tsx setup/index.ts --step service` so the drop-in
+names the new node; a pinned node that was uninstalled is skipped with a
+warning in `logs/paperclaw.error.log`.
+
 ## 8. Verify
 
 Run build and tests:

@@ -249,6 +249,13 @@ function setupSystemd(
   }
   logger.info({ unitPath }, 'Wrote systemd unit');
 
+  // The node this ran with, beside the unit rather than in it, so a linked
+  // unit stays a link. Linked or copied, the unit takes it the same way.
+  const dropIn = nodeDropInPath(unitPath);
+  fs.mkdirSync(path.dirname(dropIn), { recursive: true });
+  fs.writeFileSync(dropIn, renderNodeDropIn(nodePath));
+  logger.info({ dropIn, nodePath }, 'Pinned the node the unit runs');
+
   // Detect stale docker group before starting (user systemd only)
   const dockerGroupStale = !runningAsRoot && checkDockerGroupStale();
   if (dockerGroupStale) {
@@ -298,6 +305,33 @@ function setupSystemd(
     STATUS: 'success',
     LOG: 'logs/setup.log',
   });
+}
+
+/** The drop-in that pins the unit's node: `<unit>.d/node.conf`. */
+export function nodeDropInPath(unitPath: string): string {
+  return path.join(`${unitPath}.d`, 'node.conf');
+}
+
+/**
+ * A drop-in telling scripts/paperclaw-node.sh to run `nodePath`, the node setup
+ * ran with and so the one `npm ci` built the native modules for. Without it the
+ * wrapper falls back to nvm's default, then PATH, which is wrong for a node
+ * installed any other way, or for an nvm default other than the one in use.
+ * Quoted and escaped for systemd, which would otherwise split on a space and
+ * expand a `%`.
+ */
+export function renderNodeDropIn(nodePath: string): string {
+  const value = `PAPERCLAW_NODE=${nodePath}`
+    .replaceAll('\\', '\\\\')
+    .replaceAll('"', '\\"')
+    .replaceAll('%', '%%');
+  return [
+    '# Written by setup (setup/service.ts): the node it ran with.',
+    '# Re-run the setup service step after changing node versions.',
+    '[Service]',
+    `Environment="${value}"`,
+    '',
+  ].join('\n');
 }
 
 /** The service unit, relative to the project root. */

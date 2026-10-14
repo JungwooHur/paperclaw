@@ -1,9 +1,16 @@
+import { spawnSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
-import { renderSystemdUnit, SYSTEMD_UNIT } from './service.js';
+import {
+  nodeDropInPath,
+  renderNodeDropIn,
+  renderSystemdUnit,
+  SYSTEMD_UNIT,
+} from './service.js';
 
 /**
  * Tests for service configuration generation.
@@ -155,5 +162,111 @@ echo $! > ${JSON.stringify(pidFile)}`;
     expect(wrapper).toContain('nohup');
     expect(wrapper).toContain(nodePath);
     expect(wrapper).toContain('paperclaw.pid');
+  });
+});
+
+/**
+ * Which node the unit runs. nvm's default is right only when it is the node
+ * `npm ci` built the native modules with; a node from anywhere else (fnm, volta,
+ * a tarball) is on no PATH systemd sets. So setup pins the node it ran with in
+ * a drop-in, and scripts/paperclaw-node.sh takes that first.
+ */
+describe('node resolution (scripts/paperclaw-node.sh)', () => {
+  const wrapper = path.resolve(__dirname, '..', 'scripts', 'paperclaw-node.sh');
+  let tmp: string;
+  let nodes: Record<'pinned' | 'nvm' | 'path', string>;
+  let nvmDir: string;
+
+  function fakeNode(name: string): string {
+    const dir = path.join(tmp, `${name} bin`);
+    fs.mkdirSync(dir, { recursive: true });
+    const bin = path.join(dir, 'node');
+    fs.writeFileSync(bin, `#!/bin/sh\necho ${name}\n`, { mode: 0o755 });
+    return bin;
+  }
+
+  // By absolute path: one case runs with a PATH that has nothing on it.
+  const bash = spawnSync('sh', ['-c', 'command -v bash'], {
+    encoding: 'utf-8',
+  }).stdout.trim();
+
+  function run(env: Record<string, string>) {
+    return spawnSync(bash, [wrapper, 'node'], {
+      encoding: 'utf-8',
+      env: { HOME: tmp, NVM_DIR: nvmDir, ...env },
+    });
+  }
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'paperclaw-node-'));
+    nodes = {
+      pinned: fakeNode('pinned'),
+      nvm: fakeNode('nvm'),
+      path: fakeNode('path'),
+    };
+    nvmDir = path.join(tmp, 'nvm');
+    fs.mkdirSync(nvmDir);
+    fs.writeFileSync(
+      path.join(nvmDir, 'nvm.sh'),
+      `nvm() { [ "$1" = which ] && [ "$2" = default ] && echo '${nodes.nvm}'; }\n`,
+    );
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const onPath = () => `${path.dirname(nodes.path)}:/usr/bin:/bin`;
+
+  it('takes PAPERCLAW_NODE first, over nvm and PATH', () => {
+    const r = run({ PAPERCLAW_NODE: nodes.pinned, PATH: onPath() });
+    expect(r.stdout.trim()).toBe('pinned');
+  });
+
+  it("then nvm's default, over PATH", () => {
+    expect(run({ PATH: onPath() }).stdout.trim()).toBe('nvm');
+  });
+
+  it('then the node on PATH', () => {
+    nvmDir = path.join(tmp, 'no-nvm');
+    expect(run({ PATH: onPath() }).stdout.trim()).toBe('path');
+  });
+
+  it('says so and falls through when the pinned node is gone', () => {
+    const r = run({
+      PAPERCLAW_NODE: path.join(tmp, 'uninstalled', 'node'),
+      PATH: onPath(),
+    });
+    expect(r.stdout.trim()).toBe('nvm');
+    expect(r.stderr).toContain('PAPERCLAW_NODE');
+  });
+
+  it('exits 127 when there is no node at all', () => {
+    nvmDir = path.join(tmp, 'no-nvm');
+    const empty = path.join(tmp, 'empty');
+    fs.mkdirSync(empty);
+    expect(run({ PATH: empty }).status).toBe(127);
+  });
+
+  it("setup's drop-in makes the unit run the node setup ran with", () => {
+    const conf = renderNodeDropIn(nodes.pinned);
+    expect(conf).toMatch(/^\[Service\]$/m);
+    const value = conf.match(/^Environment="PAPERCLAW_NODE=(.*)"$/m)?.[1];
+    expect(value).toBe(nodes.pinned);
+    expect(run({ PAPERCLAW_NODE: value!, PATH: onPath() }).stdout.trim()).toBe(
+      'pinned',
+    );
+  });
+
+  it('escapes what systemd would otherwise expand', () => {
+    expect(renderNodeDropIn('/opt/50%/node')).toContain(
+      'Environment="PAPERCLAW_NODE=/opt/50%%/node"',
+    );
+  });
+
+  it('puts the drop-in beside the unit, so a linked unit stays a link', () => {
+    expect(nodeDropInPath('/etc/systemd/system/paperclaw.service')).toBe(
+      '/etc/systemd/system/paperclaw.service.d/node.conf',
+    );
   });
 });

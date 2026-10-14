@@ -137,7 +137,7 @@ If service already running: unload first.
 
 Run `npx tsx setup/index.ts --step service` and parse the status block.
 
-On Linux (systemd) this links the repo's `systemd/paperclaw.service` into `~/.config/systemd/user/` — a copy with the real paths instead when running as root or when the checkout is not `~/paperclaw`. That unit rebuilds `dist/` before every start, so a restart after an update runs the updated code.
+On Linux (systemd) this links the repo's `systemd/paperclaw.service` into `~/.config/systemd/user/` — a copy with the real paths instead when running as root or when the checkout is not `~/paperclaw`. That unit rebuilds `dist/` before every start, so a restart after an update runs the updated code. Beside it, setup writes a drop-in, `paperclaw.service.d/node.conf`, pinning `PAPERCLAW_NODE` to the node it ran with (the status block's `NODE_PATH`), so the service uses the node that built `node_modules` however node was installed.
 
 **If FALLBACK=wsl_no_systemd:** WSL without systemd detected. Tell user they can either enable systemd in WSL (`echo -e "[boot]\nsystemd=true" | sudo tee /etc/wsl.conf` then restart WSL) or use the generated `start-paperclaw.sh` wrapper.
 

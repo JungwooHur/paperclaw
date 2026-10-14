@@ -13,10 +13,13 @@ WorkingDirectory=%h/paperclaw
 # Rebuild dist/ from the checked-out source before every start, so a restart
 # after a merge runs the merged code. The leading '-' lets a failed build
 # through: the bot starts on the previous dist/ rather than not at all, and
-# says so with a startup WARN (src/build-freshness.ts). The build's own errors
-# land in the log files below.
+# says so with a startup WARN (src/build-freshness.ts). That holds because a
+# failed build writes nothing (noEmitOnError in tsconfig.json). The build's own
+# errors land in the log files below.
 ExecStartPre=-%h/paperclaw/scripts/paperclaw-node.sh npm run build
-# node comes from nvm, which no systemd PATH has; the wrapper resolves it.
+# No systemd PATH has the right node; the wrapper resolves it: PAPERCLAW_NODE
+# from setup's drop-in (paperclaw.service.d/node.conf), then nvm's default,
+# then PATH. Settings that are not node belong in .env, not in a drop-in.
 ExecStart=%h/paperclaw/scripts/paperclaw-node.sh node %h/paperclaw/dist/index.js
 Restart=always
 # A WhatsApp logout exits with this code. Restarting cannot fix a revoked device:
