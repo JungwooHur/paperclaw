@@ -137,6 +137,8 @@ If service already running: unload first.
 
 Run `npx tsx setup/index.ts --step service` and parse the status block.
 
+On Linux (systemd) this links the repo's `systemd/paperclaw.service` into `~/.config/systemd/user/` — a copy with the real paths instead when running as root or when the checkout is not `~/paperclaw`. That unit rebuilds `dist/` before every start, so a restart after an update runs the updated code.
+
 **If FALLBACK=wsl_no_systemd:** WSL without systemd detected. Tell user they can either enable systemd in WSL (`echo -e "[boot]\nsystemd=true" | sudo tee /etc/wsl.conf` then restart WSL) or use the generated `start-paperclaw.sh` wrapper.
 
 **If DOCKER_GROUP_STALE=true:** The user was added to the docker group after their session started — the systemd service can't reach the Docker socket. Ask user to run these two commands:

@@ -233,29 +233,20 @@ function setupSystemd(
     systemctlPrefix = 'systemctl --user';
   }
 
-  const unit = `[Unit]
-Description=PaperClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-# A WhatsApp logout exits with this code. Restarting cannot fix a revoked device —
-# it just loops (221 times in four hours, once) and buries the one message that
-# matters. Stop instead; store/auth-required says what to do.
-RestartPreventExitStatus=78
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/paperclaw.log
-StandardError=append:${projectRoot}/logs/paperclaw.error.log
-
-[Install]
-WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
-
-  fs.writeFileSync(unitPath, unit);
+  // The unit is systemd/paperclaw.service, never a template here: a unit
+  // written once and never refreshed is how a restart came to run stale code.
+  // A user install of the usual checkout links it, so it cannot drift.
+  const source = path.join(projectRoot, SYSTEMD_UNIT);
+  fs.rmSync(unitPath, { force: true });
+  if (!runningAsRoot && projectRoot === path.join(homeDir, 'paperclaw')) {
+    fs.symlinkSync(source, unitPath);
+  } else {
+    const template = fs.readFileSync(source, 'utf-8');
+    fs.writeFileSync(
+      unitPath,
+      renderSystemdUnit(template, projectRoot, runningAsRoot),
+    );
+  }
   logger.info({ unitPath }, 'Wrote systemd unit');
 
   // Detect stale docker group before starting (user systemd only)
@@ -307,6 +298,26 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
     STATUS: 'success',
     LOG: 'logs/setup.log',
   });
+}
+
+/** The service unit, relative to the project root. */
+export const SYSTEMD_UNIT = path.join('systemd', 'paperclaw.service');
+
+/**
+ * The repo unit as installed for a checkout at `projectRoot`, for when it
+ * cannot simply be linked. The repo file assumes ~/paperclaw (`%h/paperclaw`);
+ * any other checkout gets its real path. A system-level unit (root) is wanted
+ * by multi-user.target instead of default.target.
+ */
+export function renderSystemdUnit(
+  template: string,
+  projectRoot: string,
+  isSystem: boolean,
+): string {
+  const unit = template.replaceAll('%h/paperclaw', projectRoot);
+  return isSystem
+    ? unit.replace('WantedBy=default.target', 'WantedBy=multi-user.target')
+    : unit;
 }
 
 function setupNohupFallback(

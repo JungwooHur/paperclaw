@@ -143,6 +143,20 @@ systemctl --user daemon-reload
 systemctl --user is-active paperclaw-qa-heal.timer   # should print "active"
 ```
 
+The bot and watchdog units live in `systemd/` at the repo root and are linked
+the same way. `paperclaw.service` rebuilds `dist/` in its `ExecStartPre=`, so
+linking it is what makes a restart pick up merged code; an older install has it
+as a plain file, which `ln -sf` replaces. Then restart so the merge is running:
+
+```bash
+for u in paperclaw.service paperclaw-watchdog.service paperclaw-watchdog.timer; do
+  ln -sf "$PWD/systemd/$u" ~/.config/systemd/user/$u
+done
+systemctl --user daemon-reload
+systemctl --user restart paperclaw
+grep -c 'dist/ is older than src/' logs/paperclaw.log   # a new hit = the build failed
+```
+
 ## 8. Verify
 
 Run build and tests:

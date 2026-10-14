@@ -72,26 +72,27 @@ systemctl --user restart paperclaw
 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
 
-## A restart does NOT pick up merged code (the service runs `dist/`)
+## A restart rebuilds `dist/` first — and says so when it could not
 
-`paperclaw.service` runs `node dist/index.js`, and nothing rebuilds it. So
-`systemctl --user restart paperclaw` after a merge relaunches the OLD compiled
-code, reports `active`, logs a clean startup, and looks in every way like the
-change took effect.
+The service runs `node dist/index.js`. Its unit used to be a plain file outside
+the repo with nothing rebuilding `dist/`, so a restart after a merge relaunched
+the OLD code while reporting `active` and a clean startup (hit for real: a merged
+module did not exist in `dist/` at all, so a feature silently never ran).
 
-Hit for real while turning on external skill loading: the feature's module did
-not exist in `dist/` at all, so the restart was a no-op and the skill silently
-never installed. `ls -l dist/<the new module>.js` is the direct check — a missing
-file, or an mtime older than the merge, means the running process does not have
-the change.
+Now the unit is `systemd/paperclaw.service`, symlinked into
+`~/.config/systemd/user/` by setup and `/update`, and its `ExecStartPre=-… npm
+run build` rebuilds on every start. The `-` lets a failed build through, so the
+bot still comes up on the previous `dist/` — and `src/build-freshness.ts` then
+logs **`dist/ is older than src/`** at startup, naming the stale files. **That
+WARN means the running code is not the checked-out code**: the build error is
+just above it in `logs/paperclaw.log`. node is an nvm install on no systemd
+PATH, so `scripts/paperclaw-node.sh` resolves it (nvm default, then PATH).
 
-**Always `npm run build` before restarting after a merge.**
-
-This is ungated. Unlike the healer units, `paperclaw.service` is a plain file in
-`~/.config/systemd/user/` with no copy in this repository, so there is nowhere to
-add an `ExecStartPre=` that would survive. Bringing it into `systemd/` as a
-symlinked unit with a build step is the fix; until then the rule is prose and
-prose is not a mechanism.
+The unit has no `EnvironmentFile=` on purpose: `.env` holds the secrets, and the
+process environment reaches every child, the container runtime included. The
+code reads its settings from `.env` itself (`src/config.ts`), and
+`src/env-example.test.ts` fails for any key `.env.example` documents that does
+not take effect that way.
 
 ## An API error reaches the host as a successful answer
 
