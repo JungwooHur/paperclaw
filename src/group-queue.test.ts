@@ -467,7 +467,7 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 
-  it('sendMessage returns false for task containers so user messages queue up', async () => {
+  it('sendMessage writes nothing for task containers so user messages queue up', async () => {
     let resolveTask: () => void;
 
     const taskFn = vi.fn(async () => {
@@ -486,9 +486,9 @@ describe('GroupQueue', () => {
       'test-group',
     );
 
-    // sendMessage should return false — user messages must not go to task containers
+    // sendMessage should write nothing — user messages must not go to task containers
     const result = queue.sendMessage('group1@g.us', 'hello');
-    expect(result).toBe(false);
+    expect(result).toBeNull();
 
     resolveTask!();
     await vi.advanceTimersByTimeAsync(10);

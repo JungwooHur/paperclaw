@@ -64,9 +64,19 @@ let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 let usageLimitRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
-// Per group with a message container running: the cursor at the end of each
-// prompt it has been given and not yet finished a turn on, oldest first.
-const openPrompts: Record<string, string[]> = {};
+/** A prompt a message container was given and has not finished a turn on. */
+interface OpenPrompt {
+  /** The cursor at the end of its messages. */
+  cursor: string;
+  /** The input file it was piped in as; the first prompt has none. */
+  file?: string;
+}
+// Per group with a message container running: its open prompts, oldest first.
+const openPrompts: Record<string, OpenPrompt[]> = {};
+// router_state key: per group, the piped prompts the latest usage-limit
+// refusal put back, so a restart before the container exits can still drop
+// the files it left. Cleared once the files are dealt with.
+const REFUSED_INPUT_KEY = 'usage_limit_refused_input';
 
 /**
  * Files a paper Q&A right after the answer goes out, so it does not wait for the
@@ -249,7 +259,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // after it puts back only the messages that came later. Not the cursor at
   // the time, which a follow-up piped in mid-answer has already moved on.
   let answeredCursor = previousCursor;
-  openPrompts[chatJid] = [lastAgentTimestamp[chatJid]];
+  const prompts: OpenPrompt[] = [{ cursor: lastAgentTimestamp[chatJid] }];
+  openPrompts[chatJid] = prompts;
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -263,16 +274,30 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (limit) {
         // The CLI's refusal, not an answer: hold the request for the reset.
         usageLimited = true;
-        if (limit.notice) await channel.sendMessage(chatJid, limit.notice);
+        // Put the unanswered messages back now, not when the container exits:
+        // the window is already persisted, so a restart in between would
+        // keep a cursor past messages nothing answered, and recovery after
+        // the reset would find nothing pending.
+        lastAgentTimestamp[chatJid] = answeredCursor;
+        saveState();
+        rememberRefusedInput(chatJid, prompts);
         queue.closeStdin(chatJid);
+        if (limit.notice) await channel.sendMessage(chatJid, limit.notice);
         const resumeAt = usageLimitHeldUntil();
         if (resumeAt) resumeAfterUsageLimit(resumeAt);
         return;
       }
       // A result ends a turn, and turns take prompts in the order they were
       // given. A turn answered only through send_message counts too.
-      const settled = openPrompts[chatJid]?.shift();
-      if (settled !== undefined) answeredCursor = settled;
+      const settled = prompts.shift();
+      if (settled !== undefined) answeredCursor = settled.cursor;
+      if (usageLimited) {
+        // A turn after a refusal (extra usage, say) answered more; keep the
+        // saved cursor exact for a restart.
+        lastAgentTimestamp[chatJid] = answeredCursor;
+        saveState();
+        rememberRefusedInput(chatJid, prompts);
+      }
       // Single outbound path: formatOutbound strips <internal> blocks AND the
       // trailing "shall I save this to Notion?" offer. This used to inline only
       // the <internal> strip, so the offer-stripping rule silently did not apply
@@ -295,16 +320,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       hadError = true;
     }
   });
-  delete openPrompts[chatJid];
+  if (openPrompts[chatJid] === prompts) delete openPrompts[chatJid];
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (usageLimited) {
-    // Put the unanswered messages back. No retry: it would hit the same limit;
-    // they run when the window closes.
+    // The unanswered messages are back (since the refusal). No retry: it
+    // would hit the same limit; they run when the window closes. The
+    // container is gone, so the files it never drained can go too.
     lastAgentTimestamp[chatJid] = answeredCursor;
     saveState();
+    discardRefusedInput(chatJid, prompts);
+    rememberRefusedInput(chatJid, []);
     logger.warn(
       { group: group.name },
       'Usage limit reached, messages held until the reset',
@@ -525,14 +553,19 @@ function pipeToActiveContainer(
   channel: Channel,
   messages: NewMessage[],
 ): boolean {
-  if (!queue.sendMessage(chatJid, formatMessages(messages))) return false;
+  // Nothing into a container closing on a refusal: it checks the close
+  // sentinel before draining, so the file would be left for the next one,
+  // on top of the messages being pending. Pending is enough; they are held.
+  if (usageLimitHeldUntil()) return false;
+  const file = queue.sendMessage(chatJid, formatMessages(messages));
+  if (!file) return false;
   logger.debug(
     { chatJid, count: messages.length },
     'Piped messages to active container',
   );
   lastAgentTimestamp[chatJid] = messages[messages.length - 1].timestamp;
   saveState();
-  openPrompts[chatJid]?.push(lastAgentTimestamp[chatJid]);
+  openPrompts[chatJid]?.push({ cursor: lastAgentTimestamp[chatJid], file });
   // Show typing indicator while the container processes the piped message
   channel
     .setTyping?.(chatJid, true)
@@ -540,6 +573,54 @@ function pipeToActiveContainer(
       logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
     );
   return true;
+}
+
+/**
+ * Deletes the input files of piped prompts whose messages are pending again,
+ * so the container that runs them after the reset does not also drain them.
+ * Only those: a file whose message the cursor has passed can be its only
+ * delivery (a container that closed before draining it leaves it for the next
+ * one's start-up drain). Call only once the group's container has exited.
+ */
+function discardRefusedInput(chatJid: string, prompts: OpenPrompt[]): void {
+  const cursor = lastAgentTimestamp[chatJid] || '';
+  for (const { file, cursor: end } of prompts) {
+    if (!file || end <= cursor) continue;
+    try {
+      fs.rmSync(file, { force: true });
+    } catch (err) {
+      logger.warn({ chatJid, err }, 'Could not discard refused input file');
+    }
+  }
+}
+
+/** Persists the piped prompts a refusal put back (none: forget the group). */
+function rememberRefusedInput(chatJid: string, prompts: OpenPrompt[]): void {
+  const all = readRefusedInput();
+  const piped = prompts.filter((p) => p.file);
+  if (piped.length > 0) all[chatJid] = piped;
+  else delete all[chatJid];
+  setRouterState(REFUSED_INPUT_KEY, JSON.stringify(all));
+}
+
+function readRefusedInput(): Record<string, OpenPrompt[]> {
+  try {
+    return JSON.parse(getRouterState(REFUSED_INPUT_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Startup: a restart between a refusal and its container's exit leaves the
+ * files that container never drained. Runs after orphaned containers are
+ * stopped and state is loaded, before any container starts.
+ */
+function discardRefusedInputAfterRestart(): void {
+  for (const [chatJid, prompts] of Object.entries(readRefusedInput())) {
+    discardRefusedInput(chatJid, prompts);
+  }
+  setRouterState(REFUSED_INPUT_KEY, '{}');
 }
 
 /** Runs recovery again once a usage-limit window has closed. */
@@ -581,6 +662,7 @@ function recoverPendingMessages(): void {
 
 /** @internal - exported for testing */
 export {
+  discardRefusedInputAfterRestart as _discardRefusedInputAfterRestart,
   loadState as _loadState,
   pipeToActiveContainer as _pipeToActiveContainer,
   processGroupMessages as _processGroupMessages,
@@ -597,6 +679,7 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  discardRefusedInputAfterRestart();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
