@@ -2,7 +2,6 @@ import fs from 'fs';
 import { spawn } from 'child_process';
 import os from 'os';
 import path from 'path';
-import { fileURLToPath } from 'url';
 
 import {
   ASSISTANT_NAME,
@@ -11,7 +10,7 @@ import {
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
-import { warnIfBuildStale } from './build-freshness.js';
+import { warnIfRunningStaleBuild } from './build-freshness.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
@@ -596,12 +595,8 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   // The unit rebuilds dist/ before each start but lets a failed build through,
-  // so say so here when that left this process on old code. Only a run from
-  // dist/ can be stale: `npm run dev` runs src/ itself.
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  if (path.basename(here) === 'dist') {
-    warnIfBuildStale(path.join(here, '..', 'src'), here);
-  }
+  // so say so here when that left this process on old code.
+  warnIfRunningStaleBuild(import.meta.url);
 
   ensureContainerSystemRunning();
   initDatabase();

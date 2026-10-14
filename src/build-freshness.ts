@@ -5,9 +5,14 @@
  * build is allowed to fail — a type error must not keep the bot down — so the
  * process may start on an older dist/. Without this check that is invisible: a
  * restart reports `active`, logs a clean startup, and runs the old code.
+ *
+ * It relies on a failed build emitting nothing (`noEmitOnError` in
+ * tsconfig.json). tsc's default is to write every output despite a type error,
+ * which would leave dist/ newer than src/, run the failing code, and never warn.
  */
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import { logger } from './logger.js';
 
@@ -46,6 +51,18 @@ export function staleBuildFiles(srcDir: string, distDir: string): string[] {
   };
   walk('');
   return stale.sort();
+}
+
+/**
+ * The startup check, for the module at `moduleUrl` (main()'s import.meta.url).
+ *
+ * Only a run from dist/ can be stale; `npm run dev` runs src/ itself, so a
+ * module anywhere else checks nothing. src/ is dist/'s sibling.
+ */
+export function warnIfRunningStaleBuild(moduleUrl: string): void {
+  const here = path.dirname(fileURLToPath(moduleUrl));
+  if (path.basename(here) !== 'dist') return;
+  warnIfBuildStale(path.join(here, '..', 'src'), here);
 }
 
 /** Logs a WARN naming the stale files, if any. Never throws. */
