@@ -1,3 +1,4 @@
+import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
@@ -90,22 +91,59 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
-/**
- * TZ from the environment or .env, else the system zone. A name Intl does not
- * know falls back to the system zone with a warning: cron-parser would throw on
- * it for every scheduled task, and the container would get it too.
- */
-function resolveTimezone(): string {
-  const system = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const tz = setting('TZ');
-  if (!tz) return system;
+function isTimezone(tz: string): boolean {
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: tz });
-    return tz;
+    return true;
   } catch {
-    logger.warn({ tz, system }, 'Unknown TZ, using the system timezone');
-    return system;
+    return false;
   }
+}
+
+/**
+ * The system zone by name, or undefined when there is none to be had.
+ *
+ * Intl names it, except when the environment's TZ is one libc accepts and Intl
+ * does not (`:/etc/localtime`, a POSIX string like `KST-9`): then Intl reports
+ * no zone at all. /etc/localtime, a link into the zoneinfo tree on Linux and
+ * macOS, still names the zone the system is set to.
+ */
+export function systemTimezone(): string | undefined {
+  const intl = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (intl && isTimezone(intl)) return intl;
+  try {
+    const link = fs.readlinkSync('/etc/localtime');
+    const name = link.split('zoneinfo/').pop();
+    if (name && name !== link && isTimezone(name)) return name;
+  } catch {
+    // Not a link, or no such file: nothing to name.
+  }
+  return undefined;
+}
+
+/**
+ * The configured TZ if Intl knows it, else the system zone, else UTC.
+ *
+ * A name Intl does not know is not used: cron-parser would throw on it for
+ * every scheduled task, and the container would get it too. Every fallback
+ * warns, and the result is always a zone name, never undefined, because it is
+ * written to process.env.TZ, where undefined becomes the string "undefined".
+ */
+export function resolveTimezone(
+  configured: string | undefined,
+  system: () => string | undefined = systemTimezone,
+): string {
+  if (configured && isTimezone(configured)) return configured;
+  const fallback = system();
+  if (configured) {
+    logger.warn(
+      { tz: configured, using: fallback ?? 'UTC' },
+      'Unknown TZ, using the system timezone',
+    );
+  } else if (!fallback) {
+    logger.warn('No TZ set and the system timezone has no name, using UTC');
+  }
+  return fallback ?? 'UTC';
 }
 
 // The one timezone for everything: cron schedules, the host's own notices, the
@@ -113,7 +151,7 @@ function resolveTimezone(): string {
 // process.env.TZ, so the value is put there too — otherwise a TZ set in .env
 // would govern cron while `new Date('2026-01-01T09:00')` (a 'once' task) still
 // parsed in the system zone. TZ is not a secret; children seeing it is fine.
-export const TIMEZONE = resolveTimezone();
+export const TIMEZONE = resolveTimezone(setting('TZ'));
 process.env.TZ = TIMEZONE;
 
 // Language of the notices the host sends on its own (the agent gets the same
