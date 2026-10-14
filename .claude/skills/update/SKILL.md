@@ -154,17 +154,30 @@ bot unable to start. Re-run setup's service step there instead, which rewrites
 that copy. The watchdog units are not linked there either: the watchdog script
 reads `~/paperclaw/logs/` too.
 
+Both paths install the unit for the checkout they run in, so first make sure it
+is the one the service runs. A git worktree or a second clone has no `store/`
+(it is gitignored), and a service pointed at it has no WhatsApp session: it
+exits on the QR prompt and restarts every few seconds.
+
 ```bash
-if [ "$PWD" = "$HOME/paperclaw" ] && [ "$(id -u)" -ne 0 ]; then
+scope=--user; [ "$(id -u)" -eq 0 ] && scope=
+live=$(systemctl $scope show paperclaw -p WorkingDirectory --value 2>/dev/null)
+if [ -n "$live" ] && [ "$(readlink -f "$live")" != "$(pwd -P)" ]; then
+  echo "The service runs $live, not this checkout. Run /update there; nothing installed."
+elif [ "$PWD" = "$HOME/paperclaw" ] && [ "$(id -u)" -ne 0 ]; then
   for u in paperclaw.service paperclaw-watchdog.service paperclaw-watchdog.timer; do
     ln -sf "$PWD/systemd/$u" ~/.config/systemd/user/$u
   done
   systemctl --user daemon-reload
+  systemctl --user restart paperclaw
 else
   npx tsx setup/index.ts --step service
+  systemctl $scope restart paperclaw
 fi
-systemctl --user restart paperclaw     # as root: systemctl restart paperclaw
 ```
+
+If it printed "The service runs …", stop here and tell the user: the merge is not
+live until `/update` runs in that checkout.
 
 Then check the build the restart ran. `restart` returns once `ExecStartPre=` has
 finished, so its exit status is already there; a startup WARN in the log is not
@@ -194,6 +207,15 @@ npm run build && npm test
 **If build fails:** Show the error. Common causes:
 - Type errors from merged files — read the error, fix the file, retry
 - Missing dependencies — run `npm install` first, retry
+
+**If step 7b's build status was not 0**, the bot is still running the code from
+before the merge, and passing this step does not change that. Once the build
+passes, restart again and re-read the status until it is `status=0`:
+
+```bash
+systemctl --user restart paperclaw
+systemctl --user show paperclaw -p ExecStartPre | grep -o 'status=[0-9]*'
+```
 
 **If tests fail:** Show which tests failed. Try to diagnose and fix. If you can't fix automatically, report to the user.
 

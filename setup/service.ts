@@ -293,7 +293,6 @@ function setupSystemd(
   });
 }
 
-/** The drop-in that pins the unit's node: `<unit>.d/node.conf`. */
 /**
  * Puts systemd/paperclaw.service at unitPath and pins nodePath beside it;
  * returns the drop-in's path.
@@ -332,6 +331,7 @@ export function installSystemdUnit(opts: {
   return dropIn;
 }
 
+/** The drop-in that pins the unit's node: `<unit>.d/node.conf`. */
 export function nodeDropInPath(unitPath: string): string {
   return path.join(`${unitPath}.d`, 'node.conf');
 }
