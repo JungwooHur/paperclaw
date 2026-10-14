@@ -168,6 +168,10 @@ describe('a knob set only in .env takes effect', () => {
 
   beforeEach(() => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'paperclaw-env-'));
+    // The service's own path: <cwd>/.env, with no override. The suite points
+    // PAPERCLAW_ENV_FILE at nothing (vitest.setup.ts); this gate must not.
+    saved.PAPERCLAW_ENV_FILE = process.env.PAPERCLAW_ENV_FILE;
+    delete process.env.PAPERCLAW_ENV_FILE;
     vi.spyOn(process, 'cwd').mockReturnValue(tmp);
     vi.resetModules();
   });

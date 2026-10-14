@@ -1,3 +1,6 @@
+import os from 'os';
+import path from 'path';
+
 /**
  * Keeps the suite's git commands off the repository the suite is running in.
  *
@@ -31,3 +34,20 @@ export function scrubGitEnv(env: Record<string, string | undefined>): void {
 }
 
 scrubGitEnv(process.env);
+
+/**
+ * Keeps the suite off the developer's own .env.
+ *
+ * Settings are read from <cwd>/.env (src/env.ts), and the suite runs in a
+ * checkout, which usually has one. A real ASSISTANT_NAME there changed what a
+ * test saw, so the suite passed in CI and failed on the pre-push hook of the
+ * checkout the service runs from. Pointing the file at a path that does not
+ * exist makes every test start from the defaults; a test that needs a .env
+ * writes a temp one and points this, or the cwd, at it.
+ */
+export const NO_ENV_FILE = path.join(
+  os.tmpdir(),
+  `paperclaw-suite-has-no-env-${process.pid}`,
+  '.env',
+);
+process.env.PAPERCLAW_ENV_FILE = NO_ENV_FILE;

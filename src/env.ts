@@ -7,11 +7,16 @@ import path from 'path';
  * do with the values. This keeps secrets out of the process environment
  * so they don't leak to child processes.
  *
+ * The file is <cwd>/.env, the project root the service runs in, unless
+ * PAPERCLAW_ENV_FILE names another. The test suite uses that to read none at
+ * all (vitest.setup.ts), so a developer's own .env cannot change a result.
+ *
  * Imports nothing of this project's own: logger.ts reads LOG_LEVEL through it,
  * so a logger import here would be a cycle.
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
-  const envFile = path.join(process.cwd(), '.env');
+  const envFile =
+    process.env.PAPERCLAW_ENV_FILE || path.join(process.cwd(), '.env');
   let content: string;
   try {
     content = fs.readFileSync(envFile, 'utf-8');

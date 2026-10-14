@@ -133,6 +133,8 @@ describe('baileys log level', () => {
 
   it('reads BAILEYS_LOG_LEVEL from .env, like the other runtime knobs', async () => {
     vi.stubEnv('BAILEYS_LOG_LEVEL', '');
+    // The service's own path, <cwd>/.env: lift the suite's no-.env override.
+    vi.stubEnv('PAPERCLAW_ENV_FILE', '');
     fs.writeFileSync(path.join(cwd, '.env'), 'BAILEYS_LOG_LEVEL=info\n');
     const baileys = await connect();
 
