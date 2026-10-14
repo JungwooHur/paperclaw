@@ -1,3 +1,5 @@
+import path from 'path';
+
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
 import { GroupQueue } from './group-queue.js';
@@ -465,6 +467,54 @@ describe('GroupQueue', () => {
 
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('sendMessage returns the path of the file a container drains', async () => {
+    // The host deletes refused follow-ups by this path, so it must be the
+    // finished .json the runner reads, not the temp file it was written as.
+    const fs = await import('fs');
+    const actual = await vi.importActual<typeof import('fs')>('fs');
+    const ipcDir = path.join('/tmp/paperclaw-test-data', 'ipc');
+    actual.mkdirSync(ipcDir, { recursive: true });
+    const folderDir = actual.mkdtempSync(path.join(ipcDir, 'send-'));
+    vi.mocked(fs.default.mkdirSync).mockImplementationOnce(actual.mkdirSync);
+    vi.mocked(fs.default.writeFileSync).mockImplementationOnce(
+      actual.writeFileSync,
+    );
+    vi.mocked(fs.default.renameSync).mockImplementationOnce(actual.renameSync);
+
+    let resolveProcess: () => void;
+    queue.setProcessMessagesFn(
+      vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveProcess = resolve;
+        });
+        return true;
+      }),
+    );
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+    queue.registerProcess(
+      'group1@g.us',
+      {} as any,
+      'container-1',
+      path.basename(folderDir),
+    );
+
+    try {
+      const file = queue.sendMessage('group1@g.us', 'hello');
+      expect(file).not.toBeNull();
+      expect(path.dirname(file!)).toBe(path.join(folderDir, 'input'));
+      expect(file!.endsWith('.json')).toBe(true);
+      expect(JSON.parse(actual.readFileSync(file!, 'utf-8'))).toEqual({
+        type: 'message',
+        text: 'hello',
+      });
+    } finally {
+      actual.rmSync(folderDir, { recursive: true, force: true });
+      resolveProcess!();
+      await vi.advanceTimersByTimeAsync(10);
+    }
   });
 
   it('sendMessage writes nothing for task containers so user messages queue up', async () => {

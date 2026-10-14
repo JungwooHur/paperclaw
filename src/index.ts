@@ -73,6 +73,9 @@ interface OpenPrompt {
 }
 // Per group with a message container running: its open prompts, oldest first.
 const openPrompts: Record<string, OpenPrompt[]> = {};
+// Groups whose message container is closing on a usage-limit refusal, until it
+// exits. That can outlast the window, so the window alone does not cover it.
+const closingOnRefusal = new Set<string>();
 // router_state key: per group, the piped prompts the latest usage-limit
 // refusal put back, so a restart before the container exits can still drop
 // the files it left. Cleared once the files are dealt with.
@@ -281,6 +284,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         lastAgentTimestamp[chatJid] = answeredCursor;
         saveState();
         rememberRefusedInput(chatJid, prompts);
+        closingOnRefusal.add(chatJid);
         queue.closeStdin(chatJid);
         if (limit.notice) await channel.sendMessage(chatJid, limit.notice);
         const resumeAt = usageLimitHeldUntil();
@@ -292,8 +296,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const settled = prompts.shift();
       if (settled !== undefined) answeredCursor = settled.cursor;
       if (usageLimited) {
-        // A turn after a refusal (extra usage, say) answered more; keep the
-        // saved cursor exact for a restart.
+        // A turn after a refusal (extra usage, say): save what the exit will,
+        // so a restart before it leaves the same messages pending. Not an
+        // exact cursor: the turn settles the oldest open prompt, which is the
+        // refused one, whichever prompt it answered (#114).
         lastAgentTimestamp[chatJid] = answeredCursor;
         saveState();
         rememberRefusedInput(chatJid, prompts);
@@ -320,10 +326,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       hadError = true;
     }
   });
-  if (openPrompts[chatJid] === prompts) delete openPrompts[chatJid];
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+  // Only after the last await: the group's queue counts the container active
+  // until this run returns, so a pipe while the typing indicator clears still
+  // writes a file. It must land in prompts, or be refused after a refusal.
+  if (openPrompts[chatJid] === prompts) delete openPrompts[chatJid];
+  closingOnRefusal.delete(chatJid);
 
   if (usageLimited) {
     // The unanswered messages are back (since the refusal). No retry: it
@@ -350,9 +360,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
+    // Roll back cursor so retries can re-process these messages. That makes
+    // every piped one pending again, so the files the container never drained
+    // go: the retry would get them twice. Saved first, so a crash in between
+    // cannot leave a message neither pending nor in a file.
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
+    discardRefusedInput(chatJid, prompts);
     logger.warn(
       { group: group.name },
       'Agent error, rolled back message cursor for retry',
@@ -555,8 +569,9 @@ function pipeToActiveContainer(
 ): boolean {
   // Nothing into a container closing on a refusal: it checks the close
   // sentinel before draining, so the file would be left for the next one,
-  // on top of the messages being pending. Pending is enough; they are held.
-  if (usageLimitHeldUntil()) return false;
+  // on top of the messages being pending. Pending is enough; they are held
+  // while the window is open, and start the next container once it closes.
+  if (usageLimitHeldUntil() || closingOnRefusal.has(chatJid)) return false;
   const file = queue.sendMessage(chatJid, formatMessages(messages));
   if (!file) return false;
   logger.debug(
@@ -577,7 +592,7 @@ function pipeToActiveContainer(
 
 /**
  * Deletes the input files of piped prompts whose messages are pending again,
- * so the container that runs them after the reset does not also drain them.
+ * so the container that runs them next does not also drain them.
  * Only those: a file whose message the cursor has passed can be its only
  * delivery (a container that closed before draining it leaves it for the next
  * one's start-up drain). Call only once the group's container has exited.
@@ -660,26 +675,32 @@ function recoverPendingMessages(): void {
   }
 }
 
+/**
+ * Startup, after the database opens and before any container starts, in the
+ * order the refused-input sweep needs: stop the last process's containers, so
+ * none can still drain a file; load the cursors the files are judged against;
+ * then drop the files a refusal put back.
+ */
+function restoreStartupState(): void {
+  cleanupOrphans();
+  loadState();
+  discardRefusedInputAfterRestart();
+}
+
 /** @internal - exported for testing */
 export {
-  discardRefusedInputAfterRestart as _discardRefusedInputAfterRestart,
   loadState as _loadState,
   pipeToActiveContainer as _pipeToActiveContainer,
   processGroupMessages as _processGroupMessages,
   recoverPendingMessages as _recoverPendingMessages,
+  restoreStartupState as _restoreStartupState,
 };
 
-function ensureContainerSystemRunning(): void {
-  ensureContainerRuntimeRunning();
-  cleanupOrphans();
-}
-
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  ensureContainerRuntimeRunning();
   initDatabase();
   logger.info('Database initialized');
-  loadState();
-  discardRefusedInputAfterRestart();
+  restoreStartupState();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
