@@ -44,6 +44,7 @@ import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { logHeartbeat } from './liveness-log.js';
 import { logger } from './logger.js';
 import { qaFollowupCommand, worthFilingCheck } from './qa-followup.js';
 import {
@@ -677,10 +678,9 @@ async function main(): Promise<void> {
   // a socket-liveness signal the watchdog can read (a dead-but-not-reconnecting socket
   // shows `whatsapp=down` across heartbeats while the log itself stays fresh).
   const HEARTBEAT_MS = 10 * 60 * 1000;
+  // It is written at any LOG_LEVEL (liveness-log.ts).
   setInterval(() => {
-    logger.info(
-      `heartbeat whatsapp=${whatsapp?.isConnected() ? 'up' : 'down'}`,
-    );
+    logHeartbeat(whatsapp?.isConnected() ?? false);
   }, HEARTBEAT_MS).unref();
 
   startMessageLoop().catch((err) => {

@@ -21,7 +21,12 @@ export const logger = pino({
 });
 
 if (configuredLevel && configuredLevel !== LOG_LEVEL) {
-  logger.warn({ level: configuredLevel }, 'Unknown LOG_LEVEL, logging at info');
+  // Not `level`: that key would replace pino's own, and the line would come out
+  // unlabelled (USERLVL) with the bad value swallowed.
+  logger.warn(
+    { configured: configuredLevel },
+    'Unknown LOG_LEVEL, logging at info',
+  );
 }
 
 // Route uncaught errors through pino so they get timestamps in stderr
