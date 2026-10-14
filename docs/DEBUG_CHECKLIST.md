@@ -91,6 +91,10 @@ grep -E 'Piped messages|sendMessage' logs/paperclaw.log | tail -10
 # Check the queue state — any active containers?
 grep -E 'Starting container|Container active|concurrency limit' logs/paperclaw.log | tail -10
 
+# Is a Claude usage-limit window holding work? (values are the reset, in UTC)
+sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key LIKE 'usage_limit%';"
+grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
+
 # Check lastAgentTimestamp vs latest message timestamp
 sqlite3 store/messages.db "SELECT chat_jid, MAX(timestamp) as latest FROM messages GROUP BY chat_jid ORDER BY latest DESC LIMIT 5;"
 ```

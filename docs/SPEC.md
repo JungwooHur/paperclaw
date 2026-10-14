@@ -309,6 +309,10 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 3. Claude continues the conversation with full context
 4. Session transcripts are stored as JSONL files in `data/sessions/{group}/.claude/`
 
+### Per-Group Copies Are Seeded Once
+
+`data/sessions/{group}/.claude/settings.json` and `data/sessions/{group}/agent-runner-src/` are created the first time a group's container starts, and are never refreshed. A change to the settings defaults in `src/container-runner.ts`, or to `container/agent-runner/src/`, therefore reaches new groups only. To apply one to an existing group, delete that group's copy and it is recreated on the next run; edits the agent made to its copy are lost. A setting that must reach every group is passed with `-e` on the container command instead, as the model pin is.
+
 ---
 
 ## Message Flow
@@ -377,6 +381,18 @@ When a triggered message arrives, the agent receives all messages since its last
 
 This allows the agent to understand the conversation context even if it wasn't mentioned in every message.
 
+### Usage Limits
+
+When the account behind the token runs out of quota, the CLI bundled with the agent SDK answers each request with a one-line refusal ("You've hit your limit · resets …"). The agent runner passes that on as a successful result. `src/usage-limit.ts` recognises it, and the host does not send it as a reply:
+
+- The refused messages become pending again, and the group keeps its session, so a follow-up after the reset still has the earlier context.
+- The window lives in `router_state` (`usage_limited_until`), so it survives a restart. While it is open, no container is started for messages; they wait.
+- Held messages run two minutes after the reset, without a new message to trigger them.
+- The group is told once per window when work will resume. A later refusal that moves the reset more than an hour past the announced time sends a corrected notice.
+- A reset the text does not state, or one already in the past, is taken as an hour from now.
+
+Scheduled runs are deferred instead; see [How Scheduling Works](#how-scheduling-works). Any other error result from the SDK is still sent as the reply. The rollback is exact only while each result answers one prompt; the cases where it is not are tracked in #114.
+
 ---
 
 ## Commands
@@ -408,6 +424,8 @@ PaperClaw has a built-in scheduler that runs tasks as full agents in their group
 2. **Full Agent Capabilities**: Scheduled tasks have access to all tools (WebSearch, file operations, etc.)
 3. **Optional Messaging**: Tasks can send messages to their group using the `send_message` tool, or complete silently
 4. **Main Channel Privileges**: The main channel can schedule tasks for any group and view all tasks
+5. **One Run per Due Time**: A task's `next_run` advances only when its run finishes, so every 60-second scheduler poll during a long run finds it due again. The queue skips a task that is already running or queued. A queued task is re-read when its turn comes, and does not run if it was paused or cancelled while it waited.
+6. **Usage Limits**: A run refused by the usage limit sends nothing to the group. Its `next_run` moves to five minutes after the reset for that run only, and a `once` task stays `active` so that it runs then.
 
 ### Schedule Types
 

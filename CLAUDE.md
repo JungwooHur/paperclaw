@@ -93,6 +93,28 @@ add an `ExecStartPre=` that would survive. Bringing it into `systemd/` as a
 symlinked unit with a build step is the fix; until then the rule is prose and
 prose is not a mechanism.
 
+## An API error reaches the host as a successful answer
+
+The agent runner forwards every SDK result as `status: 'success'`, including
+ones with `is_error: true`. To the host, a refusal therefore looks like a reply,
+and it went out to WhatsApp as one. Two real cases:
+
+- **Usage limit.** Every message got the CLI's "You've hit your limit" sentence
+  as its answer, and scheduled paper work counted as done. The host now holds
+  that work and resumes it after the reset (docs/SPEC.md, "Usage Limits").
+- **Unusable default model.** After the token was switched to another account,
+  every reply was `There's an issue with the selected model (...)`. The CLI
+  bundled with the SDK had defaulted to a model that account could not use. The
+  model is now pinned through `AGENT_MODEL`.
+
+**Any other `is_error` result is still sent as the reply.** When the bot
+answers with an error sentence, this is the path it took.
+
+The model pin is a container `-e`, not a `settings.json` entry, because
+per-group `settings.json` and `agent-runner-src/` are seeded once and never
+refreshed. A change to either default reaches new groups only (docs/SPEC.md,
+"Per-Group Copies Are Seeded Once").
+
 ## systemd unit staleness (paper healer)
 
 The paper-page healers (back-matter, source-URL, math, furniture, figure, table cleanup) run **on the host** from `paperclaw-qa-heal.service` — NOT in the container. The installed unit lives at `~/.config/systemd/user/paperclaw-qa-heal.service`; the source of truth is `groups/main/research-papers/systemd/paperclaw-qa-heal.service`.
