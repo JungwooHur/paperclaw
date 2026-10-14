@@ -6,6 +6,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 
 import {
+  installSystemdUnit,
   nodeDropInPath,
   renderNodeDropIn,
   renderSystemdUnit,
@@ -268,5 +269,76 @@ describe('node resolution (scripts/paperclaw-node.sh)', () => {
     expect(nodeDropInPath('/etc/systemd/system/paperclaw.service')).toBe(
       '/etc/systemd/system/paperclaw.service.d/node.conf',
     );
+  });
+});
+
+describe('installing the unit (installSystemdUnit)', () => {
+  const repo = path.resolve(__dirname, '..');
+  let home: string;
+  let unitPath: string;
+
+  /** A checkout at `root` holding the repo's unit. */
+  function checkout(root: string): string {
+    fs.mkdirSync(path.join(root, 'systemd'), { recursive: true });
+    fs.copyFileSync(
+      path.join(repo, SYSTEMD_UNIT),
+      path.join(root, SYSTEMD_UNIT),
+    );
+    return root;
+  }
+
+  const install = (projectRoot: string, runningAsRoot = false) =>
+    installSystemdUnit({
+      projectRoot,
+      homeDir: home,
+      unitPath,
+      runningAsRoot,
+      nodePath: '/opt/node/bin/node',
+    });
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'paperclaw-unit-'));
+    const unitDir = path.join(home, '.config', 'systemd', 'user');
+    fs.mkdirSync(unitDir, { recursive: true });
+    unitPath = path.join(unitDir, 'paperclaw.service');
+  });
+
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('links the usual checkout, replacing an older plain copy', () => {
+    const root = checkout(path.join(home, 'paperclaw'));
+    fs.writeFileSync(unitPath, '[Service]\nExecStart=/old\n');
+    install(root);
+    expect(fs.lstatSync(unitPath).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(unitPath)).toBe(
+      fs.realpathSync(path.join(root, SYSTEMD_UNIT)),
+    );
+  });
+
+  it.each([
+    ['a checkout elsewhere', 'elsewhere/claw', false],
+    ['a root install', 'paperclaw', true],
+  ])('writes a copy with the real paths for %s', (_, dir, asRoot) => {
+    const root = checkout(path.join(home, dir));
+    install(root, asRoot);
+    expect(fs.lstatSync(unitPath).isSymbolicLink()).toBe(false);
+    const unit = fs.readFileSync(unitPath, 'utf-8');
+    expect(unit).not.toContain('%h/paperclaw');
+    expect(unit).toContain(`ExecStart=${root}/scripts/paperclaw-node.sh`);
+  });
+
+  it('pins the node beside the unit, linked or copied', () => {
+    for (const root of [
+      checkout(path.join(home, 'paperclaw')),
+      checkout(path.join(home, 'elsewhere')),
+    ]) {
+      const dropIn = install(root);
+      expect(dropIn).toBe(nodeDropInPath(unitPath));
+      expect(fs.readFileSync(dropIn, 'utf-8')).toBe(
+        renderNodeDropIn('/opt/node/bin/node'),
+      );
+    }
   });
 });

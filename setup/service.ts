@@ -233,28 +233,14 @@ function setupSystemd(
     systemctlPrefix = 'systemctl --user';
   }
 
-  // The unit is systemd/paperclaw.service, never a template here: a unit
-  // written once and never refreshed is how a restart came to run stale code.
-  // A user install of the usual checkout links it, so it cannot drift.
-  const source = path.join(projectRoot, SYSTEMD_UNIT);
-  fs.rmSync(unitPath, { force: true });
-  if (!runningAsRoot && projectRoot === path.join(homeDir, 'paperclaw')) {
-    fs.symlinkSync(source, unitPath);
-  } else {
-    const template = fs.readFileSync(source, 'utf-8');
-    fs.writeFileSync(
-      unitPath,
-      renderSystemdUnit(template, projectRoot, runningAsRoot),
-    );
-  }
-  logger.info({ unitPath }, 'Wrote systemd unit');
-
-  // The node this ran with, beside the unit rather than in it, so a linked
-  // unit stays a link. Linked or copied, the unit takes it the same way.
-  const dropIn = nodeDropInPath(unitPath);
-  fs.mkdirSync(path.dirname(dropIn), { recursive: true });
-  fs.writeFileSync(dropIn, renderNodeDropIn(nodePath));
-  logger.info({ dropIn, nodePath }, 'Pinned the node the unit runs');
+  const dropIn = installSystemdUnit({
+    projectRoot,
+    homeDir,
+    unitPath,
+    runningAsRoot,
+    nodePath,
+  });
+  logger.info({ unitPath, dropIn, nodePath }, 'Installed systemd unit');
 
   // Detect stale docker group before starting (user systemd only)
   const dockerGroupStale = !runningAsRoot && checkDockerGroupStale();
@@ -308,6 +294,44 @@ function setupSystemd(
 }
 
 /** The drop-in that pins the unit's node: `<unit>.d/node.conf`. */
+/**
+ * Puts systemd/paperclaw.service at unitPath and pins nodePath beside it;
+ * returns the drop-in's path.
+ *
+ * The unit is the repo's file, never a template here: a unit written once and
+ * never refreshed is how a restart came to run stale code. A user install of
+ * the usual checkout links it, so it cannot drift. Anything else, another
+ * directory or root's system unit, gets a copy with the real paths, which a
+ * link to the template (whose paths are all ~/paperclaw) would break.
+ */
+export function installSystemdUnit(opts: {
+  projectRoot: string;
+  homeDir: string;
+  unitPath: string;
+  runningAsRoot: boolean;
+  nodePath: string;
+}): string {
+  const { projectRoot, homeDir, unitPath, runningAsRoot, nodePath } = opts;
+  const source = path.join(projectRoot, SYSTEMD_UNIT);
+  fs.rmSync(unitPath, { force: true });
+  if (!runningAsRoot && projectRoot === path.join(homeDir, 'paperclaw')) {
+    fs.symlinkSync(source, unitPath);
+  } else {
+    const template = fs.readFileSync(source, 'utf-8');
+    fs.writeFileSync(
+      unitPath,
+      renderSystemdUnit(template, projectRoot, runningAsRoot),
+    );
+  }
+
+  // The node this ran with, beside the unit rather than in it, so a linked
+  // unit stays a link. Linked or copied, the unit takes it the same way.
+  const dropIn = nodeDropInPath(unitPath);
+  fs.mkdirSync(path.dirname(dropIn), { recursive: true });
+  fs.writeFileSync(dropIn, renderNodeDropIn(nodePath));
+  return dropIn;
+}
+
 export function nodeDropInPath(unitPath: string): string {
   return path.join(`${unitPath}.d`, 'node.conf');
 }
