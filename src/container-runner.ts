@@ -39,6 +39,15 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---PAPERCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---PAPERCLAW_OUTPUT_END---';
 
+/**
+ * How long a finished run waits for its output callbacks before it resolves.
+ * They write the caller's per-run state, which the caller settles once the
+ * run resolves, so they must run first. Bounded because a callback awaits a
+ * channel send, and one stuck on a dead socket must not hold the group's
+ * queue slot forever; past the bound the caller has to ignore what is late.
+ */
+export const OUTPUT_SETTLE_TIMEOUT = 120_000;
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -374,7 +383,26 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
-  return new Promise((resolve) => {
+  return new Promise((resolveRun) => {
+    // The onOutput calls, in order; it never rejects.
+    let outputChain = Promise.resolve();
+    // Every exit resolves through this, so none can return while an output
+    // callback is still running: an error exit did, and a refusal's callback
+    // then wrote the caller's state after the caller had settled it.
+    const resolve = (result: ContainerOutput): void => {
+      const bound = setTimeout(() => {
+        logger.warn(
+          { group: group.name, containerName },
+          'Output callback still running after the container exited, not waiting for it',
+        );
+        resolveRun(result);
+      }, OUTPUT_SETTLE_TIMEOUT);
+      void outputChain.then(() => {
+        clearTimeout(bound);
+        resolveRun(result);
+      });
+    };
+
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -396,7 +424,6 @@ export async function runContainerAgent(
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
     let newSessionId: string | undefined;
-    let outputChain = Promise.resolve();
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
@@ -439,7 +466,16 @@ export async function runContainerAgent(
             resetTimeout();
             // Call onOutput for all markers (including null results)
             // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            // A callback that throws must not skip the ones after it, or
+            // leave the chain rejected and the run never resolved.
+            outputChain = outputChain
+              .then(() => onOutput(parsed))
+              .catch((err) =>
+                logger.error(
+                  { group: group.name, error: err },
+                  'Output callback failed',
+                ),
+              );
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -532,12 +568,10 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          outputChain.then(() => {
-            resolve({
-              status: 'success',
-              result: null,
-              newSessionId,
-            });
+          resolve({
+            status: 'success',
+            result: null,
+            newSessionId,
           });
           return;
         }
@@ -635,16 +669,14 @@ export async function runContainerAgent(
 
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
-        outputChain.then(() => {
-          logger.info(
-            { group: group.name, duration, newSessionId },
-            'Container completed (streaming mode)',
-          );
-          resolve({
-            status: 'success',
-            result: null,
-            newSessionId,
-          });
+        logger.info(
+          { group: group.name, duration, newSessionId },
+          'Container completed (streaming mode)',
+        );
+        resolve({
+          status: 'success',
+          result: null,
+          newSessionId,
         });
         return;
       }

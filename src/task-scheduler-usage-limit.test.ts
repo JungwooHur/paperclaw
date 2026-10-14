@@ -53,7 +53,14 @@ function addDueTask(
 
 async function runDueTasks(
   sendMessage: (jid: string, text: string) => Promise<void>,
-): Promise<void> {
+) {
+  const queue = {
+    enqueueTask: (_jid: string, _id: string, fn: () => Promise<void>) => {
+      void fn();
+    },
+    closeStdin: vi.fn(),
+    notifyIdle: vi.fn(),
+  };
   _resetSchedulerLoopForTests();
   startSchedulerLoop({
     registeredGroups: () => ({
@@ -65,17 +72,12 @@ async function runDueTasks(
       },
     }),
     getSessions: () => ({}),
-    queue: {
-      enqueueTask: (_jid: string, _id: string, fn: () => Promise<void>) => {
-        void fn();
-      },
-      closeStdin: vi.fn(),
-      notifyIdle: vi.fn(),
-    } as any,
+    queue: queue as any,
     onProcess: () => {},
     sendMessage,
   });
   await vi.advanceTimersByTimeAsync(10);
+  return queue;
 }
 
 function deferredPastReset(task: ScheduledTask | undefined): boolean {
@@ -138,6 +140,34 @@ describe('a scheduled run that hits the usage limit', () => {
     addDueTask('third', 'cron', '30 23 * * *');
     await runDueTasks(sendMessage);
     expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes and idles nothing from a callback that runs after the run', async () => {
+    // The runner stops waiting for a stuck callback; by the time it finishes,
+    // the group's container can be a different one.
+    addDueTask('nightly', 'cron', '30 23 * * *');
+    let late: ((output: ContainerOutput) => Promise<void>) | undefined;
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _onProcess, onOutput) => {
+        late = onOutput;
+        return { status: 'success', result: null, newSessionId: 'session-1' };
+      },
+    );
+    const sendMessage = vi.fn(async () => {});
+    const queue = await runDueTasks(sendMessage);
+
+    await late?.({
+      status: 'success',
+      result: 'Batch done: 3 papers uploaded.',
+      newSessionId: 'session-1',
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(sendMessage).toHaveBeenCalledWith(
+      CHAT,
+      'Batch done: 3 papers uploaded.',
+    );
+    expect(queue.closeStdin).not.toHaveBeenCalled();
+    expect(queue.notifyIdle).not.toHaveBeenCalled();
   });
 
   it('returns to its own schedule once a run gets through', async () => {

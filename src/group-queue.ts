@@ -157,12 +157,14 @@ export class GroupQueue {
 
   /**
    * Send a follow-up message to the active container via IPC file.
-   * Returns true if the message was written, false if no active container.
+   * Returns the path of the file written, or null if no active container
+   * took it. A container drains these files at start-up as well as while it
+   * runs, so one it never read reaches the next container of the group.
    */
-  sendMessage(groupJid: string, text: string): boolean {
+  sendMessage(groupJid: string, text: string): string | null {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder || state.isTaskContainer)
-      return false;
+      return null;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
@@ -173,9 +175,9 @@ export class GroupQueue {
       const tempPath = `${filepath}.tmp`;
       fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text }));
       fs.renameSync(tempPath, filepath);
-      return true;
+      return filepath;
     } catch {
-      return false;
+      return null;
     }
   }
 

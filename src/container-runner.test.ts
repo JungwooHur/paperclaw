@@ -92,7 +92,11 @@ vi.mock('child_process', async () => {
 
 import { spawn } from 'child_process';
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import {
+  OUTPUT_SETTLE_TIMEOUT,
+  runContainerAgent,
+  ContainerOutput,
+} from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -212,6 +216,107 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+describe('container-runner exit with output callbacks still running', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Whether the promise has settled by now. */
+  async function settled(promise: Promise<unknown>): Promise<boolean> {
+    let done = false;
+    void promise.then(() => (done = true));
+    await vi.advanceTimersByTimeAsync(0);
+    return done;
+  }
+
+  // A refusal ends in a non-zero exit once stdin closes, while its callback
+  // can still be sending the notice. The caller settles the run's state when
+  // the run resolves, so a callback that ran later would undo that.
+  const exits: Array<[string, () => void | Promise<void>]> = [
+    ['a non-zero exit', () => void fakeProc.emit('close', 1)],
+    ['a clean exit', () => void fakeProc.emit('close', 0)],
+    [
+      'a timeout',
+      async () => {
+        await vi.advanceTimersByTimeAsync(1830000);
+        fakeProc.emit('close', 137);
+      },
+    ],
+    ['a spawn error', () => void fakeProc.emit('error', new Error('gone'))],
+  ];
+  for (const [name, exit] of exits) {
+    it(`resolves only after the callbacks have run, on ${name}`, async () => {
+      let sent: () => void = () => {};
+      const calls: string[] = [];
+      const onOutput = vi.fn(async (output: ContainerOutput) => {
+        calls.push(String(output.result));
+        if (calls.length === 1) await new Promise<void>((r) => (sent = r));
+      });
+      const resultPromise = runContainerAgent(
+        testGroup,
+        testInput,
+        () => {},
+        onOutput,
+      );
+      emitOutputMarker(fakeProc, { status: 'success', result: 'first' });
+      emitOutputMarker(fakeProc, { status: 'success', result: 'second' });
+      await vi.advanceTimersByTimeAsync(10);
+
+      await exit();
+      expect(await settled(resultPromise)).toBe(false);
+
+      sent();
+      expect(await settled(resultPromise)).toBe(true);
+      expect(calls).toEqual(['first', 'second']);
+    });
+  }
+
+  it('stops waiting for a callback that never finishes', async () => {
+    const onOutput = vi.fn(() => new Promise<void>(() => {}));
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+    emitOutputMarker(fakeProc, { status: 'success', result: 'stuck' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 1);
+
+    await vi.advanceTimersByTimeAsync(OUTPUT_SETTLE_TIMEOUT - 1000);
+    expect(await settled(resultPromise)).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await resultPromise).status).toBe('error');
+  });
+
+  it('runs the later callbacks, and resolves, after one throws', async () => {
+    const calls: string[] = [];
+    const onOutput = vi.fn(async (output: ContainerOutput) => {
+      calls.push(String(output.result));
+      if (calls.length === 1) throw new Error('send failed');
+    });
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+    emitOutputMarker(fakeProc, { status: 'success', result: 'first' });
+    emitOutputMarker(fakeProc, { status: 'success', result: 'second' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect((await resultPromise).status).toBe('success');
+    expect(calls).toEqual(['first', 'second']);
   });
 });
 
