@@ -80,14 +80,19 @@ the OLD code while reporting `active` and a clean startup (hit for real: a merge
 module did not exist in `dist/` at all, so a feature silently never ran).
 
 Now the unit is `systemd/paperclaw.service`, symlinked into
-`~/.config/systemd/user/` by setup and `/update`, and its `ExecStartPre=-… npm
-run build` rebuilds on every start. The `-` lets a failed build through, so the
-bot still comes up on the previous `dist/` — and `src/build-freshness.ts` then
+`~/.config/systemd/user/` by setup and `/update` for the usual `~/paperclaw`
+checkout (any other path, or root, gets a copy setup renders with the real
+paths, since the template's are all `%h/paperclaw`), and its `ExecStartPre=-…
+npm run build` rebuilds on every start. The `-` lets a failed build through, so
+the bot still comes up on the previous `dist/` — and `src/build-freshness.ts` then
 logs **`dist/ is older than src/`** at startup, naming the stale files. **That
 WARN means the running code is not the checked-out code**: the build error is
-just above it in `logs/paperclaw.log`. It depends on `noEmitOnError` in
-`tsconfig.json`: by default tsc writes every output despite a type error, so
-the bot would start on the NEW, failing code and the WARN would never fire.
+just above it in `logs/paperclaw.log`. Right after a restart, read the build's
+own result instead, since node writes the WARN a moment later:
+`systemctl --user show paperclaw -p ExecStartPre` must say `status=0`. The WARN
+depends on `noEmitOnError` in `tsconfig.json`: by default tsc writes every
+output despite a type error, so the bot would start on the NEW, failing code
+and the WARN would never fire.
 
 No systemd PATH has the right node, so `scripts/paperclaw-node.sh` resolves it:
 `PAPERCLAW_NODE` first, which setup writes into a drop-in beside the unit
@@ -259,6 +264,12 @@ re-renders on each ~20-30 s rotation.
 ### The watchdog's own footgun: don't confuse "idle/busy" with "hung" (heartbeat)
 
 The original watchdog decided "hung" purely from `logs/paperclaw.log` freshness, assuming "healthy operation writes every ~10 min." **That assumption was false** — paperclaw legitimately logs *nothing* for ~1h when idle, and also while a long paper batch's subagent containers grind through NotebookLM. So the watchdog kept restarting a perfectly healthy service **~hourly** (journal: `restarting paperclaw (log frozen 58m)`), and **each restart detached the batch's containers and destroyed the in-memory dispatcher loop that owns `papers_queue.json`** — a 27-paper batch stalled this way with 12 papers never dispatched and one task frozen `in_progress` for days. The dispatcher pattern assumes the main agent stays alive for the whole batch and has no restart-recovery, so an orphaned queue just sits there. **Fix:** `src/index.ts` emits an unconditional `heartbeat whatsapp=up|down` every 10 min, so log-freshness only goes stale when the event loop is *actually* hung; the watchdog's condition (3) reads the heartbeat's WA status to still catch a dead-but-not-reconnecting socket (which keeps the log fresh via heartbeats, so condition 1 can't see it). **Lesson: a liveness check needs a signal the healthy process actively emits — inferring liveness from incidental activity (log writes) false-positives the moment the process is correctly quiet.** If a long batch ever stalls, check whether a service restart orphaned it: `docker ps` (no paper containers), `papers_queue.json` mtime old with `pending`/stuck-`in_progress` entries, and `journalctl --user -u paperclaw-watchdog.service` for restart lines.
+
+Those lines (the heartbeat, `Connected to WhatsApp`, `Connection closed`) are
+written through `src/liveness-log.ts`, a child logger pinned at info, so a
+`LOG_LEVEL=warn` in `.env` cannot mute them and bring the hourly restarts back.
+`src/log-output.test.ts` runs them through pino-pretty at warn, error and silent
+and checks them against the watchdog script's own grep patterns.
 
 ## CI only ever fails one way: the pre-commit formatter did not re-stage
 

@@ -143,18 +143,38 @@ systemctl --user daemon-reload
 systemctl --user is-active paperclaw-qa-heal.timer   # should print "active"
 ```
 
-The bot and watchdog units live in `systemd/` at the repo root and are linked
-the same way. `paperclaw.service` rebuilds `dist/` in its `ExecStartPre=`, so
-linking it is what makes a restart pick up merged code; an older install has it
-as a plain file, which `ln -sf` replaces. Then restart so the merge is running:
+The bot and watchdog units live in `systemd/` at the repo root.
+`paperclaw.service` rebuilds `dist/` in its `ExecStartPre=`, so installing it is
+what makes a restart pick up merged code. Their paths all assume the checkout is
+`~/paperclaw`, so only that checkout, installed as a user service, links them;
+an older install there has a plain file, which `ln -sf` replaces. Anywhere else
+(another directory, or a root install with a system unit) setup wrote a copy
+with the real paths, and a link would swap it for the template and leave the
+bot unable to start. Re-run setup's service step there instead, which rewrites
+that copy. The watchdog units are not linked there either: the watchdog script
+reads `~/paperclaw/logs/` too.
 
 ```bash
-for u in paperclaw.service paperclaw-watchdog.service paperclaw-watchdog.timer; do
-  ln -sf "$PWD/systemd/$u" ~/.config/systemd/user/$u
-done
-systemctl --user daemon-reload
-systemctl --user restart paperclaw
-grep -c 'dist/ is older than src/' logs/paperclaw.log   # a new hit = the build failed
+if [ "$PWD" = "$HOME/paperclaw" ] && [ "$(id -u)" -ne 0 ]; then
+  for u in paperclaw.service paperclaw-watchdog.service paperclaw-watchdog.timer; do
+    ln -sf "$PWD/systemd/$u" ~/.config/systemd/user/$u
+  done
+  systemctl --user daemon-reload
+else
+  npx tsx setup/index.ts --step service
+fi
+systemctl --user restart paperclaw     # as root: systemctl restart paperclaw
+```
+
+Then check the build the restart ran. `restart` returns once `ExecStartPre=` has
+finished, so its exit status is already there; a startup WARN in the log is not
+yet, since node writes it a moment later. The build's errors are in
+`logs/paperclaw.error.log`.
+
+```bash
+systemctl --user show paperclaw -p ExecStartPre | grep -o 'status=[0-9]*'   # as root: drop --user
+# status=0: the merge is running. Anything else: the build failed, and the bot
+# is running the previous dist/.
 ```
 
 Linking leaves the node drop-in (`~/.config/systemd/user/paperclaw.service.d/node.conf`,
