@@ -347,7 +347,9 @@ This is a **public repository**. The owner's personal data and research activity
 
 **Enforcement (structural, not just prose):**
 - `.husky/pre-commit` + `.husky/commit-msg` run `scripts/check-sensitive.sh`, which blocks forbidden paths (even `git add -f`) and scans added lines / commit messages for secrets, emails, phones, JIDs, arxiv IDs, and UUIDs.
-- False positive? Fix the wording first; only as a last resort `PAPERCLAW_ALLOW_SENSITIVE=1 git commit ...`.
+- **Pushing any branch already publishes**, so `.husky/pre-push` is the gate: it runs `check-sensitive.sh --range` and `scripts/private_values.py --range` over exactly the commits being pushed, before typecheck and tests.
+- `private_values.py` matches the owner's REAL values, not shapes: the private keys of the main checkout's `.env`, the registered group JIDs, and `~/.config/paperclaw/private-values` (one value per line; outside the work tree, so it can never be staged). Add anything personal no pattern would recognise there. It has no override; a real value is never a false positive.
+- False positive? Fix the wording first; only as a last resort `PAPERCLAW_ALLOW_SENSITIVE=1 git commit ...` (or `git push`, or in front of the gh command). It skips the pattern scan only.
 - **No assistant session URLs and no tool footers — in commit messages AND in PR
   bodies.** Both are appended by the assistant's own tooling by default, so they
   have to be removed on every commit and every PR, not just remembered once.
@@ -358,21 +360,25 @@ This is a **public repository**. The owner's personal data and research activity
     looked, because nothing scanned for it.
   * The **"Generated with Claude Code" footer** carries no private data; it is
     simply not wanted on this repo's public history. It was in all 42 PR bodies.
-  * `check-sensitive.sh` blocks the session URL in commit messages and added
-    lines. **PR bodies are not reachable from a git hook, so both rules are on
-    you there** — write the body without them rather than editing it afterwards.
-- **PR bodies aren't covered by git hooks — so run the checker, every time.**
-  ```bash
-  python3 scripts/check-pr-body.py --file body.md   # BEFORE gh pr create
-  python3 scripts/check-pr-body.py --sweep          # audit everything already up
-  ```
-  A hook only sees commits; a PR body goes straight to GitHub, so every pattern
-  `check-sensitive.sh` blocks is unenforced there. And the leak that actually keeps
-  recurring is not a secret — it is PAPER CONTENT: section titles, which figure the
-  text cites where, one paper's results. Two PRs carried verbatim section titles
-  from a page before anyone noticed. The checker therefore also compares the body
-  against the real section titles on recent Notion paper pages, fetched live, which
-  is the only oracle that stays current as papers are added.
+  * `check-sensitive.sh` blocks the session URL in commits, and the gh guard
+    below blocks it in PR text. **Nothing matches the footer** — write the body
+    without it rather than editing it afterwards.
+- **PR and issue text is checked by a hook, not by memory.** A git hook only sees
+  commits; a title, body or comment goes from `gh` straight to GitHub. So
+  `.claude/settings.json` runs `scripts/guard-gh-publish.py` before every Bash
+  call, and it denies a `gh pr`/`issue`/`release` or `gh api` call whose text
+  fails `check-pr-body.py`'s scan — and one whose text it cannot read (`$(...)`,
+  a variable, a heredoc, stdin, `--fill`/`--web`). Write the body to a file in its
+  own call, then pass `--body-file`. `python3 scripts/check-pr-body.py --sweep`
+  audits what is already up; `.github/workflows/leak-scan.yml` re-runs the pattern
+  scan, redacted, as the backstop for whatever got past the local gates.
+
+  The leak that actually keeps recurring is not a secret — it is PAPER CONTENT:
+  section titles, which figure the text cites where, one paper's results. Two PRs
+  carried verbatim section titles from a page before anyone noticed. The scan
+  therefore also compares the text against the real section titles on recent
+  Notion paper pages, fetched live, which is the only oracle that stays current as
+  papers are added.
 
   **Write the body about the CODE, not about the paper.** "a figure with no anchor
   fell to the page end" is the finding; "the Experimental Evaluation section had its
