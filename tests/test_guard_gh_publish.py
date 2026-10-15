@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-from leak_helpers import (SCRIPTS, apply_env, clean_env, known_value,
+from leak_helpers import (REPO, SCRIPTS, apply_env, clean_env, known_value,
                           load_script, pattern_secret)
 
 guard = load_script("guard-gh-publish.py")
@@ -139,3 +139,31 @@ def test_hook_protocol_edges(cwd):
     proc = subprocess.run(HOOK, input=json.dumps({"tool_input": {}}),
                           capture_output=True, text=True)
     assert proc.returncode == 0
+
+
+def _settings_hook():
+    path = os.path.join(REPO, ".claude", "settings.json")
+    with open(path, encoding="utf-8") as f:
+        settings = json.load(f)
+    (entry,) = [e for e in settings["hooks"]["PreToolUse"]
+                if e["matcher"] == "Bash"]
+    (hook,) = entry["hooks"]
+    return hook
+
+
+def test_settings_run_the_guard_on_every_bash_call(cwd, tmp_path):
+    hook = _settings_hook()
+    assert hook["timeout"] >= 120  # the paper-title oracle takes ~20 s
+    event = json.dumps({"tool_input": {
+        "command": "gh pr comment 1 --body-file leak.md"}, "cwd": cwd})
+
+    def run(project_dir):
+        return subprocess.run(["sh", "-c", hook["command"]], input=event,
+                              capture_output=True, text=True,
+                              env=dict(os.environ,
+                                       CLAUDE_PROJECT_DIR=project_dir))
+
+    assert run(REPO).returncode == 2
+    # An older checkout has no guard script. The hook must allow then, not
+    # deny every Bash call, `git checkout` back included.
+    assert run(str(tmp_path)).returncode == 0

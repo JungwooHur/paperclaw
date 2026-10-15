@@ -54,11 +54,14 @@ def test_merge_contributes_only_its_own_resolution(tmp_path):
     repo.git("merge", "-q", "--no-edit", "side")
     only_merge = CHECK + ["--range", "-n", "1", "HEAD"]
     assert repo.run(only_merge).returncode == 0
-    # an evil merge: a line in the resolution that neither parent has
+    # An evil merge: a line in the resolution that neither parent has. a.txt
+    # is touched too, so the side's line shows in the combined diff, as a
+    # line one parent already has.
     repo.git("reset", "-q", "--hard", "HEAD^")
     repo.git("merge", "-q", "--no-commit", "side")
+    repo.write("a.txt", f"one\n{pattern_secret()}\nresolved\n")
     repo.write("b.txt", f"y\nclean\n{pattern_secret()}\n")
-    repo.git("add", "b.txt")
+    repo.git("add", "a.txt", "b.txt")
     repo.commit(message="merge side")
     proc = repo.run(only_merge, PAPERCLAW_REDACT="1")
     assert proc.returncode == 1

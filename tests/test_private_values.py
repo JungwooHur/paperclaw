@@ -60,6 +60,12 @@ def test_email_is_case_insensitive():
     assert pv.find("owner.name" + "@" + "MAIL.TEST", needles) == ["x"]
 
 
+def test_values_file_lives_outside_the_work_tree(tmp_path, monkeypatch):
+    monkeypatch.delenv("PAPERCLAW_PRIVATE_VALUES", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert pv._values_file() == str(tmp_path / "paperclaw" / "private-values")
+
+
 def test_short_values_are_ignored():
     assert pv.variants("x", "abc1234") == []
 
