@@ -72,7 +72,7 @@ A subset of `.env` (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `NOTION_TOKE
 **Masked Inside the Project Root Mount (main only):**
 The main group's project-root bind mount hides three paths by overlaying an empty replacement. Without this overlay the agent could `cat` the file off disk and trivially bypass the Bash PreToolUse hook below.
 - `/workspace/project/.env` → empty file. Would otherwise leak `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`.
-- `/workspace/project/store/auth` → empty directory. Would otherwise leak Baileys WhatsApp session credentials — full account takeover on WhatsApp.
+- `/workspace/project/store` → empty directory. Would otherwise leak Baileys WhatsApp session credentials — full account takeover on WhatsApp — and every copy of them set aside next to `auth/` (a revoked session is renamed, never deleted, and a backup may still be valid), plus `messages.db`, the full message history. The whole directory is masked, not just `auth/`, so a copy under a new name is covered too. The agent gets the group list from `/workspace/ipc/available_groups.json` instead.
 - `/workspace/project/logs` → empty directory. Would otherwise leak the service log (see Logs below).
 
 **NOT Mounted at All:**

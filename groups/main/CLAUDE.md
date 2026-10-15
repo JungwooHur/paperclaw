@@ -1252,9 +1252,10 @@ Main has read-only access to the project and read-write access to its group fold
 | `/workspace/group` | `groups/main/` | read-write |
 
 Key paths inside the container:
-- `/workspace/project/store/messages.db` - SQLite database
-- `/workspace/project/store/messages.db` (registered_groups table) - Group config
+- `/workspace/ipc/available_groups.json` - WhatsApp groups, each with its JID and `isRegistered`
 - `/workspace/project/groups/` - All group folders
+
+`/workspace/project/store/`, `/workspace/project/logs/` and `/workspace/project/.env` are masked and show up empty. They hold the WhatsApp credentials, the message database and the service log, which this agent never needs.
 
 ---
 
@@ -1288,17 +1289,7 @@ echo '{"type": "refresh_groups"}' > /workspace/ipc/tasks/refresh_$(date +%s).jso
 
 Then wait a moment and re-read `available_groups.json`.
 
-**Fallback**: Query the SQLite database directly:
-
-```bash
-sqlite3 /workspace/project/store/messages.db "
-  SELECT jid, name, last_message_time
-  FROM chats
-  WHERE jid LIKE '%@g.us' AND jid != '__group_sync__'
-  ORDER BY last_message_time DESC
-  LIMIT 10;
-"
-```
+If the group is still missing after a refresh, the assistant's WhatsApp account is not a member of it. There is no other source to check: the message database is not visible in the container.
 
 ### Registered Groups Config
 
@@ -1331,12 +1322,8 @@ Fields:
 
 ### Adding a Group
 
-1. Query the database to find the group's JID
-2. Read `/workspace/project/data/registered_groups.json`
-3. Add the new group entry with `containerConfig` if needed
-4. Write the updated JSON back
-5. Create the group folder: `/workspace/project/groups/{folder-name}/`
-6. Optionally create an initial `CLAUDE.md` for the group
+1. Find the group's JID in `/workspace/ipc/available_groups.json`
+2. Call the `register_group` tool with the JID, a display name, a folder name and the trigger. The host records the group and creates `groups/{folder-name}/`; it starts receiving messages immediately.
 
 Example folder name conventions:
 - "Family Chat" → `family-chat`
@@ -1378,7 +1365,7 @@ The directory will appear at `/workspace/extra/webapp` in that group's container
 
 ### Listing Groups
 
-Read `/workspace/project/data/registered_groups.json` and format it nicely.
+Read `/workspace/ipc/available_groups.json` and list the entries with `isRegistered: true`.
 
 ---
 
@@ -1390,7 +1377,7 @@ You can read and write to `/workspace/project/groups/global/CLAUDE.md` for facts
 
 ## Scheduling for Other Groups
 
-When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from `registered_groups.json`:
+When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from `available_groups.json`:
 - `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "120363000000000000@g.us")`
 
 The task will run in that group's context with access to their files and memory.
