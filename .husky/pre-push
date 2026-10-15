@@ -1,9 +1,48 @@
 # See .husky/pre-commit: without set -e only the last command's status counts.
 set -e
 
-# The rest of what CI runs, so a red build is caught before it is pushed rather
-# than a minute later on GitHub. Kept out of pre-commit deliberately: these are
-# slow enough to be annoying on every commit, and the format/secret checks there
-# are the ones that must never be skipped.
+# 1. Leak scan of exactly what this push publishes. A push to ANY branch of a
+# public repository is already publication, so this is the gate; CI's leak-scan
+# workflow only raises the alarm afterwards. It runs first so a leak is reported
+# before a minute of typecheck and tests, not after.
+#
+# stdin carries one "<local ref> <local sha> <remote ref> <remote sha>" line per
+# ref being pushed; $1 is the remote's name (or its URL when pushed by URL).
+#
+# PAPERCLAW_ALLOW_SENSITIVE=1 skips the pattern scan only (check-sensitive.sh
+# honours it). A known private value has no override short of --no-verify:
+# it is the owner's real value, so it is never a false positive.
+remote="${1:-origin}"
+if git remote | grep -qxF -- "$remote"; then
+  published="--remotes=$remote"
+else
+  published="--remotes"  # pushed by URL: anything on any remote is published
+fi
+blocked=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "$local_sha" ] || continue
+  case "$local_sha" in
+    *[!0]*) ;;
+    *) continue ;;  # all zeros: deleting a ref publishes nothing
+  esac
+  if git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    set -- "$remote_sha..$local_sha"
+  else
+    # A new branch (all-zero remote sha), or a remote tip never fetched here.
+    set -- "$local_sha" --not "$published"
+  fi
+  # </dev/null: neither may read the remaining ref lines off this loop's stdin.
+  bash scripts/check-sensitive.sh --range "$@" </dev/null || blocked=1
+  python3 scripts/private_values.py --range "$@" </dev/null || blocked=1
+done
+if [ "$blocked" -ne 0 ]; then
+  echo "pre-push: push blocked by the leak scan above (this is a PUBLIC repo)." >&2
+  exit 1
+fi
+
+# 2. The rest of what CI runs, so a red build is caught before it is pushed
+# rather than a minute later on GitHub. Kept out of pre-commit deliberately:
+# these are slow enough to be annoying on every commit, and the format/secret
+# checks there are the ones that must never be skipped.
 npm run typecheck
 npx vitest run
