@@ -1,0 +1,45 @@
+# Backstop for the local leak gates. By the time this runs the branch is already
+# public, so the real gates are the commit hooks, the pre-push hook and the gh
+# guard; this is the alarm for whatever got past them (a --no-verify push, a PR
+# edited in the browser).
+#
+# Patterns only: CI has none of the owner's private values. PAPERCLAW_REDACT=1
+# keeps matches out of the log, which is public and outlives a force-push that
+# takes the leak back off the branch.
+name: Leak scan
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  leak-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan the PR's commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PAPERCLAW_REDACT: '1'
+        run: bash scripts/check-sensitive.sh --range "$BASE_SHA..$HEAD_SHA"
+
+      # Title and body arrive through env: and stdin, never through ${{ }} in the
+      # script: a PR title is attacker-controlled text, and interpolating it into
+      # the shell would run it.
+      - name: Scan the PR's title and body
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PAPERCLAW_REDACT: '1'
+        run: |
+          rc=0
+          printf '%s\n' "$PR_TITLE" | bash scripts/check-sensitive.sh --text 'PR title' || rc=1
+          printf '%s\n' "$PR_BODY" | bash scripts/check-sensitive.sh --text 'PR body' || rc=1
+          exit "$rc"
