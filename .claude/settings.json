@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "g=\"$CLAUDE_PROJECT_DIR\"/scripts/guard-gh-publish.py; [ ! -f \"$g\" ] || exec python3 \"$g\"",
+            "command": "g=\"$CLAUDE_PROJECT_DIR\"/scripts/guard-gh-publish.py; [ -f \"$g\" ] || exit 0; e=$(cat); case \"$e\" in *gh*) printf '%s\\n' \"$e\" | python3 \"$g\" ;; esac",
             "timeout": 180
           }
         ]
