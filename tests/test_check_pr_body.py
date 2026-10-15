@@ -5,7 +5,9 @@ It used to pipe the body to `check-sensitive.sh --msg /dev/stdin`, which exits
 These tests pin that each of its three checks fires, and that a report carries
 labels, never the text it found.
 """
+import json
 import os
+import stat
 import subprocess
 
 from leak_helpers import (SCRIPTS, apply_env, clean_env, known_value,
@@ -77,3 +79,76 @@ def test_cli_title_and_file(tmp_path):
     assert proc.returncode == 1
     assert "title: patterns" in proc.stderr
     assert pattern_secret() not in proc.stdout + proc.stderr
+
+
+def test_generic_headings_and_partial_words_are_no_title_hit(
+        tmp_path, monkeypatch):
+    # A code-only body was blocked for "model architecture", a heading every
+    # paper has; and a substring match on letters ran across word boundaries.
+    cpb = _scanner(tmp_path, monkeypatch)
+    titles = ["Model architecture", "Problem Formulation",
+              "Results and Discussion", "Calibration Under Drift Data", TITLE]
+    text = ("The container image changes; the model architecture setting "
+            "(AGENT_MODEL) is untouched.\nWe discuss results and discussion "
+            "of recalibration under drift datasets.\n")
+    assert cpb.scan(text, titles, []) == []
+    hit = cpb.scan(f"fixes {TITLE.upper()}!\n", titles, [])
+    assert [k for k, _ in hit] == ["paper content"]
+
+
+def test_an_inherited_override_is_not_passed_to_the_pattern_scan(
+        tmp_path, monkeypatch):
+    cpb = _scanner(tmp_path, monkeypatch, PAPERCLAW_ALLOW_SENSITIVE="1")
+    assert "PAPERCLAW_ALLOW_SENSITIVE" not in cpb._pattern_env()
+    kinds = [k for k, _ in cpb.scan(pattern_secret(), [], [])]
+    assert kinds == ["patterns"]
+
+
+def test_cli_still_honours_the_override_it_is_run_with(tmp_path):
+    env = clean_env(tmp_path, PAPERCLAW_ALLOW_SENSITIVE="1")
+    proc = subprocess.run(CLI + ["--title", pattern_secret()], env=env,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0
+
+
+def test_titles_are_cached_privately_and_refreshed(tmp_path, monkeypatch):
+    cpb = _scanner(tmp_path, monkeypatch, NOTION_TOKEN="fake-token-123456",
+                   NOTION_RESEARCH_DB="fake-db-1")
+    calls, spawned = [], []
+
+    def fetch():
+        calls.append(1)
+        return [TITLE]
+
+    def refresh():
+        spawned.append(1)
+
+    assert cpb.section_titles(fetch, refresh) == [TITLE]
+    assert cpb.section_titles(fetch, refresh) == [TITLE]
+    assert len(calls) == 1 and not spawned
+    path = cpb.title_cache_path()
+    assert path.startswith(str(tmp_path))
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    # stale: served from the cache while a refresh runs in the background
+    with open(path) as f:
+        data = json.load(f)
+    data["at"] -= cpb.TITLE_CACHE_FRESH + 1
+    with open(path, "w") as f:
+        json.dump(data, f)
+    assert cpb.section_titles(fetch, refresh) == [TITLE]
+    assert len(calls) == 1 and len(spawned) == 1
+    # too old, or for another database: fetched again before answering
+    data["at"] -= cpb.TITLE_CACHE_MAX_AGE
+    with open(path, "w") as f:
+        json.dump(data, f)
+    cpb.section_titles(fetch, refresh)
+    assert len(calls) == 2
+    monkeypatch.setenv("NOTION_RESEARCH_DB", "fake-db-2")
+    cpb.section_titles(fetch, refresh)
+    assert len(calls) == 3
+
+
+def test_short_text_needs_no_oracle(tmp_path, monkeypatch):
+    cpb = _scanner(tmp_path, monkeypatch)
+    assert not cpb.could_hold_a_title("feat: add a guard")
+    assert cpb.could_hold_a_title(TITLE)
