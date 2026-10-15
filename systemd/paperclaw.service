@@ -1,0 +1,40 @@
+[Unit]
+Description=PaperClaw Personal Assistant
+After=network.target
+
+# Installed as a SYMLINK into ~/.config/systemd/user/ (setup/service.ts, /update),
+# so the running unit is always this file. Paths assume the checkout is
+# ~/paperclaw, as the watchdog unit does; setup writes a copy with the real
+# path when it is not.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/paperclaw
+# Rebuild dist/ from the checked-out source before every start, so a restart
+# after a merge runs the merged code. The leading '-' lets a failed build
+# through: the bot starts on the previous dist/ rather than not at all, and
+# says so with a startup WARN (src/build-freshness.ts). That holds because a
+# failed build writes nothing (noEmitOnError in tsconfig.json). The build's own
+# errors land in the log files below.
+ExecStartPre=-%h/paperclaw/scripts/paperclaw-node.sh npm run build
+# No systemd PATH has the right node; the wrapper resolves it: PAPERCLAW_NODE
+# from setup's drop-in (paperclaw.service.d/node.conf), then nvm's default,
+# then PATH. Settings that are not node belong in .env, not in a drop-in.
+ExecStart=%h/paperclaw/scripts/paperclaw-node.sh node %h/paperclaw/dist/index.js
+Restart=always
+# A WhatsApp logout exits with this code. Restarting cannot fix a revoked device:
+# it just loops (221 times in four hours, once) and buries the one message that
+# matters. Stop instead; store/auth-required says what to do.
+RestartPreventExitStatus=78
+RestartSec=5
+Environment=HOME=%h
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
+# No EnvironmentFile=: .env holds the secrets, and the process environment
+# reaches every child, the container runtime included. The code reads its
+# settings from .env itself (src/config.ts).
+# scripts/paperclaw-watchdog.sh reads this log to decide whether the bot is hung.
+StandardOutput=append:%h/paperclaw/logs/paperclaw.log
+StandardError=append:%h/paperclaw/logs/paperclaw.error.log
+
+[Install]
+WantedBy=default.target

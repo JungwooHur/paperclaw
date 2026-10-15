@@ -233,30 +233,14 @@ function setupSystemd(
     systemctlPrefix = 'systemctl --user';
   }
 
-  const unit = `[Unit]
-Description=PaperClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-# A WhatsApp logout exits with this code. Restarting cannot fix a revoked device —
-# it just loops (221 times in four hours, once) and buries the one message that
-# matters. Stop instead; store/auth-required says what to do.
-RestartPreventExitStatus=78
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/paperclaw.log
-StandardError=append:${projectRoot}/logs/paperclaw.error.log
-
-[Install]
-WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
-
-  fs.writeFileSync(unitPath, unit);
-  logger.info({ unitPath }, 'Wrote systemd unit');
+  const dropIn = installSystemdUnit({
+    projectRoot,
+    homeDir,
+    unitPath,
+    runningAsRoot,
+    nodePath,
+  });
+  logger.info({ unitPath, dropIn, nodePath }, 'Installed systemd unit');
 
   // Detect stale docker group before starting (user systemd only)
   const dockerGroupStale = !runningAsRoot && checkDockerGroupStale();
@@ -307,6 +291,91 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
     STATUS: 'success',
     LOG: 'logs/setup.log',
   });
+}
+
+/**
+ * Puts systemd/paperclaw.service at unitPath and pins nodePath beside it;
+ * returns the drop-in's path.
+ *
+ * The unit is the repo's file, never a template here: a unit written once and
+ * never refreshed is how a restart came to run stale code. A user install of
+ * the usual checkout links it, so it cannot drift. Anything else, another
+ * directory or root's system unit, gets a copy with the real paths, which a
+ * link to the template (whose paths are all ~/paperclaw) would break.
+ */
+export function installSystemdUnit(opts: {
+  projectRoot: string;
+  homeDir: string;
+  unitPath: string;
+  runningAsRoot: boolean;
+  nodePath: string;
+}): string {
+  const { projectRoot, homeDir, unitPath, runningAsRoot, nodePath } = opts;
+  const source = path.join(projectRoot, SYSTEMD_UNIT);
+  fs.rmSync(unitPath, { force: true });
+  if (!runningAsRoot && projectRoot === path.join(homeDir, 'paperclaw')) {
+    fs.symlinkSync(source, unitPath);
+  } else {
+    const template = fs.readFileSync(source, 'utf-8');
+    fs.writeFileSync(
+      unitPath,
+      renderSystemdUnit(template, projectRoot, runningAsRoot),
+    );
+  }
+
+  // The node this ran with, beside the unit rather than in it, so a linked
+  // unit stays a link. Linked or copied, the unit takes it the same way.
+  const dropIn = nodeDropInPath(unitPath);
+  fs.mkdirSync(path.dirname(dropIn), { recursive: true });
+  fs.writeFileSync(dropIn, renderNodeDropIn(nodePath));
+  return dropIn;
+}
+
+/** The drop-in that pins the unit's node: `<unit>.d/node.conf`. */
+export function nodeDropInPath(unitPath: string): string {
+  return path.join(`${unitPath}.d`, 'node.conf');
+}
+
+/**
+ * A drop-in telling scripts/paperclaw-node.sh to run `nodePath`, the node setup
+ * ran with and so the one `npm ci` built the native modules for. Without it the
+ * wrapper falls back to nvm's default, then PATH, which is wrong for a node
+ * installed any other way, or for an nvm default other than the one in use.
+ * Quoted and escaped for systemd, which would otherwise split on a space and
+ * expand a `%`.
+ */
+export function renderNodeDropIn(nodePath: string): string {
+  const value = `PAPERCLAW_NODE=${nodePath}`
+    .replaceAll('\\', '\\\\')
+    .replaceAll('"', '\\"')
+    .replaceAll('%', '%%');
+  return [
+    '# Written by setup (setup/service.ts): the node it ran with.',
+    '# Re-run the setup service step after changing node versions.',
+    '[Service]',
+    `Environment="${value}"`,
+    '',
+  ].join('\n');
+}
+
+/** The service unit, relative to the project root. */
+export const SYSTEMD_UNIT = path.join('systemd', 'paperclaw.service');
+
+/**
+ * The repo unit as installed for a checkout at `projectRoot`, for when it
+ * cannot simply be linked. The repo file assumes ~/paperclaw (`%h/paperclaw`);
+ * any other checkout gets its real path. A system-level unit (root) is wanted
+ * by multi-user.target instead of default.target.
+ */
+export function renderSystemdUnit(
+  template: string,
+  projectRoot: string,
+  isSystem: boolean,
+): string {
+  const unit = template.replaceAll('%h/paperclaw', projectRoot);
+  return isSystem
+    ? unit.replace('WantedBy=default.target', 'WantedBy=multi-user.target')
+    : unit;
 }
 
 function setupNohupFallback(

@@ -1,5 +1,17 @@
-import { describe, it, expect } from 'vitest';
+import { spawnSync } from 'child_process';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
+
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
+
+import {
+  installSystemdUnit,
+  nodeDropInPath,
+  renderNodeDropIn,
+  renderSystemdUnit,
+  SYSTEMD_UNIT,
+} from './service.js';
 
 /**
  * Tests for service configuration generation.
@@ -46,31 +58,6 @@ function generatePlist(
 </plist>`;
 }
 
-function generateSystemdUnit(
-  nodePath: string,
-  projectRoot: string,
-  homeDir: string,
-  isSystem: boolean,
-): string {
-  return `[Unit]
-Description=PaperClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/paperclaw.log
-StandardError=append:${projectRoot}/logs/paperclaw.error.log
-
-[Install]
-WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
-}
-
 describe('plist generation', () => {
   it('contains the correct label', () => {
     const plist = generatePlist(
@@ -110,48 +97,52 @@ describe('plist generation', () => {
   });
 });
 
-describe('systemd unit generation', () => {
-  it('user unit uses default.target', () => {
-    const unit = generateSystemdUnit(
-      '/usr/bin/node',
-      '/home/user/paperclaw',
-      '/home/user',
-      false,
-    );
-    expect(unit).toContain('WantedBy=default.target');
+describe('systemd unit (systemd/paperclaw.service)', () => {
+  const repo = path.resolve(__dirname, '..');
+  const unit = fs.readFileSync(path.join(repo, SYSTEMD_UNIT), 'utf-8');
+
+  it('keeps the restart policy, and stops on a WhatsApp logout', () => {
+    expect(unit).toMatch(/^Restart=always$/m);
+    expect(unit).toMatch(/^RestartPreventExitStatus=78$/m);
+    expect(unit).toMatch(/^RestartSec=5$/m);
+    expect(unit).toMatch(/^Environment=HOME=%h$/m);
+    expect(unit).toMatch(/^Environment=PATH=.*%h\/\.local\/bin$/m);
   });
 
-  it('system unit uses multi-user.target', () => {
-    const unit = generateSystemdUnit(
-      '/usr/bin/node',
-      '/home/user/paperclaw',
-      '/home/user',
-      true,
+  it('logs to the file the watchdog reads', () => {
+    const watchdog = fs.readFileSync(
+      path.join(repo, 'scripts', 'paperclaw-watchdog.sh'),
+      'utf-8',
     );
-    expect(unit).toContain('WantedBy=multi-user.target');
+    const log = watchdog.match(/^LOG="\$\{HOME\}(\/[^"]+)"$/m)?.[1];
+    expect(log).toBeTruthy();
+    expect(unit).toContain(`StandardOutput=append:%h${log}`);
+    expect(unit).toMatch(/^StandardError=append:%h\/paperclaw\/logs\//m);
   });
 
-  it('contains restart policy', () => {
-    const unit = generateSystemdUnit(
-      '/usr/bin/node',
-      '/home/user/paperclaw',
-      '/home/user',
-      false,
-    );
-    expect(unit).toContain('Restart=always');
-    expect(unit).toContain('RestartSec=5');
+  it('rebuilds dist/ before starting, and starts even if that fails', () => {
+    expect(unit).toMatch(/^ExecStartPre=-\S+ npm run build$/m);
   });
 
-  it('sets correct ExecStart', () => {
-    const unit = generateSystemdUnit(
-      '/usr/bin/node',
-      '/srv/paperclaw',
-      '/home/user',
-      false,
-    );
-    expect(unit).toContain(
-      'ExecStart=/usr/bin/node /srv/paperclaw/dist/index.js',
-    );
+  it('runs dist/index.js through the node resolver, which exists', () => {
+    const start = unit.match(/^ExecStart=(\S+) node (\S+)$/m);
+    expect(start?.[2]).toBe('%h/paperclaw/dist/index.js');
+    const wrapper = start![1].replace('%h/paperclaw', repo);
+    fs.accessSync(wrapper, fs.constants.X_OK);
+    expect(unit).toContain(`ExecStartPre=-${start![1]} `);
+  });
+
+  it('renders the real path for a checkout outside ~/paperclaw', () => {
+    const out = renderSystemdUnit(unit, '/srv/claw', false);
+    expect(out).not.toContain('%h/paperclaw');
+    expect(out).toContain('ExecStart=/srv/claw/scripts/paperclaw-node.sh');
+    expect(out).toContain('WantedBy=default.target');
+  });
+
+  it('renders a system unit wanted by multi-user.target', () => {
+    const out = renderSystemdUnit(unit, '/root/paperclaw', true);
+    expect(out).toContain('WantedBy=multi-user.target');
+    expect(out).not.toContain('WantedBy=default.target');
   });
 });
 
@@ -172,5 +163,182 @@ echo $! > ${JSON.stringify(pidFile)}`;
     expect(wrapper).toContain('nohup');
     expect(wrapper).toContain(nodePath);
     expect(wrapper).toContain('paperclaw.pid');
+  });
+});
+
+/**
+ * Which node the unit runs. nvm's default is right only when it is the node
+ * `npm ci` built the native modules with; a node from anywhere else (fnm, volta,
+ * a tarball) is on no PATH systemd sets. So setup pins the node it ran with in
+ * a drop-in, and scripts/paperclaw-node.sh takes that first.
+ */
+describe('node resolution (scripts/paperclaw-node.sh)', () => {
+  const wrapper = path.resolve(__dirname, '..', 'scripts', 'paperclaw-node.sh');
+  let tmp: string;
+  let nodes: Record<'pinned' | 'nvm' | 'path', string>;
+  let nvmDir: string;
+
+  function fakeNode(name: string): string {
+    const dir = path.join(tmp, `${name} bin`);
+    fs.mkdirSync(dir, { recursive: true });
+    const bin = path.join(dir, 'node');
+    fs.writeFileSync(bin, `#!/bin/sh\necho ${name}\n`, { mode: 0o755 });
+    return bin;
+  }
+
+  // By absolute path: one case runs with a PATH that has nothing on it.
+  const bash = spawnSync('sh', ['-c', 'command -v bash'], {
+    encoding: 'utf-8',
+  }).stdout.trim();
+
+  function run(env: Record<string, string>) {
+    return spawnSync(bash, [wrapper, 'node'], {
+      encoding: 'utf-8',
+      env: { HOME: tmp, NVM_DIR: nvmDir, ...env },
+    });
+  }
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'paperclaw-node-'));
+    nodes = {
+      pinned: fakeNode('pinned'),
+      nvm: fakeNode('nvm'),
+      path: fakeNode('path'),
+    };
+    nvmDir = path.join(tmp, 'nvm');
+    fs.mkdirSync(nvmDir);
+    fs.writeFileSync(
+      path.join(nvmDir, 'nvm.sh'),
+      `nvm() { [ "$1" = which ] && [ "$2" = default ] && echo '${nodes.nvm}'; }\n`,
+    );
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const onPath = () => `${path.dirname(nodes.path)}:/usr/bin:/bin`;
+
+  it('takes PAPERCLAW_NODE first, over nvm and PATH', () => {
+    const r = run({ PAPERCLAW_NODE: nodes.pinned, PATH: onPath() });
+    expect(r.stdout.trim()).toBe('pinned');
+  });
+
+  it("then nvm's default, over PATH", () => {
+    expect(run({ PATH: onPath() }).stdout.trim()).toBe('nvm');
+  });
+
+  it('then the node on PATH', () => {
+    nvmDir = path.join(tmp, 'no-nvm');
+    expect(run({ PATH: onPath() }).stdout.trim()).toBe('path');
+  });
+
+  it('says so and falls through when the pinned node is gone', () => {
+    const r = run({
+      PAPERCLAW_NODE: path.join(tmp, 'uninstalled', 'node'),
+      PATH: onPath(),
+    });
+    expect(r.stdout.trim()).toBe('nvm');
+    expect(r.stderr).toContain('PAPERCLAW_NODE');
+  });
+
+  it('exits 127 when there is no node at all', () => {
+    nvmDir = path.join(tmp, 'no-nvm');
+    const empty = path.join(tmp, 'empty');
+    fs.mkdirSync(empty);
+    expect(run({ PATH: empty }).status).toBe(127);
+  });
+
+  it("setup's drop-in makes the unit run the node setup ran with", () => {
+    const conf = renderNodeDropIn(nodes.pinned);
+    expect(conf).toMatch(/^\[Service\]$/m);
+    const value = conf.match(/^Environment="PAPERCLAW_NODE=(.*)"$/m)?.[1];
+    expect(value).toBe(nodes.pinned);
+    expect(run({ PAPERCLAW_NODE: value!, PATH: onPath() }).stdout.trim()).toBe(
+      'pinned',
+    );
+  });
+
+  it('escapes what systemd would otherwise expand', () => {
+    expect(renderNodeDropIn('/opt/50%/node')).toContain(
+      'Environment="PAPERCLAW_NODE=/opt/50%%/node"',
+    );
+  });
+
+  it('puts the drop-in beside the unit, so a linked unit stays a link', () => {
+    expect(nodeDropInPath('/etc/systemd/system/paperclaw.service')).toBe(
+      '/etc/systemd/system/paperclaw.service.d/node.conf',
+    );
+  });
+});
+
+describe('installing the unit (installSystemdUnit)', () => {
+  const repo = path.resolve(__dirname, '..');
+  let home: string;
+  let unitPath: string;
+
+  /** A checkout at `root` holding the repo's unit. */
+  function checkout(root: string): string {
+    fs.mkdirSync(path.join(root, 'systemd'), { recursive: true });
+    fs.copyFileSync(
+      path.join(repo, SYSTEMD_UNIT),
+      path.join(root, SYSTEMD_UNIT),
+    );
+    return root;
+  }
+
+  const install = (projectRoot: string, runningAsRoot = false) =>
+    installSystemdUnit({
+      projectRoot,
+      homeDir: home,
+      unitPath,
+      runningAsRoot,
+      nodePath: '/opt/node/bin/node',
+    });
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'paperclaw-unit-'));
+    const unitDir = path.join(home, '.config', 'systemd', 'user');
+    fs.mkdirSync(unitDir, { recursive: true });
+    unitPath = path.join(unitDir, 'paperclaw.service');
+  });
+
+  afterEach(() => {
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  it('links the usual checkout, replacing an older plain copy', () => {
+    const root = checkout(path.join(home, 'paperclaw'));
+    fs.writeFileSync(unitPath, '[Service]\nExecStart=/old\n');
+    install(root);
+    expect(fs.lstatSync(unitPath).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(unitPath)).toBe(
+      fs.realpathSync(path.join(root, SYSTEMD_UNIT)),
+    );
+  });
+
+  it.each([
+    ['a checkout elsewhere', 'elsewhere/claw', false],
+    ['a root install', 'paperclaw', true],
+  ])('writes a copy with the real paths for %s', (_, dir, asRoot) => {
+    const root = checkout(path.join(home, dir));
+    install(root, asRoot);
+    expect(fs.lstatSync(unitPath).isSymbolicLink()).toBe(false);
+    const unit = fs.readFileSync(unitPath, 'utf-8');
+    expect(unit).not.toContain('%h/paperclaw');
+    expect(unit).toContain(`ExecStart=${root}/scripts/paperclaw-node.sh`);
+  });
+
+  it('pins the node beside the unit, linked or copied', () => {
+    for (const root of [
+      checkout(path.join(home, 'paperclaw')),
+      checkout(path.join(home, 'elsewhere')),
+    ]) {
+      const dropIn = install(root);
+      expect(dropIn).toBe(nodeDropInPath(unitPath));
+      expect(fs.readFileSync(dropIn, 'utf-8')).toBe(
+        renderNodeDropIn('/opt/node/bin/node'),
+      );
+    }
   });
 });

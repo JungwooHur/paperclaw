@@ -143,6 +143,59 @@ systemctl --user daemon-reload
 systemctl --user is-active paperclaw-qa-heal.timer   # should print "active"
 ```
 
+The bot and watchdog units live in `systemd/` at the repo root.
+`paperclaw.service` rebuilds `dist/` in its `ExecStartPre=`, so installing it is
+what makes a restart pick up merged code. Their paths all assume the checkout is
+`~/paperclaw`, so only that checkout, installed as a user service, links them;
+an older install there has a plain file, which `ln -sf` replaces. Anywhere else
+(another directory, or a root install with a system unit) setup wrote a copy
+with the real paths, and a link would swap it for the template and leave the
+bot unable to start. Re-run setup's service step there instead, which rewrites
+that copy. The watchdog units are not linked there either: the watchdog script
+reads `~/paperclaw/logs/` too.
+
+Both paths install the unit for the checkout they run in, so first make sure it
+is the one the service runs. A git worktree or a second clone has no `store/`
+(it is gitignored), and a service pointed at it has no WhatsApp session: it
+exits on the QR prompt and restarts every few seconds.
+
+```bash
+scope=--user; [ "$(id -u)" -eq 0 ] && scope=
+live=$(systemctl $scope show paperclaw -p WorkingDirectory --value 2>/dev/null)
+if [ -n "$live" ] && [ "$(readlink -f "$live")" != "$(pwd -P)" ]; then
+  echo "The service runs $live, not this checkout. Run /update there; nothing installed."
+elif [ "$PWD" = "$HOME/paperclaw" ] && [ "$(id -u)" -ne 0 ]; then
+  for u in paperclaw.service paperclaw-watchdog.service paperclaw-watchdog.timer; do
+    ln -sf "$PWD/systemd/$u" ~/.config/systemd/user/$u
+  done
+  systemctl --user daemon-reload
+  systemctl --user restart paperclaw
+else
+  npx tsx setup/index.ts --step service
+  systemctl $scope restart paperclaw
+fi
+```
+
+If it printed "The service runs …", stop here and tell the user: the merge is not
+live until `/update` runs in that checkout.
+
+Then check the build the restart ran. `restart` returns once `ExecStartPre=` has
+finished, so its exit status is already there; a startup WARN in the log is not
+yet, since node writes it a moment later. The build's errors are in
+`logs/paperclaw.error.log`.
+
+```bash
+systemctl --user show paperclaw -p ExecStartPre | grep -o 'status=[0-9]*'   # as root: drop --user
+# status=0: the merge is running. Anything else: the build failed, and the bot
+# is running the previous dist/.
+```
+
+Linking leaves the node drop-in (`~/.config/systemd/user/paperclaw.service.d/node.conf`,
+written by setup) alone. If the update switched node versions and rebuilt
+`node_modules`, re-run `npx tsx setup/index.ts --step service` so the drop-in
+names the new node; a pinned node that was uninstalled is skipped with a
+warning in `logs/paperclaw.error.log`.
+
 ## 8. Verify
 
 Run build and tests:
@@ -154,6 +207,15 @@ npm run build && npm test
 **If build fails:** Show the error. Common causes:
 - Type errors from merged files — read the error, fix the file, retry
 - Missing dependencies — run `npm install` first, retry
+
+**If step 7b's build status was not 0**, the bot is still running the code from
+before the merge, and passing this step does not change that. Once the build
+passes, restart again and re-read the status until it is `status=0`:
+
+```bash
+systemctl --user restart paperclaw
+systemctl --user show paperclaw -p ExecStartPre | grep -o 'status=[0-9]*'
+```
 
 **If tests fail:** Show which tests failed. Try to diagnose and fix. If you can't fix automatically, report to the user.
 

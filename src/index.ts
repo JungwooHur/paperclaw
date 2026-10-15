@@ -10,6 +10,7 @@ import {
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
+import { warnIfRunningStaleBuild } from './build-freshness.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
@@ -43,6 +44,7 @@ import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { logHeartbeat } from './liveness-log.js';
 import { logger } from './logger.js';
 import { qaFollowupCommand, worthFilingCheck } from './qa-followup.js';
 import {
@@ -727,6 +729,10 @@ export {
 };
 
 async function main(): Promise<void> {
+  // The unit rebuilds dist/ before each start but lets a failed build through,
+  // so say so here when that left this process on old code.
+  warnIfRunningStaleBuild(import.meta.url);
+
   ensureContainerRuntimeRunning();
   initDatabase();
   logger.info('Database initialized');
@@ -806,10 +812,9 @@ async function main(): Promise<void> {
   // a socket-liveness signal the watchdog can read (a dead-but-not-reconnecting socket
   // shows `whatsapp=down` across heartbeats while the log itself stays fresh).
   const HEARTBEAT_MS = 10 * 60 * 1000;
+  // It is written at any LOG_LEVEL (liveness-log.ts).
   setInterval(() => {
-    logger.info(
-      `heartbeat whatsapp=${whatsapp?.isConnected() ? 'up' : 'down'}`,
-    );
+    logHeartbeat(whatsapp?.isConnected() ?? false);
   }, HEARTBEAT_MS).unref();
 
   startMessageLoop().catch((err) => {

@@ -10,6 +10,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import { readEnvFile } from './env.js';
+
 /**
  * The environment variable that names extra skill sources.
  *
@@ -19,6 +21,20 @@ import path from 'path';
  * and warns about nothing, because from its side nothing was configured.
  */
 export const EXTRA_SKILLS_DIRS_ENV = 'EXTRA_SKILLS_DIRS';
+
+/**
+ * EXTRA_SKILLS_DIRS from the environment, else from .env.
+ *
+ * Read on every run rather than once at startup, so an edit to .env reaches the
+ * next container without a restart. The service loads no env file into its own
+ * environment, so a process.env-only read would ignore the .env value entirely.
+ */
+export function extraSkillsDirsSetting(): string | undefined {
+  return (
+    process.env[EXTRA_SKILLS_DIRS_ENV] ||
+    readEnvFile([EXTRA_SKILLS_DIRS_ENV])[EXTRA_SKILLS_DIRS_ENV]
+  );
+}
 
 /** What a configured skill directory turned out to be. */
 export type SkillDirState = 'ok' | 'missing' | 'empty';

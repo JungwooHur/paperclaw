@@ -29,6 +29,7 @@ import {
 } from '../auth-state.js';
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
+import { logConnected, logConnectionClosed } from '../liveness-log.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -44,13 +45,17 @@ const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
  * else warn. A name pino does not know also gives warn, since pino throws on
  * it and the connect would fail with it.
  */
-function baileysLogLevel(): string {
+export function baileysLogLevel(): string {
   const level =
     process.env.BAILEYS_LOG_LEVEL ||
     readEnvFile(['BAILEYS_LOG_LEVEL']).BAILEYS_LOG_LEVEL ||
     'warn';
   if (level === 'silent' || level in pino.levels.values) return level;
-  logger.warn({ level }, 'Unknown BAILEYS_LOG_LEVEL, logging baileys at warn');
+  // Not `level`, which would replace pino's own (see logger.ts).
+  logger.warn(
+    { configured: level },
+    'Unknown BAILEYS_LOG_LEVEL, logging baileys at warn',
+  );
   return 'warn';
 }
 
@@ -143,14 +148,11 @@ export class WhatsAppChannel implements Channel {
           lastDisconnect?.error as { output?: { statusCode?: number } }
         )?.output?.statusCode;
         const shouldReconnect = reason !== DisconnectReason.loggedOut;
-        logger.info(
-          {
-            reason,
-            shouldReconnect,
-            queuedMessages: this.outgoingQueue.length,
-          },
-          'Connection closed',
-        );
+        logConnectionClosed({
+          reason,
+          shouldReconnect,
+          queuedMessages: this.outgoingQueue.length,
+        });
 
         if (shouldReconnect) {
           logger.info('Reconnecting...');
@@ -180,7 +182,7 @@ export class WhatsAppChannel implements Channel {
       } else if (connection === 'open') {
         this.connected = true;
         clearAuthRequired();
-        logger.info('Connected to WhatsApp');
+        logConnected();
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
         this.sock.sendPresenceUpdate('available').catch((err) => {

@@ -13,12 +13,12 @@ afterEach(() => fs.rmSync(AUTH_REQUIRED_FILE, { force: true }));
 
 describe('auth-state', () => {
   it('uses an exit code the unit refuses to restart', () => {
-    // Must match RestartPreventExitStatus in setup/service.ts, or the logout
-    // loop comes straight back.
+    // Must match RestartPreventExitStatus in the service unit (which setup
+    // links or copies), or the logout loop comes straight back.
     expect(AUTH_REQUIRED_EXIT_CODE).toBe(78);
-    const unit = fs.readFileSync('setup/service.ts', 'utf-8');
-    expect(unit).toContain(
-      `RestartPreventExitStatus=${AUTH_REQUIRED_EXIT_CODE}`,
+    const unit = fs.readFileSync('systemd/paperclaw.service', 'utf-8');
+    expect(unit).toMatch(
+      new RegExp(`^RestartPreventExitStatus=${AUTH_REQUIRED_EXIT_CODE}$`, 'm'),
     );
   });
 

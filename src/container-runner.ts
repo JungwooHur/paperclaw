@@ -22,7 +22,7 @@ import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
-  EXTRA_SKILLS_DIRS_ENV,
+  extraSkillsDirsSetting,
   inspectSkillDir,
   resolveExtraSkillDirs,
   syncSkillDirs,
@@ -224,7 +224,7 @@ function buildVolumeMounts(
   const skillsDst = path.join(groupSessionsDir, 'skills');
   const skillSources = [path.join(process.cwd(), 'container', 'skills')];
   const extra = resolveExtraSkillDirs(
-    process.env[EXTRA_SKILLS_DIRS_ENV],
+    extraSkillsDirsSetting(),
     inspectSkillDir,
   );
   for (const warning of extra.warnings) logger.warn(warning);
@@ -285,18 +285,21 @@ function buildVolumeMounts(
   return mounts;
 }
 
+/** The .env keys handed to the container on stdin, and nothing else. */
+export const CONTAINER_SECRET_KEYS = [
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'NOTION_TOKEN',
+  'NOTION_RESEARCH_DB',
+  'OUTPUT_LANGUAGE',
+];
+
 /**
  * Read allowed secrets from .env for passing to the container via stdin.
  * Secrets are never written to disk or mounted as files.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile([
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_API_KEY',
-    'NOTION_TOKEN',
-    'NOTION_RESEARCH_DB',
-    'OUTPUT_LANGUAGE',
-  ]);
+  return readEnvFile(CONTAINER_SECRET_KEYS);
 }
 
 function buildContainerArgs(
@@ -588,8 +591,7 @@ export async function runContainerAgent(
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const logFile = path.join(logsDir, `container-${timestamp}.log`);
-      const isVerbose =
-        process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
+      const isVerbose = logger.level === 'debug' || logger.level === 'trace';
 
       const logLines = [
         `=== Container Run Log ===`,

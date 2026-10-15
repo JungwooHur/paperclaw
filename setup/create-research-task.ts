@@ -11,13 +11,14 @@ import {
   getRegisteredGroup,
   setRegisteredGroup,
 } from '../src/db.js';
+import { MAIN_GROUP_FOLDER as GROUP_FOLDER, TIMEZONE } from '../src/config.js';
+import { readEnvFile } from '../src/env.js';
 import { CronExpressionParser } from 'cron-parser';
 
 initDatabase();
 
-const GROUP_FOLDER = process.env.MAIN_GROUP_FOLDER || 'main';
-const CHAT_JID = process.env.CHAT_JID;
-const TIMEZONE = process.env.TZ || 'Asia/Seoul';
+// The same .env the service reads (TZ there governs the host's cron too).
+const CHAT_JID = process.env.CHAT_JID || readEnvFile(['CHAT_JID']).CHAT_JID;
 
 if (!CHAT_JID) {
   console.error('CHAT_JID env var is required (your WhatsApp JID, e.g. 821012345678@s.whatsapp.net)');

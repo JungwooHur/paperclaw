@@ -65,6 +65,7 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
 
+import { logger as appLogger } from '../logger.js';
 import { WhatsAppChannel } from './whatsapp.js';
 
 type Log = { info(msg: string): void; warn(msg: string): void };
@@ -104,6 +105,7 @@ describe('baileys log level', () => {
   });
 
   afterEach(() => {
+    appLogger.level = 'info';
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
     fs.rmSync(cwd, { recursive: true, force: true });
@@ -133,6 +135,8 @@ describe('baileys log level', () => {
 
   it('reads BAILEYS_LOG_LEVEL from .env, like the other runtime knobs', async () => {
     vi.stubEnv('BAILEYS_LOG_LEVEL', '');
+    // The service's own path, <cwd>/.env: lift the suite's no-.env override.
+    vi.stubEnv('PAPERCLAW_ENV_FILE', '');
     fs.writeFileSync(path.join(cwd, '.env'), 'BAILEYS_LOG_LEVEL=info\n');
     const baileys = await connect();
 
@@ -152,5 +156,26 @@ describe('baileys log level', () => {
     expect(logged('connection errored')).toBe(false);
     expect(logged('baileys warning')).toBe(true);
     expect(logged('BAILEYS_LOG_LEVEL')).toBe(true);
+    // Under its own level and naming the value, not as an unlabelled line.
+    const warning = JSON.parse(
+      lines.find((line) => line.includes('BAILEYS_LOG_LEVEL'))!,
+    );
+    expect(warning.level).toBe(40);
+    expect(Object.values(warning)).toContain('INFO');
+  });
+
+  it('writes the connect and close lines the watchdog reads at any LOG_LEVEL', async () => {
+    // LOG_LEVEL=warn in .env: without these the watchdog would restart a
+    // healthy bot (log-output.test.ts holds them to its grep patterns).
+    appLogger.level = 'warn';
+    await connect();
+    ev.emit('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 405 } } },
+    });
+
+    expect(logged('Connected to WhatsApp')).toBe(true);
+    expect(logged('Connection closed')).toBe(true);
+    expect(logged('Reconnecting')).toBe(false);
   });
 });
