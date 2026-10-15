@@ -137,9 +137,13 @@ async function runTask(
   // query loop to time out. A short delay handles any final MCP calls.
   const TASK_CLOSE_DELAY_MS = 10000;
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
+  // Set once the run returns. The runner stops waiting for a stuck callback
+  // after OUTPUT_SETTLE_TIMEOUT; one that finishes later must not close or
+  // idle the group's next container.
+  let runEnded = false;
 
   const scheduleClose = () => {
-    if (closeTimer) return; // already scheduled
+    if (closeTimer || runEnded) return; // already scheduled, or too late
     closeTimer = setTimeout(() => {
       logger.debug({ taskId: task.id }, 'Closing task container after result');
       deps.queue.closeStdin(task.chat_jid);
@@ -175,7 +179,7 @@ async function runTask(
           }
           scheduleClose();
         }
-        if (streamedOutput.status === 'success') {
+        if (streamedOutput.status === 'success' && !runEnded) {
           deps.queue.notifyIdle(task.chat_jid);
         }
         if (streamedOutput.status === 'error') {
@@ -183,6 +187,7 @@ async function runTask(
         }
       },
     );
+    runEnded = true;
 
     if (closeTimer) clearTimeout(closeTimer);
 
@@ -198,6 +203,7 @@ async function runTask(
       'Task completed',
     );
   } catch (err) {
+    runEnded = true;
     if (closeTimer) clearTimeout(closeTimer);
     error = err instanceof Error ? err.message : String(err);
     logger.error({ taskId: task.id, error }, 'Task failed');

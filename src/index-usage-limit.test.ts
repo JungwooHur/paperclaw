@@ -1,9 +1,18 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./container-runner.js', () => ({
   runContainerAgent: vi.fn(),
   writeTasksSnapshot: vi.fn(),
   writeGroupsSnapshot: vi.fn(),
+}));
+// Startup stops the last process's containers; there are none in a test.
+vi.mock('./container-runtime.js', () => ({
+  cleanupOrphans: vi.fn(),
+  ensureContainerRuntimeRunning: vi.fn(),
 }));
 // Answers here are short and never filed, but keep the Q&A filer from ever
 // starting a process from a test.
@@ -13,9 +22,11 @@ vi.mock('./qa-followup.js', () => ({
 }));
 
 import { ContainerOutput, runContainerAgent } from './container-runner.js';
+import { cleanupOrphans } from './container-runtime.js';
 import {
   _initTestDatabase,
   getAllSessions,
+  getRouterState,
   setSession,
   storeChatMetadata,
   storeMessage,
@@ -26,6 +37,7 @@ import {
   _pipeToActiveContainer,
   _processGroupMessages,
   _recoverPendingMessages,
+  _restoreStartupState,
   _setChannels,
   _setRegisteredGroups,
 } from './index.js';
@@ -56,7 +68,8 @@ const channel: Channel = {
 
 function agentReplies(...results: string[]): void {
   vi.mocked(runContainerAgent).mockImplementation(
-    async (_group, _input, _onProcess, onOutput) => {
+    async (_group, input, _onProcess, onOutput) => {
+      bootPrompts.push(startupPrompt(input.prompt));
       for (const result of results) {
         const output: ContainerOutput = {
           status: 'success',
@@ -97,12 +110,59 @@ function promptOfRun(index: number): string {
   return vi.mocked(runContainerAgent).mock.calls[index][1].prompt;
 }
 
+function timesIn(text: string, part: string): number {
+  return text.split(part).length - 1;
+}
+
+// Stands in for data/ipc/<folder>/input, which the host writes follow-ups to
+// and a container drains.
+let inputDir: string;
+// The first prompt of each container agentReplies started, as the runner
+// builds it: the host's prompt plus every input file it drains at start-up.
+let bootPrompts: string[];
+
+/** Pipes write real input files, the way GroupQueue.sendMessage does. */
+function pipesWriteFiles(): void {
+  let written = 0;
+  vi.spyOn(GroupQueue.prototype, 'sendMessage').mockImplementation(
+    (_jid, text) => {
+      written++;
+      const file = path.join(
+        inputDir,
+        `${String(written).padStart(4, '0')}.json`,
+      );
+      fs.writeFileSync(file, JSON.stringify({ type: 'message', text }));
+      return file;
+    },
+  );
+}
+
+function inputFiles(): string[] {
+  return fs
+    .readdirSync(inputDir)
+    .filter((f) => f.endsWith('.json'))
+    .sort();
+}
+
+/** The runner's start-up drain: every input file, in order, into the prompt. */
+function startupPrompt(prompt: string): string {
+  const drained = inputFiles().map((file) => {
+    const filePath = path.join(inputDir, file);
+    const { text } = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    fs.unlinkSync(filePath);
+    return text as string;
+  });
+  return [prompt, ...drained].join('\n');
+}
+
 let closeStdin: ReturnType<typeof vi.spyOn>;
 let enqueueMessageCheck: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
+  inputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-limit-input-'));
+  bootPrompts = [];
   _initTestDatabase();
   setSession('main', 'session-old');
   // A fresh process: cursors and sessions come from the (empty) database.
@@ -121,6 +181,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
+  fs.rmSync(inputDir, { recursive: true, force: true });
 });
 
 describe('a message answered with the usage limit', () => {
@@ -220,7 +281,7 @@ describe('a message answered with the usage limit', () => {
 
   it('keeps a follow-up piped in during the answer pending when the limit refuses it', async () => {
     userSays('m1', 'what is section 2 about?', NOW - 60_000);
-    vi.spyOn(GroupQueue.prototype, 'sendMessage').mockReturnValue(true);
+    pipesWriteFiles();
     vi.mocked(runContainerAgent).mockImplementationOnce(
       async (_group, _input, _onProcess, onOutput) => {
         // The follow-up arrives while the first answer is being written, and
@@ -255,7 +316,7 @@ describe('a message answered with the usage limit', () => {
 
   it('puts back only the piped messages no turn has finished on', async () => {
     userSays('m1', 'what is section 2 about?', NOW - 60_000);
-    vi.spyOn(GroupQueue.prototype, 'sendMessage').mockReturnValue(true);
+    pipesWriteFiles();
     vi.mocked(runContainerAgent).mockImplementationOnce(
       async (_group, _input, _onProcess, onOutput) => {
         const reply = (result: string) =>
@@ -323,5 +384,540 @@ describe('startup recovery', () => {
     _setRegisteredGroups({ [CHAT]: MAIN_GROUP });
     _recoverPendingMessages();
     expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
+  });
+});
+
+/**
+ * Runs m1 into a refusal, with m2 piped just before it, then the container's
+ * later turns `after` (extra usage, say). Returns while the container is
+ * still running; the function it returns lets the old run finish.
+ */
+async function refusedAndStillRunning(
+  ...after: string[]
+): Promise<() => Promise<boolean>> {
+  let exitContainer!: () => void;
+  let refused!: () => void;
+  const handled = new Promise<void>((resolve) => {
+    refused = resolve;
+  });
+  pipesWriteFiles();
+  userSays('m1', 'what is section 2 about?', NOW - 60_000);
+  vi.mocked(runContainerAgent).mockImplementationOnce(
+    async (_group, _input, _onProcess, onOutput) => {
+      const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+      _pipeToActiveContainer(CHAT, channel, [m2]);
+      for (const result of [LIMIT, ...after]) {
+        await onOutput?.({
+          status: 'success',
+          result,
+          newSessionId: 'session-new',
+        });
+      }
+      refused();
+      await new Promise<void>((resolve) => {
+        exitContainer = resolve;
+      });
+      return { status: 'success', result: null, newSessionId: 'session-new' };
+    },
+  );
+  const run = _processGroupMessages(CHAT);
+  await handled;
+  return () => {
+    exitContainer();
+    return run;
+  };
+}
+
+/**
+ * Pipes `message` once, the way the message loop would, while the host clears
+ * the typing indicator: after the container has exited, before the run ends.
+ */
+function pipedAsItExits(message: () => NewMessage): () => boolean | undefined {
+  let piped: boolean | undefined;
+  vi.spyOn(channel, 'setTyping').mockImplementation(async (_jid, on) => {
+    if (on || piped !== undefined) return;
+    piped = _pipeToActiveContainer(CHAT, channel, [message()]);
+  });
+  return () => piped;
+}
+
+describe('input files around a refusal', () => {
+  it('pipes nothing into a container closing on a refusal', async () => {
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    let piped: boolean | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        await onOutput?.({
+          status: 'success',
+          result: LIMIT,
+          newSessionId: 'session-new',
+        });
+        // A follow-up arrives while the container winds down on the close
+        // sentinel. A file written now would outlive it.
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        piped = _pipeToActiveContainer(CHAT, channel, [m2]);
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    expect(piped).toBe(false);
+    expect(inputFiles()).toEqual([]);
+
+    // Held like any other message, and asked once after the reset.
+    vi.setSystemTime(RESET + 10 * 60_000);
+    agentReplies('Both are answered.');
+    await _processGroupMessages(CHAT);
+    expect(timesIn(bootPrompts[0], 'what is section 2 about?')).toBe(1);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+  });
+
+  it('drops the file of a follow-up the refusal put back', async () => {
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        // Piped just before the refusal; the runner sees the close sentinel
+        // first and exits without draining it.
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(true);
+        await onOutput?.({
+          status: 'success',
+          result: LIMIT,
+          newSessionId: 'session-new',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    expect(inputFiles()).toEqual([]);
+
+    vi.setSystemTime(RESET + 10 * 60_000);
+    agentReplies('Both are answered.');
+    await _processGroupMessages(CHAT);
+    expect(timesIn(bootPrompts[0], 'what is section 2 about?')).toBe(1);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+  });
+
+  it('keeps the file of a follow-up the refusal did not put back', async () => {
+    // A result settles the oldest open prompt, so a background-task nudge
+    // turn can settle a follow-up whose file the runner never drained. The
+    // cursor stays past that follow-up, and the file is its only delivery.
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        const reply = (result: string) =>
+          onOutput?.({
+            status: 'success',
+            result,
+            newSessionId: 'session-new',
+          });
+        const m2 = userSays('m2', 'and section 3?', NOW - 40_000);
+        _pipeToActiveContainer(CHAT, channel, [m2]);
+        await reply('It describes the method.');
+        await reply('The translation is still running.'); // the nudge turn
+        const m3 = userSays('m3', 'and the appendix?', NOW - 20_000);
+        _pipeToActiveContainer(CHAT, channel, [m3]);
+        await reply(LIMIT);
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    expect(inputFiles()).toHaveLength(1);
+
+    vi.setSystemTime(RESET + 10 * 60_000);
+    agentReplies('Answered.');
+    await _processGroupMessages(CHAT);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+    expect(timesIn(bootPrompts[0], 'and the appendix?')).toBe(1);
+    expect(bootPrompts[0]).not.toContain('what is section 2 about?');
+  });
+
+  it('keeps the file a container left when it closed on idle', async () => {
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        await onOutput?.({
+          status: 'success',
+          result: 'It describes the method.',
+          newSessionId: 'session-new',
+        });
+        // Piped as the idle timer closed the container, which exits without
+        // draining it. The next container's start-up drain delivers it.
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        _pipeToActiveContainer(CHAT, channel, [m2]);
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+
+    // A window opens (the scheduler hit the limit) and holds the next message.
+    recordUsageLimit(LIMIT);
+    userSays('m3', 'and the appendix?', NOW - 10_000);
+    await _processGroupMessages(CHAT);
+    expect(inputFiles()).toHaveLength(1);
+
+    vi.setSystemTime(RESET + 10 * 60_000);
+    agentReplies('Answered.');
+    await _processGroupMessages(CHAT);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+    expect(timesIn(bootPrompts[0], 'and the appendix?')).toBe(1);
+  });
+
+  it('pipes nothing into it as it finishes exiting past the window', async () => {
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        await onOutput?.({
+          status: 'success',
+          result: LIMIT,
+          newSessionId: 'session-new',
+        });
+        vi.setSystemTime(RESET + 10 * 60_000); // exits after the window
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    const piped = pipedAsItExits(() =>
+      userSays('m2', 'and section 3?', RESET + 9 * 60_000),
+    );
+    await _processGroupMessages(CHAT);
+    expect(piped()).toBe(false);
+    expect(inputFiles()).toEqual([]);
+  });
+
+  it('pipes nothing into it while it closes past the window', async () => {
+    const exit = await refusedAndStillRunning();
+    // Still winding down after the reset, so the window no longer holds.
+    vi.setSystemTime(RESET + 10 * 60_000);
+    expect(usageLimitHeldUntil()).toBeNull();
+    const m3 = userSays('m3', 'and the appendix?', RESET + 9 * 60_000);
+    expect(_pipeToActiveContainer(CHAT, channel, [m3])).toBe(false);
+    await exit();
+    expect(inputFiles()).toEqual([]);
+
+    // The next container takes follow-ups again.
+    let piped: boolean | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, input, _onProcess, onOutput) => {
+        bootPrompts.push(startupPrompt(input.prompt));
+        const m4 = userSays('m4', 'and the references?', RESET + 11 * 60_000);
+        piped = _pipeToActiveContainer(CHAT, channel, [m4]);
+        await onOutput?.({
+          status: 'success',
+          result: 'All three are answered.',
+          newSessionId: 'session-new',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    expect(piped).toBe(true);
+    for (const question of [
+      'what is section 2 about?',
+      'and section 3?',
+      'and the appendix?',
+    ]) {
+      expect(timesIn(bootPrompts[0], question)).toBe(1);
+    }
+  });
+});
+
+describe('input files around an error', () => {
+  it('drops the file of a follow-up the rollback put back', async () => {
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(async () => {
+      // Piped just before the agent crashed, so never drained.
+      const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+      expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(true);
+      return { status: 'error', result: null, error: 'exited with code 137' };
+    });
+    // Not handled: the queue retries, and the retry asks both again.
+    expect(await _processGroupMessages(CHAT)).toBe(false);
+    expect(inputFiles()).toEqual([]);
+
+    agentReplies('Both are answered.');
+    await _processGroupMessages(CHAT);
+    expect(timesIn(bootPrompts[0], 'what is section 2 about?')).toBe(1);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+  });
+
+  it('drops the file of a follow-up piped as the container exits', async () => {
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(async () => ({
+      status: 'error',
+      result: null,
+      error: 'exited with code 137',
+    }));
+    const piped = pipedAsItExits(() =>
+      userSays('m2', 'and section 3?', NOW - 30_000),
+    );
+    expect(await _processGroupMessages(CHAT)).toBe(false);
+    expect(piped()).toBe(true);
+    expect(inputFiles()).toEqual([]);
+
+    agentReplies('Both are answered.');
+    await _processGroupMessages(CHAT);
+    expect(timesIn(bootPrompts[0], 'what is section 2 about?')).toBe(1);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+  });
+
+  it('keeps the file of a follow-up when the error comes after an answer', async () => {
+    // A reply went out, so there is no rollback: the cursor stays past the
+    // follow-up, and its file is the only delivery it has.
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        await onOutput?.({
+          status: 'success',
+          result: 'It describes the method.',
+          newSessionId: 'session-new',
+        });
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        _pipeToActiveContainer(CHAT, channel, [m2]);
+        return { status: 'error', result: null, error: 'exited with code 137' };
+      },
+    );
+    expect(await _processGroupMessages(CHAT)).toBe(true);
+    expect(inputFiles()).toHaveLength(1);
+
+    userSays('m3', 'and the appendix?', NOW - 10_000);
+    agentReplies('Answered.');
+    await _processGroupMessages(CHAT);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+    expect(timesIn(bootPrompts[0], 'and the appendix?')).toBe(1);
+    expect(bootPrompts[0]).not.toContain('what is section 2 about?');
+  });
+});
+
+describe('a restart between a refusal and the container exit', () => {
+  /** The new process: state from the database only, as main() starts. */
+  function restart(): void {
+    _restoreStartupState();
+    _setRegisteredGroups({ [CHAT]: MAIN_GROUP });
+  }
+
+  it('still finds the refused messages pending after the reset', async () => {
+    const exit = await refusedAndStillRunning();
+    restart();
+
+    vi.setSystemTime(RESET + 10 * 60_000);
+    _recoverPendingMessages();
+    expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
+    await exit();
+  });
+
+  it('drops the file of a follow-up the refusal put back', async () => {
+    const exit = await refusedAndStillRunning();
+    // Until startup stops the old container, it can still drain the file.
+    let filesWhenStopped: string[] | undefined;
+    vi.mocked(cleanupOrphans).mockImplementationOnce(() => {
+      filesWhenStopped = inputFiles();
+    });
+    restart();
+    expect(filesWhenStopped).toHaveLength(1);
+    expect(inputFiles()).toEqual([]);
+
+    vi.setSystemTime(RESET + 10 * 60_000);
+    agentReplies('Both are answered.');
+    await _processGroupMessages(CHAT);
+    expect(timesIn(bootPrompts[0], 'what is section 2 about?')).toBe(1);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+    await exit();
+  });
+
+  it('sees the cursor the exit saves, after a turn past the refusal', async () => {
+    // Extra usage, say: the container answers again after refusing. Which
+    // prompt that turn settles is #114's to solve; a restart before the exit
+    // must leave the same messages pending as the exit does.
+    const exit = await refusedAndStillRunning('It covers the experiments.');
+    restart();
+    const atRestart = getRouterState('last_agent_timestamp');
+    await exit();
+    expect(getRouterState('last_agent_timestamp')).toBe(atRestart);
+  });
+
+  it('takes no pipe once the window closes before the exit', async () => {
+    const exit = await refusedAndStillRunning();
+    vi.setSystemTime(RESET + 10 * 60_000);
+    const m3 = userSays('m3', 'and the appendix?', RESET + 9 * 60_000);
+    expect(_pipeToActiveContainer(CHAT, channel, [m3])).toBe(false);
+    restart();
+    expect(inputFiles()).toEqual([]);
+
+    agentReplies('All three are answered.');
+    await _processGroupMessages(CHAT);
+    for (const question of [
+      'what is section 2 about?',
+      'and section 3?',
+      'and the appendix?',
+    ]) {
+      expect(timesIn(bootPrompts[0], question)).toBe(1);
+    }
+    await exit();
+  });
+});
+
+// The runner waits for a run's callbacks before it returns, but only so long,
+// and until that fix an error exit did not wait at all. Whatever runs late
+// must leave alone the state the run's end settled.
+describe('a callback that runs after its run ended', () => {
+  it('leaves the next container open to pipes and the held input as the exit left it', async () => {
+    pipesWriteFiles();
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    // The window's notice is slow to send.
+    sendMessage.mockImplementationOnce(async () => {
+      await new Promise<void>((r) => setTimeout(r, 1500));
+    });
+    let callbacks: Promise<void> = Promise.resolve();
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(true);
+        // Both prompts were in the stream, so the CLI refuses twice, back to
+        // back. Each callback waits for the one before it; the container
+        // exits 1 once stdin closes, before the notice is out.
+        for (let i = 0; i < 2; i++) {
+          callbacks = callbacks.then(() =>
+            onOutput?.({
+              status: 'success',
+              result: LIMIT,
+              newSessionId: 'session-new',
+            }),
+          );
+        }
+        return {
+          status: 'error',
+          result: null,
+          error: 'Container exited with code 1',
+        };
+      },
+    );
+    expect(await _processGroupMessages(CHAT)).toBe(true);
+    const heldAtExit = getRouterState('usage_limit_refused_input');
+    const cursorAtExit = getRouterState('last_agent_timestamp');
+    closeStdin.mockClear();
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await callbacks;
+    expect(getRouterState('usage_limit_refused_input')).toBe(heldAtExit);
+    expect(getRouterState('last_agent_timestamp')).toBe(cursorAtExit);
+    expect(closeStdin).not.toHaveBeenCalled();
+
+    // After the reset, the group's first container takes follow-ups.
+    vi.setSystemTime(RESET + 10 * 60_000);
+    let piped: boolean | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, input, _onProcess, onOutput) => {
+        bootPrompts.push(startupPrompt(input.prompt));
+        const m3 = userSays('m3', 'and the appendix?', RESET + 11 * 60_000);
+        piped = _pipeToActiveContainer(CHAT, channel, [m3]);
+        await onOutput?.({
+          status: 'success',
+          result: 'All three are answered.',
+          newSessionId: 'session-new',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    expect(piped).toBe(true);
+    expect(timesIn(bootPrompts[0], 'and section 3?')).toBe(1);
+  });
+
+  it('delivers a late answer without closing the next container on idle', async () => {
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    let late: ((output: ContainerOutput) => Promise<void>) | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        late = onOutput;
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    const cursor = getRouterState('last_agent_timestamp');
+
+    await late?.({
+      status: 'success',
+      result: 'It describes the method.',
+      newSessionId: 'session-new',
+    });
+    expect(sentTexts()).toContain('It describes the method.');
+
+    // Another container has the group by now; an idle timer armed by the old
+    // run would close it half an hour from here.
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+    expect(closeStdin).not.toHaveBeenCalled();
+    expect(getRouterState('last_agent_timestamp')).toBe(cursor);
+  });
+
+  it('settles nothing from an answer that arrives after a refused run', async () => {
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    let late: ((output: ContainerOutput) => Promise<void>) | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        late = onOutput;
+        await onOutput?.({
+          status: 'success',
+          result: LIMIT,
+          newSessionId: 'session-new',
+        });
+        return {
+          status: 'error',
+          result: null,
+          error: 'Container exited with code 1',
+        };
+      },
+    );
+    await _processGroupMessages(CHAT);
+    const cursor = getRouterState('last_agent_timestamp');
+    const held = getRouterState('usage_limit_refused_input');
+    const notifyIdle = vi.spyOn(GroupQueue.prototype, 'notifyIdle');
+
+    await late?.({
+      status: 'success',
+      result: 'It describes the method.',
+      newSessionId: 'session-new',
+    });
+
+    expect(sentTexts()).toContain('It describes the method.');
+    // Settling the refused prompt now would move the cursor past a message
+    // that recovery has to run after the reset.
+    expect(getRouterState('last_agent_timestamp')).toBe(cursor);
+    expect(getRouterState('usage_limit_refused_input')).toBe(held);
+    expect(notifyIdle).not.toHaveBeenCalled();
+  });
+
+  it("keeps the next run's session from an answer that arrives after its own run", async () => {
+    userSays('m1', 'what is section 2 about?', NOW - 120_000);
+    let late: ((output: ContainerOutput) => Promise<void>) | undefined;
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        late = onOutput;
+        return { status: 'success', result: null, newSessionId: 'session-a' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+
+    userSays('m2', 'and section 3?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(async () => ({
+      status: 'success',
+      result: null,
+      newSessionId: 'session-b',
+    }));
+    await _processGroupMessages(CHAT);
+    expect(getAllSessions()).toEqual({ main: 'session-b' });
+
+    await late?.({
+      status: 'success',
+      result: 'It describes the method.',
+      newSessionId: 'session-a',
+    });
+    expect(getAllSessions()).toEqual({ main: 'session-b' });
   });
 });
