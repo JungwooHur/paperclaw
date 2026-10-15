@@ -128,7 +128,8 @@ def scan(text, titles, needles, label="text", patterns=True):
     problems = []
     if patterns:
         proc = subprocess.run(
-            ["bash", os.path.join(SCRIPTS, "check-sensitive.sh"), "--text", label],
+            ["bash", os.path.join(SCRIPTS, "check-sensitive.sh"),
+             "--text", label],
             input=text, capture_output=True, text=True, env=_pattern_env())
         if proc.returncode != 0:
             found = [ln.strip() for ln in proc.stderr.splitlines()

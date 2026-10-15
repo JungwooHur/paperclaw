@@ -10,7 +10,8 @@ import sqlite3
 
 import pytest
 
-from leak_helpers import REPO, SCRIPTS, Repo, clean_env, known_value, load_script
+from leak_helpers import (REPO, SCRIPTS, Repo, clean_env, known_value,
+                          load_script)
 
 pv = load_script("private_values.py")
 CLI = ["python3", os.path.join(SCRIPTS, "private_values.py")]
@@ -115,7 +116,8 @@ def test_file_hit_names_the_source_never_the_value(tmp_path):
     _sources(tmp_path)
     leak = tmp_path / "body.md"
     leak.write_text(f"see {known_value()} and {_uuid().replace('-', '')}\n")
-    proc = Repo(tmp_path / "r", clean_env(tmp_path)).run(CLI + ["--file", str(leak)])
+    repo = Repo(tmp_path / "r", clean_env(tmp_path))
+    proc = repo.run(CLI + ["--file", str(leak)])
     assert proc.returncode == 1
     assert ".env:NOTION_TOKEN" in proc.stdout
     assert "private-values:3" in proc.stdout
@@ -177,8 +179,9 @@ def test_range_merge_counts_its_own_resolution_only(tmp_path):
     repo.commit(message="evil merge")
     proc = repo.run(only_merge)
     assert proc.returncode == 1
+    sha = repo.git("rev-parse", "HEAD")[:12]
     assert proc.stdout.strip().splitlines() == [
-        f"private-values:3: commit {repo.git('rev-parse', 'HEAD')[:12]} (patch)"]
+        f"private-values:3: commit {sha} (patch)"]
 
 
 def test_bad_range_blocks(tmp_path):

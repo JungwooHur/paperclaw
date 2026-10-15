@@ -83,7 +83,8 @@ def test_denied_for_content(cwd, command):
     "gh pr comment 5 --editor",
     "gh api repos/o/r/pulls/1 -F body=@-",
     "gh api repos/o/r/pulls/1 --input -",
-    "cat > clean.md <<'EOF'\nnew\nEOF\ngh pr create --title t --body-file clean.md",
+    "cat > clean.md <<'EOF'\nnew\nEOF\n"
+    "gh pr create --title t --body-file clean.md",
     "python3 make_body.py && gh pr create --title t --body-file clean.md",
     "git checkout -- clean.md && gh pr create --title t --body-file clean.md",
     "echo x | xargs gh pr comment 1 --body",
@@ -101,8 +102,8 @@ def test_cd_resolves_the_body_file(cwd):
     assert guard.guard("gh pr create --title t --body-file clean.md", cwd) == 0
     assert guard.guard("cd sub && gh pr create --title t --body-file clean.md",
                        cwd) == 2
-    assert guard.guard("(cd sub) && gh pr create --title t --body-file clean.md",
-                       cwd) == 0
+    assert guard.guard(
+        "(cd sub) && gh pr create --title t --body-file clean.md", cwd) == 0
 
 
 def test_override_skips_patterns_only(cwd):

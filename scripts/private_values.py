@@ -54,8 +54,9 @@ MIN_VALUE_LEN = 8
 _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$',
     re.IGNORECASE)
-_JID_RE = re.compile(r'^([^@\s]+)@(s\.whatsapp\.net|g\.us|lid|c\.us|broadcast)$',
-                     re.IGNORECASE)
+_JID_RE = re.compile(
+    r'^([^@\s]+)@(s\.whatsapp\.net|g\.us|lid|c\.us|broadcast)$',
+    re.IGNORECASE)
 _JID_NUMBER_RE = re.compile(r'\d{7,}')
 
 USAGE = 'usage: private_values.py --range <rev-list args> | --file F|-'
@@ -133,7 +134,7 @@ def main_checkout() -> str | None:
 
 
 def env_file() -> str | None:
-    """Path of the .env to read: PAPERCLAW_ENV_FILE, else the main checkout's."""
+    """The .env to read: PAPERCLAW_ENV_FILE, else the main checkout's."""
     override = os.environ.get('PAPERCLAW_ENV_FILE')
     if override:
         return override
@@ -173,7 +174,7 @@ def _messages_db() -> str | None:
 
 
 def _group_jids(path: str | None) -> list[str]:
-    """registered_groups.jid, read-only. Missing or unreadable DB: empty list."""
+    """registered_groups.jid, read-only; empty if the DB is missing."""
     if not path or not os.path.isfile(path):
         return []
     uri = 'file:' + urllib.request.pathname2url(os.path.abspath(path))

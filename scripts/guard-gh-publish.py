@@ -361,7 +361,8 @@ def _gh_text(args: list[str], cwd: str | None) -> Publication | None:
             break
         name, value = _split_flag(arg, short_valued)
         bundled = re.fullmatch(r'-([A-Za-z]{2,})', arg) and value is None
-        if name in blind or (bundled and any(f'-{c}' in blind for c in arg[1:])):
+        if name in blind or (
+                bundled and any(f'-{c}' in blind for c in arg[1:])):
             raise Unreadable(f'{what} {arg} composes the text where this hook '
                              'cannot read it')
         kind = flags.get(name)
@@ -416,7 +417,8 @@ def _api_text(args: list[str], cwd: str | None) -> Publication | None:
         if kind == 'typed' and text.startswith('@'):
             _read_file(text[1:], cwd, f'field {field} from', pub)
         else:
-            pub.texts.append((f'field {field}', _literal(text, f'field {field}')))
+            label = f'field {field}'
+            pub.texts.append((label, _literal(text, label)))
     return pub
 
 
@@ -480,7 +482,7 @@ def publications(command: str, cwd: str | None,
 
 
 def _check_writers(before: list[_Simple], pub: Publication) -> None:
-    """Denies a file read that an earlier command could change after the scan."""
+    """Denies a file read that an earlier command could change first."""
     if not pub.reads:
         return
     names = {os.path.basename(p) for p in pub.reads}
@@ -542,8 +544,9 @@ def guard(command: str, cwd: str | None) -> int:
         return _deny([
             f'guard-gh-publish: blocked, because {e}. This is a PUBLIC repo, '
             'so what gh publishes is scanned first, and this text cannot be.',
-            'Write the text to a file in its own tool call, then publish with '
-            'a literal --title and --body-file <file> (gh api: -F body=@<file>).',
+            'Write the text to a file in its own tool call, then publish '
+            'with a literal --title and --body-file <file> (gh api: '
+            '-F body=@<file>).',
         ])
     texts = [(pub, label, text) for pub in pubs for label, text in pub.texts]
     if not texts:
@@ -562,8 +565,9 @@ def guard(command: str, cwd: str | None) -> int:
     return _deny([
         'guard-gh-publish: blocked — this text must not go to a PUBLIC repo:',
         *problems,
-        'Rewrite it: placeholders (<arxiv-id>, "paper A", section 4) instead of '
-        'specific papers, and no secrets or personal identifiers.',
+        'Rewrite it: placeholders (<arxiv-id>, "paper A", section 4) '
+        'instead of specific papers, and no secrets or personal '
+        'identifiers.',
         'Only if every PATTERN hit is a false positive, prefix the gh command '
         'with PAPERCLAW_ALLOW_SENSITIVE=1. Private values and paper titles '
         'have no override.',

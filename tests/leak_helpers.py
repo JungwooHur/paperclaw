@@ -14,8 +14,9 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO, "scripts")
-SCRUBBED = ("NOTION_TOKEN", "NOTION_RESEARCH_DB", "PAPERCLAW_ALLOW_SENSITIVE",
-            "PAPERCLAW_REDACT", "PAPERCLAW_ENV_FILE", "PAPERCLAW_PRIVATE_VALUES",
+SCRUBBED = ("NOTION_TOKEN", "NOTION_RESEARCH_DB",
+            "PAPERCLAW_ALLOW_SENSITIVE", "PAPERCLAW_REDACT",
+            "PAPERCLAW_ENV_FILE", "PAPERCLAW_PRIVATE_VALUES",
             "PAPERCLAW_MESSAGES_DB")
 
 
@@ -102,5 +103,6 @@ class Repo:
         return self.git("rev-parse", "HEAD")
 
     def run(self, argv, stdin="", **extra_env):
-        return subprocess.run(argv, cwd=self.path, env=dict(self.env, **extra_env),
-                              input=stdin, capture_output=True, text=True)
+        return subprocess.run(argv, cwd=self.path,
+                              env=dict(self.env, **extra_env), input=stdin,
+                              capture_output=True, text=True)
