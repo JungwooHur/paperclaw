@@ -58,6 +58,12 @@ _JID_RE = re.compile(
     r'^([^@\s]+)@(s\.whatsapp\.net|g\.us|lid|c\.us|broadcast)$',
     re.IGNORECASE)
 _JID_NUMBER_RE = re.compile(r'\d{7,}')
+# A phone number as people write it: digits and separators only.
+_PHONE_RE = re.compile(r'^\+?[\d\s().-]+$')
+# What a phone number is written with besides its digits. A digit needle is
+# looked for in the text with these removed, so "+82 10-..." still matches.
+_SEPARATORS_RE = re.compile(r'[\s().+-]')
+_KR_PREFIX = '82'  # the owner's country code; at home a number starts with 0
 
 USAGE = 'usage: private_values.py --range <rev-list args> | --file F|-'
 
@@ -70,11 +76,14 @@ class Needle:
         label: Where the value came from. Safe to print; never the value.
         text: The text to find, case-folded when `fold` is set.
         fold: Whether to compare case-insensitively.
+        digits: Whether `text` is a phone number's digits, to be found in the
+            text with phone-number separators removed.
     """
 
     label: str
     text: str
     fold: bool
+    digits: bool = False
 
 
 def is_private_key(key: str) -> bool:
@@ -89,7 +98,10 @@ def variants(label: str, value: str) -> list[Needle]:
 
     A UUID is matched dashed and undashed, since Notion ids appear both ways.
     A WhatsApp JID is also matched by its number, which is a phone number or a
-    group id on its own. Emails, JIDs and UUIDs compare case-insensitively.
+    group id on its own; that number, and a value that is a phone number, are
+    matched whatever separators surround the digits, and a Korean number in
+    its national form too (+82 10... is written 010...). Emails, JIDs and UUIDs
+    compare case-insensitively.
 
     Args:
         label: The value's source, carried on every returned needle.
@@ -101,6 +113,8 @@ def variants(label: str, value: str) -> list[Needle]:
     value = value.strip()
     out = []
     if len(value) >= MIN_VALUE_LEN:
+        if _PHONE_RE.match(value) and len(re.sub(r'\D', '', value)) >= 7:
+            return _phone_needles(label, re.sub(r'\D', '', value))
         if _UUID_RE.match(value):
             hexed = value.replace('-', '').lower()
             dashed = '-'.join((hexed[:8], hexed[8:12], hexed[12:16],
@@ -112,8 +126,17 @@ def variants(label: str, value: str) -> list[Needle]:
             out.append(Needle(label, value, False))
     jid = _JID_RE.match(value)
     if jid:
-        out += [Needle(label, n, False)
-                for n in _JID_NUMBER_RE.findall(jid.group(1))]
+        for number in _JID_NUMBER_RE.findall(jid.group(1)):
+            out += _phone_needles(label, number)
+    return out
+
+
+def _phone_needles(label: str, number: str) -> list[Needle]:
+    """A number's digits, plus its national form when it is a Korean one."""
+    out = [Needle(label, number, False, digits=True)]
+    if number.startswith(_KR_PREFIX) and len(number) >= 10:
+        out.append(Needle(label, '0' + number[len(_KR_PREFIX):], False,
+                          digits=True))
     return out
 
 
@@ -234,11 +257,21 @@ def load_needles() -> list[Needle]:
 
 
 def find(text: str, needles: list[Needle]) -> list[str]:
-    """Labels of the values present in `text`, sorted, without duplicates."""
-    folded = None
+    """Labels of the values present in `text`, sorted, without duplicates.
+
+    NUL bytes are dropped first: UTF-16 text with ASCII content is that
+    content with a NUL after every character.
+    """
+    text = text.replace('\0', '')
+    folded = squeezed = None
     labels = set()
     for needle in needles:
-        if needle.fold:
+        if needle.digits:
+            if squeezed is None:
+                squeezed = _SEPARATORS_RE.sub('', text)
+            if needle.text in squeezed:
+                labels.add(needle.label)
+        elif needle.fold:
             if folded is None:
                 folded = text.casefold()
             if needle.text in folded:

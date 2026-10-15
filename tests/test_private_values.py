@@ -10,8 +10,8 @@ import sqlite3
 
 import pytest
 
-from leak_helpers import (REPO, SCRIPTS, Repo, clean_env, known_value,
-                          load_script)
+from leak_helpers import (REPO, SCRIPTS, Repo, clean_env, fake_mobile,
+                          known_value, load_script)
 
 pv = load_script("private_values.py")
 CLI = ["python3", os.path.join(SCRIPTS, "private_values.py")]
@@ -189,3 +189,31 @@ def test_bad_range_blocks(tmp_path):
     repo = Repo(tmp_path / "r", clean_env(tmp_path))
     repo.commit()
     assert repo.run(CLI + ["--range", "no-such-rev"]).returncode == 2
+
+
+def test_jid_number_matches_its_phone_number_forms():
+    # The main chat's JID number is the owner's phone number, which is
+    # usually written with separators, and in Korea in its national form.
+    needles = pv.variants("x", fake_mobile() + "@s.whatsapp.net")
+    a, b, c = fake_mobile()[2:4], fake_mobile()[4:8], fake_mobile()[8:]
+    for text in (f"+82 {a}-{b}-{c}", f"+82-{a}-{b}-{c}", f"+82 {a} {b} {c}",
+                 f"(+82) {a}.{b}.{c}", f"0{a}-{b}-{c}", f"0{a}{b}{c}"):
+        assert pv.find(f"call {text} now", needles) == ["x"], text
+
+
+def test_a_listed_phone_number_matches_whatever_its_separators():
+    a, b, c = fake_mobile()[2:4], fake_mobile()[4:8], fake_mobile()[8:]
+    needles = pv.variants("x", f"+82 {a}-{b}-{c}")
+    assert pv.find(f"call 0{a}.{b}.{c}", needles) == ["x"]
+    assert pv.find("call 010-1234-5678", needles) == []
+
+
+def test_utf16_text_is_matched(tmp_path):
+    env = clean_env(tmp_path)
+    (tmp_path / "private-values").write_text(known_value() + "\n")
+    repo = Repo(tmp_path / "r", env)
+    base = repo.commit()
+    repo.commit({"n.txt": f"token={known_value()}\n".encode("utf-16")})
+    proc = repo.run(CLI + ["--range", f"{base}..HEAD"])
+    assert proc.returncode == 1 and "private-values:1" in proc.stdout
+    assert known_value() not in proc.stdout + proc.stderr
