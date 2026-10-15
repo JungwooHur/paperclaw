@@ -1,9 +1,81 @@
 # See .husky/pre-commit: without set -e only the last command's status counts.
 set -e
 
-# The rest of what CI runs, so a red build is caught before it is pushed rather
-# than a minute later on GitHub. Kept out of pre-commit deliberately: these are
-# slow enough to be annoying on every commit, and the format/secret checks there
-# are the ones that must never be skipped.
+# 1. Leak scan of exactly what this push publishes. A push to ANY branch of a
+# public repository is already publication, so this is the gate; CI's leak-scan
+# workflow only raises the alarm afterwards. It runs first so a leak is reported
+# before a minute of typecheck and tests, not after.
+#
+# stdin carries one "<local ref> <local sha> <remote ref> <remote sha>" line per
+# ref being pushed; $1 is the remote's name (or its URL when pushed by URL).
+#
+# PAPERCLAW_ALLOW_SENSITIVE=1 skips the pattern scan only (check-sensitive.sh
+# honours it). A known private value has no override short of --no-verify:
+# it is the owner's real value, so it is never a false positive.
+#
+# The scanners are found next to this file, not in the working directory. From
+# a worktree git runs the MAIN checkout's hook (core.hooksPath is absolute and
+# shared) with the worktree as cwd, so the hook and its scanners would otherwise
+# be two different versions, and a worktree whose base predates a scanner could
+# not push at all. git still scans the worktree's commits: the object store is
+# shared.
+here=$(cd "$(dirname "$0")/.." && pwd)
+scan() { bash "$here/scripts/check-sensitive.sh" "$@"; }
+values() { python3 "$here/scripts/private_values.py" "$@"; }
+
+# What is already published, and so not scanned again: everything the remote
+# has, or, for a remote never fetched here (or a push by URL), everything any
+# remote has. Excluded for an existing branch too, so a rebase onto a moved
+# main does not rescan main's commits.
+remote="${1:-origin}"
+if git remote | grep -qxF -- "$remote" \
+    && [ -n "$(git for-each-ref --count=1 "refs/remotes/$remote/")" ]; then
+  published="--remotes=$remote"
+else
+  published="--remotes"
+fi
+blocked=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "$local_sha" ] || continue
+  case "$local_sha" in
+    *[!0]*) ;;
+    *) continue ;;  # all zeros: deleting a ref publishes nothing
+  esac
+  # The ref's name is published too: a branch named after a paper is a leak.
+  printf '%s\n' "$remote_ref" | scan --text "ref name" || blocked=1
+  printf '%s\n' "$remote_ref" | values --file - || blocked=1
+  # An annotated tag carries a message and a tagger no commit has. Peel it,
+  # scanning every level, down to what it points at.
+  obj=$local_sha
+  while [ "$(git cat-file -t "$obj")" = tag ]; do
+    scan --tag "$obj" </dev/null || blocked=1
+    git cat-file tag "$obj" | values --file - || blocked=1
+    obj=$(git cat-file tag "$obj" | sed -n '1s/^object //p')
+  done
+  type=$(git cat-file -t "$obj")
+  if [ "$type" != commit ]; then
+    echo "pre-push: $remote_ref points at a $type, which the leak scan cannot scan; not pushing it." >&2
+    blocked=1
+    continue
+  fi
+  if git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    set -- "$obj" --not "$remote_sha" "$published"
+  else
+    # A new branch (all-zero remote sha), or a remote tip never fetched here.
+    set -- "$obj" --not "$published"
+  fi
+  # </dev/null: neither may read the remaining ref lines off this loop's stdin.
+  scan --range "$@" </dev/null || blocked=1
+  values --range "$@" </dev/null || blocked=1
+done
+if [ "$blocked" -ne 0 ]; then
+  echo "pre-push: push blocked by the leak scan above (this is a PUBLIC repo)." >&2
+  exit 1
+fi
+
+# 2. The rest of what CI runs, so a red build is caught before it is pushed
+# rather than a minute later on GitHub. Kept out of pre-commit deliberately:
+# these are slow enough to be annoying on every commit, and the format/secret
+# checks there are the ones that must never be skipped.
 npm run typecheck
 npx vitest run
