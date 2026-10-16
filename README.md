@@ -211,6 +211,14 @@ The list of researchers PaperClaw follows lives at `groups/main/research-papers/
 
 **To add a researcher:** append their name to `researchers`. On the next nightly run, if `s2AuthorIds` doesn't have an entry for them, the collector queries Semantic Scholar for the author and caches the ID. Add the lab affiliation to `researcherLabMap` if you want their papers auto-tagged.
 
+**Map lab heads only, to the lab they run now.** An entry tags every paper that
+has that person anywhere in its author list, whatever the year and wherever they
+were at the time. A student or postdoc mapped to their old lab therefore drags
+everything they publish after leaving into it, including the papers of the lab
+they go on to run. Their papers from the old lab still get its tag without an
+entry of their own, through the head of that lab, who is almost always a
+co-author.
+
 **To change topic queries:** edit the `topics` array. Queries use Semantic Scholar's bulk-search syntax.
 
 ---
