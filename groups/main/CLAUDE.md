@@ -327,7 +327,17 @@ Headers: Authorization: Bearer $NOTION_TOKEN, Notion-Version: 2022-06-28
 ### Classification Guidelines
 - **분야**: RL, World Model, Autonomous Navigation, VLA, Control, Computer Vision, SLAM, State Estimation, Scene Representation, Generative Models (add new ones if needed)
 - **Journal/Conference**: Use abbreviations — TRO, RAL, IJRR, ICRA, IROS, CoRL, RSS, NeurIPS, Science Robotics, etc.
-- **연구실/기관 소속**: Check `researcherLabMap` in config.json first, infer from affiliations if not found
+- **연구실/기관 소속**: The paper's OWN affiliations decide: the Crossref record,
+  the arXiv page, or the PDF's first page. `researcherLabMap` in config.json only
+  supplies the tag name for a lab head who is an author. An entry maps a person
+  to ONE lab forever, so when the paper places that person somewhere else, the
+  paper wins. Never add an entry for a student or postdoc.
+  - Real incident: a former postdoc who went on to run their own lab was still
+    mapped to the old one. Every paper from the new lab was tagged with the old
+    lab, and the owner had to relabel them by hand. The same entries also pulled
+    other alumni's later industry papers into the old lab.
+  - Use an existing tag from the DB's options rather than inventing a variant
+    spelling. Two spellings of one lab split its papers between two tags.
 
 ### Long documents / books → `translate_fulltext.py` (MANDATORY, do NOT use Phase 2 section-asks)
 
