@@ -690,6 +690,19 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
     if not force and not relink and _find_refs_heading(blocks):
         rep["refs"] = "already present"
         return rep
+    # Placed before the text has all arrived, the list ends up ABOVE the rest of it:
+    # the translation is appended to the end of the page, and everything that reads
+    # the body (`reference_section.body_blocks`) then sees none of what follows.
+    # So wait for a body, as the figure and table injectors do, and for the page
+    # not to read as a fragment beside its figures — the judgement a processing
+    # request makes. An upload that pauses for longer than the healer's quiet
+    # window can still get its list early; nothing here can tell a pause from an end.
+    import collect_papers
+    if not force and not relink and (
+            not ef._has_body_to_anchor(blocks)
+            or collect_papers.classify_translation(blocks) != "TRANSLATED"):
+        rep["deferred"] = "the translation is not on the page yet"
+        return rep
     arxiv_id = arxiv_id or ef.arxiv_id_from_page(page_id)
     if not arxiv_id:
         rep["error"] = "no arxiv id"
@@ -1028,7 +1041,11 @@ def heal_references(page_id: str, apply: bool = False, created_time: str = None)
         except ValueError:
             return {"page": page_id, "skipped": "unparseable created_time"}
         age = datetime.datetime.now(datetime.timezone.utc) - made
-        if age.days > HEAL_MAX_AGE_DAYS:
+        # A page emptied for re-processing lost its list with the rest, and is being
+        # built afresh like a new page, so it gets the list back like one — however
+        # long ago the clear was, since the run that followed it may have failed.
+        import collect_papers
+        if age.days > HEAL_MAX_AGE_DAYS and not collect_papers.was_cleared(page_id):
             return {"page": page_id, "skipped": f"page is {age.days}d old"}
     return link_page(page_id, apply=apply)
 

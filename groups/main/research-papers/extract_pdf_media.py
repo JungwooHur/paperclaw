@@ -649,6 +649,13 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
         todo = tuple(k for k in full_kinds if force or not have[k])
     rep = {"page": page_id, "existing": have, "kinds": list(todo),
            "found": 0, "placed": 0, "replaced": 0, "text_archived": 0}
+    # On a page with no text yet every image anchors nowhere and lands at the top,
+    # where nothing moves it once the text arrives below. The HTML figure and table
+    # injectors already wait for a body; this one placed every PDF figure above
+    # the first heading of a page being processed.
+    if not ef._has_body_to_anchor(blocks):
+        rep["deferred"] = "no body text to anchor against"
+        return rep
     if not todo:
         rep["skipped_existing"] = True
         return rep

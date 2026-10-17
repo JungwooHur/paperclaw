@@ -205,21 +205,38 @@ def _find_existing_page(paper_url, title=None):
 
 
 def paper_status(paper_url, title=None) -> tuple:
-    """(state, page_id) where state is MISSING / UNPROCESSED / PROCESSED.
+    """(state, page_id, kind) where state is MISSING / UNPROCESSED / PROCESSED.
 
     This is the question the dedup step actually needs answered. Asking "does a row
     exist" instead is what let four papers in one day be reported done while their
-    pages held nothing but figures.
+    pages held nothing but figures. `kind` is `classify_translation`'s answer, None
+    when there is no page.
     """
     page = _find_existing_page(paper_url, title=title)
     if not page:
-        return "MISSING", None
+        return "MISSING", None, None
     pid = page["id"].replace("-", "")
-    return ("PROCESSED" if page_has_content(pid) else "UNPROCESSED"), pid
+    state, kind = status_for(read_blocks(pid))
+    return state, pid, kind
 
 
-def page_has_content(page_id, min_chars: int = 500) -> bool:
-    """Does this paper page actually carry a translation?
+MIN_TRANSLATED_CHARS = 500
+# What a clear removes: the block types a translation fragment and the healers'
+# own output are made of, with no children. Anything else on the page means
+# someone put it there, and the clear refuses rather than guess.
+CLEARABLE = ("paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item",
+             "numbered_list_item", "quote", "equation", "divider", "code", "image")
+# What a clear keeps in place: the reader's saved questions and their own pages.
+KEEP_ON_CLEAR = ("callout", "child_page", "child_database")
+CLEARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleared")
+
+
+def _live(blocks: list) -> list:
+    return [b for b in blocks if not b.get("archived") and not b.get("in_trash")]
+
+
+def classify_translation(blocks: list) -> str:
+    """EMPTY / PARTIAL / TRANSLATED: does this page carry the paper's translation?
 
     "A row exists" is NOT "the paper is done". The dispatcher creates the Notion
     page when it INGESTS a request, so by the time the subagent runs its dedup
@@ -229,36 +246,162 @@ def page_has_content(page_id, min_chars: int = 500) -> bool:
     with images and not one word of text, and every later request skips it again.
     Observed on four papers in one day.
 
-    Images do not count: they are placed from the source without any translation.
+    Nor is a fragment of the text. This used to call a page done at 500
+    characters, which an abstract alone clears, while the audit reports a page with
+    figures, a section or two and under 4,000 characters as SKIPPED_TRANSLATION and
+    says to re-process it. PARTIAL is that rule, read from `verify_sections`, so
+    the page the audit sends back is one a request will take. Stricter in one
+    respect: a page with no headings is partial only under the same bound, because
+    a long body there is a translation whose titles came out as paragraphs.
+
+    Images do not count, nor does the injected English reference list itself: both
+    are placed from the source without any translation. What FOLLOWS the list does
+    count — a translation appended below a list placed too early is still a
+    translation, and reading it as empty is how a clear would destroy it.
     """
+    import paragraph_headings
+    import reference_section
+    import verify_sections as vs
+    text = reference_section.without_list(_live(blocks))
+    if vs.body_chars(text) < MIN_TRANSLATED_CHARS:
+        return "EMPTY"
+    sections = vs.group_sections(text)
+    partial = vs.is_partial_translation(text, sections) and bool(
+        sections
+        or paragraph_headings.no_heading_finding(text)[0] == "SKIPPED_TRANSLATION")
+    return "PARTIAL" if partial else "TRANSLATED"
+
+
+def read_blocks(page_id, fetch=None):
+    """The page's top-level blocks, or None when they cannot be read."""
     import urllib.error
-    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
-    headers = {"Authorization": f"Bearer {NOTION_TOKEN}",
-               "Notion-Version": "2022-06-28"}
-    chars = 0
+    import verify_sections as vs
     try:
-        while url:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as r:
-                d = json.load(r)
-            for b in d.get("results", []):
-                t = b.get("type")
-                if t == "image":
-                    continue
-                payload = b.get(t) or {}
-                if isinstance(payload, dict):
-                    chars += sum(len(x.get("plain_text", ""))
-                                 for x in payload.get("rich_text", []))
-                    chars += len((payload.get("expression") or "")) if t == "equation" else 0
-            if chars >= min_chars:
-                return True
-            cur = d.get("next_cursor") if d.get("has_more") else None
-            url = (f"https://api.notion.com/v1/blocks/{page_id}/children"
-                   f"?page_size=100&start_cursor={cur}") if cur else None
+        return (fetch or vs.fetch_blocks)(page_id)
     except (urllib.error.URLError, OSError, ValueError):
-        # Unknown beats "empty": never let a transient error trigger a rebuild.
-        return True
-    return chars >= min_chars
+        return None
+
+
+def status_for(blocks) -> tuple:
+    """(state, kind) for a page that exists, judged on what it holds.
+
+    Unreadable blocks answer PROCESSED: unknown beats "empty", since a transient
+    error must never send a finished paper back through translation, let alone
+    clear its page.
+    """
+    if blocks is None:
+        return "PROCESSED", "TRANSLATED"
+    kind = classify_translation(blocks)
+    return ("PROCESSED" if kind == "TRANSLATED" else "UNPROCESSED"), kind
+
+
+def _ours(block: dict, me) -> bool:
+    """Did this integration write the block, and has no person edited it since?"""
+    made = (block.get("created_by") or {}).get("id")
+    edited = (block.get("last_edited_by") or {}).get("id", made)
+    return bool(me) and made == me and edited == me
+
+
+def plan_clear(blocks: list, me) -> dict:
+    """`{"ids": [...]}` to archive before an unfinished page is processed again,
+    or `{"refused": why}`. `me` is this integration's user id.
+
+    The new translation is appended to the END of the page, so whatever stays
+    ends up above it: the old fragment, and figures the figure healer will never
+    move, since it leaves a page that already has captioned figures alone. So the
+    fragment, the figures and the injected reference list go; the healers place
+    figures, tables and the list again once text is on the page.
+
+    Only blocks this integration wrote, and no person has edited since, are ever
+    archived. A page in the DB is often a reading-list row the owner annotates —
+    a line saying what to look at, a link, a bookmark — and those are theirs,
+    whatever type they are; they stay where they are, above the new text. Saved
+    questions and child pages stay too.
+
+    Among the integration's own blocks, anything outside the fragment and healer
+    types, a block with children (a Q&A nested under a paragraph), anything after
+    the reference list, a second list, or a first-principles record anywhere means
+    the page holds something a clear cannot judge, and the whole clear is refused:
+    processing then appends below what is there, which is untidy and loses nothing.
+    """
+    import descent
+    import reference_section
+    if classify_translation(blocks) == "TRANSLATED":
+        return {"refused": "the page carries a translation"}
+    if not me:
+        return {"refused": "cannot tell this integration's blocks from a person's"}
+    live = _live(blocks)
+    if descent.record_start(live) is not None:
+        return {"refused": "the page holds a first-principles record"}
+    spans = reference_section.list_spans(live)
+    if len(spans) > 1:
+        return {"refused": f"the page holds {len(spans)} reference lists"}
+    end = spans[0][1] if spans else len(live)
+    ids = []
+    for k, b in enumerate(live):
+        if b["type"] in KEEP_ON_CLEAR or not _ours(b, me):
+            continue
+        if k >= end:
+            return {"refused": f"a {b['type']} block follows the reference list"}
+        if b["type"] not in CLEARABLE or b.get("has_children"):
+            kind = b["type"] + (" with children" if b.get("has_children") else "")
+            return {"refused": f"the page holds a {kind} block"}
+        ids.append(b["id"])
+    return {"ids": ids}
+
+
+def was_cleared(page_id) -> bool:
+    """Has `clear_unprocessed` ever emptied this page? Its ids file says so."""
+    key = page_id.replace("-", "")
+    try:
+        names = os.listdir(CLEARED_DIR)
+    except OSError:
+        return False
+    return any(name.endswith(".json")
+               and name[:-len(".json")].rpartition("-")[0].replace("-", "") == key
+               for name in names)
+
+
+def clear_unprocessed(page_id) -> dict:
+    """Archive an unfinished page's blocks so the paper is processed into it afresh.
+
+    Judges the page on what it holds NOW: the page and its blocks are read again
+    and `plan_clear` applied again. The ids are written to
+    `cleared/<page>-<time>.json` before anything is archived, and an archived block
+    comes back with PATCH `archived: false`. The file is also how the healer knows
+    to put the reference list back on a page older than its usual one-week window
+    (`was_cleared`).
+    """
+    import http.client
+    import page_kind
+    import verify_sections as vs
+    from translate_fulltext import notion
+    try:
+        if not page_kind.is_paper(notion("GET", f"/pages/{page_id}")):
+            return {"refused": "not a paper page"}
+        plan = plan_clear(vs.fetch_blocks(page_id), _me_id())
+    except (RuntimeError, OSError, ValueError, http.client.HTTPException) as e:
+        return {"refused": f"page unreadable: {e}"[:200]}
+    if "refused" in plan:
+        return plan
+    rep = {"archived": 0}
+    if not plan["ids"]:
+        return rep
+    try:
+        os.makedirs(CLEARED_DIR, exist_ok=True)
+        rep["ids_file"] = os.path.join(CLEARED_DIR, f"{page_id}-{int(time.time())}.json")
+        with open(rep["ids_file"], "w") as f:
+            json.dump({"page": page_id, "ids": plan["ids"]}, f)
+    except OSError as e:
+        return {"refused": f"cannot record the ids first: {e}"[:200]}
+    for bid in plan["ids"]:
+        try:
+            notion("PATCH", f"/blocks/{bid}", {"archived": True})
+            rep["archived"] += 1
+        except (RuntimeError, OSError, ValueError, http.client.HTTPException) as e:
+            rep.setdefault("failed", []).append(f"{bid}: {e}"[:160])
+        time.sleep(0.34)
+    return rep
 
 
 def check_notion_exists(paper_url, title=None):
@@ -942,6 +1085,11 @@ def main():
     parser.add_argument('--status', type=str, default=None, metavar='URL_OR_ID',
                         help='print MISSING/UNPROCESSED/PROCESSED <page_id>; '
                              'exit 0 only when the paper is actually translated')
+    parser.add_argument('--clear-unprocessed', action='store_true',
+                        help='with --status: when the answer is UNPROCESSED, archive '
+                             'the fragment, figures and reference list this integration '
+                             'wrote (the owner\'s own blocks and saved Q&A stay) so the '
+                             'paper is processed into a clean page')
     parser.add_argument('--dedupe', action='store_true',
                         help='Archive duplicate paper pages (same arxiv_id or normalized '
                              'title), keeping the richest in each group. Backfills a missing '
@@ -954,7 +1102,16 @@ def main():
     # --dedupe runs out-of-band (host systemd timer) and must not require the
     # container-only config.json, so handle it before load_config().
     if args.status:
-        st, pid = paper_status(args.status)
+        st, pid, kind = paper_status(args.status)
+        if st == "UNPROCESSED" and args.clear_unprocessed:
+            try:
+                rep = clear_unprocessed(pid)
+            except Exception as e:  # the status line below must still be printed
+                rep = {"refused": f"clear failed: {type(e).__name__}: {e}"[:200]}
+            print(f"clear ({kind.lower()}): {json.dumps(rep)}", file=sys.stderr)
+        elif st == "UNPROCESSED" and kind == "PARTIAL":
+            print("the page holds part of a translation; --clear-unprocessed "
+                  "empties it before processing", file=sys.stderr)
         print(f"{st} {pid or ''}".strip())
         return 0 if st == "PROCESSED" else 1
     if args.dedupe:
