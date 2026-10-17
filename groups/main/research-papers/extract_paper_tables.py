@@ -68,6 +68,43 @@ def caption_number(cap: str):
     return int(tok) if tok.isdigit() else _ROMAN.get(tok.lower())
 
 
+def placed_caption(num, caption: str) -> str:
+    """The caption the injector writes on a table image: the source's, labelled.
+
+    ALWAYS "Table N…" — the per-number idempotency keys off it, and some papers'
+    <figcaption> parses empty (which would otherwise make the image un-tracked and
+    re-injected as a duplicate next run).
+    """
+    if caption.strip().lower().startswith("table"):
+        return caption
+    return f"Table {num}" + (f": {caption}" if caption.strip() else "")
+
+
+def _image_caption(block: dict) -> str:
+    return "".join(c.get("plain_text", "") for c in
+                   ((block.get("image") or {}).get("caption") or []))
+
+
+def replaced_by(blocks: list, caption_keys: set) -> list:
+    """Ids of the images a forced run's new copies stand in for.
+
+    Matched on the CAPTION only, never on the table number: the number comes from
+    the LaTeXML id counter, which restarts in an appendix (`S2.T1` and `A1.T1` are
+    both 1) and under per-section numbering, so a number match would archive a
+    different table the run never re-placed. `blocks` must be the snapshot taken
+    BEFORE the new images went in, or they would match themselves. An uncaptioned
+    image is a person's and is never matched.
+    """
+    out = []
+    for b in blocks:
+        if b.get("type") != "image" or b.get("archived") or b.get("in_trash"):
+            continue
+        key = _cap_key(_image_caption(b))
+        if key and key in caption_keys:
+            out.append(b["id"])
+    return out
+
+
 def parse_tables(html_text: str) -> list:
     """Ordered list of {id, num, caption} for each table id `SnTm` / `AnTm`.
     Scans ids directly (not <figure> boundaries) so nested table-figures — which
@@ -343,6 +380,11 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         return rep
     if not apply:
         rep["would_place"] = [t["num"] for t in tables]
+        if force:
+            # render_tables keys captions by number, last one winning; mirror it.
+            caps = {t["num"]: t["caption"] for t in tables}
+            rep["would_replace"] = len(replaced_by(
+                blocks, {_cap_key(placed_caption(n, c)) for n, c in caps.items()}))
         rep["would_archive"] = sum(1 for b in blocks
                                    if b["type"] in ef.TEXT_TYPES
                                    and _is_pure_table(ef._block_text(b)))
@@ -359,18 +401,15 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         groups.setdefault(anchor, []).append(im)
         if anchor not in order:
             order.append(anchor)
+    placed_caps = set()
     for key in order:
-        children = []
+        children, these = [], []
         for im in groups[key]:
             fid = upload_image(im["path"])
             if fid:
-                # ALWAYS caption "Table N…" — the per-number idempotency keys off it,
-                # and some papers' <figcaption> parses empty (which would otherwise
-                # make the image un-tracked and re-injected as a duplicate next run).
-                cap = im["caption"]
-                if not cap.strip().lower().startswith("table"):
-                    cap = f"Table {im['num']}" + (f": {cap}" if cap.strip() else "")
+                cap = placed_caption(im["num"], im["caption"])
                 children.append(ef._image_block(fid, cap))
+                these.append(_cap_key(cap))
                 time.sleep(0.2)
         if not children:
             continue
@@ -382,7 +421,20 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
             body["after"] = end_of_body
         notion("PATCH", f"/blocks/{page_id}/children", body)
         rep["placed"] += len(children)
+        placed_caps.update(these)
         time.sleep(0.34)
+
+    # --force REPLACES: archive the copies the new images stand in for, once the
+    # new ones are in. It used to add beside them, so a forced run left two of
+    # every table.
+    if force:
+        for bid in replaced_by(blocks, placed_caps):
+            try:
+                notion("PATCH", f"/blocks/{bid}", {"archived": True})
+                rep["replaced"] = rep.get("replaced", 0) + 1
+            except Exception as e:
+                rep.setdefault("archive_failed", []).append(f"{bid[-8:]}: {e}"[:120])
+            time.sleep(0.34)
 
     # safe removal: archive only pure-table blocks (never mixed/prose)
     if not keep_text:
