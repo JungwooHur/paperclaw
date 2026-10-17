@@ -20,12 +20,14 @@ DOC = os.path.join(
 )
 
 # A command invocation in the doc, and every long flag that follows it up to the
-# next shell command or blank line.
+# next shell command or blank line. The script may be named by its container path
+# (`/workspace/group/research-papers/x.py`): the processing step's own commands
+# are written that way, and a bare-name pattern skipped every one of them.
 # The backslash-newline alternative must come FIRST: a bare "[^\n]" would
 # swallow the backslash and stop at the newline, silently dropping every
 # flag on a continuation line — including the one that guards against
 # writing a descent to the wrong paper.
-_CALL = re.compile(r"python3 (\w+\.py)((?:\\\n|[^\n#])*)")
+_CALL = re.compile(r"python3 (?:[\w./-]*/)?(\w+\.py)((?:\\\n|[^\n#])*)")
 _FLAG = re.compile(r"--[a-z][a-z-]+")
 
 
@@ -54,6 +56,8 @@ class TestTheDocumentedCommandsAreReal:
 
     def test_every_flag_the_doc_passes_is_a_flag_the_script_accepts(self):
         for script, flags in documented_flags().items():
+            if not flags:
+                continue        # called with positional arguments only
             accepted = real_flags(script)
             unknown = flags - accepted
             assert not unknown, "%s does not accept %s" % (script,

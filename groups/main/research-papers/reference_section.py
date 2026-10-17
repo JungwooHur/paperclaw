@@ -118,6 +118,50 @@ def body_blocks(blocks: list) -> list:
     return blocks if i is None else blocks[:i]
 
 
+def _list_end(blocks: list, i: int) -> int:
+    """One past the last entry of the list whose heading is at `i`."""
+    last, j = i, i + 1
+    while j < len(blocks) and not str(blocks[j].get("type", "")).startswith("heading"):
+        if is_entry(blocks[j]):
+            last = j
+        j += 1
+    return last + 1
+
+
+def list_spans(blocks: list) -> list:
+    """`(start, end)` of every injected list: its heading through its LAST entry.
+
+    The end is the last entry, not the next heading, because whatever follows the
+    entries is not the list: a translation appended below a list placed before the
+    text arrived often opens with a paragraph, not a heading, and stretching the
+    list over it hid the whole translation from anything measuring the page.
+    """
+    spans, k = [], 0
+    while k < len(blocks):
+        i = start_index(blocks[k:])
+        if i is None:
+            break
+        i += k
+        k = _list_end(blocks, i)
+        spans.append((i, k))
+    return spans
+
+
+def without_list(blocks: list) -> list:
+    """The page with the injected lists themselves taken out, and nothing else.
+
+    `body_blocks` drops everything from the first list's heading on, which is
+    right for a healer that must leave what follows alone. A measure of how much
+    the page carries must not: a translation appended below an early list is
+    still there.
+    """
+    out, k = [], 0
+    for i, j in list_spans(blocks):
+        out += blocks[k:i]
+        k = j
+    return out + blocks[k:]
+
+
 def body_end_anchor(blocks: list):
     """Block id to append AFTER so new content lands at the end of the BODY.
 

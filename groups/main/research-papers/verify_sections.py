@@ -597,6 +597,37 @@ def _prose_chars(span: str) -> int:
     return len("\n".join(keep))
 
 
+# A page that HAS a heading or two but no real body. The figures the healer
+# injected from the Paper URL make it look populated — one page carried 10 images
+# against 1,290 characters and passed clean — and figures are never evidence that
+# the text arrived. `collect_papers.classify_translation` reads the same rule, so a
+# page this calls unfinished is one a processing request will actually re-process —
+# measured there with the injected reference list taken out. This audit reads only
+# what precedes the list, so on a page whose list sits ABOVE its translation it
+# still flags a page the status rightly calls done.
+PARTIAL_MIN_IMAGES = 3
+PARTIAL_MAX_CHARS = 4000
+PARTIAL_MAX_SECTIONS = 4
+
+
+def body_chars(blocks: list) -> int:
+    """Characters of text on the page, images excluded and equation blocks counted.
+
+    An equation block carries its expression, not rich_text; leaving it out made a
+    short, maths-heavy translation read as a fragment of one.
+    """
+    return sum(len((b.get("equation") or {}).get("expression") or "")
+               if b["type"] == "equation" else len(aq._block_text(b))
+               for b in blocks if b["type"] != "image")
+
+
+def is_partial_translation(blocks: list, sections: list) -> bool:
+    """Figures, at most a few sections, and too little text to be the paper."""
+    images = sum(1 for b in blocks if b["type"] == "image")
+    return (images >= PARTIAL_MIN_IMAGES and body_chars(blocks) < PARTIAL_MAX_CHARS
+            and len(sections) <= PARTIAL_MAX_SECTIONS)
+
+
 def load_manifest(path: str | None) -> list:
     if not path or not os.path.exists(path):
         return []
@@ -794,14 +825,11 @@ def main() -> int:
         })
 
     # 1b1e. SKIPPED_TRANSLATION for a page that HAS a heading or two but no real
-    # body. The no-headings case is caught at the early return above; a page left
-    # with just an abstract still slips past it, and the figures the healer injected
-    # make it look populated — one page carried 10 images against 1,290 characters
-    # and passed clean. Figures come from the Paper URL alone, so they are never
-    # evidence that the text arrived.
+    # body (`is_partial_translation`). The no-headings case is caught at the early
+    # return above; a page left with just an abstract still slips past it.
     _img = sum(1 for b in blocks if b["type"] == "image")
-    _txt = sum(len(aq._block_text(b)) for b in blocks if b["type"] != "image")
-    if _img >= 3 and _txt < 4000 and len(sections) <= 4:
+    _txt = body_chars(blocks)
+    if is_partial_translation(blocks, sections):
         findings.append({
             "type": "SKIPPED_TRANSLATION", "section": None,
             "block_count": _img, "chars": _txt,
