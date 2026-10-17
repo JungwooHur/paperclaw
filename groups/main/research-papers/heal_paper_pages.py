@@ -236,7 +236,14 @@ def heal(pages, apply):
         except Exception as e:
             print(f"  {pid}: figure-heal error {type(e).__name__}: {e}", file=sys.stderr)
         try:
-            n_tbl = heal_tables(pid, apply=apply).get("placed") or 0
+            _tbl = heal_tables(pid, apply=apply)
+            n_tbl = _tbl.get("placed") or 0
+            # The injector's runaway guard refuses and says why, but only in its
+            # report. Read here as a bare count, a page stuck behind it looked like
+            # a page with nothing to do.
+            if str(_tbl.get("error", "")).startswith("runaway"):
+                print(f"  {pid}: TABLES {_tbl['error']} — the copies stay until "
+                      f"`dedup_tables.py --page {pid} --apply` is run", file=sys.stderr)
         except Exception as e:
             print(f"  {pid}: table-heal error {type(e).__name__}: {e}", file=sys.stderr)
         # PDF-only papers (no arxiv/ar5iv HTML) fall through BOTH heals above —
