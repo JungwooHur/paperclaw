@@ -68,6 +68,29 @@ def caption_number(cap: str):
     return int(tok) if tok.isdigit() else _ROMAN.get(tok.lower())
 
 
+def is_table_key(key: str) -> bool:
+    """A caption key this injector could have written: every one opens "table"."""
+    return key.startswith("table")
+
+
+def table_repeats(blocks: list) -> int:
+    """How many times the most repeated TABLE caption appears among the images.
+
+    Tables only. A composite figure's panels each carry the figure's caption, so a
+    repeated figure caption is normal: measured over the DB, 13 pages repeated one,
+    and every repeat was a different picture. Counting those made the runaway guard
+    refuse such a page for good, tables still unplaced included.
+    """
+    hist = {}
+    for b in blocks:
+        if b.get("type") != "image" or b.get("archived") or b.get("in_trash"):
+            continue
+        key = _cap_key(_image_caption(b))
+        if key and is_table_key(key):
+            hist[key] = hist.get(key, 0) + 1
+    return max(hist.values(), default=0)
+
+
 def placed_caption(num, caption: str) -> str:
     """The caption the injector writes on a table image: the source's, labelled.
 
@@ -346,24 +369,22 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     # It re-injected those 7 tables on every 5-minute cycle for days: 750 copies of
     # each, 5,278 images on one page. A number that fails to parse must never read
     # as "not placed yet".
-    existing, existing_caps, cap_hist = set(), set(), {}
+    existing, existing_caps = set(), set()
     for b in blocks:
         if b["type"] == "image":
-            cap = "".join(c.get("plain_text", "") for c in
-                          ((b.get("image") or {}).get("caption") or []))
+            cap = _image_caption(b)
             key = _cap_key(cap)
             if key:
                 existing_caps.add(key)
-                cap_hist[key] = cap_hist.get(key, 0) + 1
             n = caption_number(cap)
             if n is not None:
                 existing.add(n)
-    # Backstop for the next variant of the same fault: one image per caption is the
-    # only correct state, so a repeated caption means the idempotency key has failed
-    # again. Refuse rather than add to the pile.
-    dup = max(cap_hist.values(), default=0)
+    # Backstop for the next variant of the same fault: one image per table caption
+    # is the only correct state, so a repeated one means the idempotency key has
+    # failed again. Refuse rather than add to the pile.
+    dup = table_repeats(blocks)
     if dup > 1:
-        rep["error"] = f"runaway: a caption already appears {dup}x on this page"
+        rep["error"] = f"runaway: a table caption already appears {dup}x on this page"
         return rep
 
     html_text, html_src = ef.fetch_html(arxiv_id)

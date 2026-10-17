@@ -243,7 +243,7 @@ def heal(pages, apply):
             # a page with nothing to do.
             if str(_tbl.get("error", "")).startswith("runaway"):
                 print(f"  {pid}: TABLES {_tbl['error']} — the copies stay until "
-                      f"`dedup_images.py --page {pid} --apply` is run", file=sys.stderr)
+                      f"`dedup_tables.py --page {pid} --apply` is run", file=sys.stderr)
         except Exception as e:
             print(f"  {pid}: table-heal error {type(e).__name__}: {e}", file=sys.stderr)
         # PDF-only papers (no arxiv/ar5iv HTML) fall through BOTH heals above —

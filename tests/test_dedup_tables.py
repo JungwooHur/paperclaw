@@ -1,15 +1,19 @@
-"""Repeated copies of one image are removed, and nothing else is.
+"""Repeated copies of one table image are removed, and nothing else is.
 
-An injector that could not recognise its own output placed the same tables again
-on every healer cycle, and the copies outlived the fix: the runaway guard stopped
-the growth, but nothing took the pile away, and the guard then refused the page
-for good. One image per caption is the only correct state, so every later copy
-goes and the first stays.
+The table injector, unable to recognise its own output, placed the same tables
+again on every healer cycle, and the copies outlived the fix: the runaway guard
+stopped the growth, but nothing took the pile away, and the guard then refused the
+page for good. One image per table caption is the only correct state, so every
+later copy goes and the first stays.
+
+Figures are left alone. A composite figure's panels each carry the figure's
+caption, so a repeated figure caption is normal — and the guard used to count
+those too, refusing such a page so that its tables were never placed.
 
 A forced table run is the other way copies pile up, so its replace step is pinned
 here too: it archives what the new images stand in for, and nothing else.
 """
-import dedup_images as di
+import dedup_tables as dt
 import extract_paper_tables as ept
 
 
@@ -25,34 +29,28 @@ def para(bid, text="본문"):
             "paragraph": {"rich_text": [{"plain_text": text}]}}
 
 
-def guard_counts(blocks):
-    """What inject_tables' runaway guard counts: images per caption key."""
-    hist = {}
-    for b in blocks:
-        if b["type"] == "image":
-            key = ept._cap_key(ept._image_caption(b))
-            if key:
-                hist[key] = hist.get(key, 0) + 1
-    return hist
+def without(blocks, ids):
+    ids = set(ids)
+    return [b for b in blocks if b["id"] not in ids]
 
 
-class TestWhatCountsAsTheSameImage:
+class TestWhatCountsAsTheSameTable:
 
     def test_spacing_and_case_in_the_caption_do_not_matter(self):
-        assert (di.image_key(image("a", "TABLE I:  Results\n"))
-                == di.image_key(image("b", "table i: results")))
+        assert (dt.table_key(image("a", "TABLE I:  Results\n"))
+                == dt.table_key(image("b", "table i: results")))
 
     def test_the_file_name_does_not_matter(self):
         # Tables are uploaded as table_<i> numbered per run: one table placed by
         # two runs that rendered different sets carries two names.
-        assert (di.image_key(image("a", "Table A: Hyperparameters", "table_3.png"))
-                == di.image_key(image("b", "Table A: Hyperparameters", "table_0.png")))
+        assert (dt.table_key(image("a", "Table A: Hyperparameters", "table_3.png"))
+                == dt.table_key(image("b", "Table A: Hyperparameters", "table_0.png")))
 
-    def test_an_uncaptioned_image_has_no_identity(self):
-        assert di.image_key(image("a", "")) is None
-
-    def test_only_images_have_one(self):
-        assert di.image_key(para("p")) is None
+    def test_figures_and_uncaptioned_images_have_no_key(self):
+        assert dt.table_key(image("a", "Figure 2: Samples", "tmpab.png")) is None
+        assert dt.table_key(image("b", "(a)", "tmpcd.png")) is None
+        assert dt.table_key(image("c", "")) is None
+        assert dt.table_key(para("p")) is None
 
 
 class TestWhichCopiesGo:
@@ -62,61 +60,70 @@ class TestWhichCopiesGo:
                   image("t1", "TABLE II: B", "table_1.png"),
                   image("t0b", "TABLE I: A"), image("t1b", "TABLE II: B", "table_1.png"),
                   image("t0c", "TABLE I: A")]
-        assert di.duplicate_images(blocks) == ["t0b", "t1b", "t0c"]
+        assert dt.duplicate_tables(blocks) == ["t0b", "t1b", "t0c"]
 
     def test_a_page_that_ran_away_keeps_one_of_each(self):
         captions = [f"TABLE {n}: caption {n}" for n in ("I", "II", "III", "IV", "V")]
         blocks = [image(f"{i}-{k}", c, f"table_{k}.png")
                   for i in range(55) for k, c in enumerate(captions)]
-        extra = set(di.duplicate_images(blocks))
+        extra = dt.duplicate_tables(blocks)
         assert len(extra) == 54 * 5
-        assert [b["id"] for b in blocks if b["id"] not in extra] == [
-            f"0-{k}" for k in range(5)]
+        assert [b["id"] for b in without(blocks, extra)] == [f"0-{k}" for k in range(5)]
 
     def test_copies_under_different_file_names_still_collapse(self):
         blocks = [image("first", "Table A: Hyperparameters", "table_3.png"),
                   image("again", "Table A: Hyperparameters", "table_0.png"),
                   image("more", "Table A: Hyperparameters", "table_0.png")]
-        assert di.duplicate_images(blocks) == ["again", "more"]
+        assert dt.duplicate_tables(blocks) == ["again", "more"]
 
     def test_what_it_leaves_is_a_page_the_runaway_guard_accepts(self):
         blocks = [image(f"{i}-{k}", f"Table {k}: t{k}", f"table_{(k + i) % 3}.png")
                   for i in range(4) for k in range(3)]
-        assert max(guard_counts(blocks).values()) == 4
-        extra = set(di.duplicate_images(blocks))
-        left = [b for b in blocks if b["id"] not in extra]
-        assert max(guard_counts(left).values()) == 1
+        assert ept.table_repeats(blocks) == 4
+        assert ept.table_repeats(without(blocks, dt.duplicate_tables(blocks))) == 1
 
     def test_running_it_again_finds_nothing(self):
         blocks = [image("a", "TABLE I: A"), image("b", "TABLE I: A"),
                   image("c", "TABLE II: B", "table_1.png")]
-        extra = set(di.duplicate_images(blocks))
-        assert di.duplicate_images([b for b in blocks if b["id"] not in extra]) == []
+        assert dt.duplicate_tables(without(blocks, dt.duplicate_tables(blocks))) == []
 
 
 class TestWhatIsNeverTouched:
 
+    def test_a_composite_figures_panels_share_its_caption_and_all_stay(self):
+        blocks = [image("p1", "Figure 4: Zero-shot sampling", "tmp1.png"),
+                  image("p2", "Figure 4: Zero-shot sampling", "tmp2.png"),
+                  image("s1", "(a)", "tmp3.png"), image("s2", "(a)", "tmp4.png")]
+        assert dt.duplicate_tables(blocks) == []
+
     def test_uncaptioned_images_stay_even_when_they_share_a_file(self):
-        blocks = [image("a", "", "photo.png"), image("b", "", "photo.png")]
-        assert di.duplicate_images(blocks) == []
+        blocks = [image("a", "", "image.png"), image("b", "", "image.png")]
+        assert dt.duplicate_tables(blocks) == []
 
     def test_one_file_name_under_two_captions_is_two_tables(self):
         # Every run starts its counter at table_0, so distinct tables share names.
         blocks = [image("a", "TABLE I: A", "table_0.png"),
                   image("b", "TABLE III: C", "table_0.png")]
-        assert di.duplicate_images(blocks) == []
-
-    def test_different_floats_are_left_alone(self):
-        blocks = [image("a", "TABLE I: A", "table_0.png"),
-                  image("b", "TABLE II: B", "table_1.png"),
-                  image("c", "Figure 1: C", "fig1.png")]
-        assert di.duplicate_images(blocks) == []
+        assert dt.duplicate_tables(blocks) == []
 
     def test_an_already_archived_copy_is_neither_kept_nor_archived_again(self):
         gone = image("a", "TABLE I: A")
         gone["archived"] = True
         blocks = [gone, image("b", "TABLE I: A"), image("c", "TABLE I: A")]
-        assert di.duplicate_images(blocks) == ["c"]
+        assert dt.duplicate_tables(blocks) == ["c"]
+
+
+class TestTheRunawayGuardCountsTablesOnly:
+
+    def test_repeated_figure_captions_do_not_trip_it(self):
+        blocks = [image("p1", "Figure 4: Panels", "tmp1.png"),
+                  image("p2", "Figure 4: Panels", "tmp2.png"),
+                  image("t", "Table 1: Results")]
+        assert ept.table_repeats(blocks) == 1
+
+    def test_a_repeated_table_caption_does(self):
+        blocks = [image("a", "TABLE I: Results"), image("b", "TABLE I: Results")]
+        assert ept.table_repeats(blocks) == 2
 
 
 class TestAForcedTableRunReplaces:
