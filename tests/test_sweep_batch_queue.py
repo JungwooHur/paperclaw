@@ -429,7 +429,7 @@ def test_an_unreadable_file_is_never_written_over(env, broken):
     assert env.resumes() == []
 
 
-# A resume that finishes no paper backs off.
+# A resume that settles no paper backs off.
 #
 # Measured: NotebookLM throttled its chat while `notebooklm list`, the auth probe,
 # still worked, so every resume failed within minutes, left its papers pending as
@@ -444,10 +444,12 @@ def js_time(t):
     return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
 
 
-def resume_runs(env, finished=0, minutes=4):
+def resume_runs(env, finished=0, minutes=4, failed=0,
+                error="verify_sections: MISSING 3 sections"):
     """The resume the sweep just scheduled runs now and ends `minutes` later,
-    having finished `finished` pending papers. The rest stays pending, which is
-    what the agent does on a throttle, and its last queue write ends the run."""
+    having finished `finished` pending papers and marked the next `failed` of them
+    failed with `error`. The rest stays pending, which is what the agent does on a
+    throttle, and its last queue write ends the run."""
     active = env.sql("SELECT id FROM scheduled_tasks WHERE id LIKE"
                      " 'papers-batch-resume-%' AND status = 'active'")
     assert len(active) == 1, "the sweep should have scheduled one resume"
@@ -455,9 +457,13 @@ def resume_runs(env, finished=0, minutes=4):
     env.sql("UPDATE scheduled_tasks SET status = 'completed', next_run = NULL,"
             " last_run = ? WHERE id = ?", (js_time(env.clock), active[0][0]))
     q = env.queue()
-    for p in [p for p in q["papers"] if p["status"] == "pending"][:finished]:
+    pending = [p for p in q["papers"] if p["status"] == "pending"]
+    for p in pending[:finished]:
         p["status"] = "done"
         p["notion_page_id"] = "page-" + p["id"]
+    for p in pending[finished:finished + failed]:
+        p["status"] = "failed"
+        p["error"] = error
     sbq._write_json(env.queue_path, q)
     os.utime(env.queue_path, (env.clock.timestamp(),) * 2)
 
@@ -530,6 +536,30 @@ def test_a_resume_that_finishes_a_paper_resets_the_count(env, capsys):
     # And the count starts over: the next resume that gets nowhere is n=1 again.
     resume_runs(env)
     next_resume_after(env, capsys, 2 * COOLDOWN)
+
+
+def test_papers_that_fail_for_reasons_of_their_own_are_progress(env, capsys):
+    # A page verify_sections refuses is settled: no session will run that paper
+    # again, so the batch moved even though nothing was done.
+    first_resume(env, papers=6)
+    resume_runs(env, failed=3)
+    env.advance(COOLDOWN + 1)
+
+    assert env.sweep() == 0
+
+    assert len(env.resumes()) == 2, "settling papers should cost only the cooldown"
+    assert "backing off" not in capsys.readouterr().out
+
+
+def test_papers_the_environment_failed_are_no_progress(env, capsys):
+    # A throttled session can mark its papers failed instead of leaving them
+    # pending. They are retried, so nothing settled.
+    first_resume(env, papers=6)
+    resume_runs(env, failed=3, error="NotebookLM rate limit exceeded")
+
+    out = next_resume_after(env, capsys, 2 * COOLDOWN)
+
+    assert re.search(r"backing off\b.*\bn=1\b", out)
 
 
 def test_the_wait_doubles_up_to_twelve_hours_and_stays_there(env, capsys):
@@ -643,12 +673,12 @@ def write(text):
     write('{"batch": '),
     write("\xff not json"),
     write("[]"),
-    write('{"batch": 7, "done_at_resume": 0, "resumes_without_progress": 3}'),
-    write('{"batch": "created_at:2026-10-01T00:00:00Z", "done_at_resume": 0,'
+    write('{"batch": 7, "settled_at_resume": 0, "resumes_without_progress": 3}'),
+    write('{"batch": "created_at:2026-10-01T00:00:00Z", "settled_at_resume": 0,'
           ' "resumes_without_progress": -1}'),
-    write('{"batch": "created_at:2026-10-01T00:00:00Z", "done_at_resume": 0,'
+    write('{"batch": "created_at:2026-10-01T00:00:00Z", "settled_at_resume": 0,'
           ' "resumes_without_progress": true}'),
-    write('{"batch": "created_at:2026-10-01T00:00:00Z", "done_at_resume": "0",'
+    write('{"batch": "created_at:2026-10-01T00:00:00Z", "settled_at_resume": "0",'
           ' "resumes_without_progress": 3}'),
 ], ids=["missing", "truncated", "not-json", "a-list", "batch-not-text",
         "negative-count", "bool-count", "text-count"])

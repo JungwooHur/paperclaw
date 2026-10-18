@@ -64,16 +64,17 @@ scheduled or ran within the cooldown. It writes them in three cases only:
   * no queue or a drained one, a non-empty backlog, no resume scheduled or recent:
     refill, and schedule a resume.
 
-A resume that finishes no paper backs off. The auth probe runs `notebooklm list`,
+A resume that settles no paper backs off. The auth probe runs `notebooklm list`,
 which still works while NotebookLM throttles its CHAT, so a throttled resume fails
 in minutes, leaves its papers pending and messages the owner, and without a
 backoff the next one would follow a cooldown later, all night. So each scheduled
 resume is recorded in SWEEP_STATE, a host-only file like the backlog: the batch it
-was handed and how many papers were `done` then. When the next stranded check
-finds the same batch with no more papers done, the quiet time since that resume
-doubles per resume in a row that got nowhere (cooldown * 2**n, capped at
-BACKOFF_CAP_MIN). The check runs before the probe, so a backing-off sweep never
-drives the browser. A new batch, a drained queue, or a missing or unreadable
+was handed and how many of its papers were settled then, `done` or `failed` for a
+reason of their own (an env-failed paper is retried, so it settles nothing). When
+the next stranded check finds the same batch with no more papers settled, the
+quiet time since that resume doubles per resume in a row that got nowhere
+(cooldown * 2**n, capped at BACKOFF_CAP_MIN). The check runs before the probe, so
+a backing-off sweep never drives the browser. A new batch, a drained queue, or a missing or unreadable
 state file counts from n=0, so the state can delay a resume but never block one.
 
   sweep_batch_queue.py [--dry-run] [--stale-min N] [--cooldown-min N]
@@ -397,8 +398,20 @@ def batch_id(q):
     return "papers:" + " ".join(keys)
 
 
-def done_count(q):
-    return sum(1 for p in (q or {}).get("papers", []) if p.get("status") == "done")
+def env_failed(p):
+    """A paper an environmental failure (dead NotebookLM session, rate limit)
+    buried as `failed`: retryable, not broken."""
+    return (p.get("status") == "failed"
+            and bool(_ENV_FAIL.search(str(p.get("error") or ""))))
+
+
+def settled_count(q):
+    """Papers of `q` no session will run again: `done`, or `failed` for a reason of
+    their own, such as a page verify_sections refused. An env-failed paper is
+    retried, so it is not settled; a throttled session settles nothing."""
+    return sum(1 for p in (q or {}).get("papers", [])
+               if p.get("status") == "done"
+               or (p.get("status") == "failed" and not env_failed(p)))
 
 
 def _is_count(v):
@@ -433,7 +446,7 @@ def load_state():
               f"batch from n=0")
         return None
     if not (isinstance(s, dict) and isinstance(s.get("batch"), str)
-            and _is_count(s.get("done_at_resume"))
+            and _is_count(s.get("settled_at_resume"))
             and _is_count(s.get("resumes_without_progress"))):
         print("sweep: backoff state malformed — counting this batch from n=0")
         return None
@@ -446,7 +459,7 @@ def save_state(q, n):
     try:
         _write_json(SWEEP_STATE, {
             "batch": batch_id(q),
-            "done_at_resume": done_count(q),
+            "settled_at_resume": settled_count(q),
             "resumes_without_progress": n,
             "resumed_at": _now().isoformat(),
         })
@@ -467,11 +480,11 @@ def clear_state():
 
 
 def no_progress_streak(q, state):
-    """Resumes in a row, the last one included, that finished no paper of this
+    """Resumes in a row, the last one included, that settled no paper of this
     batch. Computed, not stored, so a sweep that only looks writes nothing."""
     if state is None or state["batch"] != batch_id(q):
         return 0
-    if done_count(q) > state["done_at_resume"]:
+    if settled_count(q) > state["settled_at_resume"]:
         return 0
     return state["resumes_without_progress"] + 1
 
@@ -577,8 +590,7 @@ def main(argv=None) -> int:
     # Papers buried by an environmental failure (dead NotebookLM session, rate limit)
     # are retryable, not broken — count them as work so a queue that a bad session
     # marked "all failed" is still recovered once the environment is healthy again.
-    retryable = [p for p in papers
-                 if p.get("status") == "failed" and _ENV_FAIL.search(str(p.get("error") or ""))]
+    retryable = [p for p in papers if env_failed(p)]
     if not pending and not running and not retryable:
         return refill(q, backlog, a, snapshot)      # absent or drained
 
@@ -614,7 +626,7 @@ def main(argv=None) -> int:
                           f"({left} waiting)")
             return 0
 
-        # A resume that finished nothing hit something the auth probe cannot see,
+        # A resume that settled nothing hit something the auth probe cannot see,
         # such as a chat throttle, and the next one would fail the same way. Checked
         # before the probe, so a sweep that is backing off never drives the browser.
         state = load_state()
@@ -623,7 +635,7 @@ def main(argv=None) -> int:
             wait = backoff_min(a.cooldown_min, n)
             owed = backoff_left(conn, state, wait)
             if owed > 0:
-                print(f"sweep: backing off — n={n} resume(s) in a row finished no "
+                print(f"sweep: backing off — n={n} resume(s) in a row settled no "
                       f"paper of this batch; next resume in {math.ceil(owed)}m of a "
                       f"{wait:.0f}m wait, writing nothing")
                 return 0
