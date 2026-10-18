@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('./container-runner.js', () => ({
+  runContainerAgent: vi.fn(),
+  writeTasksSnapshot: vi.fn(),
+}));
+
+import { ContainerOutput, runContainerAgent } from './container-runner.js';
 import {
   _initTestDatabase,
   createTask,
@@ -10,6 +16,7 @@ import {
 import {
   _resetSchedulerLoopForTests,
   startSchedulerLoop,
+  TASK_CLOSE_DELAY_MS,
 } from './task-scheduler.js';
 
 describe('task scheduler', () => {
@@ -100,5 +107,72 @@ describe('task scheduler', () => {
 
       expect(registeredGroups).not.toHaveBeenCalled();
     });
+  });
+
+  // A turn the SDK ends without text — error_max_turns carries none — is still
+  // the end of a single-turn run. Left open, the runner waits on IPC until the
+  // group's hard timeout, and the group's queue is blocked the whole time.
+  it('closes a run whose only output is a turn end with no text', async () => {
+    createTask({
+      id: 'task-silent',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'resume the batch',
+      schedule_type: 'once',
+      schedule_value: '',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-10-01T00:00:00.000Z',
+    });
+
+    let exit: (() => void) | undefined;
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _onProcess, onOutput) => {
+        const turnEnd: ContainerOutput = {
+          status: 'success',
+          result: null,
+          newSessionId: 'session-1',
+        };
+        await onOutput?.(turnEnd);
+        // The container exits only once it is told to close.
+        await new Promise<void>((resolve) => {
+          exit = resolve;
+        });
+        return { status: 'success', result: null, newSessionId: 'session-1' };
+      },
+    );
+    let started = false;
+    const queue = {
+      enqueueTask: (_jid: string, _id: string, fn: () => Promise<void>) => {
+        if (started) return;
+        started = true;
+        void fn();
+      },
+      closeStdin: vi.fn(() => exit?.()),
+      notifyIdle: vi.fn(),
+    };
+
+    startSchedulerLoop({
+      registeredGroups: () => ({
+        'main@g.us': {
+          name: 'Main',
+          folder: 'main',
+          trigger: '@Andy',
+          added_at: '2026-10-01T00:00:00.000Z',
+        },
+      }),
+      getSessions: () => ({}),
+      queue: queue as any,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(queue.closeStdin).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(TASK_CLOSE_DELAY_MS);
+    expect(queue.closeStdin).toHaveBeenCalledWith('main@g.us');
+    expect(getTaskById('task-silent')?.status).toBe('completed');
   });
 });

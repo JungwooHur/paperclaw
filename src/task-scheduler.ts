@@ -27,6 +27,11 @@ import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 import { deferredTaskRun, recordUsageLimit } from './usage-limit.js';
 
+// After a query turn ends, close the task container promptly. Tasks are
+// single-turn, so there is no reason to wait for the group's hard timeout; the
+// short delay lets any final MCP calls land.
+export const TASK_CLOSE_DELAY_MS = 10000;
+
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
@@ -132,10 +137,6 @@ async function runTask(
   const sessionId =
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
 
-  // After the task produces a result, close the container promptly.
-  // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
-  // query loop to time out. A short delay handles any final MCP calls.
-  const TASK_CLOSE_DELAY_MS = 10000;
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
   // Set once the run returns. The runner stops waiting for a stuck callback
   // after OUTPUT_SETTLE_TIMEOUT; one that finishes later must not close or
@@ -179,8 +180,14 @@ async function runTask(
           }
           scheduleClose();
         }
-        if (streamedOutput.status === 'success' && !runEnded) {
-          deps.queue.notifyIdle(task.chat_jid);
+        if (streamedOutput.status === 'success') {
+          // The runner writes a success marker only when a query turn ends: an
+          // SDK result, with or without text, or the session update after the
+          // query. A result with no text (error_max_turns carries none) used to
+          // leave the container waiting on IPC until the group's hard timeout,
+          // holding the group's queue for hours.
+          scheduleClose();
+          if (!runEnded) deps.queue.notifyIdle(task.chat_jid);
         }
         if (streamedOutput.status === 'error') {
           error = streamedOutput.error || 'Unknown error';
