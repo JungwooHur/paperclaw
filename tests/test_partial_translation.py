@@ -343,7 +343,13 @@ class TestAClearedPageGetsItsListBack:
         monkeypatch.setattr(cp, "CLEARED_DIR", str(tmp_path))
         for name in records:
             (tmp_path / name).write_text("{}")
-        monkeypatch.setattr(lr, "link_page", lambda pid, apply=False: {"linked": pid})
+        monkeypatch.setattr(lr, "link_page",
+                            lambda pid, apply=False, blocks=None: {"linked": pid})
+        # A page translated as long ago as it was made: the translation's own age
+        # (tests/test_reference_list_age.py) cannot rescue it either.
+        old = [dict(b, created_time=OLD_PAGE) for b in DONE]
+        monkeypatch.setattr(lr.vs, "fetch_blocks", lambda _: old)
+        monkeypatch.setattr(cp, "_me_id", lambda: ME)
         return lr.heal_references("abc-123", created_time=OLD_PAGE)
 
     def test_an_old_page_cleared_this_week_is_healed_like_a_new_one(self, monkeypatch, tmp_path):

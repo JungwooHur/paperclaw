@@ -258,8 +258,9 @@ def heal(pages, apply):
                   file=sys.stderr)
         # The source's own English bibliography, placed at the tail, with every
         # citation the alignment could PROVE turned into a link into it. Gated to
-        # recently-created pages: this was asked for on new papers, and back-filling
-        # the whole DB is a separate, explicit decision.
+        # recently-translated pages (an old row counts by its translation's age):
+        # this was asked for on new papers, and back-filling the whole DB is a
+        # separate, explicit decision.
         n_ref = 0
         try:
             _rf = heal_references(pid, apply=apply)
