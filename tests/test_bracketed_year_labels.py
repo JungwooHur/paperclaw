@@ -90,6 +90,14 @@ class FakeNotion:
         if body.get("archived"):
             target["archived"] = True
         else:
+            for value in body.values():
+                for span in (value.get("rich_text") or () if isinstance(value, dict) else ()):
+                    # As Notion reads a span back: its text as `plain_text`, and
+                    # a link as `href` as well.
+                    span.setdefault("plain_text", span["text"]["content"])
+                    link = (span.get("text") or {}).get("link")
+                    if link:
+                        span["href"] = link["url"]
             target.update(body)
         return target
 
@@ -448,3 +456,68 @@ class TestAnAmbiguousAuthorYearIsNotLinked:
             {e["num"]: f"ref{e['num']}" for e in entries},
             {e["num"]: e["text"] for e in entries}, apply=False)
         assert linked == 1
+
+
+def citation_target(fake):
+    """The block the body's author-year citation links to."""
+    cited = next(b for b in fake.blocks if b["id"] == "c")
+    url = next(s["href"] for s in cited["paragraph"]["rich_text"] if s.get("href"))
+    return url.rsplit("#", 1)[1]
+
+
+def live_ids(fake):
+    return {b["id"] for b in fake.live()}
+
+
+class TestAuthorYearLinksFollowARebuiltList:
+    """Rebuilding the list gives every entry a new block. `link_author_year`
+    skipped every span that already carried a link, so after a rebuild each
+    author-year citation in the body pointed at an archived block, which reads
+    exactly like a working link until it is clicked."""
+
+    def linked_page(self, monkeypatch):
+        fake = FakeNotion(body() + [block("c", "paragraph",
+                                          "앞선 연구 (Roe and Poe, 2019)를 따른다.")])
+        wire(monkeypatch, fake, NATBIB)
+        report = lr.heal_references("page", apply=True, created_time=NOW)
+        assert report["author_year_linked"] == 1
+        return fake
+
+    def translation_below(self, fake):
+        # The rest of the translation arrived after the list had been written.
+        for n in range(7, 13):
+            fake.blocks += [block(f"h{n}", "heading_1", f"{n} Section {n} (섹션 {n})"),
+                            block(f"b{n}", "paragraph", SENTENCE * 20)]
+
+    def test_force_repoints_them(self, monkeypatch):
+        fake = self.linked_page(monkeypatch)
+        before = citation_target(fake)
+        report = lr.link_page("page", apply=True, force=True)
+        assert report["author_year_linked"] == 1
+        assert citation_target(fake) != before
+        assert citation_target(fake) in live_ids(fake)
+
+    def test_a_link_already_on_its_entry_is_left_alone(self, monkeypatch):
+        fake = self.linked_page(monkeypatch)
+        before = citation_target(fake)
+        assert lr.link_page("page", apply=True, relink=True)["author_year_linked"] == 0
+        assert citation_target(fake) == before
+
+    def test_the_healer_leaves_a_readable_list_where_it_is(self, monkeypatch):
+        # The boundary still reads this list; only `_find_refs_heading`, which
+        # counts paragraphs to the end of the page, does not. Replacing it is not
+        # the healer's job, and doing so stranded the links already made.
+        fake = self.linked_page(monkeypatch)
+        self.translation_below(fake)
+        assert rs.list_spans(fake.live()) == [(13, 17)]
+        report = lr.heal_references("page", apply=True, created_time=NOW)
+        assert "replaced" not in report and fake.appends == 1
+        assert citation_target(fake) in live_ids(fake)
+
+    def test_force_rebuilds_it_and_repoints_them(self, monkeypatch):
+        fake = self.linked_page(monkeypatch)
+        self.translation_below(fake)
+        report = lr.link_page("page", apply=True, force=True)
+        assert report["replaced"] == 4
+        assert len(headings_named_references(fake)) == 1
+        assert citation_target(fake) in live_ids(fake)

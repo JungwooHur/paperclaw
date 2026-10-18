@@ -407,7 +407,7 @@ def _find_refs_heading(blocks: list):
     return None
 
 
-def own_unread_list(blocks: list, entries: list):
+def own_unread_list(blocks: list, entries: list, readable: bool = False):
     """(heading id, entry ids) of a list this tool wrote but cannot read, or None.
 
     `_find_refs_heading` recognises a list by its labels. A list an older writer
@@ -421,9 +421,16 @@ def own_unread_list(blocks: list, entries: list):
     does not match that. Only the heading and the paragraphs that match are
     returned, so nothing else under the heading is touched.
 
+    A list the boundary still reads is not one of these. `_find_refs_heading`
+    counts paragraphs to the end of the page, so it misses a readable list with
+    a translation appended below it; replacing that one moved the list and left
+    links already in the body pointing at the archived copy.
+
     Args:
         blocks: The page's top-level blocks.
         entries: The bibliography as parsed from the source.
+        readable: Return such a list as well. `--force` rebuilds whatever list
+            this tool wrote, and without it would append a second.
     """
     texts = {e["text"] for e in entries}
 
@@ -439,8 +446,9 @@ def own_unread_list(blocks: list, entries: list):
         return False
 
     ours = set(reference_headings(blocks))
+    read = {start for start, _end in reference_section.list_spans(blocks)}
     for i, b in enumerate(blocks):
-        if b["id"] not in ours:
+        if b["id"] not in ours or (i in read and not readable):
             continue
         run = []
         for x in blocks[i + 1:]:
@@ -855,7 +863,7 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
         # The list to take down first: the one `--force` rebuilds, or one this
         # tool wrote in a form nothing reads any more. The second is replaced
         # without `--force`, because nothing else will ever remove it.
-        old = found or own_unread_list(blocks, entries)
+        old = found or own_unread_list(blocks, entries, readable=force)
         if not old and not may_inject_references(blocks) and not force:
             # A list is already there even if its entries did not parse. Appending
             # a second one is how a page runs away; refuse and say so.
@@ -1050,6 +1058,26 @@ def author_year_index(entries: list) -> dict:
     return out
 
 
+def is_stale_citation(span: dict, page_id: str, index: dict, ref_ids: dict) -> bool:
+    """Is this span an author-year citation linked to a block its entry has left?
+
+    Rebuilding the list gives every entry a new block, and a linker that skips
+    whatever is already linked leaves those citations pointing at archived
+    blocks, which reads exactly like a working link until one is clicked.
+
+    Only a span that IS one citation, linked into this page, qualifies. A link
+    someone put on prose is theirs, and one already on its entry stays as it is.
+    """
+    if span.get("type") != "text":
+        return False
+    url = span.get("href") or ((span.get("text") or {}).get("link") or {}).get("url")
+    if not url or f"{page_id.replace('-', '')}#" not in url:
+        return False
+    m = _AY_CITE.fullmatch((span.get("text") or {}).get("content", ""))
+    num = index.get(_ay_key(m.group(1), m.group(2))) if m else None
+    return num in ref_ids and not url.endswith("#" + ref_ids[num].replace("-", ""))
+
+
 def link_author_year(page_id: str, blocks: list, index: dict, ref_ids: dict,
                      entries_by_num: dict, apply: bool) -> int:
     """Link every `Author et al. YEAR` in the body to its reference block."""
@@ -1061,8 +1089,11 @@ def link_author_year(page_id: str, blocks: list, index: dict, ref_ids: dict,
             continue
         out, hits = [], 0
         for sp in spans:
-            if sp.get("type") != "text" or sp.get("href"):
+            stale = is_stale_citation(sp, page_id, index, ref_ids)
+            if sp.get("type") != "text" or (sp.get("href") and not stale):
                 out.append(sp); continue
+            if stale:                      # drop the old target before relinking
+                sp = dict(sp, href=None, text=dict(sp.get("text") or {}, link=None))
             text, pos = sp["text"]["content"], 0
             for m in _AY_CITE.finditer(text):
                 num = index.get(_ay_key(m.group(1), m.group(2)))
