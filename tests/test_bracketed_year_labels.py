@@ -180,6 +180,17 @@ class TestReadingTheListBack:
 NOW = "2099-01-01T00:00:00.000Z"    # never older than the healer's age gate
 
 
+def wire(monkeypatch, fake, html):
+    """Point both healers at `fake`, and the source fetch at `html`."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    monkeypatch.setattr(sb, "fetch_blocks", fake.live)
+    monkeypatch.setattr(sb, "_api", fake.api)
+    monkeypatch.setattr(lr.vs, "fetch_blocks", fake.live)
+    monkeypatch.setattr(lr, "notion", fake.api)
+    monkeypatch.setattr(ef, "arxiv_id_from_page", lambda _p: "2401.12345")
+    monkeypatch.setattr(ef, "fetch_html", lambda _a: (html, "https://example.org/"))
+
+
 class TestTheHealerCycleSettles:
     """Back-matter stripping, then the reference healer, as one healer cycle runs
     them — against a page held in memory instead of Notion."""
@@ -188,18 +199,9 @@ class TestTheHealerCycleSettles:
         return (sb.strip_backmatter("page", apply=True),
                 lr.heal_references("page", apply=True, created_time=NOW))
 
-    def wire(self, monkeypatch, fake):
-        monkeypatch.setattr(time, "sleep", lambda _s: None)
-        monkeypatch.setattr(sb, "fetch_blocks", fake.live)
-        monkeypatch.setattr(sb, "_api", fake.api)
-        monkeypatch.setattr(lr.vs, "fetch_blocks", fake.live)
-        monkeypatch.setattr(lr, "notion", fake.api)
-        monkeypatch.setattr(ef, "arxiv_id_from_page", lambda _p: "2401.12345")
-        monkeypatch.setattr(ef, "fetch_html", lambda _a: (NATBIB, "https://example.org/"))
-
     def test_a_list_written_once_stays(self, monkeypatch):
         fake = FakeNotion(body())
-        self.wire(monkeypatch, fake)
+        wire(monkeypatch, fake, NATBIB)
         _, first = self.cycle()
         assert first["refs"] == "injected 3"
         for _ in range(3):
@@ -214,7 +216,7 @@ class TestTheHealerCycleSettles:
             block(f"old{i}", "paragraph", f"[{label[:-1]}] Author {i}. A title.")
             for i, label in enumerate(LABELS)]
         fake = FakeNotion(body() + mangled)
-        self.wire(monkeypatch, fake)
+        wire(monkeypatch, fake, NATBIB)
         stripped, healed = self.cycle()
         assert stripped["archived"] == len(mangled)
         assert healed["refs"] == "injected 3"
@@ -252,6 +254,81 @@ class TestAuthorYearCitationsAreLinked:
     def test_the_healer_links_them_when_it_writes_the_list(self, monkeypatch):
         cited = block("c", "paragraph", "앞선 연구 (Roe and Poe, 2019)를 따른다.")
         fake = FakeNotion(body() + [cited])
-        TestTheHealerCycleSettles().wire(monkeypatch, fake)
+        wire(monkeypatch, fake, NATBIB)
         report = lr.heal_references("page", apply=True, created_time=NOW)
         assert (report["refs"], report["author_year_linked"]) == ("injected 3", 1)
+
+
+def natbib_list(labels, author="Jane Doe{n}."):
+    return ('<ul class="ltx_biblist">\n'
+            + "".join(natbib_item(n, label, author.format(n=n), f"Invented title {n}.")
+                      for n, label in enumerate(labels, 1))
+            + '</ul>\n')
+
+
+# Three labels the boundary refuses: 47 characters with the year, where a label
+# may hold 40. Invented names; a consortium-style author list reaches that.
+LONG = [f"Invented Consortium Number {n} Team et&nbsp;al. [20{10 + n}]" for n in (1, 2, 3)]
+SOME_LONG = natbib_list(LONG + [f"Doe{n} et&nbsp;al. [20{10 + n}]" for n in range(4, 11)])
+
+
+class TestTheWriterWritesOnlyWhatTheBoundaryReads:
+    """`strip_backmatter` decides whether a list is ours by reading its labels;
+    the injector's own guard reads only the heading. So any list with more than
+    a fifth of its labels outside the boundary's grammar was archived and written
+    again on every cycle. The writer now asks the boundary before it writes."""
+
+    def test_the_label_check_agrees_with_the_boundary(self):
+        for label in ["7", "ACDE12", "VSP + 17", "Doe et al. [2021]",
+                      "Doe et al. (2021)", "Fou"]:
+            assert rs.is_label(label), label
+        for label in ["Invented Consortium Number 1 Team et al. [2011]",
+                      "Doe [n.d.]", "Invented", "see below", "홍길동 [2020]"]:
+            assert not rs.is_label(label), label
+
+    def test_a_label_it_would_refuse_is_written_as_the_entry_number(self, monkeypatch):
+        texts = written_entries(monkeypatch, lr.parse_bibliography(SOME_LONG))
+        assert texts[0].startswith("[1] Jane Doe1.")
+        assert texts[3].startswith("[Doe4 et al. [2014]] Jane Doe4.")
+
+    def test_every_written_entry_is_read_back(self, monkeypatch):
+        entries = lr.parse_bibliography(SOME_LONG)
+        texts = written_entries(monkeypatch, entries)
+        found = lr.ref_ids_from_texts({f"b{i}": t for i, t in enumerate(texts)}, entries)
+        assert len(found) == len(entries)
+
+    def test_a_list_with_some_long_labels_settles(self, monkeypatch):
+        fake = FakeNotion(body(30))
+        wire(monkeypatch, fake, SOME_LONG)
+        for _ in range(4):
+            sb.strip_backmatter("page", apply=True)
+            lr.heal_references("page", apply=True, created_time=NOW)
+        assert fake.appends == 1
+        assert rs.list_spans(fake.live()) == [(60, 71)]
+
+    # An English bibliography that gives three authors' names in Hangul: no label
+    # can make those entries readable, so the list cannot be written at all.
+    HANGUL = natbib_list([f"Doe{n} et&nbsp;al. [20{10 + n}]" for n in range(1, 11)],
+                         author="Jane Doe{n} and 홍길동.")
+
+    def test_a_list_the_boundary_cannot_read_is_never_written(self, monkeypatch):
+        fake = FakeNotion(body(30))
+        wire(monkeypatch, fake, self.HANGUL)
+        for _ in range(4):
+            sb.strip_backmatter("page", apply=True)
+            report = lr.heal_references("page", apply=True, created_time=NOW)
+        assert (fake.appends, report["refs"]) == (0, "not written")
+
+    def test_force_does_not_trade_a_list_for_nothing(self, monkeypatch):
+        texts = written_entries(monkeypatch, lr.parse_bibliography(NATBIB))
+        fake = FakeNotion(body() + [block("ref", "heading_1", "References")]
+                          + [block(f"e{i}", "paragraph", t) for i, t in enumerate(texts)])
+        wire(monkeypatch, fake, self.HANGUL)
+        assert lr.link_page("page", apply=True, force=True)["refs"] == "not written"
+        assert len(rs.list_spans(fake.live())) == 1
+
+    def test_the_injector_refuses_it_whoever_calls_it(self, monkeypatch):
+        import pytest
+        for html in (self.HANGUL, natbib_list(["Doe [2021]", "Roe [2022]"])):
+            with pytest.raises(lr.UnreadableList):
+                written_entries(monkeypatch, lr.parse_bibliography(html))

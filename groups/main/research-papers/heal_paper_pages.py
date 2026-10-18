@@ -267,6 +267,10 @@ def heal(pages, apply):
             if str(_rf.get("refs", "")).startswith(("injected", "would inject")):
                 print(f"  {pid}: REFERENCES {_rf['refs']} entries, "
                       f"{_rf.get('sections_linked', 0)} section(s) linked")
+            elif _rf.get("refs") == "not written":
+                # A refusal read by nobody looks exactly like a page with no work.
+                print(f"  {pid}: REFERENCES not written: {_rf.get('warning')}",
+                      file=sys.stderr)
         except Exception as e:
             print(f"  {pid}: reference-heal error {type(e).__name__}: {e}",
                   file=sys.stderr)

@@ -98,6 +98,23 @@ def entry_label(text: str):
     return label
 
 
+def _cites(label: str) -> bool:
+    """Does the label read as a citation: a year or index, or a bare tag?"""
+    return any(c.isdigit() for c in label) or bool(_BARE_TAG.match(label))
+
+
+def is_label(label: str) -> bool:
+    """Would an entry opening with `[label]` be read as one?
+
+    Asked by the writer before it writes, so it never puts out a label this
+    module would refuse. An entry is the label plus English text, and the text
+    is the source's own, so the label is the half the writer controls.
+    """
+    label = label.strip()
+    return (entry_label(f"[{label}] ") == label and _cites(label)
+            and not _KOREAN.search(label))
+
+
 def is_entry(block: dict) -> bool:
     """Does this block open with a reference label, in English?
 
@@ -109,7 +126,7 @@ def is_entry(block: dict) -> bool:
     label = entry_label(text)
     if label is None or _KOREAN.search(text):
         return False
-    return any(c.isdigit() for c in label) or bool(_BARE_TAG.match(label))
+    return _cites(label)
 
 
 def looks_like_list(paragraphs: list) -> bool:

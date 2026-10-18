@@ -464,18 +464,63 @@ def _link(page_id: str, block_id: str, entry: str = "") -> str:
             f"#{block_id.replace('-', '')}")
 
 
+class UnreadableList(ValueError):
+    """The list would not be recognised as a reference list once written."""
+
+
+def written_label(entry: dict) -> str:
+    """The label an entry is written under: its own, or else its number.
+
+    Its own whenever the boundary reads it as a label, which every style in use
+    does. A label it would refuse (longer than a label may be, with no digit, a
+    corporate name over six letters) is written as the entry's number. The
+    boundary decides whether the list is ours by its labels, so a list it cannot
+    read is archived by back-matter stripping and written again by the healer,
+    every cycle.
+    """
+    label = entry.get("label") or str(entry["num"])
+    return label if reference_section.is_label(label) else str(entry["num"])
+
+
+def entry_texts(entries: list) -> list:
+    """The paragraph `inject_references` writes for each entry."""
+    return [f"[{written_label(e)}] {e['text']}"[:2000] for e in entries]
+
+
+def list_is_recognised(entries: list) -> bool:
+    """Would the boundary read the list written for these entries as one?
+
+    `written_label` makes every label readable. What can still fail is the
+    text, which is the source's own: an English bibliography can give an
+    author's name in Hangul. A list of fewer than three entries never reads
+    as one either.
+    """
+    return reference_section.looks_like_list(
+        [{"type": "paragraph", "paragraph": {"rich_text": [{"plain_text": text}]}}
+         for text in entry_texts(entries)])
+
+
 def inject_references(page_id: str, entries: list, apply: bool) -> dict:
-    """Append the English reference list; return {num: block_id}."""
+    """Append the English reference list; return {num: block_id}.
+
+    Raises:
+        UnreadableList: the boundary would not recognise the list once it is
+            written. Back-matter stripping would archive it as a translated
+            bibliography and the healer would write it again, on every cycle. A
+            copy count never sees that loop, because the old list is always gone
+            before the new one arrives, so it is refused here, before the write.
+    """
+    if not list_is_recognised(entries):
+        raise UnreadableList(f"{len(entries)} entries would not read as a "
+                             f"reference list once written")
     ids = {}
     blocks = [{"object": "block", "type": "heading_1",
                "heading_1": {"rich_text": [{"type": "text",
                                             "text": {"content": REFS_HEADING}}]}}]
-    for e in entries:
+    for text in entry_texts(entries):
         blocks.append({"object": "block", "type": "paragraph",
                        "paragraph": {"rich_text": [
-                           {"type": "text",
-                            "text": {"content":
-                                f"[{e.get('label') or e['num']}] {e['text']}"[:2000]}}]}})
+                           {"type": "text", "text": {"content": text}}]}})
     if not apply:
         return {}
     made = []
@@ -752,6 +797,14 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
             rep["warning"] = ("a reference heading is already on the page but its "
                               "entries were not recognised; refusing to append")
             return rep
+        if not list_is_recognised(entries):
+            # Checked before anything is archived, so `--force` cannot trade a
+            # list for nothing.
+            rep["refs"] = "not written"
+            rep["warning"] = ("the list would not read as a reference list once "
+                              "written: back-matter stripping would archive it and "
+                              "this would write it again, every cycle")
+            return rep
         if found and force and apply:
             for bid in [found[0]] + found[1]:
                 try:
@@ -970,7 +1023,9 @@ def ref_ids_from_texts(texts: dict, entries: list) -> dict:
     # Whitespace is dropped entirely on both sides: the source writes
     # `[VSP + 17]` and the translated body writes `[VSP+17]` for the same entry.
     tight = lambda text: re.sub(r"\s+", "", text)
-    by_label = {tight(e["label"]): e["num"] for e in entries if e.get("label")}
+    # Keyed on the label each entry was WRITTEN under, which is its number when
+    # the boundary would not have read its own.
+    by_label = {tight(written_label(e)): e["num"] for e in entries}
     # The boundary's own label grammar, so a label is read back exactly as it was
     # written: an inner `[2021]` closes the label, it does not end it early.
     found = {}
