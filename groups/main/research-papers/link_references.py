@@ -982,7 +982,7 @@ HEAL_MAX_AGE_DAYS = 7
 
 # --- author-year papers -------------------------------------------------------
 # Half the papers here do not cite by number at all: the body says
-# "(Brohan et al. 2022)" and the reference list is labelled "Brohan et al. [2022]".
+# "(Doe et al. 2022)" and the reference list is labelled "Doe et al. [2022]".
 # The numeric path above can do nothing with that, so those pages got a reference
 # list and not one working link — on one of them, 73 citations.
 #
