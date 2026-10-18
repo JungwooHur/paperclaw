@@ -211,7 +211,10 @@ def _load_json(path):
             data = json.load(f)
     except FileNotFoundError:
         return None
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+    # ValueError covers JSONDecodeError and UnicodeDecodeError, and also what
+    # json.load raises past Python's integer digit limit; deep nesting raises
+    # RecursionError.
+    except (ValueError, OSError, RecursionError) as e:
         raise Unreadable(f"{os.path.basename(path)}: {type(e).__name__}: {e}") from e
     if not isinstance(data, dict) or not isinstance(data.get("papers", []), list):
         raise Unreadable(f"{os.path.basename(path)}: not a {{\"papers\": [...]}} object")
@@ -441,7 +444,7 @@ def load_state():
     except FileNotFoundError:
         print("sweep: no backoff state — counting this batch from n=0")
         return None
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+    except (ValueError, OSError, RecursionError) as e:    # as in _load_json
         print(f"sweep: backoff state unreadable ({type(e).__name__}) — counting this "
               f"batch from n=0")
         return None

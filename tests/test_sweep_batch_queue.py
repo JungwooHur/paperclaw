@@ -414,13 +414,21 @@ def test_a_dry_run_writes_nothing(env, setup):
     assert env.resumes() == before_tasks
 
 
+# What json.load rejects without a JSONDecodeError: an integer past Python's
+# digit limit is a plain ValueError, and deep nesting a RecursionError.
+TOO_MANY_DIGITS = '{"papers": [], "n": ' + "1" * 5000 + "}"
+TOO_DEEP = '{"papers": ' + "[" * 100000
+
+
+@pytest.mark.parametrize("text", ['{"papers": [', TOO_MANY_DIGITS, TOO_DEEP],
+                         ids=["truncated", "too-many-digits", "too-deep"])
 @pytest.mark.parametrize("broken", ["queue", "backlog"])
-def test_an_unreadable_file_is_never_written_over(env, broken):
+def test_an_unreadable_file_is_never_written_over(env, broken, text):
     env.write_queue([paper(i) for i in range(10)])
     env.write_backlog([paper(20)])
     path = env.queue_path if broken == "queue" else env.backlog_path
     with open(path, "w", encoding="utf-8") as f:
-        f.write('{"papers": [')
+        f.write(text)
     before = env.files()
 
     assert env.sweep() == 1
@@ -680,8 +688,12 @@ def write(text):
           ' "resumes_without_progress": true}'),
     write('{"batch": "created_at:2026-10-01T00:00:00Z", "settled_at_resume": "0",'
           ' "resumes_without_progress": 3}'),
+    write('{"batch": "created_at:2026-10-01T00:00:00Z", "settled_at_resume": '
+          + "1" * 5000 + ', "resumes_without_progress": 3}'),
+    write("[" * 100000),
 ], ids=["missing", "truncated", "not-json", "a-list", "batch-not-text",
-        "negative-count", "bool-count", "text-count"])
+        "negative-count", "bool-count", "text-count", "too-many-digits",
+        "too-deep"])
 def test_a_missing_or_broken_state_counts_from_zero(env, damage, capsys):
     first_resume(env)
     resume_runs(env)
