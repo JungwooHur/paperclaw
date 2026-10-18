@@ -127,6 +127,27 @@ _SECTION = re.compile(r'<section[^>]+id="(S\d+)"[^>]*>.*?<h2[^>]*>(.*?)</h2>', r
 _ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)"')
 
 
+def _unbracket(label: str) -> str:
+    """The label without ONE enclosing bracket pair, when it has one.
+
+    `[7]` and `[ACDE12]` lose their brackets; natbib's `Doe et al. [2021]` has
+    none around it and keeps the year's. Stripping every leading and trailing
+    bracket took the year's closing one too, so the list went out as
+    `[Doe et al. [2021] …`, which nothing recognised as a reference list: the
+    back-matter healer archived it and the injector wrote it again, every cycle.
+    """
+    if not (label.startswith("[") and label.endswith("]")):
+        return label.strip()
+    depth = 0
+    for i, c in enumerate(label):
+        depth += {"[": 1, "]": -1}.get(c, 0)
+        if depth == 0:
+            # The opening bracket closes here; only at the very end is it a pair
+            # around the whole label (`[A] and [B]` is two groups, not one).
+            return label[1:-1].strip() if i == len(label) - 1 else label.strip()
+    return label.strip()
+
+
 def parse_bibliography(html: str) -> list:
     """[{num, text}] for every entry in the source's reference list, in order."""
     out = []
@@ -138,7 +159,7 @@ def parse_bibliography(html: str) -> list:
             body = body[:tag[1]] + body[tag[2]:]
         text = ef._clean(body)
         if text:
-            mark = label.strip("[]").strip() or m.group(1)
+            mark = _unbracket(label) or m.group(1)
             # The id is the bibliography's internal order and need not be the
             # number the paper cites the entry by: `bib.bib15` can be `[1]`.
             # Keying on the id numbered the injected list 15, 20, 3 and compared
@@ -940,12 +961,14 @@ def ref_ids_from_texts(texts: dict, entries: list) -> dict:
     # `[VSP + 17]` and the translated body writes `[VSP+17]` for the same entry.
     tight = lambda text: re.sub(r"\s+", "", text)
     by_label = {tight(e["label"]): e["num"] for e in entries if e.get("label")}
+    # The boundary's own label grammar, so a label is read back exactly as it was
+    # written: an inner `[2021]` closes the label, it does not end it early.
     found = {}
     for bid, text in texts.items():
-        head = re.match(r"\s*\[([^\]]{1,32})\]", text or "")
-        if not head:
+        head = reference_section.entry_label(text)
+        if head is None:
             continue
-        num = by_label.get(tight(head.group(1)))
+        num = by_label.get(tight(head))
         if num is not None:
             found[num] = bid
     return found

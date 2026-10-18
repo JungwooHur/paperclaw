@@ -50,8 +50,19 @@ import re
 # instead: it is short, and it carries a digit — every style ends its label with
 # a year or an index. A corporate tag with no digit (`[Fou]`) is allowed only
 # when it is a single short word, which keeps a bracketed clause of prose out.
+#
+# One bracket pair may sit INSIDE the label, at its end: natbib's author-year
+# style puts the year in square brackets (`Doe et al. [2021]`), so the entry is
+# written `[Doe et al. [2021]] …`. Refusing every inner bracket made such a list
+# invisible again, and the healers took turns removing and re-adding it on every
+# cycle. The inner group is year-sized and must close the label, so a sentence
+# that merely opens with a bracketed aside citing something (`[see [12] below]`)
+# is still not a label.
 MAX_LABEL_CHARS = 40
-_LABEL = r"\[([^\[\]\n]{1,%d})\]" % MAX_LABEL_CHARS
+MAX_INNER_CHARS = 8
+_PLAIN = r"[^\[\]\n]"
+_LABEL = r"\[(%s{1,%d}(?:\[%s{1,%d}\]\s*)?)\]" % (
+    _PLAIN, MAX_LABEL_CHARS, _PLAIN, MAX_INNER_CHARS)
 _ENTRY = re.compile(r"\s*" + _LABEL + r"\s")
 _BARE_TAG = re.compile(r"^[^\W\d_]{1,6}$", re.UNICODE)
 _KOREAN = re.compile(r"[가-힣]")
@@ -67,6 +78,26 @@ def block_text(block: dict) -> str:
     return "".join(s.get("plain_text", "") for s in payload.get("rich_text", []))
 
 
+def entry_label(text: str):
+    """The label an entry opens with, or None.
+
+    `[Doe et al. [2021]] J. Doe, …` gives `Doe et al. [2021]`, `[7] …` gives `7`.
+    The label's SHAPE only: bracketed, short, at most one year-sized group closing
+    it. Whether it also reads as a citation (a digit, or a bare tag) and whether
+    the block is English is `is_entry`'s question. The read-back that maps written
+    entries to their blocks needs only this, because it looks the label up in the
+    bibliography — and it must use this grammar, or the label it finds is not the
+    label that was written.
+    """
+    found = _ENTRY.match(text or "")
+    if not found:
+        return None
+    label = found.group(1).strip()
+    if not label or label.startswith("[") or len(label) > MAX_LABEL_CHARS:
+        return None
+    return label
+
+
 def is_entry(block: dict) -> bool:
     """Does this block open with a reference label, in English?
 
@@ -75,10 +106,9 @@ def is_entry(block: dict) -> bool:
     out.
     """
     text = block_text(block)
-    found = _ENTRY.match(text)
-    if not found or _KOREAN.search(text):
+    label = entry_label(text)
+    if label is None or _KOREAN.search(text):
         return False
-    label = found.group(1).strip()
     return any(c.isdigit() for c in label) or bool(_BARE_TAG.match(label))
 
 
