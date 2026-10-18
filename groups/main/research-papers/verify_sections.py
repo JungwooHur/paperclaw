@@ -78,10 +78,13 @@ _APPENDIX_PREFIX = re.compile(r"^\s*(?:appendix|부록)\s+(?=[A-Z]\b)", re.I)
 
 _KEY_RE = re.compile(
     r"^\s*("
-    r"[IVXLC]+(?:-[A-Z])?"        # I, IV, III-A
+    # appendix subsection A.1, B-2 (unique key each). FIRST, because the roman
+    # alternative below also reads a lone C/I/L/V/X as a numeral: `C.1`..`C.4`
+    # all keyed as `C` and were reported as duplicates of Appendix C and of each other.
+    r"[A-Z](?:[.-]\d+)+"
+    r"|[IVXLC]+(?:-[A-Z])?"        # I, IV, III-A
     r"|[A-Z]-[A-Z]"               # appendix subsection A-A, A-B (each its own)
     r"|\d+(?:\.\d+)*(?:-[A-Z])?"  # 2, 2.1, 3-A
-    r"|[A-Z](?:[.-]\d+)+"         # appendix subsection A.1, B-2 (unique key each)
     r"|[A-Z](?=[.:)\-])"          # appendix letter A./B. — must be followed by
                                   #   punctuation, NOT a space, so an unlabeled
                                   #   heading like "A New Approach" isn't keyed
@@ -115,6 +118,30 @@ _ARTIFACT_PATS = [
 # section's measured length.
 _TAIL_RE = re.compile(r"\n\s*(references|bibliography|acknowledg(e)?ments)\b",
                       re.IGNORECASE)
+# arXiv's HTML ends with its own page chrome ("Experimental support, please view
+# the build logs ... Instructions for reporting errors"). When a paper's LAST
+# section follows its reference list, nothing else cuts it off, and it was counted
+# as that section's source text.
+_CHROME_RE = re.compile(r"Experimental\s+support,\s+please\s+view\s+the\s+build\s+logs")
+_LETTERED_KEY = re.compile(r"[A-Z](?:[.-]\d+)*")
+
+
+def _appendix_past(tail: str, ordered_sections: list) -> bool:
+    """Does one of the page's lettered (appendix) headings open a line of `tail`?
+
+    Args:
+        tail: The source text past the back-matter cut, lowercased.
+        ordered_sections: The page's (key, title) pairs.
+    """
+    for key, title in ordered_sections:
+        if not _LETTERED_KEY.fullmatch(key or "") or key == "I":
+            continue
+        words = [w for w in re.split(r"\W+", title) if len(w) > 2][:4]
+        if words and re.search(r"\n\s*(?:appendix\s+)?" + re.escape(key.lower())
+                               + r"[.\s]+" + r"\W+".join(re.escape(w.lower()) for w in words),
+                               tail):
+            return True
+    return False
 
 
 def _echo_norm(s: str) -> str:
@@ -359,6 +386,54 @@ def _strip_html(html: str) -> str:
     return re.sub(r"\n\s*\n+", "\n", html)
 
 
+_TABLE_FLOAT = re.compile(r'<figure\b[^>]*\bclass="[^"]*\bltx_table\b[^"]*"[^>]*>', re.I)
+_FIGURE_TAG = re.compile(r"<(/?)figure\b[^>]*>", re.I)
+# Stands in for a table's text, one character per character of it (a private-use
+# code point, which no paper's text contains).
+_TABLE_MARK = "\ue000"
+
+
+def _drop_tables(html: str) -> str:
+    """LaTeXML HTML with the text of every table float blanked out.
+
+    A table is never translated: it is placed on the page as a rendered image,
+    so its cells are no section's text. `_prose_chars` drops a run of short
+    cells, but a table whose cells are sentences (worked examples, prompts)
+    passes for prose, and an appendix made of such tables measured thousands of
+    characters against a translation that was complete. Cells could also be
+    read as a numbered heading, or hold a section's title, and cut or place a
+    span there.
+
+    The table becomes a line of `_TABLE_MARK` as long as its text, so a span
+    keeps its extent: a section that is one sentence and a table is still a
+    located section, measured small, and not a heading lost in a contents list
+    (see `source_section_chars`). A float whose closing tag cannot be found is
+    kept, so a malformed page loses nothing.
+    """
+    out, pos = [], 0
+    for m in _TABLE_FLOAT.finditer(html):
+        if m.start() < pos:                  # inside a table already blanked
+            continue
+        depth, end = 0, None
+        for tag in _FIGURE_TAG.finditer(html, m.start()):
+            depth += -1 if tag.group(1) else 1
+            if depth == 0:
+                end = tag.end()
+                break
+        if end is None:
+            continue
+        size = len(_strip_html(html[m.start():end]).strip())
+        out += [html[pos:m.start()], "\n", _TABLE_MARK * size, "\n"]
+        pos = end
+    out.append(html[pos:])
+    return "".join(out)
+
+
+def source_text_from_html(html: str) -> str:
+    """The text the audit measures a LaTeXML (arXiv) page against."""
+    return _strip_html(_drop_tables(html))
+
+
 def source_text_from_arxiv(arxiv_id: str):
     for tmpl in ARXIV_CANDIDATES:
         url = tmpl.format(id=arxiv_id)
@@ -369,7 +444,7 @@ def source_text_from_arxiv(arxiv_id: str):
         except Exception:
             continue
         if len(html) > 50000 and "ltx_document" in html and "Fatal error" not in html:
-            return _strip_html(html)
+            return source_text_from_html(html)
     return None
 
 
@@ -461,7 +536,9 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
     words' needle (e.g. '2.3' + 'Generating Physical Experience'), taking the
     LAST occurrence — body headings come after any abstract/ToC mention of the
     same words. All located headings are then sorted by position and each
-    section's span runs to the next located heading (tail cut at References).
+    section's span runs to the next located heading, stopping at a References
+    heading. The tail is cut at the last References unless the page's appendices
+    follow it, and arXiv's page chrome at the end is never counted.
 
     A parent heading whose children are also located therefore measures only
     its own intro span (parent start -> first child start), matching how the
@@ -482,6 +559,20 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
         last = m
     if last and last.start() >= len(full_text) * 0.5:
         body = full_text[: last.start()]
+    # The page ends with arXiv's own chrome, which is never the paper's text.
+    chrome = _CHROME_RE.search(full_text)
+    doc_end = (chrome.start() if chrome and chrome.start() >= len(full_text) * 0.5
+               else len(full_text))
+    # Appendices printed AFTER the reference list were cut off with it, so an
+    # appendix subsection was unlocated, or located in the table of contents at
+    # the top and measured against the body text that follows it there: a
+    # complete subsection of ~430 characters read as CONTENT_LOSS against ~1,400.
+    # When a lettered heading of the page really sits past the cut, measure to
+    # the end of the document; each span below stops at the first References
+    # heading after its start, so the bibliography is still never counted.
+    if len(body) >= doc_end or _appendix_past(full_text[len(body):doc_end].lower(),
+                                              ordered_sections):
+        body = full_text[:doc_end]
     low = body.lower()
     found = []
     for key, title in ordered_sections:
@@ -529,11 +620,18 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
             end = pos[nxt_key]
         else:
             continue                             # unknown end -> unmeasurable
-        span = _prose_chars(body[pos[key]:min(end, _next_source_heading(body, pos[key], end))])
+        ref = _TAIL_RE.search(body, pos[key] + 1, end)
+        if ref:
+            end = ref.start()                    # the bibliography is no section's text
+        segment = body[pos[key]:min(end, _next_source_heading(body, pos[key], end))]
+        span = _prose_chars(segment.replace(_TABLE_MARK, ""))
         # A "section" of a couple of hundred characters means the headings located
         # inside a nested list, not in the body — report nothing rather than a
-        # ratio computed against a table of contents entry.
-        out[key] = span if span >= 200 else None
+        # ratio computed against a table of contents entry. Its tables count toward
+        # that judgement, though not toward its text: a sentence and a table is a
+        # real section, measured small, and reported as unmeasured it would meet
+        # the empty-section rule and read as a dropped translation.
+        out[key] = span if _prose_chars(segment) >= 200 else None
     return out
 
 
@@ -551,14 +649,22 @@ def _unused_legacy_span(found, body, ordered_sections):
     return out
 
 
-_SRC_HEAD = re.compile(r"^[ \t]*\d+(?:\.\d+){0,3}\.?[ \t]+[A-Z][A-Za-z]", re.M)
+# A numbered heading line, or an appendix one: `C.1 …` or `Appendix C …`. Since
+# appendices after the references are measured, a lettered heading the page lacks
+# merged into the section before it just as a numbered one used to — a complete
+# last subsection of appendix B measured against all of appendix C as well.
+_SRC_HEAD = re.compile(
+    r"^[ \t]*(?:\d+(?:\.\d+){0,3}|[A-Z](?:\.\d+){1,3}|Appendix[ \t]+[A-Z])"
+    r"\.?[ \t]+[A-Z][A-Za-z]", re.M)
 
 
 def _next_source_heading(body: str, idx: int, limit: int) -> int:
-    """Offset of the next numbered heading line after `idx`, else `limit`.
+    """Offset of the next numbered or appendix heading line after `idx`, else `limit`.
 
     Deliberately narrow: the label must open a SHORT line (a heading, not a
-    numbered sentence) and be followed by a capitalised word.
+    numbered sentence) and be followed by a capitalised word; a lettered label
+    needs a number after it (`C.1`) or the word Appendix before it, so a line
+    opening "A New …" is not one.
     """
     for m in _SRC_HEAD.finditer(body, idx + 1, limit):
         line_end = body.find("\n", m.start())
