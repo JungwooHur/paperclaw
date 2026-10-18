@@ -840,6 +840,7 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
 HEAL_MAX_AGE_DAYS = 7
 
 _HEADINGS = ("heading_1", "heading_2", "heading_3")
+_DATED = _HEADINGS + ("paragraph",)
 
 
 def _parse_time(stamp):
@@ -854,12 +855,17 @@ def _parse_time(stamp):
 def translated_at(blocks: list, me):
     """When this integration put the translation on the page, or None.
 
-    The earliest `created_time` among the headings this integration wrote and no
-    person has edited since (`collect_papers._ours`). Only those count: the owner
-    annotates rows with headings of their own, and one written last week must not
-    make a page translated long ago look new, nor one written long ago make a
-    fresh translation look old. The EARLIEST, because the healers keep adding
-    headings of their own to an old page (a split heading, a promoted title).
+    The earliest `created_time` among the headings and paragraphs this
+    integration wrote and no person has edited since (`collect_papers._ours`).
+    Only those count: the owner annotates rows with blocks of their own, and one
+    written last week must not make a page translated long ago look new, nor one
+    written long ago make a fresh translation look old. The EARLIEST, and
+    paragraphs too, because the healers re-create headings on an old page: a
+    promoted title or a split heading is a new block, and once every title on a
+    page has been promoted only its paragraphs still carry the translation's date.
+    Rows are created with no body, so an old paragraph of ours is an old
+    translation. Saved Q&A is a callout, so it dates nothing. A page with no
+    heading of ours is not one of our translations at all.
 
     Args:
         blocks: The page's top-level blocks, as the API returns them.
@@ -870,8 +876,11 @@ def translated_at(blocks: list, me):
         integration's.
     """
     import collect_papers
-    stamps = [_parse_time(b.get("created_time")) for b in blocks
-              if b.get("type") in _HEADINGS and collect_papers._ours(b, me)]
+    ours = [b for b in blocks
+            if b.get("type") in _DATED and collect_papers._ours(b, me)]
+    if not any(b.get("type") in _HEADINGS for b in ours):
+        return None
+    stamps = [_parse_time(b.get("created_time")) for b in ours]
     stamps = [t for t in stamps if t is not None]
     return min(stamps) if stamps else None
 

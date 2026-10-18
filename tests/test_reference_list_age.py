@@ -7,9 +7,9 @@ is translated into that row. Such a page is a week-old translation on a
 months-old page, so it was skipped; it had never been cleared (an empty page has
 nothing to clear), so the clear-record exception did not cover it either.
 
-The translation is dated by the headings this integration wrote and no person
-has edited since. The owner's own headings say nothing about when the paper was
-translated, in either direction.
+The translation is dated by the headings and paragraphs this integration wrote
+and no person has edited since. The owner's own blocks say nothing about when
+the paper was translated, in either direction.
 """
 import datetime
 
@@ -38,6 +38,13 @@ def heading(bid, days_ago, who=BOT, edited_by=None, kind="heading_1"):
 def paragraph(bid, days_ago, who=BOT):
     return {"id": bid, "type": "paragraph", "created_time": stamp(days_ago),
             "paragraph": {"rich_text": []},
+            "created_by": who, "last_edited_by": who}
+
+
+def callout(bid, days_ago, who=BOT):
+    """A saved Q&A, which this integration also writes."""
+    return {"id": bid, "type": "callout", "created_time": stamp(days_ago),
+            "callout": {"rich_text": []},
             "created_by": who, "last_edited_by": who}
 
 
@@ -91,6 +98,12 @@ class TestAnOldRowTranslatedNow:
         heal = Heal(monkeypatch, tmp_path, blocks)
         assert heal.run(OLD_ROW) == {"linked": "abc-123"}
 
+    def test_an_older_saved_answer_does_not_date_it(self, monkeypatch, tmp_path):
+        # A question was answered on the row weeks before the paper was sent.
+        blocks = [callout("qa", 19), heading("h1", 0), paragraph("p1", 0)]
+        heal = Heal(monkeypatch, tmp_path, blocks)
+        assert heal.run(OLD_ROW) == {"linked": "abc-123"}
+
     def test_the_window_still_applies_to_the_translation(self, monkeypatch, tmp_path):
         blocks = [heading("h1", lr.HEAL_MAX_AGE_DAYS + 2)]
         heal = Heal(monkeypatch, tmp_path, blocks)
@@ -119,6 +132,24 @@ class TestAnOldTranslationStaysSkipped:
         blocks = [heading("h1", 200), heading("split", 0)]
         heal = Heal(monkeypatch, tmp_path, blocks)
         assert "skipped" in heal.run(OLD_ROW)
+
+    def test_promoted_titles_do_not_make_it_look_new(self, monkeypatch, tmp_path):
+        # Every title was a paragraph and the healer promoted them all today: each
+        # heading is a new block, and only the paragraphs keep the old date.
+        blocks = [heading("t1", 0), paragraph("p1", 200), heading("t2", 0),
+                  paragraph("p2", 200)]
+        heal = Heal(monkeypatch, tmp_path, blocks)
+        rep = heal.run(OLD_ROW)
+        assert "skipped" in rep and heal.linked is None
+
+    def test_a_paragraph_a_person_edited_does_not_date_it(self, monkeypatch, tmp_path):
+        # The owner rewrote an old paragraph of ours; it no longer reads as ours,
+        # so the fresh translation around it is not made to look old.
+        edited = paragraph("p0", 200)
+        edited["last_edited_by"] = PERSON
+        blocks = [edited, heading("h1", 0), paragraph("p1", 0)]
+        heal = Heal(monkeypatch, tmp_path, blocks)
+        assert heal.run(OLD_ROW) == {"linked": "abc-123"}
 
     def test_no_heading_of_ours_means_skip(self, monkeypatch, tmp_path):
         blocks = [heading("mine", 0, who=PERSON), paragraph("p1", 0)]
