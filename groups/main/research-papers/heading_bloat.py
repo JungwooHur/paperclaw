@@ -18,6 +18,7 @@ title from a sentence that merely happens to be long.
 This module imports nothing but the standard library, like `reference_section`,
 so a healer can never fail to load because of it.
 """
+import re
 
 # Must match the threshold `verify_sections` uses to report HEADING_BLOAT; a
 # heading this code declines to split still has to be reported by the audit.
@@ -28,6 +29,8 @@ MAX_HEADING_CHARS = 160
 MAX_TITLE_CHARS = 120
 
 _SEPARATOR = ': '
+
+_HANGUL = re.compile('[가-힣]')
 
 
 def text_of(block: dict) -> str:
@@ -59,14 +62,56 @@ def title_length(text: str) -> int | None:
     return at + 1
 
 
+def bilingual_halves(text: str):
+    """The two halves of an `English title (번역)` heading, or None.
+
+    The text must END with the parenthetical, so a title followed by anything
+    else is not one pair; the parenthetical is the one whose bracket closes the
+    text, so an acronym in the English title — `Foo (FB) (번역)` — stays in the
+    English half. The translation must carry Hangul and the English half must
+    not: Korean before the bracket is a body sentence, not a source title.
+
+    Returns:
+        `(english, translation)` with surrounding space stripped, or None when
+        the text is not one such pair.
+    """
+    text = text.strip()
+    if not text.endswith(')'):
+        return None
+    depth = 0
+    for at in range(len(text) - 1, -1, -1):
+        if text[at] == ')':
+            depth += 1
+        elif text[at] == '(':
+            depth -= 1
+            if depth == 0:
+                break
+    else:
+        return None
+    english, translation = text[:at].strip(), text[at + 1:-1].strip()
+    if not english or _HANGUL.search(english) or not _HANGUL.search(translation):
+        return None
+    return english, translation
+
+
 def is_bloated(block: dict) -> bool:
     """Is this block a heading carrying more than a heading's worth of text?
+
+    Headings here are written `English title (번역)`, so a long source title
+    doubles past the limit with nothing swallowed: a 104-character title and its
+    translation make 191. Such a pair is a heading when each half alone is
+    within the limit. It cannot be split anyway — it has no run-in colon to cut
+    at — so reporting it only made the audit fail on that page forever.
 
     The audit reports what this returns and the repair below acts on it, so the
     two can never drift apart into flagging one set and fixing another.
     """
     kind = block.get('type', '')
-    return kind.startswith('heading') and len(text_of(block)) > MAX_HEADING_CHARS
+    text = text_of(block)
+    if not kind.startswith('heading') or len(text) <= MAX_HEADING_CHARS:
+        return False
+    halves = bilingual_halves(text)
+    return halves is None or max(map(len, halves)) > MAX_HEADING_CHARS
 
 
 def split_spans(spans: list, offset: int):

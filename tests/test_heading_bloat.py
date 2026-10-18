@@ -136,3 +136,70 @@ class TestOneDefinitionOfBloat:
     def test_the_audit_flags_a_block_through_this_predicate(self):
         import verify_sections
         assert verify_sections.heading_bloat.is_bloated is hb.is_bloated
+
+
+TITLE = ("Learning Robust Whole-Body Control Policies from Noisy Human "
+         "Demonstrations with Curricula and Priors")
+TITLE_KO = ("잡음이 섞인 사람의 시연 데이터로부터 단계적 커리큘럼과 사전 지식을 함께 "
+            "활용하여 강건한 전신 제어 정책을 학습하는 방법")
+
+
+class TestALongBilingualTitle:
+    """Headings are written `English title (번역)`, so a long source title
+    passes the limit with nothing swallowed. It has no run-in colon, so the
+    repair can never split it, and the audit used to fail on that page forever.
+    """
+
+    def test_a_long_title_and_its_translation_is_a_heading(self):
+        text = f"{TITLE} ({TITLE_KO})"
+        assert len(text) > hb.MAX_HEADING_CHARS
+        assert not hb.is_bloated(heading(text))
+
+    def test_an_acronym_in_the_title_stays_in_the_english_half(self):
+        text = f"{TITLE} (LRWB) ({TITLE_KO})"
+        assert hb.bilingual_halves(text) == (f"{TITLE} (LRWB)", TITLE_KO)
+        assert not hb.is_bloated(heading(text))
+
+    def test_a_section_label_does_not_matter(self):
+        assert not hb.is_bloated(heading(f"4.2 {TITLE} (4.2 {TITLE_KO})"))
+
+    def test_an_english_half_over_the_limit_is_still_bloat(self):
+        long_en = TITLE + " " + "and Several Further Clauses " * 3
+        assert len(long_en) > hb.MAX_HEADING_CHARS
+        assert hb.is_bloated(heading(f"{long_en} ({TITLE_KO})"))
+
+    def test_a_translation_over_the_limit_is_still_bloat(self):
+        long_ko = TITLE_KO + " " + BODY
+        assert len(long_ko) > hb.MAX_HEADING_CHARS
+        assert hb.is_bloated(heading(f"{TITLE} ({long_ko})"))
+
+
+class TestASwallowedParagraphIsStillBloat:
+    """The exemption is for one title pair, nothing more: a heading that took
+    its body in must keep being reported, whatever brackets it carries."""
+
+    def test_a_korean_body_after_the_title(self):
+        assert hb.is_bloated(heading(f"{LEAD} {BODY}"))
+
+    def test_a_korean_body_ending_in_a_bracket(self):
+        # Korean before the bracket is a sentence, not a source title — even
+        # when each side of the bracket alone is short enough to be a heading.
+        text = (f"{LEAD} {BODY[:110].rstrip()} "
+                f"(그림 3과 표 2에서 보듯이 이 경향은 모든 규모에서 유지됩니다)")
+        assert len(text) > hb.MAX_HEADING_CHARS
+        assert max(map(len, text.rsplit(" (", 1))) <= hb.MAX_HEADING_CHARS
+        assert hb.is_bloated(heading(text))
+
+    def test_a_body_after_the_pair(self):
+        text = f"{LEAD} (매끄러운 거듭제곱 법칙) {BODY}"
+        assert hb.bilingual_halves(text) is None
+        assert hb.is_bloated(heading(text))
+
+    def test_an_english_parenthetical_is_not_a_translation(self):
+        assert hb.is_bloated(heading(f"{TITLE} ({TITLE})"))
+
+    def test_an_unbalanced_bracket_is_not_a_pair(self):
+        assert hb.bilingual_halves(f"{TITLE} {TITLE_KO})") is None
+
+    def test_a_split_still_works_where_it_did(self):
+        assert hb.split_block(heading(f"{LEAD} {BODY}")) is not None
