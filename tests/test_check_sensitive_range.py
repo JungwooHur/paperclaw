@@ -44,6 +44,10 @@ def test_commit_message_is_scanned_including_hash_lines(tmp_path):
     "groups/main/research-papers/papers_backlog.json",
     # The host-side record of what the last batch resume was handed.
     "groups/main/research-papers/papers_sweep_state.json",
+    # What an atomic write leaves behind when its rename fails.
+    "groups/main/research-papers/papers_queue.json.tmp",
+    "groups/main/research-papers/papers_backlog.json.tmp",
+    "groups/main/research-papers/papers_sweep_state.json.tmp",
 ])
 def test_forbidden_path(tmp_path, path):
     repo = _repo(tmp_path)
