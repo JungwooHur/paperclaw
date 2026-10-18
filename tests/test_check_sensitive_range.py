@@ -38,14 +38,19 @@ def test_commit_message_is_scanned_including_hash_lines(tmp_path):
     assert proc.returncode == 1 and "(message)" in proc.stderr
 
 
-def test_forbidden_path(tmp_path):
+@pytest.mark.parametrize("path", [
+    "store/state.json",
+    # The host-side list of papers a batch has not reached yet.
+    "groups/main/research-papers/papers_backlog.json",
+])
+def test_forbidden_path(tmp_path, path):
     repo = _repo(tmp_path)
     base = repo.commit()
-    repo.commit({"store/state.json": "{}\n"}, "oops")
+    repo.commit({path: "{}\n"}, "oops")
     proc = repo.run(CHECK + ["--range", f"{base}..HEAD"])
     assert proc.returncode == 1
     assert "[path] forbidden file in commit" in proc.stderr
-    assert "store/state.json" in proc.stderr
+    assert path in proc.stderr
 
 
 def test_merge_contributes_only_its_own_resolution(tmp_path):

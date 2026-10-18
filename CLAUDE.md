@@ -227,7 +227,51 @@ The agent uploads translated sections with **hand-rolled multi-batch Notion PATC
 
 `papers_queue.json` is driven by an agent INSIDE a container, and the dispatcher pattern has it fan out background subagents and then *wait* for their notifications. That only holds in INTERACTIVE mode, where an incoming message re-invokes the agent. **A scheduled task is a one-shot container** — `task-scheduler.ts` calls `queue.closeStdin()` before running it, so the agent gets exactly ONE turn, and **the instant it ends that turn the container exits and every in-flight background subagent is killed with it.**
 
-Seen twice, both leaving the batch dead with nobody to notice: (1) a watchdog restart detached the containers mid-run (fixed by the liveness heartbeat above), and (2) a scheduled resume dispatched 3 subagents, announced "now I'll wait for `task_notification`", ended its turn 147 s in — and the batch sat frozen for **two days** (3 papers stuck `in_progress` mid-translation, 10 never dispatched). **Prose can't fix this: the agent did exactly what it said; the runtime killed it.** So there are two layers — `groups/main/CLAUDE.md` now requires a scheduled run to POLL `TaskOutput` to completion instead of ending its turn (so a run makes real progress), and **`sweep_batch_queue.py` runs on the 5-minute healer** as the structural backstop: a queue with `pending`/`in_progress` work, untouched ≥20 min, with NO agent container alive, gets its dead `in_progress` entries reconciled back to `pending` and a fresh resume scheduled. Guarded against misfiring — it no-ops while a container is up, while the queue is being touched, when drained, and when a resume is already scheduled or ran within the cooldown. **If a batch "isn't progressing", check the queue's mtime and `docker ps` before assuming a per-paper failure.**
+Seen twice, both leaving the batch dead with nobody to notice: (1) a watchdog restart detached the containers mid-run (fixed by the liveness heartbeat above), and (2) a scheduled resume dispatched 3 subagents, announced "now I'll wait for `task_notification`", ended its turn 147 s in — and the batch sat frozen for **two days** (3 papers stuck `in_progress` mid-translation, 10 never dispatched). **Prose can't fix this: the agent did exactly what it said; the runtime killed it.** So there are two layers — `groups/main/CLAUDE.md` now requires a scheduled run to POLL `TaskOutput` to completion instead of ending its turn (so a run makes real progress), and **`sweep_batch_queue.py` runs on the 5-minute healer** as the structural backstop: a queue with `pending`/`in_progress` work, untouched ≥20 min, with NO agent container alive, gets its dead `in_progress` entries reconciled back to `pending` and a fresh resume scheduled. Guarded against misfiring — it writes nothing while a container is up or the queue is being touched, and schedules no second resume while one is already scheduled or ran within the cooldown. It does write in two cases the next section adds: a drained or absent queue is refilled from the backlog, and an over-full stranded queue is trimmed even while a resume is already scheduled. **If a batch "isn't progressing", check the queue's mtime and `docker ps` before assuming a per-paper failure.**
+
+### …and a session that polls to the end runs out of session
+
+Polling to completion exposed a third failure. The runner gives a scheduled run
+`maxTurns: 50`, and two resume sessions each stopped at exactly 50 main-agent API
+requests, after about 10 papers, with 3 subagents still in flight. The SDK result
+for `error_max_turns` carries no text, and `task-scheduler.ts` armed its close
+timer only for output that had text. So neither run was closed: the runner waited
+on IPC until the main group's 5 h no-output timeout. The runs took 7.8 h and 6.5+ h,
+each sitting idle for about 5 h after the cap. The group's queue was blocked the
+whole time, because a task container takes no piped messages (`src/group-queue.ts`).
+
+Two fixes:
+
+- `task-scheduler.ts` now closes a scheduled run on every success marker, with or
+  without text. The runner writes one only when a query turn ends.
+- `sweep_batch_queue.py` gives each resume a session-sized chunk, `BATCH_CHUNK = 6`
+  papers. The rest waits in `research-papers/papers_backlog.json`, a host-only file
+  that no agent prompt names, so an agent that deletes the queue at the end cannot
+  lose it.
+  - A stranded queue keeps its first 6 pending papers, and the rest move to the
+    FRONT of the backlog.
+  - A queue that is gone or drained is refilled with the next chunk, and a resume is
+    scheduled, when no container is up and no resume is recent.
+  - While a resume is already scheduled, a queue with too many papers is trimmed
+    anyway.
+  - Both files are written atomically, destination first. A crash can duplicate a
+    paper, which the subagent's dedup check makes harmless, but never drop one.
+  - Right before any write it runs `docker ps` again and compares the queue's
+    bytes with its first read, and writes nothing if either changed. The
+    NotebookLM auth probe alone takes seconds, and an agent that starts in that
+    window writes the queue too: overwriting it would drop that agent's paper,
+    or a refilled chunk that has already left the backlog.
+  - The queue carries `backlog_remaining`, so the final summary can say how many
+    papers continue in later sessions.
+
+**Why chunking and not a higher cap.** Each group's runner copy is seeded once
+(docs/SPEC.md, "Per-Group Copies Are Seeded Once"), so a new `maxTurns` never
+reaches the existing main group. The 5 h no-output timeout also bounds a session,
+because a scheduled run emits nothing until its one turn ends. A higher cap would
+only turn a clean stop into a hard kill. `tests/test_sweep_batch_queue.py` covers
+the chunking, and `src/task-scheduler.test.ts` covers the close. **When a batch looks
+stalled, read `papers_backlog.json` and the `papers-batch-resume-*` tasks as well as
+the queue — the queue only ever holds one session's share.**
 
 ## WhatsApp connection can hang silently (watchdog)
 
