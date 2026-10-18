@@ -58,7 +58,7 @@ SCANNER_RE='^scripts/check-sensitive\.sh$'
 SELF_EXCLUDE_RE='^(\.husky/|vendor/|package-lock\.json$|.*\.lock$)'
 
 # --- 1. forbidden paths -----------------------------------------------------
-FORBIDDEN_PATH_RE='(^|/)\.env(\..*)?$|\.(db|sqlite3?|db-journal|pdf|keys\.json)$|(^|/)(attachments|conversations|sessions)/|(^|/)(store|data|logs)/|notebooks\.json$|papers_queue\.json$|papers_backlog\.json$|(^|/)research-papers/config\.json$|baileys_auth|x-auth'
+FORBIDDEN_PATH_RE='(^|/)\.env(\..*)?$|\.(db|sqlite3?|db-journal|pdf|keys\.json)$|(^|/)(attachments|conversations|sessions)/|(^|/)(store|data|logs)/|notebooks\.json$|papers_queue\.json$|papers_backlog\.json$|papers_sweep_state\.json$|(^|/)research-papers/config\.json$|baileys_auth|x-auth'
 ALLOWED_PATH_RE='\.env\.example$'
 
 # --- content patterns -------------------------------------------------------

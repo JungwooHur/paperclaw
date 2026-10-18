@@ -6,7 +6,10 @@ the queue a session sees and the rest in a host-only backlog, and refills the
 queue from it once nothing is running. Whatever it does, a paper must never be
 dropped: a crash may leave one in both files, never in neither.
 """
+import datetime
+import json
 import os
+import re
 import sqlite3
 import time
 
@@ -59,11 +62,13 @@ def ids(papers):
 
 
 class Env:
-    """A queue, a backlog and a DB in a temp dir, with nothing running."""
+    """A queue, a backlog, the backoff state and a DB in a temp dir, with nothing
+    running and a clock that moves only when a test moves it."""
 
     def __init__(self, tmp_path, monkeypatch):
         self.queue_path = str(tmp_path / "papers_queue.json")
         self.backlog_path = str(tmp_path / "papers_backlog.json")
+        self.state_path = str(tmp_path / "papers_sweep_state.json")
         self.db = str(tmp_path / "messages.db")
         conn = sqlite3.connect(self.db)
         conn.executescript(SCHEMA)
@@ -75,16 +80,28 @@ class Env:
         conn.close()
         self.container = False
         self.auth = True
+        self.probes = 0
+        self.clock = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
         monkeypatch.setattr(sbq, "QUEUE", self.queue_path)
         monkeypatch.setattr(sbq, "BACKLOG", self.backlog_path)
+        monkeypatch.setattr(sbq, "SWEEP_STATE", self.state_path)
         monkeypatch.setattr(sbq, "DB", self.db)
+        monkeypatch.setattr(sbq, "_now", lambda: self.clock)
         monkeypatch.setattr(sbq, "agent_container_running", lambda: self.container)
-        monkeypatch.setattr(sbq, "notebooklm_auth_ok", lambda: self.auth)
+        monkeypatch.setattr(sbq, "notebooklm_auth_ok", self._probe)
 
-    def write_queue(self, papers, idle_min=60):
-        sbq._write_json(self.queue_path, {"papers": papers,
-                                          "created_at": "2026-10-01T00:00:00Z",
-                                          "session_processed": 3})
+    def _probe(self):
+        self.probes += 1
+        return self.auth
+
+    def advance(self, minutes):
+        self.clock += datetime.timedelta(minutes=minutes)
+
+    def write_queue(self, papers, idle_min=60, created_at="2026-10-01T00:00:00Z"):
+        q = {"papers": papers, "session_processed": 3}
+        if created_at is not None:
+            q["created_at"] = created_at
+        sbq._write_json(self.queue_path, q)
         then = time.time() - idle_min * 60
         os.utime(self.queue_path, (then, then))
 
@@ -99,7 +116,7 @@ class Env:
 
     def files(self):
         out = {}
-        for path in (self.queue_path, self.backlog_path):
+        for path in (self.queue_path, self.backlog_path, self.state_path):
             if os.path.exists(path):
                 with open(path, "rb") as f:
                     out[path] = f.read()
@@ -215,6 +232,7 @@ def test_nothing_moves_while_a_container_is_up(env, setup):
 
     assert env.files() == before
     assert env.resumes() == []
+    assert env.probes == 0, "the browser is never driven while a container is up"
 
 
 def test_a_refill_waits_for_a_resume_already_scheduled(env):
@@ -409,3 +427,273 @@ def test_an_unreadable_file_is_never_written_over(env, broken):
 
     assert env.files() == before
     assert env.resumes() == []
+
+
+# A resume that finishes no paper backs off.
+#
+# Measured: NotebookLM throttled its chat while `notebooklm list`, the auth probe,
+# still worked, so every resume failed within minutes, left its papers pending as
+# the prompt says, and messaged the owner. Without a backoff the sweeper would
+# schedule the next one a cooldown later, all night long.
+
+COOLDOWN = 30
+
+
+def js_time(t):
+    """A stamp in the form the scheduler writes last_run (Date.toISOString)."""
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
+
+
+def resume_runs(env, finished=0, minutes=4):
+    """The resume the sweep just scheduled runs now and ends `minutes` later,
+    having finished `finished` pending papers. The rest stays pending, which is
+    what the agent does on a throttle, and its last queue write ends the run."""
+    active = env.sql("SELECT id FROM scheduled_tasks WHERE id LIKE"
+                     " 'papers-batch-resume-%' AND status = 'active'")
+    assert len(active) == 1, "the sweep should have scheduled one resume"
+    env.advance(minutes)
+    env.sql("UPDATE scheduled_tasks SET status = 'completed', next_run = NULL,"
+            " last_run = ? WHERE id = ?", (js_time(env.clock), active[0][0]))
+    q = env.queue()
+    for p in [p for p in q["papers"] if p["status"] == "pending"][:finished]:
+        p["status"] = "done"
+        p["notion_page_id"] = "page-" + p["id"]
+    sbq._write_json(env.queue_path, q)
+    os.utime(env.queue_path, (env.clock.timestamp(),) * 2)
+
+
+def next_resume_after(env, capsys, minutes):
+    """Scheduling waits `minutes` after the last resume ended, and no longer.
+    Returns what the sweep printed while it waited."""
+    resumes = len(env.resumes())
+    env.advance(minutes - 1)
+    before = env.files()
+    probes = env.probes
+
+    assert env.sweep() == 0
+
+    waiting = capsys.readouterr().out
+    assert len(env.resumes()) == resumes, f"resumed before {minutes}m"
+    assert env.files() == before, "a sweep that backs off writes nothing"
+    assert env.probes == probes, "a sweep that backs off never drives the browser"
+    env.advance(2)
+
+    assert env.sweep() == 0
+
+    capsys.readouterr()
+    assert len(env.resumes()) == resumes + 1, f"no resume after {minutes}m"
+    return waiting
+
+
+def first_resume(env, papers=4, **queue):
+    env.write_queue([paper(i) for i in range(papers)], **queue)
+    assert env.sweep() == 0
+    assert len(env.resumes()) == 1
+
+
+def test_two_resumes_that_finish_nothing_wait_60_then_120_minutes(env, capsys):
+    first_resume(env)
+
+    resume_runs(env)
+    out = next_resume_after(env, capsys, 2 * COOLDOWN)
+    # The line names n and the time left: one minute of the hour.
+    assert re.search(r"backing off\b.*\bn=1\b.*\b1m\b", out)
+
+    resume_runs(env)
+    out = next_resume_after(env, capsys, 4 * COOLDOWN)
+    assert re.search(r"backing off\b.*\bn=2\b.*\b1m\b", out)
+
+
+def test_the_normal_cooldown_still_comes_first(env, capsys):
+    first_resume(env)
+    resume_runs(env)
+    env.advance(COOLDOWN - 1)
+
+    assert env.sweep() == 0
+
+    assert len(env.resumes()) == 1
+    assert "backing off" not in capsys.readouterr().out
+
+
+def test_a_resume_that_finishes_a_paper_resets_the_count(env, capsys):
+    first_resume(env)
+    resume_runs(env)
+    next_resume_after(env, capsys, 2 * COOLDOWN)
+    resume_runs(env)
+    next_resume_after(env, capsys, 4 * COOLDOWN)
+
+    resume_runs(env, finished=1)
+    env.advance(COOLDOWN + 1)
+    assert env.sweep() == 0
+    assert len(env.resumes()) == 4, "progress should cost only the cooldown"
+
+    # And the count starts over: the next resume that gets nowhere is n=1 again.
+    resume_runs(env)
+    next_resume_after(env, capsys, 2 * COOLDOWN)
+
+
+def test_the_wait_doubles_up_to_twelve_hours_and_stays_there(env, capsys):
+    first_resume(env)
+    for wait in (60, 120, 240, 480, 12 * 60, 12 * 60, 12 * 60):
+        resume_runs(env)
+        next_resume_after(env, capsys, wait)
+
+
+@pytest.mark.parametrize("created_at,new_created_at,new_first", [
+    ("2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", 0),
+    (None, None, 10),
+], ids=["new-created_at", "no-created_at-new-papers"])
+def test_a_new_batch_counts_from_zero(env, capsys, created_at, new_created_at,
+                                      new_first):
+    first_resume(env, created_at=created_at)
+    resume_runs(env)
+    env.write_queue([paper(i) for i in range(new_first, new_first + 4)],
+                    created_at=new_created_at)
+    env.advance(COOLDOWN + 1)
+
+    assert env.sweep() == 0
+
+    assert len(env.resumes()) == 2
+    assert "backing off" not in capsys.readouterr().out
+
+
+def test_a_queue_without_created_at_is_recognised_by_its_papers(env, capsys):
+    first_resume(env, created_at=None)
+    resume_runs(env)
+
+    next_resume_after(env, capsys, 2 * COOLDOWN)
+
+
+def test_a_drained_queue_and_backlog_reset_the_count(env, capsys):
+    first_resume(env)
+    resume_runs(env)
+    env.write_queue([paper(i, "done") for i in range(4)])
+
+    assert env.sweep() == 0
+
+    # The same created_at again, so only the reset can make this n=0.
+    env.write_queue([paper(i) for i in range(4)])
+    env.advance(COOLDOWN + 1)
+    assert env.sweep() == 0
+    assert len(env.resumes()) == 2
+    assert "backing off" not in capsys.readouterr().out
+
+
+def test_the_refill_path_records_the_batch_it_hands_out(env, capsys):
+    backlog_only(env)
+    assert env.sweep() == 0
+    assert len(env.resumes()) == 1
+
+    resume_runs(env)
+
+    next_resume_after(env, capsys, 2 * COOLDOWN)
+
+
+def test_with_its_task_row_gone_the_wait_runs_from_when_it_was_scheduled(
+        env, capsys):
+    first_resume(env)
+    resume_runs(env)
+    env.sql("DELETE FROM scheduled_tasks")
+
+    # Four of the 60 minutes went by during the run.
+    next_resume_after(env, capsys, 2 * COOLDOWN - 4)
+
+
+def stranded_past_its_wait(env, capsys):
+    first_resume(env)
+    resume_runs(env)
+    env.advance(2 * COOLDOWN + 1)
+    capsys.readouterr()
+
+
+def drained(env, capsys):
+    first_resume(env)
+    resume_runs(env, finished=4)
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("setup", [stranded_past_its_wait, drained])
+def test_a_dry_run_leaves_the_backoff_state_alone(env, setup, capsys):
+    setup(env, capsys)
+    with open(env.state_path, "rb") as f:
+        state = f.read()
+    tasks = env.resumes()
+
+    assert env.sweep("--dry-run") == 0
+
+    with open(env.state_path, "rb") as f:
+        assert f.read() == state
+    assert env.resumes() == tasks
+
+
+def missing(path):
+    os.remove(path)
+
+
+def write(text):
+    def corrupt(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    corrupt.__name__ = "corrupt"
+    return corrupt
+
+
+@pytest.mark.parametrize("damage", [
+    missing,
+    write('{"batch": '),
+    write("\xff not json"),
+    write("[]"),
+    write('{"batch": 7, "done_at_resume": 0, "resumes_without_progress": 3}'),
+    write('{"batch": "created_at:2026-10-01T00:00:00Z", "done_at_resume": 0,'
+          ' "resumes_without_progress": -1}'),
+    write('{"batch": "created_at:2026-10-01T00:00:00Z", "done_at_resume": 0,'
+          ' "resumes_without_progress": true}'),
+    write('{"batch": "created_at:2026-10-01T00:00:00Z", "done_at_resume": "0",'
+          ' "resumes_without_progress": 3}'),
+], ids=["missing", "truncated", "not-json", "a-list", "batch-not-text",
+        "negative-count", "bool-count", "text-count"])
+def test_a_missing_or_broken_state_counts_from_zero(env, damage, capsys):
+    first_resume(env)
+    resume_runs(env)
+    damage(env.state_path)
+    env.advance(COOLDOWN + 1)
+    capsys.readouterr()
+
+    assert env.sweep() == 0
+
+    assert len(env.resumes()) == 2
+    assert "n=0" in capsys.readouterr().out
+
+
+def test_a_wait_with_nothing_to_count_from_never_blocks_a_resume(env):
+    first_resume(env)
+    resume_runs(env)
+    env.sql("DELETE FROM scheduled_tasks")
+    with open(env.state_path, encoding="utf-8") as f:
+        state = json.load(f)
+    state["resumed_at"] = "not a time"
+    with open(env.state_path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+    # Stale again, and well inside the hour an anchor would have asked for.
+    env.advance(21)
+    assert env.sweep() == 0
+
+    assert len(env.resumes()) == 1
+
+
+def test_a_state_that_cannot_be_written_never_costs_the_resume(env, monkeypatch):
+    env.write_queue([paper(i) for i in range(4)])
+    real = sbq._write_json
+
+    def no_room_for_state(path, data):
+        if path == env.state_path:
+            raise OSError("disk full")
+        real(path, data)
+
+    monkeypatch.setattr(sbq, "_write_json", no_room_for_state)
+
+    assert env.sweep() == 0
+
+    assert len(env.resumes()) == 1
+    assert not os.path.exists(env.state_path)

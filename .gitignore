@@ -82,6 +82,7 @@ groups/main/research-papers/*
 notebooks.json
 papers_queue.json
 papers_backlog.json
+papers_sweep_state.json
 .claude/settings.local.json
 
 # OS
