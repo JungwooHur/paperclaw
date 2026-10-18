@@ -222,3 +222,36 @@ class TestTheHealerCycleSettles:
         assert (stripped["archived"], healed["refs"]) == (0, "already present")
         live = [rs.block_text(b) for b in fake.live()]
         assert live[-3].startswith("[Doe et al. [2021]] ")
+
+
+class TestAuthorYearCitationsAreLinked:
+    """The body of a natbib paper cites `(Doe et al., 2021)`, and the index that
+    links it is keyed by the name and year in each entry's label. The parser
+    takes the label out of the entry's text, so an index read from the text was
+    empty and not one such citation was ever linked."""
+
+    def test_every_entry_is_indexed_by_its_label(self):
+        index = lr.author_year_index(lr.parse_bibliography(NATBIB))
+        assert index == {("doe et al", "2021"): 1, ("roe and poe", "2019"): 2,
+                         ("smith", "2020a"): 3}
+
+    def citations_linked(self, sentence):
+        entries = lr.parse_bibliography(NATBIB)
+        page = body(1) + [block("c", "paragraph", sentence)]
+        return lr.link_author_year(
+            "page", page, lr.author_year_index(entries),
+            {e["num"]: f"ref{e['num']}" for e in entries},
+            {e["num"]: e["text"] for e in entries}, apply=False)
+
+    def test_a_citation_in_the_body_is_linked(self):
+        assert self.citations_linked("앞선 연구 (Doe et al., 2021)에서 보였다.") == 1
+
+    def test_a_non_breaking_space_in_the_body_still_matches(self):
+        assert self.citations_linked("앞선 연구 (Doe et\xa0al., 2021)에서 보였다.") == 1
+
+    def test_the_healer_links_them_when_it_writes_the_list(self, monkeypatch):
+        cited = block("c", "paragraph", "앞선 연구 (Roe and Poe, 2019)를 따른다.")
+        fake = FakeNotion(body() + [cited])
+        TestTheHealerCycleSettles().wire(monkeypatch, fake)
+        report = lr.heal_references("page", apply=True, created_time=NOW)
+        assert (report["refs"], report["author_year_linked"]) == ("injected 3", 1)

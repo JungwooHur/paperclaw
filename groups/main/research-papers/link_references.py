@@ -893,14 +893,24 @@ def label_pattern(labels: list):
 
 
 def _ay_key(name: str, year: str) -> tuple:
-    return (re.sub(r"[^a-z0-9 ]", "", name.lower()).strip(), year)
+    # Any run of whitespace is one space. Matching a literal space only, the
+    # non-breaking one in `et&nbsp;al.` was dropped with the punctuation, so a
+    # body that kept it keyed `doe etal` against the index's `doe et al`.
+    words = re.sub(r"[^a-z0-9\s]", "", name.lower()).split()
+    return (" ".join(words), year)
 
 
 def author_year_index(entries: list) -> dict:
-    """{(normalised name, year): reference number} from the bibliography labels."""
+    """{(normalised name, year): reference number} from the bibliography labels.
+
+    Read from the entry's LABEL, which is where its name and year are. The parser
+    takes the label out of the entry's text, so the text opens with the full
+    author list, and an index read from it came out empty on every natbib page:
+    not one `(Doe et al., 2021)` in the body was linked.
+    """
     out = {}
     for e in entries:
-        m = _AY_LABEL.match(e["text"] or "")
+        m = _AY_LABEL.match(e.get("label") or "")
         if m:
             out[_ay_key(m.group(1), m.group(2))] = e["num"]
     return out
