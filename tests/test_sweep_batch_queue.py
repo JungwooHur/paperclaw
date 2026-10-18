@@ -311,6 +311,67 @@ def test_a_crash_between_the_two_writes_loses_no_paper(env, setup, monkeypatch):
     assert env.unfinished() >= before
 
 
+def lands_during(env, monkeypatch, name, container_up):
+    """Run the sweep's slow step `name` with a paper request landing inside it:
+    the main container starts and its agent adds a paper to the queue. The
+    container may already be gone again by the time the sweep looks."""
+    real = getattr(sbq, name)
+
+    def slow_step(*args):
+        result = real(*args)
+        env.container = container_up
+        q = env.queue() or {"papers": []}
+        env.write_queue(q["papers"] + [paper(99)], idle_min=0)
+        return result
+
+    monkeypatch.setattr(sbq, name, slow_step)
+
+
+# The NotebookLM probe takes seconds; the DB can be locked for up to 15 s.
+@pytest.mark.parametrize("setup,slow_step", [
+    (backlog_only, "notebooklm_auth_ok"),
+    (stranded_with_excess, "notebooklm_auth_ok"),
+    (scheduled_with_excess, "recent_resume"),
+])
+@pytest.mark.parametrize("container_up", [True, False],
+                         ids=["container-up", "container-gone"])
+def test_a_queue_the_agent_writes_mid_sweep_is_never_written_over(
+        env, monkeypatch, setup, slow_step, container_up):
+    setup(env)
+    owed = env.unfinished() | {"p99"}
+    tasks = env.resumes()
+    lands_during(env, monkeypatch, slow_step, container_up)
+
+    assert env.sweep() == 0
+
+    assert env.unfinished() == owed
+    assert "p99" in ids(env.queue()["papers"])
+    assert env.resumes() == tasks
+
+
+def test_a_refill_stands_down_for_an_agent_that_started_mid_probe(
+        env, monkeypatch):
+    # The agent reads "no queue" while the probe runs and writes its own queue
+    # once the sweep is over, so whatever the sweep put there is overwritten.
+    backlog_only(env)
+    owed = env.unfinished() | {"p99"}
+    seen = {}
+
+    def probe():
+        env.container = True
+        seen["queue"] = env.queue()
+        return True
+
+    monkeypatch.setattr(sbq, "notebooklm_auth_ok", probe)
+
+    assert env.sweep() == 0
+    env.write_queue((seen["queue"] or {"papers": []})["papers"] + [paper(99)],
+                    idle_min=0)
+
+    assert env.unfinished() == owed
+    assert env.resumes() == []
+
+
 @pytest.mark.parametrize("setup", [stranded_with_excess, backlog_only,
                                    scheduled_with_excess])
 def test_a_dry_run_writes_nothing(env, setup):

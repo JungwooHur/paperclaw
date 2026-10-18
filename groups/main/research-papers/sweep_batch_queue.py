@@ -48,7 +48,10 @@ agent prompt names, and the sweeper hands out the next chunk once a queue drains
 Never lose a paper: both files are written atomically, and a paper is written to
 its destination before it is removed from its source. A crash between the two
 writes can duplicate a paper, which the subagent's dedup check makes harmless; it
-cannot drop one.
+cannot drop one. The queue is the agent's file, so right before any write the sweep
+runs `docker ps` again and compares the queue with its first read, and writes
+nothing if either changed (see still_quiet): an agent that started during the
+seconds-long NotebookLM probe writes the queue too.
 
 Idempotent and cheap: no-ops when the queue is still being worked, a container is
 up, a resume is already scheduled/just ran, or there is nothing left to hand out.
@@ -184,6 +187,41 @@ def load_queue():
     return _load_json(QUEUE)
 
 
+def queue_snapshot():
+    """The queue's bytes, or None when there is no queue. Raises Unreadable."""
+    try:
+        with open(QUEUE, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Unreadable(f"{os.path.basename(QUEUE)}: {type(e).__name__}: {e}") from e
+
+
+def still_quiet(snapshot) -> bool:
+    """Checked right before writing, against the queue as `main` first read it.
+
+    The queue belongs to the agent. Between the first look and a write, the sweep
+    runs the NotebookLM probe (seconds) and waits on the DB (up to 15 s), and a
+    paper request landing in that window starts the main container, whose agent
+    writes the queue too. Writing over that would drop the agent's paper, or, on a
+    refill, the chunk just taken out of the backlog: its only other copy. So stand
+    down if a container is up now or the queue changed, and let the next cycle look
+    again. `docker ps` goes first because it is the slow one: the queue is read
+    last, leaving only the write itself after it."""
+    if agent_container_running():
+        print("sweep: an agent container started during the sweep — writing nothing")
+        return False
+    try:
+        now = queue_snapshot()
+    except Unreadable:
+        now = not snapshot          # anything but the snapshot
+    if now != snapshot:
+        print("sweep: the queue changed during the sweep — writing nothing")
+        return False
+    return True
+
+
 def load_backlog():
     data = _load_json(BACKLOG)
     return list(data.get("papers", [])) if data else []
@@ -316,7 +354,7 @@ def recent_resume(conn, cooldown_min: int) -> bool:
     return bool(row)
 
 
-def refill(q, backlog, a) -> int:
+def refill(q, backlog, a, snapshot) -> int:
     """No batch in flight: hand the next chunk of the backlog to a fresh session."""
     if not backlog:
         return 0                                    # nothing waiting
@@ -341,7 +379,7 @@ def refill(q, backlog, a) -> int:
         chunk, rest = backlog[:BATCH_CHUNK], backlog[BATCH_CHUNK:]
         print(f"sweep: REFILL — next {len(chunk)} of {len(backlog)} backlog papers, "
               f"no batch in flight{' (dry-run)' if a.dry_run else ''}")
-        if auth_expired() or a.dry_run:
+        if auth_expired() or a.dry_run or not still_quiet(snapshot):
             return 0
 
         # A drained queue still holds the last session's results. `done` ones were
@@ -377,6 +415,9 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     try:
+        # Taken before the parse, so a write that lands between the two still
+        # reads as a change in still_quiet.
+        snapshot = queue_snapshot()
         q = load_queue()
         backlog = load_backlog()
     except Unreadable as e:
@@ -392,7 +433,7 @@ def main(argv=None) -> int:
     retryable = [p for p in papers
                  if p.get("status") == "failed" and _ENV_FAIL.search(str(p.get("error") or ""))]
     if not pending and not running and not retryable:
-        return refill(q, backlog, a)                # absent or drained
+        return refill(q, backlog, a, snapshot)      # absent or drained
 
     age_min = (datetime.datetime.now().timestamp() - os.path.getmtime(QUEUE)) / 60
     if age_min < a.stale_min:
@@ -416,7 +457,7 @@ def main(argv=None) -> int:
                 if a.dry_run:
                     print(f"sweep: would move {len(pending) - BATCH_CHUNK} pending papers "
                           f"to the backlog (dry-run)")
-                else:
+                elif still_quiet(snapshot):
                     moved, left = write_trimmed(q, backlog)
                     print(f"sweep: moved {moved} pending papers to the backlog "
                           f"({left} waiting)")
@@ -429,7 +470,7 @@ def main(argv=None) -> int:
         print(f"sweep: STRANDED batch — {len(pending)} pending, {len(running)} in_progress, "
               f"{len(retryable)} env-failed, queue idle {age_min:.0f}m, no agent container"
               f"{' (dry-run)' if a.dry_run else ''}")
-        if auth_expired() or a.dry_run:
+        if auth_expired() or a.dry_run or not still_quiet(snapshot):
             return 0
 
         # Their containers are gone, so in_progress can never complete — hand them back
