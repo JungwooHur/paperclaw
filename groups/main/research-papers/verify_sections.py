@@ -115,8 +115,15 @@ _ARTIFACT_PATS = [
     ("listing-glyph", re.compile(r"⬇")),
 ]
 # Where a source paper's body ends — don't let "References" inflate the last
-# section's measured length.
-_TAIL_RE = re.compile(r"\n\s*(references|bibliography|acknowledg(e)?ments)\b",
+# section's measured length. A NeurIPS paper checklist is back matter as well, and
+# it is unlettered and comes AFTER the appendices: measured to the end of the
+# document, the last appendix took in all of it (one complete subsection of ~1,200
+# characters measured ~20,700). Its items cannot stop the span either, since each
+# item's number is a line of its own ("1." then "Claims"). A bare "Checklist" is
+# the heading only as a whole line, never a paragraph that opens with the word.
+_TAIL_RE = re.compile(r"\n\s*(references|bibliography|acknowledg(e)?ments"
+                      r"|(?:neurips\s+(?:\d{4}\s+)?)?paper\s+checklist"
+                      r"|checklist(?=[ \t]*\n))\b",
                       re.IGNORECASE)
 # arXiv's HTML ends with its own page chrome ("Experimental support, please view
 # the build logs ... Instructions for reporting errors"). When a paper's LAST
@@ -536,9 +543,9 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
     words' needle (e.g. '2.3' + 'Generating Physical Experience'), taking the
     LAST occurrence — body headings come after any abstract/ToC mention of the
     same words. All located headings are then sorted by position and each
-    section's span runs to the next located heading, stopping at a References
-    heading. The tail is cut at the last References unless the page's appendices
-    follow it, and arXiv's page chrome at the end is never counted.
+    section's span runs to the next located heading, stopping at a back-matter
+    heading (References, a paper checklist). The tail is cut at the last one unless
+    the page's appendices follow it, and arXiv's page chrome is never counted.
 
     A parent heading whose children are also located therefore measures only
     its own intro span (parent start -> first child start), matching how the
@@ -622,7 +629,7 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
             continue                             # unknown end -> unmeasurable
         ref = _TAIL_RE.search(body, pos[key] + 1, end)
         if ref:
-            end = ref.start()                    # the bibliography is no section's text
+            end = ref.start()                    # back matter is no section's text
         segment = body[pos[key]:min(end, _next_source_heading(body, pos[key], end))]
         span = _prose_chars(segment.replace(_TABLE_MARK, ""))
         # A "section" of a couple of hundred characters means the headings located

@@ -10,8 +10,15 @@ on such a paper, each producing findings about sections that were complete:
   so an appendix subsection was found only in the table of contents at the top
   and measured against the body text that follows it there;
 * the last section ran to the end of the arXiv page, so the page's own chrome
-  was counted as that section's source text.
+  was counted as that section's source text;
+* measured to the end of the document, the last appendix also took in the
+  unlettered back matter after it, a NeurIPS paper checklist.
 """
+import json
+import sys
+
+import pytest
+
 import verify_sections as vs
 
 SENTENCE = ("The method is evaluated on a range of tasks and compared with the "
@@ -71,6 +78,32 @@ SECTIONS = [("1", "Introduction"), ("2", "Method"),
 
 def measured(text=None):
     return vs.source_section_chars(text or source(), SECTIONS)
+
+
+def complete_translation(ratio=0.6):
+    """Translated length per section of a page that translated everything."""
+    return {key: int(len(SPANS[key]) * ratio) for key, _ in SECTIONS}
+
+
+def audit(monkeypatch, capsys, text, sizes, extra=()):
+    """Findings of the full audit on a page with `sizes[key]` chars per section."""
+    def block(kind, content, bid):
+        return {"type": kind, "id": bid, "has_children": False,
+                kind: {"rich_text": [{"type": "text", "plain_text": content,
+                                      "text": {"content": content}}]}}
+    korean = "번역된 본문 문장이 이어집니다. "
+    page = []
+    for key, title in SECTIONS:
+        page += [block("heading_2", f"{key} {title} (번역 제목)", f"h{key}"),
+                 block("paragraph", (korean * 400)[:sizes[key]], f"p{key}")]
+    page += list(extra)
+    monkeypatch.setattr(vs, "fetch_blocks", lambda _: page)
+    monkeypatch.setattr(vs, "page_title", lambda _: "a paper")
+    monkeypatch.setattr(vs, "load_source_text", lambda *_: text)
+    monkeypatch.setattr(sys, "argv", ["verify_sections.py", "--page", "p",
+                                      "--arxiv", "test-paper", "--json"])
+    vs.main()
+    return json.loads(capsys.readouterr().out)["findings"]
 
 
 def close_to(got, key, slack=80):
@@ -205,29 +238,11 @@ class TestTablesAreNotSource:
         assert got["A.1"] is not None and got["A.1"] < len(ONE_SENTENCE) + 40
 
     def test_the_audit_does_not_call_it_a_dropped_translation(self, monkeypatch, capsys):
-        import json
-        import sys
-
-        def block(kind, text, bid):
-            return {"type": kind, "id": bid, "has_children": False,
-                    kind: {"rich_text": [{"type": "text", "plain_text": text,
-                                          "text": {"content": text}}]}}
-        korean = "번역된 본문 문장이 이어집니다. "
-        page = []
-        for key, title in SECTIONS:
-            size = 40 if key == "A.1" else int(len(SPANS[key]) * 0.6)
-            page += [block("heading_2", f"{key} {title} (번역 제목)", f"h{key}"),
-                     block("paragraph", (korean * 400)[:size], f"p{key}")]
-        page.append({"type": "image", "id": "img", "image": {}})
+        sizes = complete_translation()
+        sizes["A.1"] = 40
         html = html_source(tables=table("A1.T1", rows=12), a1=ONE_SENTENCE)
-        monkeypatch.setattr(vs, "fetch_blocks", lambda _: page)
-        monkeypatch.setattr(vs, "page_title", lambda _: "a paper")
-        monkeypatch.setattr(vs, "load_source_text",
-                            lambda *_: vs.source_text_from_html(html))
-        monkeypatch.setattr(sys, "argv", ["verify_sections.py", "--page", "p",
-                                          "--arxiv", "test-paper", "--json"])
-        vs.main()
-        findings = json.loads(capsys.readouterr().out)["findings"]
+        findings = audit(monkeypatch, capsys, vs.source_text_from_html(html), sizes,
+                         extra=[{"type": "image", "id": "img", "image": {}}])
         assert [f for f in findings if f.get("section") == "A.1"] == []
 
     def test_a_table_with_no_closing_tag_is_kept(self):
@@ -244,3 +259,68 @@ class TestThePageChromeIsNotSource:
 
     def test_the_chrome_changes_nothing_it_follows(self):
         assert measured()["A.2"] == measured(source(chrome=""))["A.2"]
+
+
+# How LaTeXML's text of a NeurIPS paper checklist reads: an unnumbered heading,
+# then each item's number on a line of its own, so no item opens a numbered
+# heading line that would stop a span.
+CHECKLIST_ITEM = ("Question: Do the claims made in the abstract and introduction "
+                  "accurately reflect the contributions and scope of the work?\n"
+                  "Answer: [Yes]\nJustification: " + SENTENCE * 3 + "\nGuidelines:\n"
+                  "•\nThe answer NA means that the work makes no such claim. "
+                  + SENTENCE * 2)
+
+
+def checklist(heading="NeurIPS Paper Checklist"):
+    items = ["Claims", "Limitations", "Theory Assumptions and Proofs",
+             "Experimental Result Reproducibility", "Open access to data and code"]
+    return "\n".join([heading] + [f"{n}.\n{item}\n{CHECKLIST_ITEM}"
+                                  for n, item in enumerate(items, start=1)])
+
+
+class TestBackMatterAfterTheLastAppendix:
+    """Unlettered back matter after the appendices is no appendix's text."""
+
+    @pytest.mark.parametrize("body_chars", [3000, 9000])
+    def test_the_last_appendix_ends_at_the_checklist(self, monkeypatch, body_chars):
+        # At 9000 the last References sits past half the document, so the tail
+        # is cut there and brought back because the appendices follow it; at
+        # 3000 it is not cut at all. The checklist must end the span either way.
+        monkeypatch.setitem(SPANS, "1", prose(body_chars))
+        monkeypatch.setitem(SPANS, "2", prose(body_chars))
+        text = source(chrome=checklist() + "\n" + CHROME)
+        assert close_to(measured(text)["A.2"], "A.2")
+
+    @pytest.mark.parametrize("heading", ["NeurIPS Paper Checklist",
+                                         "NeurIPS 2024 Paper Checklist",
+                                         "Paper Checklist", "Checklist"])
+    def test_each_form_of_the_heading_ends_it(self, heading):
+        text = source(chrome=checklist(heading) + "\n" + CHROME)
+        assert close_to(measured(text)["A.2"], "A.2")
+
+    def test_a_paragraph_opening_with_the_word_is_not_a_checklist(self):
+        lines = SPANS["A.2"].splitlines()
+        a2 = "\n".join(lines[:1] + ["Checklist items were rated by two annotators "
+                                     "and disagreements were settled by discussion."]
+                        + lines[1:])
+        text = source().replace(SPANS["A.2"], a2)
+        assert measured(text)["A.2"] > len(SPANS["A.2"])
+
+    def test_appendices_after_a_checklist_are_still_measured(self):
+        # Some papers print the checklist between the references and the
+        # appendices; it must stop a span, not end the document.
+        text = source().replace("\nA Additional Experiments",
+                                "\n" + checklist() + "\nA Additional Experiments")
+        got = measured(text)
+        assert all(close_to(got[key], key) for key in ("2", "A", "A.1", "A.2")), got
+
+    def test_a_complete_last_appendix_is_not_reported(self, monkeypatch, capsys):
+        text = source(chrome=checklist() + "\n" + CHROME)
+        findings = audit(monkeypatch, capsys, text, complete_translation())
+        assert [f for f in findings if f.get("section") == "A.2"] == []
+
+    def test_a_short_last_appendix_is_not_a_dropped_translation(self, monkeypatch, capsys):
+        monkeypatch.setitem(SPANS, "A.2", prose(300))
+        text = source(chrome=checklist() + "\n" + CHROME)
+        findings = audit(monkeypatch, capsys, text, complete_translation())
+        assert [f for f in findings if f.get("section") == "A.2"] == []
