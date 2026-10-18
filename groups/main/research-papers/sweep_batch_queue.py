@@ -458,7 +458,14 @@ def load_state():
 
 def save_state(q, n):
     """Record what the resume just scheduled was handed. The resume is already in
-    the DB, so a failed write only loses the count, never the resume."""
+    the DB, so a failed write only costs the count, never the resume.
+
+    A failed write leaves the previous file in place (_write_json replaces it
+    whole or not at all). With n > 0 that file is this batch's, written by the
+    last resume with n - 1, so the next check counts n again: the wait stops
+    growing instead of starting over. With n == 0 whatever is there reads as
+    n=0 next time: no state, another batch's, or this batch's from before the
+    progress just counted."""
     try:
         _write_json(SWEEP_STATE, {
             "batch": batch_id(q),
@@ -467,8 +474,10 @@ def save_state(q, n):
             "resumed_at": _now().isoformat(),
         })
     except OSError as e:
+        then = (f"the last one stays, so the next check counts n={n} again, not "
+                f"n={n + 1}" if n else "the next check counts from n=0")
         print(f"sweep: could not record the backoff state ({type(e).__name__}: {e})"
-              f" — the next check counts from n=0", file=sys.stderr)
+              f" — {then}", file=sys.stderr)
 
 
 def clear_state():

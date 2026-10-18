@@ -724,18 +724,49 @@ def test_a_wait_with_nothing_to_count_from_never_blocks_a_resume(env):
     assert len(env.resumes()) == 1
 
 
-def test_a_state_that_cannot_be_written_never_costs_the_resume(env, monkeypatch):
-    env.write_queue([paper(i) for i in range(4)])
+def no_room_for_state(env, monkeypatch):
     real = sbq._write_json
 
-    def no_room_for_state(path, data):
+    def write(path, data):
         if path == env.state_path:
             raise OSError("disk full")
         real(path, data)
 
-    monkeypatch.setattr(sbq, "_write_json", no_room_for_state)
+    monkeypatch.setattr(sbq, "_write_json", write)
+
+
+def test_a_state_that_cannot_be_written_never_costs_the_resume(
+        env, monkeypatch, capsys):
+    env.write_queue([paper(i) for i in range(4)])
+    no_room_for_state(env, monkeypatch)
 
     assert env.sweep() == 0
 
     assert len(env.resumes()) == 1
     assert not os.path.exists(env.state_path)
+    # Nothing was recorded before, so the next check does count from zero.
+    assert "n=0" in capsys.readouterr().err
+
+
+def test_a_failed_state_write_says_where_the_count_stands(
+        env, monkeypatch, capsys):
+    # The state the last resume wrote stays on disk, so the next check counts
+    # from it: the wait stops growing rather than starting over.
+    first_resume(env)
+    resume_runs(env)
+    next_resume_after(env, capsys, 2 * COOLDOWN)
+    resume_runs(env)
+    next_resume_after(env, capsys, 4 * COOLDOWN)     # n=2 recorded
+    no_room_for_state(env, monkeypatch)
+    resume_runs(env)
+    env.advance(8 * COOLDOWN + 1)
+
+    assert env.sweep() == 0
+
+    assert len(env.resumes()) == 4
+    err = capsys.readouterr().err
+    assert re.search(r"\bn=3\b", err) and "n=0" not in err, err
+    # And the next check does what the line said.
+    resume_runs(env)
+    out = next_resume_after(env, capsys, 8 * COOLDOWN)
+    assert re.search(r"backing off\b.*\bn=3\b", out)
