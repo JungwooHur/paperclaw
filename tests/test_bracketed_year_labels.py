@@ -420,3 +420,31 @@ class TestAListWeWroteButCannotRead:
             block(f"e{n}", "paragraph", f"[Doe{n} et al. [2021] {e['text']}"[:2000])
             for n, e in enumerate(entries, 1)]
         assert lr.own_unread_list(page, entries) == ("ref", ["e1", "e2", "e3"])
+
+
+class TestAnAmbiguousAuthorYearIsNotLinked:
+    """Two entries can carry the same label: a corporate author's two reports of
+    one year, with no `a`/`b` to tell them apart. A body citation then names
+    either one and the index cannot say which. Keeping the last entry linked
+    every citation of the first to the wrong work."""
+
+    TWINS = ('<ul class="ltx_biblist">\n'
+             + natbib_item(1, "Acme [2022]", "Acme.", "A first invented report.")
+             + natbib_item(2, "Acme [2022]", "Acme.", "A second invented report.")
+             + natbib_item(3, "Roe and Poe [2019]", "Rick Roe and Pat Poe.",
+                           "An invented title.")
+             + '</ul>\n')
+
+    def test_the_shared_key_is_left_out_of_the_index(self):
+        index = lr.author_year_index(lr.parse_bibliography(self.TWINS))
+        assert index == {("roe and poe", "2019"): 3}
+
+    def test_a_citation_of_either_is_left_unlinked(self):
+        entries = lr.parse_bibliography(self.TWINS)
+        page = body(1) + [block("c", "paragraph",
+                                "보고서 (Acme, 2022)와 (Roe and Poe, 2019)를 따른다.")]
+        linked = lr.link_author_year(
+            "page", page, lr.author_year_index(entries),
+            {e["num"]: f"ref{e['num']}" for e in entries},
+            {e["num"]: e["text"] for e in entries}, apply=False)
+        assert linked == 1

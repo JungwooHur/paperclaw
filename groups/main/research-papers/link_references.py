@@ -979,8 +979,10 @@ HEAL_MAX_AGE_DAYS = 7
 # list and not one working link — on one of them, 73 citations.
 #
 # This needs no alignment and makes no assumption: the label IS the citation. Name
-# plus year identifies one entry outright, and the year's `a`/`b` suffix is what
-# separates an author's two papers in the same year, so it is part of the key.
+# plus year identifies one entry, and the year's `a`/`b` suffix is what separates
+# an author's two papers in the same year, so it is part of the key. A list can
+# still give two works the same label (a corporate author's two reports of one
+# year, with no suffix); such a key names neither, and is left unlinked.
 # The label is bracketed in one paper and parenthesised in the next —
 # "Belkhale et al. (2024)" and "Achiam et al. [2023]" are the same thing.
 _AY_LABEL = re.compile(r"^(.+?)\s*[\[(](\d{4}[a-z]?)[\])]")
@@ -1030,12 +1032,21 @@ def author_year_index(entries: list) -> dict:
     takes the label out of the entry's text, so the text opens with the full
     author list, and an index read from it came out empty on every natbib page:
     not one `(Doe et al., 2021)` in the body was linked.
+
+    A key two entries share is left out. The body cites either work by the same
+    words, so whichever entry the index kept, every citation of the other was
+    linked to the wrong work.
     """
-    out = {}
+    out, shared = {}, set()
     for e in entries:
         m = _AY_LABEL.match(e.get("label") or "")
         if m:
-            out[_ay_key(m.group(1), m.group(2))] = e["num"]
+            key = _ay_key(m.group(1), m.group(2))
+            if key in out or key in shared:
+                shared.add(key)
+                out.pop(key, None)
+            else:
+                out[key] = e["num"]
     return out
 
 
