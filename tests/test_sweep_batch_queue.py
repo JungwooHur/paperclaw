@@ -374,6 +374,18 @@ def test_a_refill_stands_down_for_an_agent_that_started_mid_probe(
 
 @pytest.mark.parametrize("setup", [stranded_with_excess, backlog_only,
                                    scheduled_with_excess])
+def test_a_sweep_that_writes_never_reports_that_it_skipped(env, setup, capsys):
+    setup(env)
+    before = env.files()
+
+    assert env.sweep() == 0
+
+    assert env.files() != before
+    assert "skipping" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("setup", [stranded_with_excess, backlog_only,
+                                   scheduled_with_excess])
 def test_a_dry_run_writes_nothing(env, setup):
     setup(env)
     before_files, before_tasks = env.files(), env.resumes()

@@ -53,8 +53,16 @@ runs `docker ps` again and compares the queue with its first read, and writes
 nothing if either changed (see still_quiet): an agent that started during the
 seconds-long NotebookLM probe writes the queue too.
 
-Idempotent and cheap: no-ops when the queue is still being worked, a container is
-up, a resume is already scheduled/just ran, or there is nothing left to hand out.
+Idempotent and cheap. It writes nothing while the queue is still being worked or a
+container is up, and never schedules a second resume while one is already scheduled
+or ran within the cooldown. It writes in three cases only:
+
+  * a stranded queue, no resume scheduled or recent: reconcile, trim, and schedule
+    a resume;
+  * a stranded queue with a resume already scheduled or recent: trim only, so the
+    run that fires next still gets a session-sized queue;
+  * no queue or a drained one, a non-empty backlog, no resume scheduled or recent:
+    refill, and schedule a resume.
 
   sweep_batch_queue.py [--dry-run] [--stale-min N] [--cooldown-min N]
 """
@@ -450,10 +458,14 @@ def main(argv=None) -> int:
     conn = sqlite3.connect(DB, timeout=15)
     try:
         if recent_resume(conn, a.cooldown_min):
+            # No second resume, but whichever run fires next still gets a
+            # session-sized queue.
+            over = len(pending) > BATCH_CHUNK
             print(f"sweep: stranded ({len(pending)} pending, {len(running)} in_progress) "
-                  f"but a resume is already scheduled/recent — skipping")
-            # Whichever run fires next still gets a session-sized queue.
-            if len(pending) > BATCH_CHUNK:
+                  f"but a resume is already scheduled/recent — "
+                  + (f"no new resume, trimming the queue to {BATCH_CHUNK} pending"
+                     if over else "skipping"))
+            if over:
                 if a.dry_run:
                     print(f"sweep: would move {len(pending) - BATCH_CHUNK} pending papers "
                           f"to the backlog (dry-run)")
