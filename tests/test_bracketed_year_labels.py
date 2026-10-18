@@ -160,8 +160,9 @@ class TestTheGuardsStillHold:
         assert not rs.is_entry(para("[Doe et al. [2021]] 저자. 어떤 제목."))
 
     def test_the_mangled_form_is_not_an_entry(self):
-        # A list already written as `[Doe et al. [2021] …` is NOT protected:
-        # back-matter stripping removes it once and the injector writes it anew.
+        # A list already written as `[Doe et al. [2021] …` is NOT protected. It
+        # is replaced instead: by back-matter stripping and the injector, or by
+        # the injector alone once it is too long to strip (see below).
         assert not rs.is_entry(para("[Doe et al. [2021] Jane Doe. A title."))
 
 
@@ -332,3 +333,90 @@ class TestTheWriterWritesOnlyWhatTheBoundaryReads:
         for html in (self.HANGUL, natbib_list(["Doe [2021]", "Roe [2022]"])):
             with pytest.raises(lr.UnreadableList):
                 written_entries(monkeypatch, lr.parse_bibliography(html))
+
+
+TWENTY = natbib_list([f"Doe{n} et&nbsp;al. [20{10 + n % 10}]" for n in range(1, 21)])
+
+
+def mangled_list(html):
+    """The list as the old parser wrote it: every label lost its year's `]`."""
+    return [block("old-ref", "heading_1", "References")] + [
+        block(f"old{i}", "paragraph", f"[{e['label'][:-1]}] {e['text']}")
+        for i, e in enumerate(lr.parse_bibliography(html))]
+
+
+def headings_named_references(fake):
+    return [b["id"] for b in fake.live() if rs.block_text(b) == "References"]
+
+
+class TestAListWeWroteButCannotRead:
+    """A list already written in the broken form is removed by back-matter
+    stripping only while it is under half the page. Past that, stripping refuses
+    and the injector sees a heading it cannot parse, so the broken list stayed
+    for good. It is recognised by its text instead, and replaced."""
+
+    def test_one_longer_than_half_the_page_is_replaced(self, monkeypatch):
+        fake = FakeNotion(body(6) + mangled_list(TWENTY))
+        wire(monkeypatch, fake, TWENTY)
+        stripped = sb.strip_backmatter("page", apply=True)
+        healed = lr.heal_references("page", apply=True, created_time=NOW)
+        assert "refused" in stripped
+        assert (healed["refs"], healed["replaced"]) == ("injected 20", 21)
+        assert len(headings_named_references(fake)) == 1
+        assert rs.list_spans(fake.live()) == [(12, 33)]
+        for _ in range(2):
+            stripped = sb.strip_backmatter("page", apply=True)
+            healed = lr.heal_references("page", apply=True, created_time=NOW)
+            assert (stripped["archived"], healed["refs"]) == (0, "already present")
+        assert fake.appends == 1
+
+    def test_force_replaces_it_instead_of_adding_a_second(self, monkeypatch):
+        fake = FakeNotion(body(6) + mangled_list(TWENTY))
+        wire(monkeypatch, fake, TWENTY)
+        lr.link_page("page", apply=True, force=True)
+        assert len(headings_named_references(fake)) == 1
+
+    def test_only_the_entries_are_taken_down(self, monkeypatch):
+        # A translation appended below a list placed before it arrived can open
+        # with a paragraph; it sits under the list's heading and is not the list.
+        after = block("after", "paragraph", SENTENCE * 20)
+        fake = FakeNotion(body(6) + mangled_list(TWENTY) + [after])
+        wire(monkeypatch, fake, TWENTY)
+        lr.heal_references("page", apply=True, created_time=NOW)
+        live = {b["id"] for b in fake.live()}
+        assert "after" in live and not live & {"old-ref", "old0", "old19"}
+
+    def test_a_list_that_is_not_ours_is_left_alone(self, monkeypatch):
+        translated = [block("ref", "heading_1", "References")] + [
+            block(f"t{n}", "paragraph", f"[{n}] 제인 도{n} 그리고 앤 투. 지어낸 제목 {n}.")
+            for n in range(1, 21)]
+        fake = FakeNotion(body(6) + translated)
+        wire(monkeypatch, fake, TWENTY)
+        healed = lr.heal_references("page", apply=True, created_time=NOW)
+        assert healed["refs"] == "already present (unparsed)"
+        assert fake.appends == 0 and len(fake.live()) == 33
+
+    def test_nothing_is_written_when_the_old_list_will_not_go(self, monkeypatch):
+        fake = FakeNotion(body(6) + mangled_list(TWENTY))
+        api = fake.api
+
+        def refuse_one(method, path, body=None, **kw):
+            if path == "/blocks/old7":
+                raise RuntimeError("409 conflict")
+            return api(method, path, body, **kw)
+        wire(monkeypatch, fake, TWENTY)
+        monkeypatch.setattr(lr, "notion", refuse_one)
+        healed = lr.heal_references("page", apply=True, created_time=NOW)
+        assert "stopped with 14 block(s) left" in healed["error"]
+        assert fake.appends == 0
+        # The heading is archived last, so the next run still finds the rest.
+        assert headings_named_references(fake) == ["old-ref"]
+
+    def test_an_entry_cut_off_at_the_block_limit_is_still_ours(self):
+        long_text = "Jane Doe and Ann Two. " + "An invented title that runs on. " * 80
+        entries = [{"num": n, "label": f"Doe{n} et al. [2021]", "text": f"{n} {long_text}"}
+                   for n in range(1, 4)]
+        page = [block("ref", "heading_1", "References")] + [
+            block(f"e{n}", "paragraph", f"[Doe{n} et al. [2021] {e['text']}"[:2000])
+            for n, e in enumerate(entries, 1)]
+        assert lr.own_unread_list(page, entries) == ("ref", ["e1", "e2", "e3"])

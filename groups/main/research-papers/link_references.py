@@ -407,6 +407,68 @@ def _find_refs_heading(blocks: list):
     return None
 
 
+def own_unread_list(blocks: list, entries: list):
+    """(heading id, entry ids) of a list this tool wrote but cannot read, or None.
+
+    `_find_refs_heading` recognises a list by its labels. A list an older writer
+    put out with malformed labels is invisible to it, and `may_inject_references`
+    then rightly refuses to add a second one. Back-matter stripping removes such
+    a list only while it is under half the page, so a long one stayed for good,
+    and everything else read it as body.
+
+    This reads the TEXT instead. Each entry was written as `[<label>] <the
+    source's entry text>`, verbatim and in English, and a translated bibliography
+    does not match that. Only the heading and the paragraphs that match are
+    returned, so nothing else under the heading is touched.
+
+    Args:
+        blocks: The page's top-level blocks.
+        entries: The bibliography as parsed from the source.
+    """
+    texts = {e["text"] for e in entries}
+
+    def written_by_us(text: str) -> bool:
+        at = text.find("] ") if text.startswith("[") else -1
+        while at != -1:
+            rest = text[at + 2:]
+            # 2000 characters is where the writer cut a long entry off.
+            if rest and (rest in texts or (
+                    len(text) >= 2000 and any(t.startswith(rest) for t in texts))):
+                return True
+            at = text.find("] ", at + 1)
+        return False
+
+    ours = set(reference_headings(blocks))
+    for i, b in enumerate(blocks):
+        if b["id"] not in ours:
+            continue
+        run = []
+        for x in blocks[i + 1:]:
+            if HEADING_LEVEL.get(x["type"]):
+                break
+            if x["type"] == "paragraph" and block_text(x).strip():
+                run.append(x)
+        mine = [x["id"] for x in run if written_by_us(block_text(x))]
+        if mine and len(mine) >= reference_section.ENTRY_SHARE * len(run):
+            return b["id"], mine
+    return None
+
+
+def _archive(ids: list) -> list:
+    """Archive these blocks in order, stopping at the first that fails.
+
+    Returns:
+        The ids still live, the failing one first; empty when all were archived.
+    """
+    for i, bid in enumerate(ids):
+        try:
+            notion("PATCH", f"/blocks/{bid}", {"archived": True})
+        except Exception:
+            return ids[i:]
+        time.sleep(0.15)
+    return []
+
+
 _LABEL = re.compile(r"^.*?[\[(]\d{4}[a-z]?[\])]\s*")
 _CONNECTOR = {"and", "others", "et", "al", "van", "von", "de", "der", "den", "di",
               "da", "el", "bin", "ibn", "jr", "sr", "the"}
@@ -790,7 +852,11 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
                                      entries)
         rep["refs"] = f"already present ({len(ref_ids)})"
     else:
-        if not may_inject_references(blocks) and not force:
+        # The list to take down first: the one `--force` rebuilds, or one this
+        # tool wrote in a form nothing reads any more. The second is replaced
+        # without `--force`, because nothing else will ever remove it.
+        old = found or own_unread_list(blocks, entries)
+        if not old and not may_inject_references(blocks) and not force:
             # A list is already there even if its entries did not parse. Appending
             # a second one is how a page runs away; refuse and say so.
             rep["refs"] = "already present (unparsed)"
@@ -805,13 +871,17 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
                               "written: back-matter stripping would archive it and "
                               "this would write it again, every cycle")
             return rep
-        if found and force and apply:
-            for bid in [found[0]] + found[1]:
-                try:
-                    notion("PATCH", f"/blocks/{bid}", {"archived": True})
-                except Exception:
-                    pass
-                time.sleep(0.15)
+        if old:
+            rep["replaced"] = 1 + len(old[1])
+        if old and apply:
+            # The heading goes last: if an archive fails, the heading is still
+            # there, so the next run finds what is left and finishes the job.
+            left = _archive(old[1] + [old[0]])
+            if left:
+                # Writing anyway would leave two lists on the page.
+                rep["error"] = (f"archiving the old list stopped with {len(left)} "
+                                f"block(s) left; nothing written")
+                return rep
             blocks = vs.fetch_blocks(page_id)
         ref_ids = inject_references(page_id, entries, apply)
         rep["refs"] = f"{'injected' if apply else 'would inject'} {len(entries)}"
