@@ -289,7 +289,7 @@ def offline(monkeypatch):
     monkeypatch.setattr(collect_papers, "classify_translation", lambda _: "TRANSLATED")
     monkeypatch.setattr(ef, "arxiv_id_from_page", lambda _: "xxxx")
     state = {"html": PAR}
-    monkeypatch.setattr(ef, "fetch_html", lambda _: (state["html"], "src"))
+    monkeypatch.setattr(ef, "html_renders", lambda _: iter([(state["html"], "src")]))
     return state
 
 
@@ -319,7 +319,7 @@ class TestAnUnreadableBibliographyIsReported:
     def test_a_source_with_no_entries_at_all_is_printed_too(self, offline, capsys):
         # An HTML render with figures and no bibliography: native-latest has been
         # seen to drop the list that v1 carries.
-        offline["html"] = source([])
+        offline["html"] = figure(source([]))
         rep = heal()
         assert rep["error"] == "no bibliography in source"
         assert "p: REFS error" in capsys.readouterr().err
@@ -352,7 +352,14 @@ class TestStatesThatAreNotFaultsStayQuiet:
         assert capsys.readouterr().err == ""
 
     def test_a_pdf_only_paper(self, offline, monkeypatch, capsys):
-        monkeypatch.setattr(ef, "fetch_html", lambda _: (None, None))
+        monkeypatch.setattr(ef, "html_renders", lambda _: iter([]))
+        assert heal()["error"] == "no HTML source"
+        assert capsys.readouterr().err == ""
+
+    def test_a_page_that_answers_with_neither_figure_nor_list(
+            self, offline, capsys):
+        # What ar5iv serves, with a 200, for a paper it could not convert.
+        offline["html"] = '<html><body><p>Conversion failed.</p></body></html>'
         assert heal()["error"] == "no HTML source"
         assert capsys.readouterr().err == ""
 
@@ -379,3 +386,54 @@ class TestStatesThatAreNotFaultsStayQuiet:
         monkeypatch.setattr(lr, "link_page", lambda *_a, **_k: rep)
         assert heal() is rep
         assert capsys.readouterr().err == ""
+
+
+# --- which render is read -----------------------------------------------------
+
+def figure(html):
+    return html.replace('<section id="bib"',
+                        '<figure id="S1.F1" class="ltx_figure"></figure><section id="bib"')
+
+
+class TestARenderWithNoFigureStillHasItsBibliography:
+    """`ef.fetch_html` takes a render only if it has a `<figure`.
+
+    That is the figure injector's need, and the reference linker borrowed it. A
+    paper with no figure therefore read as "no HTML source", the state kept quiet
+    as a PDF-only paper, and never got its list.
+    """
+
+    @staticmethod
+    def renders(monkeypatch, *pages):
+        pulled = []
+
+        def gen(_):
+            for i, page in enumerate(pages):
+                pulled.append(i)
+                yield page, f"render-{i}"
+        monkeypatch.setattr(ef, "html_renders", gen)
+        return pulled
+
+    def test_its_bibliography_is_read(self, offline, monkeypatch, capsys):
+        self.renders(monkeypatch, PAR)
+        rep = heal()
+        assert rep["entries"] == 3 and "error" not in rep
+        assert capsys.readouterr().err == ""
+
+    def test_a_render_with_a_figure_is_still_the_one_read(self, monkeypatch):
+        # As before: the render the figures come from, when there is one.
+        with_figure = figure(source([bibitem(1, 1, ENTRIES[0][1])]))
+        self.renders(monkeypatch, PAR, with_figure)
+        assert lr.fetch_source("xxxx") == (with_figure, "render-1")
+
+    def test_the_first_render_with_a_figure_ends_the_fetch(self, monkeypatch):
+        # One request for a paper whose native render is whole, every cycle.
+        pulled = self.renders(monkeypatch, figure(PAR), PAR)
+        assert lr.fetch_source("xxxx")[1] == "render-0"
+        assert pulled == [0]
+
+    def test_the_figure_injector_still_needs_a_figure(self, monkeypatch):
+        self.renders(monkeypatch, PAR)
+        assert ef.fetch_html("xxxx") == (None, None)
+        self.renders(monkeypatch, PAR, figure(PAR))
+        assert ef.fetch_html("xxxx") == (figure(PAR), "render-1")

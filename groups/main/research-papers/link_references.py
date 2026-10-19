@@ -142,6 +142,24 @@ _SECTION = re.compile(r'<section[^>]+id="(S\d+)' + reference_section.LTX_ID_SUFF
 _ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)' + reference_section.LTX_ID_SUFFIX + '"')
 
 
+def fetch_source(arxiv_id: str):
+    """(html, source_url) of the render to read the bibliography from.
+
+    The render `ef.fetch_html` takes, the first with a figure, so the list and
+    the figures still come from the same source. Failing that, the first with
+    a bibliography entry: `ef.fetch_html` refuses a render with no figure, which
+    made a paper without one read as "no HTML source", the state a PDF-only
+    paper is in, and it never got its list. (None, None) when neither is found.
+    """
+    listed = None
+    for data, final in ef.html_renders(arxiv_id):
+        if "<figure" in data:
+            return data, final
+        if listed is None and _ANY_BIB_ITEM.search(data):
+            listed = (data, final)
+    return listed or (None, None)
+
+
 def parse_bibliography(html: str) -> list:
     """[{num, text}] for every entry in the source's reference list, in order."""
     out = []
@@ -724,7 +742,7 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
     if not arxiv_id:
         rep["error"] = "no arxiv id"
         return rep
-    html, _src = ef.fetch_html(arxiv_id)
+    html, _src = fetch_source(arxiv_id)
     if not html:
         rep["error"] = "no HTML source"
         return rep
@@ -1056,8 +1074,10 @@ def body_blocks_of(blocks: list) -> list:
 #   * `skipped` (from `_heal_references`): older than the healer's window.
 #   * "no arxiv id": not an arXiv paper. `heal_figures` has already tried to
 #     resolve an id from the title this cycle, so there is no source to read.
-#   * "no HTML source": a PDF-only paper, for which arXiv rendered no HTML. A
-#     fetch that failed reads the same and is simply retried next cycle.
+#   * "no HTML source": no render has a figure or a bibliography entry
+#     (`fetch_source`). A PDF-only paper, for which arXiv rendered no HTML, or
+#     one ar5iv could not convert. A fetch that failed reads the same and is
+#     simply retried next cycle.
 # Every other `error` is printed. That includes a source whose `ltx_bibitem`
 # entries parse to none, which is how ids with a `\par` suffix went unseen, and
 # a source with no entries at all, since a native render has been seen to drop

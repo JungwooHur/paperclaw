@@ -51,9 +51,13 @@ def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", _html.unescape(_TAG.sub("", s))).strip()
 
 
-def fetch_html(arxiv_id: str):
-    """Return (html, source_url). arxiv-native first (latest version), ar5iv
-    fallback (often stale v1 — see the ar5iv note in CLAUDE.md)."""
+def html_renders(arxiv_id: str):
+    """Yield (html, source_url) for each HTML render of the paper that answers.
+
+    arxiv-native first (latest version), ar5iv fallback (often stale v1 — see
+    the ar5iv note in CLAUDE.md). Lazy, so a caller that stops at the first
+    render it can use fetches no more than that.
+    """
     for url in (f"https://arxiv.org/html/{arxiv_id}",
                 f"https://ar5iv.labs.arxiv.org/html/{arxiv_id}"):
         try:
@@ -61,10 +65,16 @@ def fetch_html(arxiv_id: str):
             with urllib.request.urlopen(req, timeout=30) as r:
                 data = r.read().decode("utf-8", "replace")
                 final = r.geturl()
-            if "<figure" in data:
-                return data, final
         except Exception:
             continue
+        yield data, final
+
+
+def fetch_html(arxiv_id: str):
+    """Return (html, source_url) of the first render with a figure in it."""
+    for data, final in html_renders(arxiv_id):
+        if "<figure" in data:
+            return data, final
     return None, None
 
 
