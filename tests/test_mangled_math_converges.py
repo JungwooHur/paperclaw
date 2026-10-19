@@ -69,6 +69,33 @@ class TestTextModeKoreanIsNotProse:
         assert not hm.is_mangled(with_unit(r"\text{초 {단위} 초} + 1"))
 
 
+class TestTextModeParsesLikeLatex:
+    """A text-mode command takes ONE argument, braced or not, and is a command
+    only when its backslash is not itself escaped."""
+
+    @pytest.mark.parametrize("expr", [r"2\text 초", r"5\,\text 초", r"\mathrm 분 + 1"])
+    def test_an_unbraced_argument_is_one_token(self, expr):
+        assert not hm.is_mangled(with_unit(expr))
+
+    def test_an_unbraced_label_is_not_rebuilt(self, notion_page):
+        # Flagged, its rebuild wrote the equation `2\text` with the label moved
+        # into prose: an argument-less command, which renders as an error.
+        page = notion_page([with_unit(r"2\text 초")])
+        hm.heal_page("p", apply=True)
+        assert page.calls == []
+
+    def test_only_that_one_token_is_text(self):
+        assert hm.is_mangled(with_unit(r"2\text 초 동안"))
+
+    def test_after_a_line_break_the_letters_are_math(self):
+        # `\\` is a line break, so `text{초}` is four letters and a group.
+        assert hm.is_mangled(with_unit(r"2\\text{초}"))
+        assert hm.is_mangled(with_unit(r"2\\text 초"))
+
+    def test_a_command_after_a_line_break_still_counts(self):
+        assert not hm.is_mangled(with_unit(r"a \\\text{초}"))
+
+
 class TestRealManglingIsStillCaught:
     """The two fingerprints from the module docstring must still fire."""
 

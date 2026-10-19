@@ -58,7 +58,9 @@ TEXT_TYPES = ("paragraph", "quote", "bulleted_list_item", "numbered_list_item")
 
 # Commands whose argument is set in text mode, where Korean is legitimate.
 TEXT_MODE = re.compile(r"\\(?:text(?:rm|bf|it|tt|sf|normal)?|mathrm|mbox"
-                       r"|operatorname\*?)\s*(?=\{)")
+                       r"|operatorname\*?)\s*")
+# One unbraced argument that is a control sequence: `\text\ldots`.
+_CONTROL = re.compile(r"\\(?:[A-Za-z]+|.)?", re.S)
 
 
 def _group_end(s: str, i: int):
@@ -80,18 +82,44 @@ def _group_end(s: str, i: int):
     return None
 
 
+def _escaped(s: str, i: int) -> bool:
+    """True when the backslash at s[i] is itself escaped, i.e. the second half of
+    a `\\\\` line break: an odd run of backslashes precedes it."""
+    n = 0
+    while i - n > 0 and s[i - n - 1] == "\\":
+        n += 1
+    return n % 2 == 1
+
+
+def _argument_end(s: str, i: int):
+    """Index just past the one argument a command takes at s[i], the way LaTeX
+    reads it: a brace group, else a single token (`\\text 초` is valid). None
+    when the group never closes; s[i] itself when there is no argument."""
+    if i >= len(s) or s[i] == "}":
+        return i
+    if s[i] == "{":
+        return _group_end(s, i)
+    if s[i] == "\\":
+        return _CONTROL.match(s, i).end()
+    return i + 1
+
+
 def _without_text_mode(expr: str) -> str:
     r"""EXPR with the argument of every text-mode command removed.
 
     An unclosed group is left in place: it is a broken parse, not a text-mode
-    argument, so whatever Korean follows it still counts."""
-    out, pos = [], 0
-    while (m := TEXT_MODE.search(expr, pos)):
-        end = _group_end(expr, m.end())
+    argument, so whatever Korean follows it still counts. Nor is `\\text{…}` a
+    command: the `\\` is a line break, and the letters after it are math."""
+    out, pos, at = [], 0, 0
+    while (m := TEXT_MODE.search(expr, at)):
+        if _escaped(expr, m.start()):
+            at = m.start() + 1
+            continue
+        end = _argument_end(expr, m.end())
         if end is None:
             break
         out.append(expr[pos:m.start()] + " ")
-        pos = end
+        pos = at = end
     out.append(expr[pos:])
     return "".join(out)
 
