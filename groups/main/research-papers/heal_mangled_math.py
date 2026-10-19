@@ -128,7 +128,11 @@ def _balance_dollar_runs(text: str) -> str:
     r"""Extend a `$…$` run that stops inside an unclosed `(` so it takes its closing
     paren with it: `$\Theta_q(\mathbf{x}_q$, m)` -> `$\Theta_q(\mathbf{x}_q, m)$`.
     wrap_math is deliberately conservative and stops at the comma; left alone the
-    formula renders split across a plain-text tail."""
+    formula renders split across a plain-text tail.
+
+    It never crosses Korean: in `$s_t($상태)` the paren holds the formula's Korean
+    name, and carrying the run on to the `)` put that name inside the equation,
+    which is the very thing the healer repairs."""
     out, pos = [], 0
     for m in re.finditer(r"\$([^$\n]+)\$", text):
         out.append(text[pos:m.start()])
@@ -144,7 +148,7 @@ def _balance_dollar_runs(text: str) -> str:
                     if need == 0:
                         take = i + 1
                         break
-                elif ch in "$\n":
+                elif ch in "$\n" or KOREAN.match(ch):
                     break
             if take:
                 expr += tail[:take]

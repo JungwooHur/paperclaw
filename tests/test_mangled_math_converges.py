@@ -274,3 +274,37 @@ class TestAStuckRunIsVisibleInTheJournal:
         assert len(stuck) == 1 and "7" in stuck[0] and "8" in stuck[0]
         # Nothing was written, so the page is not counted as healed.
         assert "healed 0/1" in out.out
+
+
+# --- One leftover Korean span must not cost the whole run ---------------------
+
+# Swapped parses of the most common gloss shape, a formula followed by its Korean
+# name with no space: `s_t(상태)`. wrap_math leaves the `(` inside the run, so the
+# rebuild gets `$s_t($상태)`, and the paren balancer used to carry the run on to
+# the `)` across the Korean, giving the equation `s_t(상태)`.
+GLOSSED = [
+    para(text("에이전트는 "), eq("관측을 받아 "), text("s_t(상태)"),
+         eq("를 갱신한다 ")),
+    para(text(r"\pi_\theta"), eq("는 정책이고 "), text(r"\gamma"),
+         eq(r"는 할인율이다 \)")),
+]
+
+
+class TestAKoreanGlossStaysProse:
+
+    def test_the_balancer_does_not_cross_korean(self):
+        assert hm._balance_dollar_runs("$s_t($상태)를") == "$s_t($상태)를"
+
+    def test_it_still_closes_a_formula_cut_at_the_comma(self):
+        assert (hm._balance_dollar_runs(r"$\Theta_q(\mathbf{x}_q$, m) - ")
+                == r"$\Theta_q(\mathbf{x}_q, m)$ - ")
+
+    def test_a_run_with_a_gloss_is_repaired_and_stays_repaired(self, notion_page):
+        page = notion_page([para(text("서론 문단입니다.")), GENUINE[1]] + GLOSSED
+                           + [para(text("결론 문단입니다."))])
+        rep = hm.heal_page("p", apply=True)
+        assert rep["unconverged"] == 0 and rep["mangled_blocks"] == 3
+        assert not any(hm.is_mangled(b) for b in page.fetch("p"))
+        page.calls.clear()
+        hm.heal_page("p", apply=True)
+        assert page.calls == []
