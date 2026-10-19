@@ -116,6 +116,34 @@ class TestTheOtherShapesAreUnchanged:
         assert lr.parse_bibliography(html) == []
 
 
+class TestTheLeakedParIsDroppedFromTheEntry:
+    """The render that suffixes its ids also leaves `\\par` in the entry text.
+
+    It follows each accented letter of a name, `Exä\\parmplé\\par`, and went into
+    the injected list as written. The ar5iv copy of the same paper has none.
+    """
+
+    def test_an_accented_name_is_read_whole(self):
+        html = source([bibitem(1, 1, "Q. Exä\\parmplé\\par. A title. In Venue, 2020.")])
+        assert lr.parse_bibliography(html)[0]["text"] == (
+            "Q. Exämplé. A title. In Venue, 2020.")
+
+    def test_and_so_is_an_author_year_label(self):
+        html = source([bibitem(1, "Exä\\parmplé\\par et al. (2020)", ENTRIES[0][1])])
+        assert lr.parse_bibliography(html)[0]["label"] == "Exämplé et al. (2020)"
+
+    def test_a_formulas_own_commands_are_kept(self):
+        # `\partial` and `\parallel` start with the same four letters.
+        text = "On \\partial and \\parallel flows. 2020."
+        assert lr.parse_bibliography(source([bibitem(1, 1, text)]))[0]["text"] == text
+
+    def test_a_render_without_the_suffix_is_read_as_before(self):
+        # Nothing says a `\par` there is not the paper's own TeX.
+        text = "Set in a \\parbox. 2020."
+        html = source([bibitem(1, 1, text, suffix="")])
+        assert lr.parse_bibliography(html)[0]["text"] == text
+
+
 FOUR = ENTRIES + [(4, "D. Author. A fourth title. In Venue, 2023.")]
 
 

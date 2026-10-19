@@ -127,6 +127,14 @@ def _tag_span(body: str):
         depth += 1 if edge.group(0).lower().startswith('<span') else -1
         at = edge.end()
     return body[open_tag.end():at - len('</span>')], open_tag.start(), at
+
+
+# The render that suffixes its ids also leaves that `\par` in the entry text,
+# after each accented letter of a name: `Exä\parmplé\par`. It is dropped from
+# such a render only, and never where it begins `\partial` or `\parallel`, the
+# commands a formula in a title can carry. Elsewhere it is the paper's own TeX.
+_PAR_RENDER = re.compile(r'id="bib\.bibx?\d+\\par"')
+_LEAKED_PAR = re.compile(r'\\par(?!tial|allel)')
 # A section's id takes the same suffix as an entry's (`S4\par`). Missed, the
 # section did not end the one before it, which then took all its citations.
 _SECTION = re.compile(r'<section[^>]+id="(S\d+)' + reference_section.LTX_ID_SUFFIX
@@ -137,8 +145,9 @@ _ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)' + reference_section.LTX_ID_SUFFIX
 def parse_bibliography(html: str) -> list:
     """[{num, text}] for every entry in the source's reference list, in order."""
     out = []
+    leaked = bool(_PAR_RENDER.search(html))
     for m in _BIB_ITEM.finditer(html):
-        body = m.group(2)
+        body = _LEAKED_PAR.sub("", m.group(2)) if leaked else m.group(2)
         tag = _tag_span(body)
         label = ef._clean(tag[0]).strip() if tag else ""
         if tag:
