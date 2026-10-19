@@ -471,3 +471,24 @@ class TestACutNeverHalvesAFormula:
             ([0], True), ([1], False)]
         assert archived_ids(page) == {"b1"}
 
+# --- A text-mode argument stays with its command -------------------------------
+
+class TestATextModeArgumentStaysWithItsCommand:
+    """The balancer stops at Korean, but not at the one token a bare `\\text`
+    takes: stopping there leaves `$d(\\text$`, a command with no argument."""
+
+    def test_the_balancer_carries_a_bare_text_argument(self):
+        assert (hm._balance_dollar_runs(r"$d(\text$ 초)로")
+                == r"$d(\text 초)$로")
+
+    def test_it_still_stops_at_korean_after_that_argument(self):
+        assert (hm._balance_dollar_runs(r"$d(\text$ 초 동안)로")
+                == r"$d(\text$ 초 동안)로")
+
+    def test_the_rebuilt_equation_keeps_its_argument(self, notion_page):
+        page = notion_page([para(text("지연은 "), eq("각 단계마다 "),
+                                 text(r"d(\text 초)"), eq("로 측정된다 "))])
+        hm.heal_page("p", apply=True)
+        assert [s["equation"]["expression"] for b in page.written()
+                for s in b["paragraph"]["rich_text"]
+                if s["type"] == "equation"] == [r"d(\text 초)"]

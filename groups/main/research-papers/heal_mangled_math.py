@@ -162,7 +162,9 @@ def _balance_dollar_runs(text: str) -> str:
 
     It never crosses Korean: in `$s_t($상태)` the paren holds the formula's Korean
     name, and carrying the run on to the `)` put that name inside the equation,
-    which is the very thing the healer repairs."""
+    which is the very thing the healer repairs. Korean that a bare `\text` takes
+    as its argument is the exception: `$d(\text$ 초)` stopped there leaves a
+    command with no argument, which renders as an error."""
     out, pos = [], 0
     for m in re.finditer(r"\$([^$\n]+)\$", text):
         out.append(text[pos:m.start()])
@@ -178,7 +180,8 @@ def _balance_dollar_runs(text: str) -> str:
                     if need == 0:
                         take = i + 1
                         break
-                elif ch in "$\n" or KOREAN.match(ch):
+                elif ch in "$\n" or (KOREAN.match(ch) and KOREAN.search(
+                        _without_text_mode(expr + tail[:i + 1]))):
                     break
             if take:
                 expr += tail[:take]
