@@ -226,6 +226,25 @@ class TestTheStyleClassifierReadsTheSuffix:
                       body=" ".join(cite(n, f"Doe{n} et al.") for n in range(1, 7)))
         assert vc.classify_bibliography(html) == ("author-year", None)
 
+    # The same render ends every anchor's visible text in `\par\par`. That made
+    # a name too long to be read as one, and a number not a number, which turns
+    # a numeric paper author-year: the verdict that strips its markers.
+    LEAKED = "\\par\\par"
+
+    def test_a_number_that_ends_in_the_leaked_par_is_still_a_number(self):
+        html = source([bibitem(n, f"Doe{n} et al. [202{n}]", f"Doe{n}. A title {n}.")
+                       for n in range(1, 7)],
+                      body=" ".join(f"[{cite(n, str(n) + self.LEAKED)}]"
+                                    for n in range(1, 7)))
+        assert vc.classify_bibliography(html) == ("numeric", 6)
+
+    def test_a_name_that_ends_in_it_is_still_a_name(self):
+        html = source([bibitem(n, f"Doe{n} et al. [202{n}]", f"Doe{n}. A title {n}.")
+                       for n in range(1, 7)],
+                      body=" ".join(cite(n, f"Doe{n} et al. (202{n})" + self.LEAKED)
+                                    for n in range(1, 7)))
+        assert vc.classify_bibliography(html) == ("author-year", None)
+
 
 class TestLeakedCitationUrlsWithTheSuffix:
     """A flattened anchor leaks into the body as `N <url>#bib.bibN`."""
