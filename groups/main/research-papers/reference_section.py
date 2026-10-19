@@ -174,3 +174,16 @@ def body_end_anchor(blocks: list):
     """
     i = start_index(blocks)
     return blocks[i - 1]["id"] if i else None
+
+
+# --- the source's entry ids ---------------------------------------------------
+# Not about the page: the one thing every reader of arXiv's HTML must agree on
+# about a bibliography entry's id. It lives here because each of those readers
+# already imports this module, and it adds no dependency.
+#
+# Some arXiv-native renders write every id with a literal `\par` after it,
+# `<li id="bib.bib7\par">`, and the body's anchors with the same suffix
+# URL-encoded, `href="#bib.bib7%5Cpar"`. The ar5iv copy of the same paper writes
+# plain `bib.bib7`. A pattern that knew only the plain form read such a source as
+# one with no bibliography at all. Put this right after the id's number.
+BIB_ID_SUFFIX = r"(?:\\par|%5[Cc]par)?"

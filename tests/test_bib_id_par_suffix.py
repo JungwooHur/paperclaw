@@ -1,0 +1,277 @@
+r"""Bibliography ids that carry a literal `\par`, and a failure that said nothing.
+
+Some arXiv-native renders write every entry id as `bib.bib7\par` and the body's
+anchors to it as `#bib.bib7%5Cpar`, the same suffix URL-encoded. The ar5iv copy
+of the same paper writes plain `bib.bib7`. Every pattern that knew only the
+plain form read such a source as one with no bibliography, so the page got no
+reference list and no linked citation.
+
+Nobody heard about it either: the healer reads only `slots_linked` from
+`heal_references`, and a page whose source could not be read reported zero,
+exactly like a page with nothing to do.
+"""
+import datetime
+
+import pytest
+
+import clean_source_urls as csu
+import collect_papers
+import extract_paper_figures as ef
+import link_references as lr
+import verify_citations as vc
+
+
+def bibitem(n, label, text, suffix="\\par", x=""):
+    """One LaTeXML bibliography entry, its id written with `suffix`."""
+    return (f'<li id="bib.bib{x}{n}{suffix}" class="ltx_bibitem">'
+            f'<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">[{label}]</span>'
+            f'<span class="ltx_bibblock">{text}</span></li>\n')
+
+
+def cite(n, shown, suffix="%5Cpar"):
+    """One in-body anchor to entry `n`, showing `shown`."""
+    return f'<a href="#bib.bib{n}{suffix}" class="ltx_ref">{shown}</a>'
+
+
+def source(items, body=""):
+    return ('<article class="ltx_document">'
+            '<section id="S1" class="ltx_section">'
+            '<h2 class="ltx_title ltx_title_section">1 Introduction</h2>'
+            f'<p class="ltx_p">{body}</p></section>'
+            '<section id="bib" class="ltx_bibliography"><ul class="ltx_biblist">\n'
+            + "".join(items) + '</ul></section></article>')
+
+
+ENTRIES = [(1, "A. Author. A first title. In Venue, 2020."),
+           (2, "B. Author. A second title. In Venue, 2021."),
+           (3, "C. Author. A third title. In Venue, 2022.")]
+
+# The shape the bug was found in: `\par` on every id, `%5Cpar` on every anchor.
+PAR = source([bibitem(n, n, t) for n, t in ENTRIES],
+             body=f"Prior work [{cite(2, 2)}, {cite(1, 1)}] and later [{cite(3, 3)}].")
+
+
+class TestTheParSuffixIsRead:
+
+    def test_every_entry_is_read(self):
+        assert [e["text"] for e in lr.parse_bibliography(PAR)] == [t for _, t in ENTRIES]
+
+    def test_entry_numbers_are_ints(self):
+        entries = lr.parse_bibliography(PAR)
+        assert [e["num"] for e in entries] == [1, 2, 3]
+        assert [e["id_num"] for e in entries] == [1, 2, 3]
+        assert all(type(e["num"]) is int and type(e["id_num"]) is int
+                   for e in entries)
+
+    def test_the_suffix_is_not_left_in_the_entry_or_its_label(self):
+        for e in lr.parse_bibliography(PAR):
+            assert "par" not in e["label"] and "\\" not in e["text"]
+
+    def test_the_bodys_anchors_resolve_through_the_encoded_suffix(self):
+        assert lr.source_citation_sequence(PAR) == {"1": [2, 1, 3]}
+
+    def test_the_paragraph_reading_resolves_them_too(self):
+        assert lr.source_citation_paragraphs(PAR) == {"1": [[2, 1, 3]]}
+
+    def test_a_lowercase_escape_is_the_same_suffix(self):
+        # Percent-escapes are case-insensitive; `%5c` is as valid as `%5C`.
+        html = source([bibitem(n, n, t) for n, t in ENTRIES],
+                      body=f"See [{cite(3, 3, '%5cpar')}].")
+        assert lr.source_citation_sequence(html) == {"1": [3]}
+
+    def test_an_anchor_maps_to_the_label_not_the_id(self):
+        # The suffix must not break the id -> cited-number mapping: `bib.bib15`
+        # can be `[1]`.
+        html = source([bibitem(15, 1, ENTRIES[0][1]), bibitem(20, 2, ENTRIES[1][1]),
+                       bibitem(3, 3, ENTRIES[2][1])],
+                      body=f"[{cite(20, 2)}] [{cite(15, 1)}]")
+        assert lr.source_citation_sequence(html) == {"1": [2, 1]}
+
+
+class TestTheOtherShapesAreUnchanged:
+
+    def test_plain_ids_and_anchors(self):
+        html = source([bibitem(n, n, t, suffix="") for n, t in ENTRIES],
+                      body=f"[{cite(2, 2, '')}, {cite(1, 1, '')}]")
+        assert [e["num"] for e in lr.parse_bibliography(html)] == [1, 2, 3]
+        assert lr.source_citation_sequence(html) == {"1": [2, 1]}
+
+    def test_alphabetic_ids(self):
+        html = source([bibitem(1, "ACDE12", ENTRIES[0][1], suffix="", x="x"),
+                       bibitem(2, "VSP + 17", ENTRIES[1][1], suffix="", x="x")])
+        entries = lr.parse_bibliography(html)
+        assert [(e["num"], e["label"]) for e in entries] == [(1, "ACDE12"),
+                                                            (2, "VSP + 17")]
+
+    def test_alphabetic_ids_with_the_suffix(self):
+        html = source([bibitem(7, "ACDE12", ENTRIES[0][1], x="x")],
+                      body=f'[<a href="#bib.bibx7%5Cpar">ACDE12</a>]')
+        assert [e["id_num"] for e in lr.parse_bibliography(html)] == [7]
+        assert lr.source_citation_sequence(html) == {"1": [7]}
+
+    def test_an_unknown_suffix_is_still_not_an_id(self):
+        # Only `\par` is accepted; anything else after the number stays unread,
+        # which is what `heal_references` then reports.
+        html = source([bibitem(n, n, t, suffix="\\relax") for n, t in ENTRIES])
+        assert lr.parse_bibliography(html) == []
+
+
+class TestTheStyleClassifierReadsTheSuffix:
+    """verify_citations decides numeric vs author-year from the body's anchors.
+
+    A natbib list labels its entries `Doe et al. [2021]` while the body cites by
+    number, so only the anchors say this paper is numeric. Unread anchors made it
+    author-year, and `--apply` on that verdict strips every numeric marker.
+    """
+
+    NATBIB = source(
+        [bibitem(n, f"Doe{n} et al. [202{n}]", f"Doe{n}. A title {n}.")
+         for n in range(1, 7)],
+        body=" ".join(f"[{cite(n, n)}]" for n in range(1, 7)))
+
+    def test_a_numerically_cited_paper_is_numeric(self):
+        assert vc.classify_bibliography(self.NATBIB)[0] == "numeric"
+
+    def test_the_entry_count_comes_from_the_suffixed_ids(self):
+        assert vc.classify_bibliography(self.NATBIB) == ("numeric", 6)
+
+    def test_an_author_year_body_is_still_author_year(self):
+        html = source([bibitem(n, f"Doe{n} et al. [202{n}]", f"Doe{n}. A title {n}.")
+                       for n in range(1, 7)],
+                      body=" ".join(cite(n, f"Doe{n} et al.") for n in range(1, 7)))
+        assert vc.classify_bibliography(html) == ("author-year", None)
+
+
+class TestLeakedCitationUrlsWithTheSuffix:
+    """A flattened anchor leaks into the body as `N <url>#bib.bibN`."""
+
+    @staticmethod
+    def group(suffix):
+        return (f"이전 연구 [ 1 https://arxiv.org/html/xxxx#bib.bib1{suffix} , "
+                f"2 https://arxiv.org/html/xxxx#bib.bib2{suffix} ]는 그렇다.")
+
+    def test_the_plain_form_is_removed_whole(self):
+        out = csu.strip_citation_urls(self.group(""))
+        assert out.startswith("이전 연구") and out.endswith("는 그렇다.")
+        assert "http" not in out and "[" not in out and "]" not in out
+
+    def test_a_suffixed_group_is_removed_exactly_like_a_plain_one(self):
+        assert (csu.strip_citation_urls(self.group("%5Cpar"))
+                == csu.strip_citation_urls(self.group("")))
+
+
+# --- the failure is heard -----------------------------------------------------
+
+def rich(text):
+    return [{"type": "text", "text": {"content": text}, "plain_text": text}]
+
+
+def blk(bid, kind, text):
+    return {"id": bid, "type": kind, kind: {"rich_text": rich(text)}}
+
+
+REFERENCE_LIST = [blk("h", "heading_1", "References")] + [
+    blk(f"r{n}", "paragraph", f"[{n}] {t}") for n, t in ENTRIES]
+
+
+@pytest.fixture
+def offline(monkeypatch):
+    """A translated page whose source is whatever the test sets."""
+    def no_writes(*_a, **_k):
+        raise AssertionError("wrote to Notion")
+    monkeypatch.setattr(lr, "notion", no_writes)
+    monkeypatch.setattr(lr.vs, "fetch_blocks", lambda _: [])
+    monkeypatch.setattr(ef, "_has_body_to_anchor", lambda _: True)
+    monkeypatch.setattr(collect_papers, "classify_translation", lambda _: "TRANSLATED")
+    monkeypatch.setattr(ef, "arxiv_id_from_page", lambda _: "xxxx")
+    state = {"html": PAR}
+    monkeypatch.setattr(ef, "fetch_html", lambda _: (state["html"], "src"))
+    return state
+
+
+def heal(page="p"):
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return lr.heal_references(page, created_time=now)
+
+
+class TestAnUnreadableBibliographyIsReported:
+
+    def test_entries_the_parser_cannot_read_are_not_called_no_bibliography(
+            self, offline):
+        # "no bibliography in source" reads as a paper without references; this
+        # is a parser that could not see them.
+        offline["html"] = source([bibitem(n, n, t, suffix="\\relax") for n, t in ENTRIES])
+        rep = lr.link_page("p")
+        assert rep["entries"] == 0 and rep["bibitems"] == 3
+        assert rep["error"] != "no bibliography in source"
+
+    def test_the_healer_prints_it(self, offline, capsys):
+        offline["html"] = source([bibitem(n, n, t, suffix="\\relax") for n, t in ENTRIES])
+        rep = heal("page-1")
+        err = capsys.readouterr().err
+        assert f"page-1: REFS error {rep['error']}" in err
+        assert len(err.strip().splitlines()) == 1
+
+    def test_a_source_with_no_entries_at_all_is_printed_too(self, offline, capsys):
+        # An HTML render with figures and no bibliography: native-latest has been
+        # seen to drop the list that v1 carries.
+        offline["html"] = source([])
+        rep = heal()
+        assert rep["error"] == "no bibliography in source"
+        assert "p: REFS error" in capsys.readouterr().err
+
+    def test_any_other_error_is_printed_and_the_report_returned(
+            self, monkeypatch, capsys):
+        rep = {"page": "p", "entries": 0, "error": "something new went wrong"}
+        monkeypatch.setattr(lr, "link_page", lambda *_a, **_k: rep)
+        assert heal() is rep
+        assert "p: REFS error something new went wrong" in capsys.readouterr().err
+
+    def test_the_par_source_now_parses_and_says_nothing(self, offline, capsys):
+        rep = heal()
+        assert rep["entries"] == 3 and "error" not in rep
+        assert capsys.readouterr().err == ""
+
+
+class TestStatesThatAreNotFaultsStayQuiet:
+    """Each is true of a healthy page and stays true every cycle."""
+
+    def test_a_page_whose_translation_has_not_arrived(
+            self, offline, monkeypatch, capsys):
+        monkeypatch.setattr(collect_papers, "classify_translation", lambda _: "PARTIAL")
+        assert heal()["deferred"]
+        assert capsys.readouterr().err == ""
+
+    def test_a_page_that_already_has_its_list(self, offline, monkeypatch, capsys):
+        monkeypatch.setattr(lr.vs, "fetch_blocks", lambda _: REFERENCE_LIST)
+        assert heal()["refs"] == "already present"
+        assert capsys.readouterr().err == ""
+
+    def test_a_pdf_only_paper(self, offline, monkeypatch, capsys):
+        monkeypatch.setattr(ef, "fetch_html", lambda _: (None, None))
+        assert heal()["error"] == "no HTML source"
+        assert capsys.readouterr().err == ""
+
+    def test_a_paper_with_no_arxiv_source(self, offline, monkeypatch, capsys):
+        monkeypatch.setattr(ef, "arxiv_id_from_page", lambda _: None)
+        assert heal()["error"] == "no arxiv id"
+        assert capsys.readouterr().err == ""
+
+    def test_a_page_too_old_for_the_healer(self, monkeypatch, capsys):
+        # The age gate is `_heal_references`' own decision, and how it dates a
+        # page is not this test's business: only that a skip says nothing.
+        rep = {"page": "p", "skipped": "page is 40d old"}
+        monkeypatch.setattr(lr, "_heal_references", lambda *_a, **_k: rep)
+        assert heal() is rep
+        assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize("rep", [
+        {"page": "p", "deferred": "the translation is not on the page yet"},
+        {"page": "p", "refs": "already present"},
+        {"page": "p", "error": "no HTML source"},
+        {"page": "p", "error": "no arxiv id"},
+    ])
+    def test_the_same_reports_handed_back_directly(self, monkeypatch, capsys, rep):
+        monkeypatch.setattr(lr, "link_page", lambda *_a, **_k: rep)
+        assert heal() is rep
+        assert capsys.readouterr().err == ""

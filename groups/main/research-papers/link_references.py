@@ -94,8 +94,12 @@ def expand(group: str) -> list:
 # only structural difference between the two, and missing it made every
 # alphabetically-cited paper report "no bibliography in source" — which reads as
 # a paper without references rather than as a parser that could not see them.
-_BIB_ITEM = re.compile(r'<li[^>]+id="bib\.bibx?(\d+)"[^>]*>(.*?)</li>',
-                       re.S | re.I)
+# Some renders also add a `\par` after the number (`reference_section`).
+_BIB_ITEM = re.compile(r'<li[^>]+id="bib\.bibx?(\d+)' + reference_section.BIB_ID_SUFFIX
+                       + r'"[^>]*>(.*?)</li>', re.S | re.I)
+# Every entry the source has, read or not. Only an entry that is there and did
+# not parse tells a parser fault from a source with no bibliography.
+_ANY_BIB_ITEM = re.compile(r'<li\b[^>]*\bclass="[^"]*\bltx_bibitem\b', re.I)
 # The label the body actually cites: `[7]` in a numeric list, `[ACDE12]` in an
 # alphabetic one. It is stripped from the entry text, because it is written back
 # as the entry's own marker and would otherwise appear twice.
@@ -124,7 +128,7 @@ def _tag_span(body: str):
         at = edge.end()
     return body[open_tag.end():at - len('</span>')], open_tag.start(), at
 _SECTION = re.compile(r'<section[^>]+id="(S\d+)"[^>]*>.*?<h2[^>]*>(.*?)</h2>', re.S | re.I)
-_ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)"')
+_ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)' + reference_section.BIB_ID_SUFFIX + '"')
 
 
 def parse_bibliography(html: str) -> list:
@@ -714,7 +718,11 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
     entries = parse_bibliography(html)
     rep["entries"] = len(entries)
     if not entries:
-        rep["error"] = "no bibliography in source"
+        # "No bibliography" reads as a paper without references, so say it only
+        # when that is true. Entries that are there and unread are a parser fault.
+        rep["bibitems"] = len(_ANY_BIB_ITEM.findall(html))
+        rep["error"] = (f"{rep['bibitems']} ltx_bibitem entries in source, none parsed"
+                        if rep["bibitems"] else "no bibliography in source")
         return rep
 
     found = _find_refs_heading(blocks)
@@ -1027,8 +1035,39 @@ def body_blocks_of(blocks: list) -> list:
     return reference_section.body_blocks(blocks)
 
 
+# What the healer is NOT told about. Each report below describes a healthy page
+# and stays true cycle after cycle, so a line for it would repeat every few
+# minutes and bury the line that matters. `link_page`'s return paths:
+#   * `deferred`: the translation is not on the page yet. Carries no `error`.
+#   * `refs: already present`: the list is there, the work is done. No `error`.
+#   * `skipped` (from `_heal_references`): older than the healer's window.
+#   * "no arxiv id": not an arXiv paper. `heal_figures` has already tried to
+#     resolve an id from the title this cycle, so there is no source to read.
+#   * "no HTML source": a PDF-only paper, for which arXiv rendered no HTML. A
+#     fetch that failed reads the same and is simply retried next cycle.
+# Every other `error` is printed. That includes a source whose `ltx_bibitem`
+# entries parse to none, which is how ids with a `\par` suffix went unseen, and
+# a source with no entries at all, since a native render has been seen to drop
+# the list that v1 carries.
+_QUIET_ERRORS = frozenset({"no arxiv id", "no HTML source"})
+
+
 def heal_references(page_id: str, apply: bool = False, created_time: str = None) -> dict:
-    """Healer entry point — no-op on a page that already has its reference list."""
+    """Healer entry point — no-op on a page that already has its reference list.
+
+    The healer reads only `slots_linked` from the report, so a source that could
+    not be read looked exactly like a page with nothing to do. An error is
+    therefore printed here, as one stderr line, unless it is one of the states
+    above. The report is returned unchanged.
+    """
+    rep = _heal_references(page_id, apply=apply, created_time=created_time)
+    if rep.get("error") and rep["error"] not in _QUIET_ERRORS:
+        print(f"  {page_id}: REFS error {rep['error']}", file=sys.stderr)
+    return rep
+
+
+def _heal_references(page_id: str, apply: bool = False, created_time: str = None) -> dict:
+    """`heal_references` without the line it prints on a failure."""
     if created_time is None:
         try:
             created_time = notion("GET", f"/pages/{page_id}").get("created_time")
