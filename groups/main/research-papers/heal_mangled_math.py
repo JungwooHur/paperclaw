@@ -35,14 +35,14 @@ such, because that needs the section re-translated, not re-parsed.
 
 Nor does it write a rebuild it would flag again. A run whose rebuilt paragraphs
 are still mangled is split, so the block that cannot converge is left out and the
-blocks beside it are still repaired. What stays mangled is left as it is and
-reported as `unconverged`: writing it would change nothing but the block ids, and
-it would happen again on every cycle.
+blocks beside it are still repaired, but only at a block break no formula crosses:
+half a formula written alone is broken LaTeX nothing flags. What stays mangled is
+left as it is and reported as `unconverged`: writing it would change nothing but
+the block ids, and it would happen again on every cycle.
 
   heal_mangled_math.py --page <id> [--dry-run]
 """
 import argparse
-import itertools
 import os
 import re
 import sys
@@ -231,27 +231,26 @@ def rebuild(text: str):
     return out, truncated
 
 
-def _converging_pieces(run: list, converges) -> list:
+def _converging_pieces(run: list, converges, separable) -> list:
     """RUN split into [(blocks, converged)], so a block whose rebuild cannot
     converge is left out instead of holding back the blocks beside it.
 
     The whole run is tried first: Notion splits a long paragraph at its size limit,
     so a formula can straddle two blocks and parse only when they are joined.
-    Failing that, the run is cut wherever the blocks' own rebuilds switch between
-    converging and not, and each piece is tried again. Blocks that converge alone
-    but not together are written one at a time; blocks that converge no way at all
-    stay together as one piece to leave alone."""
+    Failing that, the run is cut only where SEPARABLE(left, right) holds, i.e. the
+    two sides rebuild to what they do joined, and each piece is written when it
+    converges. A cut through a formula would write half of it, an unterminated
+    environment or a fraction missing its denominator, which nothing flags
+    afterwards, so it could never rejoin its stuck half to be rebuilt whole."""
     if converges(run):
         return [(run, True)]
-    if len(run) == 1:
-        return [(run, False)]
-    alone = {i: converges([i]) for i in run}
-    groups = [list(g) for _, g in itertools.groupby(run, key=alone.get)]
-    if len(groups) == 1:
-        if alone[run[0]]:
-            return [([i], True) for i in run]
-        return [(run, False)]
-    return [p for g in groups for p in _converging_pieces(g, converges)]
+    pieces, start = [], 0
+    for c in range(1, len(run)):
+        if separable(run[start:c], run[c:]):
+            pieces.append(run[start:c])
+            start = c
+    pieces.append(run[start:])
+    return [(p, converges(p)) for p in pieces]
 
 
 def heal_page(page_id: str, apply: bool = False) -> dict:
@@ -302,8 +301,17 @@ def heal_page(page_id: str, apply: bool = False) -> dict:
     def converges(piece):
         return not any(is_mangled(ch) for ch in build(piece)[3])
 
+    def joined(piece):
+        """The rebuild as one string, with block breaks and blank space left out."""
+        return re.sub(r"\s+", "", "".join(
+            f"\x01{c}\x01" if kind == "equation" else c
+            for kind, c in build(piece)[1]))
+
+    def separable(left, right):
+        return joined(left + right) == joined(left) + joined(right)
+
     for run in runs:
-        for piece, ok in _converging_pieces(run, converges):
+        for piece, ok in _converging_pieces(run, converges, separable):
             text, parts, truncated, children = build(piece)
             if not parts:
                 continue

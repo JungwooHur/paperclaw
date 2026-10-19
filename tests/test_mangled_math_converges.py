@@ -392,26 +392,82 @@ class TestOneStuckBlockDoesNotHoldBackItsRun:
 
 
 class TestHowARunIsSplit:
-    """The split, against a stand-in for `the rebuild of these blocks converges`."""
+    """The split, against stand-ins for `the rebuild of these blocks converges`
+    and `a cut here changes neither side's rebuild`."""
 
     @staticmethod
-    def split(run, good):
-        return hm._converging_pieces(run, lambda r: tuple(r) in good)
+    def split(run, good, straddled=()):
+        # STRADDLED: adjacent blocks a formula crosses, so a cut between them is
+        # never separable.
+        return hm._converging_pieces(
+            run, lambda r: tuple(r) in good,
+            lambda left, right: (left[-1], right[0]) not in straddled)
 
     def test_a_converging_run_stays_whole(self):
         assert self.split([1, 2, 3], {(1, 2, 3)}) == [([1, 2, 3], True)]
 
     def test_the_stuck_block_is_cut_out(self):
-        good = {(1,), (3,), (4,), (3, 4)}
+        good = {(1,), (3,), (4,)}
         assert self.split([1, 2, 3, 4], good) == [
-            ([1], True), ([2], False), ([3, 4], True)]
+            ([1], True), ([2], False), ([3], True), ([4], True)]
 
-    def test_blocks_stuck_alone_are_tried_together(self):
-        # A formula straddling a Notion split parses only when both halves join.
-        assert self.split([1, 2, 3], {(1, 2), (3,)}) == [([1, 2], True), ([3], True)]
+    def test_a_straddled_break_is_never_cut(self):
+        # A formula crossing it parses only when both halves join.
+        assert self.split([1, 2, 3], {(1, 2), (3,)}, straddled={(1, 2)}) == [
+            ([1, 2], True), ([3], True)]
 
-    def test_blocks_clean_alone_but_not_joined_go_one_by_one(self):
-        assert self.split([1, 2], {(1,), (2,)}) == [([1], True), ([2], True)]
+    def test_a_straddled_pair_beside_a_stuck_half_is_left_whole(self):
+        # Block 2 converges alone, but only as half of block 1's formula.
+        assert self.split([1, 2], {(2,)}, straddled={(1, 2)}) == [([1, 2], False)]
 
-    def test_a_run_stuck_every_way_is_left_whole(self):
-        assert self.split([1, 2], set()) == [([1, 2], False)]
+    def test_a_formula_over_three_blocks_keeps_all_three(self):
+        assert self.split([1, 2, 3], {(3,)}, straddled={(1, 2), (2, 3)}) == [
+            ([1, 2, 3], False)]
+
+
+# --- A cut never halves a formula --------------------------------------------
+
+# A formula Notion split across two blocks, beside a Korean subscript that cannot
+# converge. Cut at the split, the half that converges alone is written as half a
+# formula, and nothing flags that afterwards, so it can never rejoin its stuck
+# half to be rebuilt whole.
+ALIGNED_HEAD = r"\begin{aligned} \mathcal{L} &= \sum_t r_t \\"
+ALIGNED_TAIL = r" &+ \lambda \|\theta\|^2 \end{aligned} 그리고 "
+STRADDLED = {
+    # Written alone, the tail was `$\end{aligned}$` with no `\begin`.
+    "environment, stuck head": [
+        para(eq("손실 함수 "), text(r"\mathcal{L}_{총}"), eq("는 다음과 같다 "),
+             text(ALIGNED_HEAD)),
+        para(text(ALIGNED_TAIL), eq("이것이 최종 목적 함수이다."))],
+    # Written alone, the head was an environment with no `\end`, reported as
+    # truncated although the source is whole.
+    "environment, stuck tail": [
+        para(eq("손실 함수는 "), text(ALIGNED_HEAD)),
+        para(text(ALIGNED_TAIL), text(r"\mathcal{L}_{총}"), eq("는 최종 목적이다."))],
+    # Written alone, the head was `$\frac{1}$` and a stray `{`.
+    "fraction, stuck tail": [
+        para(eq("보상은 "), text(r"r_t = \frac{1}{")),
+        para(text(r"1 + e^{-x}} 이며 "), text(r"\mathcal{L}_{총}"), eq("는 손실이다."))],
+}
+
+
+class TestACutNeverHalvesAFormula:
+
+    @pytest.mark.parametrize("blocks", STRADDLED.values(), ids=STRADDLED.keys())
+    def test_the_straddled_pair_is_left_whole(self, notion_page, blocks):
+        page = notion_page(blocks)
+        rep = hm.heal_page("p", apply=True)
+        assert page.calls == []
+        assert [(r["blocks"], r["unconverged"]) for r in rep["runs"]] == [
+            ([0, 1], True)]
+
+    def test_a_cut_the_formula_does_not_cross_is_still_made(self, notion_page):
+        # The same subscript, with the environment whole inside its own block.
+        page = notion_page([
+            para(eq("손실 함수 "), text(r"\mathcal{L}_{총}"), eq("는 다음과 같다 ")),
+            para(text(ALIGNED_HEAD + ALIGNED_TAIL), eq("이것이 최종 목적 함수이다."))])
+        rep = hm.heal_page("p", apply=True)
+        assert [(r["blocks"], r["unconverged"]) for r in rep["runs"]] == [
+            ([0], True), ([1], False)]
+        assert archived_ids(page) == {"b1"}
+
