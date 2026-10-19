@@ -308,3 +308,74 @@ class TestAKoreanGlossStaysProse:
         page.calls.clear()
         hm.heal_page("p", apply=True)
         assert page.calls == []
+
+
+# A swapped block whose rebuild cannot converge: a Korean subscript outside text
+# mode comes back as the equation `\mathcal{L}_{총}`, which is still flagged.
+SUBSCRIPT = para(eq("손실 함수 "), text(r"\mathcal{L}_{총}"), eq("는 다음과 같다 "))
+
+
+def archived_ids(page):
+    return {p.rsplit("/", 1)[1] for _, p, b in page.calls if b.get("archived")}
+
+
+class TestOneStuckBlockDoesNotHoldBackItsRun:
+    """Consecutive mangled blocks are joined into one run, so a single block that
+    cannot converge used to leave every block beside it unrepaired."""
+
+    def test_soup_beside_the_template_is_still_repaired(self, notion_page):
+        page = notion_page([para(text("앞 문단.")), GENUINE[1], GENUINE[2],
+                            TEMPLATE, para(text("끝 문단."))])
+        rep = hm.heal_page("p", apply=True)
+        assert rep["mangled_blocks"] == 2 and rep["unconverged"] == 1
+        assert archived_ids(page) == {"b1", "b2"}       # never the template, b3
+        assert [r["blocks"] for r in rep["runs"] if r["unconverged"]] == [[3]]
+
+    def test_a_korean_subscript_block_leaves_only_itself(self, notion_page):
+        page = notion_page([GLOSSED[0], SUBSCRIPT, GLOSSED[1]])
+        rep = hm.heal_page("p", apply=True)
+        assert rep["mangled_blocks"] == 2 and rep["unconverged"] == 1
+        assert archived_ids(page) == {"b0", "b2"}
+        assert [r["blocks"] for r in rep["runs"] if r["unconverged"]] == [[1]]
+
+    def test_the_split_run_converges(self, notion_page):
+        page = notion_page([GENUINE[1], GENUINE[2], TEMPLATE] + GLOSSED)
+        hm.heal_page("p", apply=True)
+        assert page.written(), "the blocks beside the template must be written"
+        assert not [b for b in page.written() if hm.is_mangled(b)]
+        page.calls.clear()
+        rep = hm.heal_page("p", apply=True)
+        assert page.calls == [] and rep["unconverged"] == 1
+
+    @pytest.mark.parametrize("apply", [False, True])
+    def test_dry_run_reports_the_same_split(self, notion_page, apply):
+        notion_page([GLOSSED[0], SUBSCRIPT, GLOSSED[1]])
+        rep = hm.heal_page("p", apply=apply)
+        assert [(r["blocks"], r["unconverged"]) for r in rep["runs"]] == [
+            ([0], False), ([1], True), ([2], False)]
+
+
+class TestHowARunIsSplit:
+    """The split, against a stand-in for `the rebuild of these blocks converges`."""
+
+    @staticmethod
+    def split(run, good):
+        return hm._converging_pieces(run, lambda r: tuple(r) in good)
+
+    def test_a_converging_run_stays_whole(self):
+        assert self.split([1, 2, 3], {(1, 2, 3)}) == [([1, 2, 3], True)]
+
+    def test_the_stuck_block_is_cut_out(self):
+        good = {(1,), (3,), (4,), (3, 4)}
+        assert self.split([1, 2, 3, 4], good) == [
+            ([1], True), ([2], False), ([3, 4], True)]
+
+    def test_blocks_stuck_alone_are_tried_together(self):
+        # A formula straddling a Notion split parses only when both halves join.
+        assert self.split([1, 2, 3], {(1, 2), (3,)}) == [([1, 2], True), ([3], True)]
+
+    def test_blocks_clean_alone_but_not_joined_go_one_by_one(self):
+        assert self.split([1, 2], {(1,), (2,)}) == [([1], True), ([2], True)]
+
+    def test_a_run_stuck_every_way_is_left_whole(self):
+        assert self.split([1, 2], set()) == [([1, 2], False)]

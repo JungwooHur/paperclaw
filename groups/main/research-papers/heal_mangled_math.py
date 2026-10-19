@@ -34,13 +34,15 @@ unterminated environment stays truncated — the block is emitted and reported a
 such, because that needs the section re-translated, not re-parsed.
 
 Nor does it write a rebuild it would flag again. A run whose rebuilt paragraphs
-are still mangled is left as it is and reported as `unconverged`: writing it
-would change nothing but the block ids, and it would happen again on every
-cycle.
+are still mangled is split, so the block that cannot converge is left out and the
+blocks beside it are still repaired. What stays mangled is left as it is and
+reported as `unconverged`: writing it would change nothing but the block ids, and
+it would happen again on every cycle.
 
   heal_mangled_math.py --page <id> [--dry-run]
 """
 import argparse
+import itertools
 import os
 import re
 import sys
@@ -201,6 +203,29 @@ def rebuild(text: str):
     return out, truncated
 
 
+def _converging_pieces(run: list, converges) -> list:
+    """RUN split into [(blocks, converged)], so a block whose rebuild cannot
+    converge is left out instead of holding back the blocks beside it.
+
+    The whole run is tried first: Notion splits a long paragraph at its size limit,
+    so a formula can straddle two blocks and parse only when they are joined.
+    Failing that, the run is cut wherever the blocks' own rebuilds switch between
+    converging and not, and each piece is tried again. Blocks that converge alone
+    but not together are written one at a time; blocks that converge no way at all
+    stay together as one piece to leave alone."""
+    if converges(run):
+        return [(run, True)]
+    if len(run) == 1:
+        return [(run, False)]
+    alone = {i: converges([i]) for i in run}
+    groups = [list(g) for _, g in itertools.groupby(run, key=alone.get)]
+    if len(groups) == 1:
+        if alone[run[0]]:
+            return [([i], True) for i in run]
+        return [(run, False)]
+    return [p for g in groups for p in _converging_pieces(g, converges)]
+
+
 def heal_page(page_id: str, apply: bool = False) -> dict:
     import time
     import verify_sections as vs
@@ -223,46 +248,58 @@ def heal_page(page_id: str, apply: bool = False) -> dict:
     if cur:
         runs.append(cur)
 
+    built = {}
+
+    def build(piece):
+        """The rebuild of these blocks, as the children that would be written."""
+        key = tuple(piece)
+        if key not in built:
+            text = "".join(flatten(blocks[i]) for i in piece)
+            parts, truncated = rebuild(text)
+            children = []
+            for kind, c in parts:
+                if kind == "equation":
+                    children.append({"object": "block", "type": "equation",
+                                     "equation": {"expression": c[:1000]}})
+                else:
+                    children.append({"object": "block", "type": "paragraph",
+                                     "paragraph": {"rich_text": _inline_rich_text(c)}})
+            built[key] = (text, parts, truncated, children)
+        return built[key]
+
+    # Write a piece only when the next pass would leave it alone. A rebuild that
+    # is still mangled changes nothing but the block ids, and every write bumps
+    # the page's last-edited time, which keeps it in the healer's window: one
+    # such block was rewritten on every cycle for days.
+    def converges(piece):
+        return not any(is_mangled(ch) for ch in build(piece)[3])
+
     for run in runs:
-        text = "".join(flatten(blocks[i]) for i in run)
-        parts, truncated = rebuild(text)
-        if not parts:
-            continue
-        children = []
-        for kind, c in parts:
-            if kind == "equation":
-                children.append({"object": "block", "type": "equation",
-                                 "equation": {"expression": c[:1000]}})
-            else:
-                children.append({"object": "block", "type": "paragraph",
-                                 "paragraph": {"rich_text": _inline_rich_text(c)}})
-        run_rep = {"blocks": run, "chars": len(text),
-                   "paragraphs": sum(1 for k, _ in parts if k == "paragraph"),
-                   "equations": sum(1 for k, _ in parts if k == "equation"),
-                   "truncated": truncated, "unconverged": False}
-        # Write a run only when the next pass would leave it alone. A rebuild that
-        # is still mangled changes nothing but the block ids, and every write bumps
-        # the page's last-edited time, which keeps it in the healer's window: one
-        # such block was rewritten on every cycle for days.
-        if any(is_mangled(ch) for ch in children):
-            rep["unconverged"] += 1
-            run_rep["unconverged"] = True
+        for piece, ok in _converging_pieces(run, converges):
+            text, parts, truncated, children = build(piece)
+            if not parts:
+                continue
+            run_rep = {"blocks": piece, "chars": len(text),
+                       "paragraphs": sum(1 for k, _ in parts if k == "paragraph"),
+                       "equations": sum(1 for k, _ in parts if k == "equation"),
+                       "truncated": truncated, "unconverged": not ok}
             rep["runs"].append(run_rep)
-            continue
-        rep["mangled_blocks"] += len(run)
-        rep["new_blocks"] += len(parts)
-        rep["truncated_runs"] += 1 if truncated else 0
-        rep["runs"].append(run_rep)
-        if not apply:
-            continue
-        # insert after the run, then archive the originals — never the other way
-        # round, so a failed insert can't leave the section empty.
-        notion("PATCH", f"/blocks/{page_id}/children",
-               {"children": children, "after": blocks[run[-1]]["id"]})
-        time.sleep(0.4)
-        for i in run:
-            notion("PATCH", f"/blocks/{blocks[i]['id']}", {"archived": True})
-            time.sleep(0.25)
+            if not ok:
+                rep["unconverged"] += 1
+                continue
+            rep["mangled_blocks"] += len(piece)
+            rep["new_blocks"] += len(parts)
+            rep["truncated_runs"] += 1 if truncated else 0
+            if not apply:
+                continue
+            # insert after the piece, then archive the originals — never the other
+            # way round, so a failed insert can't leave the section empty.
+            notion("PATCH", f"/blocks/{page_id}/children",
+                   {"children": children, "after": blocks[piece[-1]]["id"]})
+            time.sleep(0.4)
+            for i in piece:
+                notion("PATCH", f"/blocks/{blocks[i]['id']}", {"archived": True})
+                time.sleep(0.25)
     return rep
 
 
