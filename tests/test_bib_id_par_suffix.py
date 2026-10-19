@@ -437,3 +437,23 @@ class TestARenderWithNoFigureStillHasItsBibliography:
         assert ef.fetch_html("xxxx") == (None, None)
         self.renders(monkeypatch, PAR, figure(PAR))
         assert ef.fetch_html("xxxx") == (figure(PAR), "render-1")
+
+    def test_the_figure_render_is_whatever_fetch_html_returns(self, monkeypatch):
+        # The list and the figures share a source because both ask `ef.fetch_html`,
+        # and a test that stubs only that keeps the linker off the network.
+        monkeypatch.setattr(ef, "fetch_html", lambda _a: (PAR, "stub"))
+
+        def walk_again(_a):
+            raise AssertionError("fetched the renders a second time")
+        monkeypatch.setattr(ef, "html_renders", walk_again)
+        assert lr.fetch_source("xxxx") == (PAR, "stub")
+
+    def test_with_no_figure_anywhere_the_latest_list_is_read(self, monkeypatch):
+        # The figures then come from the PDF, the latest version. The list is the
+        # native render's, also the latest, and ar5iv's (often v1) only when the
+        # native render has none.
+        ar5iv = source([bibitem(1, 1, ENTRIES[0][1])])
+        self.renders(monkeypatch, PAR, ar5iv)
+        assert lr.fetch_source("xxxx") == (PAR, "render-0")
+        self.renders(monkeypatch, "<html><body></body></html>", ar5iv)
+        assert lr.fetch_source("xxxx") == (ar5iv, "render-1")

@@ -145,19 +145,22 @@ _ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)' + reference_section.LTX_ID_SUFFIX
 def fetch_source(arxiv_id: str):
     """(html, source_url) of the render to read the bibliography from.
 
-    The render `ef.fetch_html` takes, the first with a figure, so the list and
-    the figures still come from the same source. Failing that, the first with
-    a bibliography entry: `ef.fetch_html` refuses a render with no figure, which
-    made a paper without one read as "no HTML source", the state a PDF-only
-    paper is in, and it never got its list. (None, None) when neither is found.
+    What `ef.fetch_html` returns, so the list comes from the render the figures
+    come from. That one refuses a render with no figure, which made a paper
+    without one read as "no HTML source", the state a PDF-only paper is in, and
+    it never got its list. So when it finds none, the first render with a
+    bibliography entry. The figures then come from the PDF, the latest version,
+    and so does this list unless the native render has none and ar5iv's, often
+    v1, is read. The renders are fetched again for that, which costs only a
+    paper with no figure in any render. (None, None) when none has a list.
     """
-    listed = None
+    html, src = ef.fetch_html(arxiv_id)
+    if html:
+        return html, src
     for data, final in ef.html_renders(arxiv_id):
-        if "<figure" in data:
+        if _ANY_BIB_ITEM.search(data):
             return data, final
-        if listed is None and _ANY_BIB_ITEM.search(data):
-            listed = (data, final)
-    return listed or (None, None)
+    return None, None
 
 
 def parse_bibliography(html: str) -> list:
