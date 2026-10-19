@@ -47,9 +47,9 @@ _MARKERS = ("lh3.googleusercontent.com", "ar5iv", "arxiv.org", "#bib.bib")
 # workflow's strip-inline-citations rule). A leftover Figure/Table/Eq reference
 # URL (#S.. anchor) -> drop just the URL so the "Figure 5"/"Table 2" text survives.
 # An anchor can end in a URL-encoded `\par` (`#bib.bib7%5Cpar`, see
-# `reference_section.BIB_ID_SUFFIX`); left out, it stranded `%5Cpar` in the body.
+# `reference_section.LTX_ID_SUFFIX`); left out, it stranded `%5Cpar` in the body.
 _BIBCITE = re.compile(r"\s*\[?[\s\d,]*(?:https?://[^\s\]]*#bib\.bib\d+"
-                      + reference_section.BIB_ID_SUFFIX + r"[\s\d,]*)+\]?", re.I)
+                      + reference_section.LTX_ID_SUFFIX + r"[\s\d,]*)+\]?", re.I)
 _ARXIVURL = re.compile(r"\s*https?://[^\s]*(?:ar5iv|arxiv\.org)[^\s]*", re.I)
 
 

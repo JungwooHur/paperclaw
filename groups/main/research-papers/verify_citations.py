@@ -96,7 +96,7 @@ def classify_bibliography(html):
     markers. The inline anchor is the reader-visible citation, so it decides.
     """
     # Some renders add a `\par` after every id and anchor (`reference_section`).
-    suffix = reference_section.BIB_ID_SUFFIX
+    suffix = reference_section.LTX_ID_SUFFIX
     inline = re.findall(r'href="#bib\.bib\d+' + suffix + r'"[^>]*>\s*([^<]{1,24})<',
                         html)
     if len(inline) >= 5:

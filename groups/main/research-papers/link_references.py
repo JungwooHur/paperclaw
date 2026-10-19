@@ -95,7 +95,7 @@ def expand(group: str) -> list:
 # alphabetically-cited paper report "no bibliography in source" — which reads as
 # a paper without references rather than as a parser that could not see them.
 # Some renders also add a `\par` after the number (`reference_section`).
-_BIB_ITEM = re.compile(r'<li[^>]+id="bib\.bibx?(\d+)' + reference_section.BIB_ID_SUFFIX
+_BIB_ITEM = re.compile(r'<li[^>]+id="bib\.bibx?(\d+)' + reference_section.LTX_ID_SUFFIX
                        + r'"[^>]*>(.*?)</li>', re.S | re.I)
 # Every entry the source has, read or not. Only an entry that is there and did
 # not parse tells a parser fault from a source with no bibliography.
@@ -127,8 +127,11 @@ def _tag_span(body: str):
         depth += 1 if edge.group(0).lower().startswith('<span') else -1
         at = edge.end()
     return body[open_tag.end():at - len('</span>')], open_tag.start(), at
-_SECTION = re.compile(r'<section[^>]+id="(S\d+)"[^>]*>.*?<h2[^>]*>(.*?)</h2>', re.S | re.I)
-_ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)' + reference_section.BIB_ID_SUFFIX + '"')
+# A section's id takes the same suffix as an entry's (`S4\par`). Missed, the
+# section did not end the one before it, which then took all its citations.
+_SECTION = re.compile(r'<section[^>]+id="(S\d+)' + reference_section.LTX_ID_SUFFIX
+                      + r'"[^>]*>.*?<h2[^>]*>(.*?)</h2>', re.S | re.I)
+_ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)' + reference_section.LTX_ID_SUFFIX + '"')
 
 
 def parse_bibliography(html: str) -> list:
@@ -182,7 +185,8 @@ def source_citation_sequence(html: str) -> dict:
     return out
 
 
-_TOP_SECTION = re.compile(r'<section[^>]+id="(S\d+)"[^>]*>', re.I)
+_TOP_SECTION = re.compile(r'<section[^>]+id="(S\d+)' + reference_section.LTX_ID_SUFFIX
+                          + r'"[^>]*>', re.I)
 _LTX_PARA = re.compile(r'<p[^>]*class="[^"]*ltx_p[^"]*"[^>]*>(.*?)</p>', re.S | re.I)
 
 

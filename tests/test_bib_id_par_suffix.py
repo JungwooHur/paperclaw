@@ -116,6 +116,63 @@ class TestTheOtherShapesAreUnchanged:
         assert lr.parse_bibliography(html) == []
 
 
+FOUR = ENTRIES + [(4, "D. Author. A fourth title. In Venue, 2023.")]
+
+
+def two_sections(second):
+    """Section 1 with a plain id citing [1], [2]; section 2 with id `second`.
+
+    Section 2 cites [3] itself and [4] from a subsection whose id carries the
+    same suffix, as the render writes it.
+    """
+    sub = second.replace("S2", "S2.SS1", 1)
+    return ('<article class="ltx_document">'
+            '<section id="S1" class="ltx_section">'
+            '<h2 class="ltx_title ltx_title_section">1 Introduction</h2>'
+            f'<p class="ltx_p">[{cite(1, 1)}], [{cite(2, 2)}]</p></section>'
+            f'<section id="{second}" class="ltx_section">'
+            '<h2 class="ltx_title ltx_title_section">2 Method</h2>'
+            f'<p class="ltx_p">[{cite(3, 3)}]</p>'
+            f'<section id="{sub}" class="ltx_subsection">'
+            '<h3 class="ltx_title ltx_title_subsection">2.1 Detail</h3>'
+            f'<p class="ltx_p">[{cite(4, 4)}]</p></section></section>'
+            '<section id="bib" class="ltx_bibliography"><ul class="ltx_biblist">\n'
+            + "".join(bibitem(n, n, t) for n, t in FOUR)
+            + '</ul></section></article>')
+
+
+class TestSuffixedSectionIds:
+    """The render that suffixes the bibliography's ids suffixes every other id too.
+
+    A section whose id the reader missed did not end the section before it, so
+    every citation inside it was credited to the last section that was read.
+    """
+
+    @pytest.mark.parametrize("second", ["S2", "S2\\par"])
+    def test_each_section_keeps_its_own_citations(self, second):
+        assert lr.source_citation_sequence(two_sections(second)) == {
+            "1": [1, 2], "2": [3, 4]}
+
+    @pytest.mark.parametrize("second", ["S2", "S2\\par"])
+    def test_and_its_own_paragraphs(self, second):
+        assert lr.source_citation_paragraphs(two_sections(second)) == {
+            "1": [[1, 2]], "2": [[3], [4]]}
+
+    @pytest.mark.parametrize("second", ["S2", "S2\\par"])
+    def test_the_page_links_both_sections(self, offline, monkeypatch, second):
+        offline["html"] = two_sections(second)
+        page = [blk("h1", "heading_1", "1 서론 (Introduction)"),
+                blk("p1", "paragraph", "선행 연구 [1], [2]."),
+                blk("h2", "heading_1", "2 방법 (Method)"),
+                blk("p2", "paragraph", "이 방법 [3]."),
+                blk("h3", "heading_2", "2.1 세부 (Detail)"),
+                blk("p3", "paragraph", "세부 사항 [4].")]
+        monkeypatch.setattr(lr.vs, "fetch_blocks", lambda _: page)
+        rep = lr.link_page("p")
+        assert rep["sections_linked"] == 2
+        assert rep["would_link"] == {"1": 2, "2": 2}
+
+
 class TestTheStyleClassifierReadsTheSuffix:
     """verify_citations decides numeric vs author-year from the body's anchors.
 
