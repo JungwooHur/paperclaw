@@ -250,6 +250,13 @@ class TestARunThatCannotConvergeIsNotWritten:
         assert rep["mangled_blocks"] == 0 and rep["new_blocks"] == 0
         assert [r["blocks"] for r in rep["runs"] if r["unconverged"]] == [[1]]
 
+    def test_a_stuck_run_names_its_blocks_by_id(self, notion_page):
+        # Positions shift whenever a block above is inserted or archived; the
+        # id is what a hand edit can be aimed at.
+        notion_page([para(text("앞 문단.")), TEMPLATE])
+        rep = hm.heal_page("p")
+        assert [r["ids"] for r in rep["runs"] if r["unconverged"]] == [["b1"]]
+
     def test_the_other_runs_are_still_repaired(self, notion_page):
         page = notion_page(MIXED)
         rep = hm.heal_page("p", apply=True)
@@ -293,12 +300,14 @@ class TestAStuckRunIsVisibleInTheJournal:
             monkeypatch.setattr(hp, name, lambda *a, **k: {})
         monkeypatch.setattr(hp, "heal_mangled", lambda *a, **k: {
             "new_blocks": 0, "unconverged": 1,
-            "runs": [{"blocks": [7, 8], "unconverged": True}]})
+            "runs": [{"blocks": [7, 8], "ids": ["blk-seven", "blk-eight"],
+                      "unconverged": True}]})
         hp.heal(["pg"], apply=True)
         out = capsys.readouterr()
         stuck = [ln for ln in out.err.splitlines()
                  if "pg:" in ln and "MANGLED-MATH" in ln]
-        assert len(stuck) == 1 and "7" in stuck[0] and "8" in stuck[0]
+        assert len(stuck) == 1
+        assert "blk-seven" in stuck[0] and "blk-eight" in stuck[0]
         # Nothing was written, so the page is not counted as healed.
         assert "healed 0/1" in out.out
 

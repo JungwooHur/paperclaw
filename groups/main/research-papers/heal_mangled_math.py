@@ -307,7 +307,10 @@ def heal_page(page_id: str, apply: bool = False) -> dict:
             text, parts, truncated, children = build(piece)
             if not parts:
                 continue
-            run_rep = {"blocks": piece, "chars": len(text),
+            # Positions are only this read's; the ids are what a hand edit can be
+            # aimed at, since any block inserted or archived above shifts them.
+            run_rep = {"blocks": piece, "ids": [blocks[i]["id"] for i in piece],
+                       "chars": len(text),
                        "paragraphs": sum(1 for k, _ in parts if k == "paragraph"),
                        "equations": sum(1 for k, _ in parts if k == "equation"),
                        "truncated": truncated, "unconverged": not ok}

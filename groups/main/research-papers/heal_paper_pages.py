@@ -220,10 +220,12 @@ def heal(pages, apply):
         if mm.get("unconverged"):
             # The healer leaves these alone rather than rewrite them every cycle,
             # so without this line a stuck block would be silent.
-            stuck = "; ".join(",".join(map(str, r["blocks"]))
+            # By id: a top-level position shifts as soon as another healer
+            # inserts or archives a block above it.
+            stuck = "; ".join(",".join(r["ids"])
                               for r in mm.get("runs", []) if r.get("unconverged"))
             print(f"  {pid}: MANGLED-MATH {mm['unconverged']} run(s) would rebuild "
-                  f"still mangled (blocks {stuck}) — left as is; needs the section "
+                  f"still mangled (block ids {stuck}) — left as is; needs the section "
                   f"re-translated or a hand edit", file=sys.stderr)
         n_mf = mf.get("converted") or 0
         if mf.get("error"):
