@@ -33,6 +33,11 @@ It cannot restore text the translation never produced. A run that ends inside an
 unterminated environment stays truncated — the block is emitted and reported as
 such, because that needs the section re-translated, not re-parsed.
 
+Nor does it write a rebuild it would flag again. A run whose rebuilt paragraphs
+are still mangled is left as it is and reported as `unconverged`: writing it
+would change nothing but the block ids, and it would happen again on every
+cycle.
+
   heal_mangled_math.py --page <id> [--dry-run]
 """
 import argparse
@@ -49,6 +54,46 @@ ENV = re.compile(r"\\begin\{(aligned|align|alignat|cases|matrix|bmatrix|pmatrix|
 TEXT_TYPES = ("paragraph", "quote", "bulleted_list_item", "numbered_list_item")
 
 
+# Commands whose argument is set in text mode, where Korean is legitimate.
+TEXT_MODE = re.compile(r"\\(?:text(?:rm|bf|it|tt|sf|normal)?|mathrm|mbox"
+                       r"|operatorname\*?)\s*(?=\{)")
+
+
+def _group_end(s: str, i: int):
+    """Index just past the brace group opening at s[i], or None when it never
+    closes. Escaped braces (`\\{`, `\\}`) do not count."""
+    depth = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _without_text_mode(expr: str) -> str:
+    r"""EXPR with the argument of every text-mode command removed.
+
+    An unclosed group is left in place: it is a broken parse, not a text-mode
+    argument, so whatever Korean follows it still counts."""
+    out, pos = [], 0
+    while (m := TEXT_MODE.search(expr, pos)):
+        end = _group_end(expr, m.end())
+        if end is None:
+            break
+        out.append(expr[pos:m.start()] + " ")
+        pos = end
+    out.append(expr[pos:])
+    return "".join(out)
+
+
 def is_mangled(block: dict) -> bool:
     r"""True when this block's equation spans hold prose, or its text still carries
     `\(` / `\)` debris — the two fingerprints of the swapped parse."""
@@ -59,9 +104,11 @@ def is_mangled(block: dict) -> bool:
     for s in spans:
         if s.get("type") == "equation":
             expr = (s.get("equation") or {}).get("expression", "")
-            # A formula never contains Korean; a Korean run inside an equation span
-            # is prose that the parse swallowed.
-            if KOREAN.search(expr):
+            # A formula never contains Korean outside text mode; a Korean run
+            # there is prose that the parse swallowed. Inside `\text{…}` it is
+            # a legitimate label (`2\text{초}`), and flagging it looped: the
+            # rebuild wraps the label straight back into the same equation.
+            if KOREAN.search(_without_text_mode(expr)):
                 return True
             if re.search(r"\\{1,2}[()]", expr):
                 return True
@@ -158,7 +205,7 @@ def heal_page(page_id: str, apply: bool = False) -> dict:
 
     blocks = vs.fetch_blocks(page_id)
     rep = {"page": page_id, "mangled_blocks": 0, "new_blocks": 0,
-           "truncated_runs": 0, "runs": []}
+           "truncated_runs": 0, "unconverged": 0, "runs": []}
 
     # Consecutive mangled blocks are ONE run: Notion splits a long paragraph at its
     # block size limit, so a formula can straddle the boundary and only the joined
@@ -177,15 +224,6 @@ def heal_page(page_id: str, apply: bool = False) -> dict:
         parts, truncated = rebuild(text)
         if not parts:
             continue
-        rep["mangled_blocks"] += len(run)
-        rep["new_blocks"] += len(parts)
-        rep["truncated_runs"] += 1 if truncated else 0
-        rep["runs"].append({"blocks": run, "chars": len(text),
-                            "paragraphs": sum(1 for k, _ in parts if k == "paragraph"),
-                            "equations": sum(1 for k, _ in parts if k == "equation"),
-                            "truncated": truncated})
-        if not apply:
-            continue
         children = []
         for kind, c in parts:
             if kind == "equation":
@@ -194,6 +232,25 @@ def heal_page(page_id: str, apply: bool = False) -> dict:
             else:
                 children.append({"object": "block", "type": "paragraph",
                                  "paragraph": {"rich_text": _inline_rich_text(c)}})
+        run_rep = {"blocks": run, "chars": len(text),
+                   "paragraphs": sum(1 for k, _ in parts if k == "paragraph"),
+                   "equations": sum(1 for k, _ in parts if k == "equation"),
+                   "truncated": truncated, "unconverged": False}
+        # Write a run only when the next pass would leave it alone. A rebuild that
+        # is still mangled changes nothing but the block ids, and every write bumps
+        # the page's last-edited time, which keeps it in the healer's window: one
+        # such block was rewritten on every cycle for days.
+        if any(is_mangled(ch) for ch in children):
+            rep["unconverged"] += 1
+            run_rep["unconverged"] = True
+            rep["runs"].append(run_rep)
+            continue
+        rep["mangled_blocks"] += len(run)
+        rep["new_blocks"] += len(parts)
+        rep["truncated_runs"] += 1 if truncated else 0
+        rep["runs"].append(run_rep)
+        if not apply:
+            continue
         # insert after the run, then archive the originals — never the other way
         # round, so a failed insert can't leave the section empty.
         notion("PATCH", f"/blocks/{page_id}/children",

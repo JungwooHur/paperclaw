@@ -217,6 +217,14 @@ def heal(pages, apply):
         n_math = wm.get("edited") or 0
         n_eq = eq.get("equations") or 0
         n_mm = mm.get("new_blocks") or 0
+        if mm.get("unconverged"):
+            # The healer leaves these alone rather than rewrite them every cycle,
+            # so without this line a stuck block would be silent.
+            stuck = "; ".join(",".join(map(str, r["blocks"]))
+                              for r in mm.get("runs", []) if r.get("unconverged"))
+            print(f"  {pid}: MANGLED-MATH {mm['unconverged']} run(s) would rebuild "
+                  f"still mangled (blocks {stuck}) — left as is; needs the section "
+                  f"re-translated or a hand edit", file=sys.stderr)
         n_mf = mf.get("converted") or 0
         if mf.get("error"):
             print(f"  {pid}: fence-heal error {mf['error']}", file=sys.stderr)
