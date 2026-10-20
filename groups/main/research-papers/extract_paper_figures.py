@@ -524,6 +524,9 @@ def element_span(html_text: str, at: int):
 
 
 _SECTION_OPEN = re.compile(r"<section\b[^>]*>", re.I)
+# `S3`, `A1`, `S2a` (a part that restarts the numbering), `Sx1` (unnumbered) —
+# not a paragraph some renders also mark `ltx_section` (`subsubsubsectionx12`).
+_TOP_SECTION_ID = re.compile(r"[SA]x?[0-9]+[a-z]?(?:\\par)?")
 _TAG_SPAN = re.compile(r'<span\b[^>]*\bclass="ltx_tag\b[^"]*"[^>]*>', re.I)
 _TITLE_OPEN = re.compile(r"<h[1-6]\b[^>]*>", re.I)
 _UNTAGGED_NUMBER = re.compile(r"\s*([0-9]+|[IVX]+)\.?\s+(?=\S)")
@@ -555,7 +558,7 @@ def source_sections(html_text: str) -> list:
         sid = re.search(r'\bid="([^"]+)"', tag)
         cls = re.search(r'\bclass="([^"]*)"', tag)
         cls = cls.group(1) if cls else ""
-        if not sid or "." in sid.group(1) or not re.search(
+        if not sid or not _TOP_SECTION_ID.fullmatch(sid.group(1)) or not re.search(
                 r"\bltx_(?:section|appendix)\b", cls):
             continue
         span = element_span(html_text, found.start())
@@ -788,6 +791,42 @@ def _anchor_for(num, blocks: list, fid: str = "", section=None, sections=None):
     return section_anchor(fid, blocks, section, sections)
 
 
+def in_section(blocks: list, head: int, i: int) -> bool:
+    """Does block `i` sit in the section that the heading at `head` opens?"""
+    if i <= head:
+        return False
+    level = _level(blocks[head])
+    return not any(b.get("type", "").startswith("heading") and _level(b) <= level
+                   for b in blocks[head + 1:i])
+
+
+def figure_anchors(figs: list, blocks: list, sections=None) -> dict:
+    """{figure number: block to insert it after, or None} for `parse_figures`.
+
+    The first block citing the figure (`_anchor_for`). One no text cites goes
+    under the heading of its own section, after the figures of that section
+    the text cites before it: right under the heading it sat ABOVE a
+    lower-numbered figure cited further down, out of reading order. Then beside
+    its neighbours (`fill_anchor_gaps`); the page end is the last resort.
+    """
+    nums = [f["num"] for f in figs]
+    found = {f["num"]: _anchor_for(f["num"], blocks, f["id"], f.get("section"),
+                                   sections) for f in figs}
+    at = {b["id"]: i for i, b in enumerate(blocks)}
+    for num in sorted((n for n in nums if n is not None), key=_series_key):
+        head = found.get(num)
+        if (not head or not blocks[at[head]]["type"].startswith("heading")
+                or first_mention("figure", num, blocks)):
+            continue
+        series = _series_key(num)
+        lower = [n for n in nums if n is not None and found.get(n)
+                 and _series_key(n)[0] == series[0] and _series_key(n) < series
+                 and in_section(blocks, at[head], at[found[n]])]
+        if lower:
+            found[num] = found[max(lower, key=_series_key)]
+    return fill_anchor_gaps(nums, found)
+
+
 def _image_block(fid: str, caption: str) -> dict:
     img = {"type": "file_upload", "file_upload": {"id": fid}}
     if caption:
@@ -894,14 +933,11 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     # Resolve anchors first, then fill the gaps IN NUMERIC ORDER. A figure the body
     # never cites (or whose citation the translation dropped) used to fall straight
     # to "__end__" — which is the last section, so it surfaced in the appendix while
-    # the figures around it sat chapters earlier. Anchoring it to the nearest
-    # lower-numbered figure that IS placed keeps the sequence readable; the page end
-    # remains the last resort, for a figure with no placed neighbour at all.
+    # the figures around it sat chapters earlier. It now goes to its own section,
+    # after the figures that section cites before it, else beside the nearest
+    # placed neighbour (`figure_anchors`); the page end remains the last resort.
     _sort_key = lambda f: _series_key(f["num"])
-    sections = source_sections(html_text)
-    by_num = {f["num"]: _anchor_for(f["num"], blocks, f["id"], f.get("section"),
-                                    sections) for f in figs}
-    by_num = fill_anchor_gaps([f["num"] for f in figs], by_num)
+    by_num = figure_anchors(figs, blocks, source_sections(html_text))
     resolved = {id(f): by_num.get(f["num"]) for f in figs}
     ordered_figs = sorted(figs, key=_sort_key)
 
