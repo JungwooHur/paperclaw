@@ -95,11 +95,15 @@ def classify_bibliography(html):
     STRIPS them: on three real pages that verdict covered 94, 113 and 35 correct
     markers. The inline anchor is the reader-visible citation, so it decides.
     """
-    inline = re.findall(r'href="#bib\.bib\d+"[^>]*>\s*([^<]{1,24})<', html)
+    # Some renders add a `\par` after every id and anchor (`reference_section`),
+    # and end each anchor's text in `\par\par`, which is not part of what it shows.
+    suffix = reference_section.LTX_ID_SUFFIX
+    inline = re.findall(r'href="#bib\.bib\d+' + suffix
+                        + r'"[^>]*>\s*([^<]{1,24}?)(?:\\par)*\s*<', html)
     if len(inline) >= 5:
         numeric = sum(1 for t in inline if t.strip().isdigit())
         if numeric >= 0.8 * len(inline):
-            entries = re.findall(r'id="bib\.bib(\d+)"', html)
+            entries = re.findall(r'id="bib\.bib(\d+)' + suffix + '"', html)
             return "numeric", max(int(n) for n in entries) if entries else None
         if numeric <= 0.2 * len(inline):
             return "author-year", None
