@@ -171,6 +171,86 @@ class TestAListOrARangeOfTables:
         assert ef.mentions("table", 2, "Table 2와 3개의 실험을 비교한다.")
 
 
+class TestAListGoesOnOnlyWithAnotherLabel:
+    """A number after "Table 2, " or "Table 2와 " is another label only when
+    nothing makes it a quantity: a section (`3절`), a duration (`3초`), a count
+    (`3가지`), an ordinal (`3rd`), a unit (`4 m/s`, `32 GPUs`). Reading those
+    as citations anchored the next float on ordinary prose, and the relocation
+    moved a correctly placed table off the sentence citing it."""
+
+    @pytest.mark.parametrize("text, num", [
+        ("Table 2와 3절에서 설명한 설정을 비교한다.", 3),
+        ("설정은 Table 2에 있다 (Table 1, 3rd row 참조).", 3),
+        ("Table 2, 3 seeds 평균을 보고한다.", 3),
+        ("Table 1, 2 GB의 메모리가 필요하다.", 2),
+        ("In Table 1, 2 of the 5 methods fail.", 2),
+        ("Table 1, 5-shot 설정이다.", 5),
+        ("표 2와 3년 동안의 데이터", 3),
+    ])
+    def test_tables(self, text, num):
+        assert not ef.mentions("table", num, text)
+
+    @pytest.mark.parametrize("text, num", [
+        ("그림 2, 3D 재구성 결과를 보인다.", 3),
+        ("(그림 4, 3초 후의 상태)", 3),
+        ("(그림 4, 3분 동안)", 3),
+        ("그림 2와 3가지 방법", 3),
+        ("Figure 2 and 3 epochs are compared.", 3),
+        ("As shown in Figure 2, 3 layers suffice.", 3),
+        ("Figure 2 to 7 times faster", 7),
+        ("Fig. 3 - 10 trials", 10),
+        ("Figure 2, 32 GPUs", 32),
+        ("Fig. 3, 4 m/s", 4),
+        ("Figure 1 to 3D", 3),
+        ("Figure 1, and 3 more", 3),
+    ])
+    def test_figures(self, text, num):
+        assert not ef.mentions("figure", num, text)
+
+    @pytest.mark.parametrize("kind, text, num", [
+        ("figure", "Figures 3 to 5 show the rollouts.", 4),
+        ("figure", "Fig. 1 & 2", 2),
+        ("figure", "Figure 7, 8 and 9.", 9),
+        ("figure", "그림 1, 2", 2),
+        ("table", "Table 2와 3 참조.", 3),
+        ("table", "Tables 2 and 3 show it.", 3),
+        ("table", "Tables A.1 and A.2 show it.", "A.2"),
+        ("table", "TABLE II and III show it.", 3),
+    ])
+    def test_a_real_list_still_cites_every_label(self, kind, text, num):
+        roman = {3: "iii"}.get(num, "") if "II" in text else ""
+        assert ef.mentions(kind, num, text, roman)
+
+    def test_the_prose_is_no_citation_to_move_a_table_to(self):
+        source = [table("S2.T1", "Table 1: Setup."), table("S2.T2", "Table 2: Settings."),
+                  table("S4.T3", "Table 3: Main results.")]
+        blocks = [heading("h1", "1 Introduction (서론)"),
+                  para("p1", "Table 2와 3절에서 설명한 설정을 비교한다."),
+                  heading("h2", "2 Method (방법)"),
+                  para("p2", "Table 1 참조. Table 2 참조."),
+                  img("i1", "Table 1: Setup."), img("i2", "Table 2: Settings."),
+                  heading("h4", "4 Experiments (실험)"),
+                  para("p4", "주요 결과는 Table 3 참조."),
+                  img("i3", "Table 3: Main results.")]
+        assert et.table_anchors(source, blocks)["S4.T3"] == ("p4", True)
+        assert "i3" not in moved(et.plan_relocation(blocks, source, ME))
+
+
+class TestAnOrdinalStillCites:
+    """`그림 2번` is "figure number 2"; only a count (`표 2개`) is not a citation."""
+
+    @pytest.mark.parametrize("kind, text, num", [
+        ("figure", "그림 2번에서 보듯이 정책이 수렴한다.", 2),
+        ("table", "표 3번을 보면", 3),
+        ("figure", "그림 2와 3번에서", 3),
+    ])
+    def test_it(self, kind, text, num):
+        assert ef.mentions(kind, num, text)
+
+    def test_a_count_is_still_no_citation(self):
+        assert not ef.mentions("table", 2, "표 2개를 비교한다.")
+
+
 # --- fallback: the float's own section, not its number --------------------
 
 
@@ -207,6 +287,138 @@ class TestFallbackToTheTablesOwnSection:
     def test_figures_fall_back_to_their_own_section_too(self):
         assert ef._anchor_for(5, self.PAGE, "S3.F5") == "h3"
         assert ef._anchor_for(6, self.PAGE, "S4.F6") is None
+
+
+class TestOnlyATopLevelHeadingIsTheSection:
+    """`6-DoF Pose Tracking`, `3) Reward` and a local `4. Flexibility` all open
+    with a number, and taking the first such heading put a float of section 6,
+    III or IV inside another section — and the relocation moved a table that
+    already sat under its own `6 Limitations` there."""
+
+    DOF = [heading("h1", "1 Introduction (서론)"), para("p1", "서론."),
+           heading("h3", "3 Method (방법)"), para("p3", "방법."),
+           heading("h3x", "6-DoF Pose Tracking (6-DoF 포즈 추적)", 2), para("q3", "추적."),
+           heading("h4", "4 Experiments (실험)"), para("p4", "실험."),
+           heading("h6", "6 Limitations (한계)"), para("p6", "한계.")]
+
+    def test_a_title_opening_with_a_number_is_no_section(self):
+        assert et.table_anchors([table("S6.T4", "Table 4: Failures.")],
+                                self.DOF)["S6.T4"] == ("h6", False)
+        assert ef._anchor_for("7", self.DOF, "S6.F7") == "h6"
+
+    def test_a_table_under_its_own_section_stays(self):
+        blocks = self.DOF[:-1] + [img("t6", "Table 6: Failures."), self.DOF[-1]]
+        plan = et.plan_relocation(blocks, [table("S6.T6", "Table 6: Failures.")], ME)
+        assert plan["moves"] == []
+
+    def test_an_ieee_item_label_is_no_section(self):
+        blocks = [heading("h1", "I. INTRODUCTION (서론)"), para("p1", "서론."),
+                  heading("h2", "II. METHOD (방법)"),
+                  heading("h2a", "A. Policy (정책)", 2),
+                  heading("h2a3", "3) Reward (보상)", 3), para("q3", "보상."),
+                  heading("h3", "III. EXPERIMENTS (실험)"), para("p3", "실험.")]
+        assert et.table_anchors([table("S3.T2", "TABLE II: Results.")],
+                                blocks)["S3.T2"] == ("h3", False)
+        assert ef._anchor_for("3", blocks, "S3.F3") == "h3"
+
+    def test_a_section_heading_beats_a_local_subsection_number(self):
+        blocks = [heading("hIII", "III. Architecture", 2), para("p0", "본문."),
+                  heading("h1", "1. Backbone", 3), heading("h2", "2. Goal conditioning", 3),
+                  heading("h4", "4. Flexibility", 3), para("p4", "본문."),
+                  heading("hIV", "IV. Training data", 2), para("p5", "본문.")]
+        assert et.table_anchors([table("S4.T2", "TABLE II: Mixture.")],
+                                blocks)["S4.T2"] == ("hIV", False)
+
+    def test_a_section_the_page_opens_at_its_first_subsection(self):
+        blocks = [heading("h5", "5 Post-Training"), para("p5", "본문."),
+                  heading("h61", "6.1 Dense features", 3), para("p61", "본문."),
+                  heading("h616", "6.1.6 Video classification", 3),
+                  heading("h7", "7 Evaluation"), para("p7", "본문.")]
+        assert et.table_anchors([table("S6.T6", "Table 6: Video.")],
+                                blocks)["S6.T6"] == ("h61", False)
+
+
+def section_html(sid, tag, title, body="", cls="ltx_section"):
+    """A top-level LaTeXML section, with its printed label in an `ltx_tag`."""
+    return (f'<section id="{sid}" class="{cls}"><h2 class="ltx_title">'
+            f'<span class="ltx_tag ltx_tag_section">{tag} </span>{title}</h2>'
+            f'{body}</section>')
+
+
+def table_html(tid, caption):
+    return (f'<figure id="{tid}" class="ltx_table"><figcaption class="ltx_caption">'
+            f'{caption}</figcaption><table><tr><td>1</td></tr></table></figure>')
+
+
+class TestTheSectionIsTheOneTheSourcePrintsItIn:
+    """The section comes from the source, not from the page's numbers: a page
+    may number its own sections, and an id may not name its section at all."""
+
+    SUMMARY_HTML = "".join(
+        section_html(f"S{n}", n, title,
+                     table_html("S2.T1", "Table 1: Prior work.") if n == 2 else
+                     table_html("S4.T3", "Table 3: Clip scenarios.") if n == 4 else "")
+        for n, title in [(1, "Introduction"), (2, "Related Work"), (3, "Architecture"),
+                         (4, "Causal Dataset"), (5, "Training Strategy")])
+    SUMMARY = [heading("g1", "1. Limits of prior work"), para("q1", "본문."),
+               heading("g2", "2. Contributions"), para("q2", "본문."),
+               heading("g3", "3. Causal Dataset"), img("iT3", "Table 3: Clip scenarios."),
+               para("q3", "본문."),
+               heading("g4", "4. The model"), para("q4", "본문."),
+               heading("g5", "5. Training Strategy"), para("q5", "본문.")]
+
+    def test_the_heading_carrying_the_sections_title(self):
+        tables = et.parse_tables(self.SUMMARY_HTML)
+        sections = ef.source_sections(self.SUMMARY_HTML)
+        assert et.table_anchors(tables, self.SUMMARY, sections)["S4.T3"] == ("g3", False)
+        plan = et.plan_relocation(self.SUMMARY, tables, ME, sections=sections)
+        assert plan["moves"] == []
+
+    def test_no_number_on_a_page_numbered_apart_from_the_source(self):
+        # Its '3.' is the source's 4, so its '2.' says nothing about section 2.
+        tables = et.parse_tables(self.SUMMARY_HTML)
+        sections = ef.source_sections(self.SUMMARY_HTML)
+        assert et.table_anchors(tables, self.SUMMARY, sections)["S2.T1"] == (None, False)
+
+    def test_no_number_without_a_heading_that_shows_the_numbering(self):
+        # Korean titles alone cannot show that '4.' is the source's 4.
+        page = [heading("k1", "1. 서론"), heading("k3", "3. 구현"),
+                heading("k4", "4. 성능 평가"), para("q4", "본문.")]
+        tables = et.parse_tables(self.SUMMARY_HTML)
+        sections = ef.source_sections(self.SUMMARY_HTML)
+        assert et.table_anchors(tables, page, sections)["S4.T3"] == (None, False)
+
+    def test_a_number_on_a_page_that_shows_it_numbers_as_the_source(self):
+        page = [heading("e1", "1 Introduction (서론)"), heading("e2", "2 관련 연구"),
+                heading("e4", "4 데이터셋"), para("q4", "본문.")]
+        tables = et.parse_tables(self.SUMMARY_HTML)
+        sections = ef.source_sections(self.SUMMARY_HTML)
+        anchors = et.table_anchors(tables, page, sections)
+        assert anchors["S4.T3"] == ("e4", False)
+        assert anchors["S2.T1"] == ("e2", False)
+
+    def test_a_title_in_the_bracket_counts_too(self):
+        page = [heading("g1", "1. 기존 연구의 한계"), heading("g3", "3. 인과 데이터셋 (Causal Dataset)")]
+        tables = et.parse_tables(self.SUMMARY_HTML)
+        assert et.table_anchors(tables, page)["S4.T3"] == ("g3", False)
+
+    def test_a_restarted_part_is_not_the_body_section_of_its_number(self):
+        # A supplementary part restarts the section ids (S1a, S2a); the floats
+        # inside keep ids S1.Tn, S2.Tn.
+        html = (section_html("S1", 1, "Introduction") + section_html("S2", 2, "Related Work")
+                + section_html("S1a", "A", "Supplementary data")
+                + section_html("S2a", "B", "Supplementary results",
+                               table_html("S2.T9", "Table 9: Extra results.")))
+        blocks = [heading("h1", "1. Introduction"), para("p1", "본문."),
+                  heading("h2", "2. Related Work"), para("p2", "본문."),
+                  heading("ha", "Appendix A: Supplementary data"), para("pa", "본문."),
+                  heading("hb", "Appendix B: Supplementary results"), para("pb", "본문."),
+                  img("i9", "Table 9: Extra results.")]
+        tables = et.parse_tables(html)
+        sections = ef.source_sections(html)
+        assert et.table_anchors(tables, blocks, sections)["S2.T9"] == ("hb", False)
+        # It already sits in that section: no reason to move it.
+        assert et.plan_relocation(blocks, tables, ME, sections=sections)["moves"] == []
 
 
 # --- the caption is the table's own -----------------------------------------

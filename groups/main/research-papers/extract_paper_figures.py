@@ -102,8 +102,9 @@ def _figure_caption(body: str) -> str:
 
 
 def parse_figures(html_text: str, source_url: str) -> list:
-    """Ordered list of {id, num, img_url, caption}, one per figure image,
-    deduped by image URL (composite figures expose one img per subfigure)."""
+    """Ordered list of {id, num, img_url, caption[, section]}, one per figure
+    image, deduped by image URL (composite figures expose one img per
+    subfigure); `section` as `enclosing_section` gives it."""
     # Resolve relative img srcs against the page's <base href> if present. Some
     # arxiv HTML pages set `<base href="/html/<id>vN/">` and give srcs relative to
     # it (`images/x.jpg`); urljoin against the page URL alone would drop the version
@@ -111,6 +112,7 @@ def parse_figures(html_text: str, source_url: str) -> list:
     bm = re.search(r'<base[^>]+href=["\']?([^"\'>\s]+)', html_text, re.I)
     base = urljoin(source_url, _html.unescape(bm.group(1))) if bm else source_url
     out, seen, no_image = [], set(), []
+    sections = source_sections(html_text)
     for fid, body in _iter_figures(html_text):
         imgs = _IMG.findall(body)
         img = _IMG.search(body)
@@ -128,10 +130,12 @@ def parse_figures(html_text: str, source_url: str) -> list:
             continue
         seen.add(url)
         caption = _figure_caption(body)[:1900]
-        out.append({"id": fid,
-                    "num": figure_label(fid, caption),
-                    "img_url": url,
-                    "caption": caption})
+        fig = {"id": fid, "num": figure_label(fid, caption), "img_url": url,
+               "caption": caption}
+        section = enclosing_section(sections, html_text.find(f'id="{fid}"'))
+        if section:
+            fig["section"] = section
+        out.append(fig)
     parse_figures.no_image = no_image     # read by inject_figures for its report
     return out
 
@@ -347,17 +351,43 @@ ROMAN_VALUES = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7,
 # One printed label: `A.1` / `S2`, `10` / `2.1`, or a roman numeral that no Latin
 # letter continues (`Table in` is not Table I). It must end there: a longer number
 # (`10`, `1.2`) is a different label, and a Hangul counter makes it a count —
-# 표 2개 is "two tables".
+# 표 2개 is "two tables". 번 is not one: 그림 2번 is "figure number 2".
 _LABEL = (r"(?P<label>[A-Z]\.?[0-9]+(?:\.[0-9]+)*|[0-9]+(?:\.[0-9]+)*"
-          r"|[ivx]+(?![A-Za-z0-9]))(?![0-9]|\.[0-9]|[개장번차배명회줄행열층단쪽권편종])")
+          r"|[ivx]+(?![A-Za-z0-9]))(?![0-9]|\.[0-9]|[개장차배명회줄행열층단쪽권편종])")
 # What joins the labels of one citation: a list, or a range (`2-4`, `2~4`, `2 to 4`).
 _JOIN = (r"(?:\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+|\s*(?:&|및|[와과])\s*"
          r"|(?P<range>\s*[-–—~]\s*|\s+to\s+))")
 _CITATION = {kind: re.compile(
-    rf"(?<!Data )(?:(?<![A-Za-z]){latin}|(?<![가-힣]){hangul})[\s~]*{_LABEL}", re.I)
-    for kind, (latin, hangul) in _FLOAT_WORDS.items()}
+    rf"(?<!Data )(?P<word>(?<![A-Za-z]){latin}|(?<![가-힣]){hangul})[\s~]*{_LABEL}",
+    re.I) for kind, (latin, hangul) in _FLOAT_WORDS.items()}
 _NEXT_LABEL = re.compile(_JOIN + _LABEL, re.I)
 _MAX_RANGE = 30
+_PLURAL = re.compile(r"(?:figures|figs|tables|tabs)\b", re.I)
+_NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+# What a Korean sentence glues onto a float label: a particle, or 번 ("number").
+# Anything else glued on makes the number a quantity: 3절 (section 3), 3초,
+# 3가지, 3년.
+_PARTICLE = re.compile(r"에|의|은|는|이(?![상하내])|가(?!지)|을|를|과|와|도|까지|부터"
+                       r"|으?로|처럼|보다|번|참조|및")
+
+
+def _a_quantity_follows(text: str, at: int, plural: bool) -> bool:
+    """Does what follows the number ending at `at` make it a quantity, not a label?
+
+    Only a list's later numbers are asked: after "Table 2, " the next number is
+    as often a count or a measure as another table. `3D`, `3rd`, `5-shot`,
+    `30%`, a Hangul word that is no particle (`3절`, `3초`), and, after a
+    SINGULAR word, an English word (`Figure 2 and 3 epochs`, `Fig. 3, 4 m/s`):
+    a list of figures says "Figures".
+    """
+    if _NEXT_LABEL.match(text, at):
+        return False            # the list goes on
+    rest = text[at:]
+    if re.match(r"[A-Za-z%°]|\s*[-–—]\s*[A-Za-z가-힣]", rest):
+        return True
+    if re.match(r"[가-힣]", rest):
+        return not _PARTICLE.match(rest)
+    return bool(not plural and re.match(r"\s+[A-Za-z]", rest))
 
 
 def _label_key(label) -> str:
@@ -375,11 +405,15 @@ def cited_labels(kind: str, text: str) -> set:
 
     "Tables 2 and 3에" cites 2 and 3, "표 2–4" cites 2, 3 and 4. Reading only the
     label after the word missed the rest of the list, and the relocation then
-    moved a table off the very sentence citing it.
+    moved a table off the very sentence citing it. A later number of a list
+    counts only when nothing makes it a quantity (`_a_quantity_follows`):
+    "Table 2와 3절에서" cites Table 2 and section 3, and reading it as Table 3
+    moved that table off the sentence that really cites it.
     """
     out = set()
     for found in _CITATION[kind].finditer(text or ""):
         labels, at = [found.group("label")], found.end()
+        plural = bool(_PLURAL.match(found.group("word")))
         while True:
             more = _NEXT_LABEL.match(text, at)
             if not more:
@@ -387,6 +421,9 @@ def cited_labels(kind: str, text: str) -> set:
             low, high = labels[-1], more.group("label")
             if _is_roman(high) != _is_roman(labels[0]):
                 break   # "Table 2 and I think": a pronoun, not Table I
+            if (_NUMBER.fullmatch(high)
+                    and _a_quantity_follows(text, more.end(), plural)):
+                break   # "Table 2와 3절", "Figure 2, 32 GPUs"
             if more.group("range"):
                 # Only an ascending run of numbers is a range; `2-1` is a label
                 # of its own (chapter 2, table 1), not a citation of table 1.
@@ -457,45 +494,288 @@ def appendix_anchor(letter: str, blocks: list):
     return None
 
 
+def element_span(html_text: str, at: int):
+    """`(inner_start, inner_end, end)` of the element whose start tag holds `at`.
+
+    Walks the nesting of that element's own tag, so a table figure that wraps its
+    panels in figures of their own ends at ITS closing tag, not the first one.
+    An element that is never closed runs to the end of the text.
+    """
+    start = html_text.rfind("<", 0, at + 1)
+    tag = re.match(r"<([A-Za-z][\w-]*)", html_text[start:]) if start >= 0 else None
+    open_end = html_text.find(">", at)
+    if not tag or open_end < 0:
+        return None
+    opener = re.compile(rf"<{tag.group(1)}\b", re.I)
+    closer = re.compile(rf"</{tag.group(1)}\s*>", re.I)
+    depth, i = 1, open_end + 1
+    while True:
+        close = closer.search(html_text, i)
+        if not close:
+            return open_end + 1, len(html_text), len(html_text)
+        nested = opener.search(html_text, i, close.start())
+        if nested:
+            depth, i = depth + 1, nested.end()
+            continue
+        depth -= 1
+        if not depth:
+            return open_end + 1, close.start(), close.end()
+        i = close.end()
+
+
+_SECTION_OPEN = re.compile(r"<section\b[^>]*>", re.I)
+_TAG_SPAN = re.compile(r'<span\b[^>]*\bclass="ltx_tag\b[^"]*"[^>]*>', re.I)
+_TITLE_OPEN = re.compile(r"<h[1-6]\b[^>]*>", re.I)
+_UNTAGGED_NUMBER = re.compile(r"\s*([0-9]+|[IVX]+)\.?\s+(?=\S)")
+
+
+def _section_label(tag: str, appendix: bool):
+    """3 for a printed `3`, `3.` or `III`; "B" for `Appendix B` or a lone `B`."""
+    tag = re.sub(r"\\par\b", "", tag).strip()
+    letter = re.fullmatch(r"(?:appendix\s+)?([A-Z])\.?", tag, re.I)
+    if letter and (appendix or tag.lower().startswith("appendix")):
+        return letter.group(1).upper()
+    number = re.fullmatch(r"([0-9]+|[IVX]+)\.?", tag)
+    if number:
+        token = number.group(1)
+        return int(token) if token.isdigit() else ROMAN_VALUES.get(token.lower())
+    return letter.group(1).upper() if letter else None
+
+
+def source_sections(html_text: str) -> list:
+    """Every top-level section of a LaTeXML source, in document order.
+
+    Each is `{"id", "label", "title", "start", "end"}`: `label` is what the
+    section prints — 3 for `3` or `III`, "B" for `Appendix B` or a restarted
+    part's `B` — or None, and `title` its heading without that label.
+    """
+    out = []
+    for found in _SECTION_OPEN.finditer(html_text or ""):
+        tag = found.group(0)
+        sid = re.search(r'\bid="([^"]+)"', tag)
+        cls = re.search(r'\bclass="([^"]*)"', tag)
+        cls = cls.group(1) if cls else ""
+        if not sid or "." in sid.group(1) or not re.search(
+                r"\bltx_(?:section|appendix)\b", cls):
+            continue
+        span = element_span(html_text, found.start())
+        if not span:
+            continue
+        inner = html_text[span[0]:span[1]]
+        head = _TITLE_OPEN.search(inner)
+        title, label = "", None
+        if head:
+            head_span = element_span(inner, head.start())
+            title_html = inner[head_span[0]:head_span[1]]
+            tag_open = _TAG_SPAN.search(title_html)
+            if tag_open:
+                tag_span = element_span(title_html, tag_open.start())
+                label = _section_label(_clean(title_html[tag_span[0]:tag_span[1]]),
+                                       "ltx_appendix" in cls)
+                title_html = title_html[:tag_open.start()] + title_html[tag_span[2]:]
+            title = _clean(title_html)
+            untagged = None if tag_open else _UNTAGGED_NUMBER.match(title)
+            if untagged:        # a render that prints the number in the title
+                label = _section_label(untagged.group(1), False)
+                title = title[untagged.end():]
+        out.append({"id": re.sub(r"\\par$", "", sid.group(1)), "label": label,
+                    "title": title, "start": found.start(), "end": span[2]})
+    return out
+
+
+def enclosing_section(sections: list, at: int):
+    """`{"id", "label", "title"}` of the top-level section holding position `at`."""
+    inside = [s for s in sections if s["start"] <= at < s["end"]]
+    if not inside:
+        return None
+    s = inside[-1]
+    return {"id": s["id"], "label": s["label"], "title": s["title"]}
+
+
+# A top-level section label: `2`, `2.`, `II.`, followed by the title. Not
+# `2.1`, `6-DoF` (a title that opens with a number), `3)` (an IEEE item), `III-A`.
+_TOP_LEVEL = re.compile(r"\s*([0-9]+|[IVX]+)[.:]?(?=\s|$)")
+_SUBSECTION = re.compile(r"\s*(?:([0-9]+)\.[0-9]|([IVX]+)-[A-Z](?![A-Za-z]))")
+
+
 def _top_level_number(heading_text: str):
-    """2 for "2 Method" / "2. Method" / "II. METHOD"; None for "2.1 …" or no label."""
+    """2 for "2 Method" / "2. Method" / "II. METHOD"; None for "2.1 …",
+    "6-DoF …", "3) …" or no label."""
+    found = _TOP_LEVEL.match(heading_text or "")
+    if not found:
+        return None
+    token = found.group(1)
+    return int(token) if token.isdigit() else ROMAN_VALUES.get(token.lower())
+
+
+def _subsection_of(heading_text: str):
+    """6 for "6.1 …" or "6.1.6 …", 4 for "IV-A …"; None otherwise."""
+    found = _SUBSECTION.match(heading_text or "")
+    if not found:
+        return None
+    if found.group(1):
+        return int(found.group(1))
+    return ROMAN_VALUES.get(found.group(2).lower())
+
+
+def _title_key(title: str) -> str:
+    return re.sub(r"[^0-9a-z가-힣]", "", (title or "").lower())
+
+
+def _heading_title_keys(heading_text: str) -> set:
+    """'3. Causal Dataset (인과 데이터셋)' and 'Appendix B: Causal Dataset' ->
+    {'causaldataset', ...}: the title (with or without what follows its
+    bracket, as in '3 Title (번역) — 발췌'), and what a trailing bracket holds,
+    since a page may write '3. 인과 데이터셋 (Causal Dataset)' instead."""
     import verify_sections as vs
-    key = vs.section_key(heading_text) or ""
-    if key.isdigit():
-        return int(key)
-    return ROMAN_VALUES.get(key.lower()) if re.fullmatch(r"[IVX]+", key) else None
+    text = vs._APPENDIX_PREFIX.sub("", heading_text or "")
+    keys = {vs._echo_norm(text), _title_key(vs.english_title(text))}
+    bracket = re.search(r"\(([^()]*)\)\W*$", text)
+    if bracket:
+        keys.add(_title_key(bracket.group(1)))
+    return {k for k in keys if len(k) >= 4}
+
+
+def _level(block: dict) -> int:
+    return int(block["type"][-1]) if block["type"][-1].isdigit() else 9
+
+
+def _shallowest(found: list):
+    """The first of the shallowest headings in `found`, or None."""
+    return min(found, key=_level)["id"] if found else None
+
+
+_APPENDIX_HEADING = re.compile(r"\s*(?:appendix|appendices|부록|[A-HJ-UWYZ][.:](?=\s))",
+                               re.I)
+
+
+def _heading_titled(title: str, blocks: list, appendix: bool = False):
+    """The section heading carrying the source section's `title`, or None.
+
+    A section heading of the same kind: one labelled with a top-level number
+    for a numbered section (any number — a page may number its own), an
+    appendix heading for an appendix. A title alone is too common to go on:
+    the body's run-in `Implementation Details` is not appendix B's. And not one
+    of two at the same depth: a page that holds a section twice says nothing
+    about which copy is the float's.
+    """
+    key = _title_key(title)
+    if len(key) < 4:
+        return None
+    found = []
+    for b in blocks:
+        text = _block_text(b) if b["type"].startswith("heading") else ""
+        kind = (_APPENDIX_HEADING.match(text) if appendix
+                else _top_level_number(text) is not None)
+        if kind and key in _heading_title_keys(text):
+            found.append(b)
+    top = [b for b in found if _level(b) == min(map(_level, found))] if found else []
+    return top[0]["id"] if len(top) == 1 else None
+
+
+def _section_number(section: dict):
+    """The number a source section prints, else the one its id gives a render
+    that prints none (`S3` is 3); None for an appendix or a restarted part."""
+    label = section.get("label")
+    if label is not None:
+        return label if isinstance(label, int) else None
+    found = re.fullmatch(r"S([0-9]+)", section.get("id") or "")
+    return int(found.group(1)) if found else None
+
+
+def _numbering_mirrors(blocks: list, sections: list) -> bool:
+    """Does the page number its sections as the source does?
+
+    Only on evidence: a numbered heading carrying the title the source prints
+    under the same number, and none carrying one it prints under another. A
+    page that summarises a paper numbers its own sections — its `3.` may be the
+    source's 4 — and a heading in Korean alone says nothing either way.
+    """
+    numbers = {}
+    for s in sections:
+        n, key = _section_number(s), _title_key(s.get("title"))
+        if n is not None and len(key) >= 4:
+            numbers[key] = n
+    agree = False
+    for b in blocks:
+        if not b["type"].startswith("heading"):
+            continue
+        text = _block_text(b)
+        n = _top_level_number(text)
+        found = {numbers[k] for k in _heading_title_keys(text) if k in numbers}
+        if n is None or not found:
+            continue
+        if n not in found:
+            return False
+        agree = True
+    return agree
+
+
+def _numbered_heading(n: int, blocks: list):
+    """The heading of section `n`: the shallowest heading labelled `n`, else the
+    first of its subsections (a page may open the section at `6.1`)."""
+    headings = [b for b in blocks if b["type"].startswith("heading")]
+    found = _shallowest([b for b in headings if _top_level_number(_block_text(b)) == n])
+    if found:
+        return found
+    return next((b["id"] for b in headings if _subsection_of(_block_text(b)) == n), None)
 
 
 _OWN_SECTION = re.compile(r"(S|A)(\d+)\.")
 
 
-def section_anchor(fid: str, blocks: list):
-    """The heading of the section a float sits in, read from its LaTeXML id.
+def _label_from_id(found):
+    """The section label a float id names: 3 for `S3.`, "A" for `A1.`."""
+    n = int(found.group(2))
+    if found.group(1) == "S":
+        return n
+    return chr(ord("A") + n - 1) if 1 <= n <= 26 else None
 
-    `S3.T5` is in section 3 and `A1.T6` in the first appendix, A. The fallback
-    used to be the heading whose number equals the FLOAT's number, which has
-    nothing to do with where the float is: Table 6 went under `6 Conclusion`
-    whatever section printed it, and a table with no section of its number
-    fell to the end of the body.
+
+def section_anchor(fid: str, blocks: list, section=None, sections=None):
+    """The heading of the section a float sits in, or None.
+
+    The section is the one the source prints the float in (`section`, from
+    `enclosing_section`), else the one its LaTeXML id names (`S3.T5` is in
+    section 3, `A1.T6` in appendix A). The fallback used to be the heading whose
+    number equals the FLOAT's number, which has nothing to do with where the
+    float is: Table 6 went under `6 Conclusion` whatever section printed it.
+
+    The heading is the one carrying the section's title, else the shallowest
+    one labelled with its number — `6-DoF …`, `3) …` and a local `4.` inside
+    another section are not section headings. A number is trusted only while the
+    page numbers its sections as the source does (`_numbering_mirrors`, given
+    `sections`), and an id names no section when the source puts the float in
+    another one: a supplementary part restarts the section ids (`S2a`) while
+    its floats keep `S2.T9`.
 
     Returns None when the page has no such heading; the caller's own last
     resort decides, which beats a confident wrong place.
     """
-    m = _OWN_SECTION.match(fid or "")
-    if not m:
+    own = _OWN_SECTION.match(fid or "")
+    if section is not None:
+        found = _heading_titled(section.get("title"), blocks,
+                                isinstance(section.get("label"), str))
+        if found:
+            return found
+        label = section.get("label")
+        if label is None and own and section.get("id") == own.group(0)[:-1]:
+            label = _label_from_id(own)
+    else:
+        label = _label_from_id(own) if own else None
+    if label is None:
         return None
-    n = int(m.group(2))
-    if m.group(1) == "A":
-        return appendix_anchor(chr(ord("A") + n - 1), blocks) if 1 <= n <= 26 else None
-    for b in blocks:
-        if b["type"].startswith("heading") and _top_level_number(_block_text(b)) == n:
-            return b["id"]
-    return None
+    if isinstance(label, str):
+        return appendix_anchor(label, blocks)
+    if sections and not _numbering_mirrors(blocks, sections):
+        return None
+    return _numbered_heading(label, blocks)
 
 
-def _anchor_for(num, blocks: list, fid: str = ""):
+def _anchor_for(num, blocks: list, fid: str = "", section=None, sections=None):
     """Block id to insert a figure `num` after: first body mention of the figure
-    number, else the heading of the section it sits in, else None (page end)."""
+    number, else the heading of the section it sits in (`section_anchor`), else
+    None (page end)."""
     if num is None:
         return None
     found = first_mention("figure", num, blocks)
@@ -505,7 +785,7 @@ def _anchor_for(num, blocks: list, fid: str = ""):
     if letter:
         # An appendix figure belongs in its appendix, never in the body.
         return appendix_anchor(letter.group(1), blocks)
-    return section_anchor(fid, blocks)
+    return section_anchor(fid, blocks, section, sections)
 
 
 def _image_block(fid: str, caption: str) -> dict:
@@ -618,7 +898,9 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     # lower-numbered figure that IS placed keeps the sequence readable; the page end
     # remains the last resort, for a figure with no placed neighbour at all.
     _sort_key = lambda f: _series_key(f["num"])
-    by_num = {f["num"]: _anchor_for(f["num"], blocks, f["id"]) for f in figs}
+    sections = source_sections(html_text)
+    by_num = {f["num"]: _anchor_for(f["num"], blocks, f["id"], f.get("section"),
+                                    sections) for f in figs}
     by_num = fill_anchor_gaps([f["num"] for f in figs], by_num)
     resolved = {id(f): by_num.get(f["num"]) for f in figs}
     ordered_figs = sorted(figs, key=_sort_key)

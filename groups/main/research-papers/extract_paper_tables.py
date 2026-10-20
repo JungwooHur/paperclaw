@@ -175,33 +175,7 @@ def forced_keys(placed: list, tables: list) -> set:
             | {key for key, t in _legacy_keys(tables).items() if t["id"] in ids})
 
 
-def _element_span(html_text: str, at: int):
-    """`(inner_start, inner_end, end)` of the element whose start tag holds `at`.
-
-    Walks the nesting of that element's own tag, so a table figure that wraps its
-    panels in figures of their own ends at ITS closing tag, not the first one.
-    An element that is never closed runs to the end of the text.
-    """
-    start = html_text.rfind("<", 0, at + 1)
-    tag = re.match(r"<([A-Za-z][\w-]*)", html_text[start:]) if start >= 0 else None
-    open_end = html_text.find(">", at)
-    if not tag or open_end < 0:
-        return None
-    opener = re.compile(rf"<{tag.group(1)}\b", re.I)
-    closer = re.compile(rf"</{tag.group(1)}\s*>", re.I)
-    depth, i = 1, open_end + 1
-    while True:
-        close = closer.search(html_text, i)
-        if not close:
-            return open_end + 1, len(html_text), len(html_text)
-        nested = opener.search(html_text, i, close.start())
-        if nested:
-            depth, i = depth + 1, nested.end()
-            continue
-        depth -= 1
-        if not depth:
-            return open_end + 1, close.start(), close.end()
-        i = close.end()
+_element_span = ef.element_span
 
 
 def _element_body(html_text: str, at: int) -> str:
@@ -263,8 +237,9 @@ def _legacy_caption(html_text: str, at: int, fid: str) -> str:
 
 
 def parse_tables(html_text: str) -> list:
-    """Ordered list of {id, num, caption, legacy_caption} for each table id
-    `SnTm` / `AnTm`.
+    """Ordered list of {id, num, caption, legacy_caption[, section]} for each
+    table id `SnTm` / `AnTm`; `section` is the top-level section the source
+    prints it in (`ef.enclosing_section`), when there is one.
     Scans ids directly (not <figure> boundaries) so nested table-figures — which
     truncate a non-greedy `<figure>…</figure>` match — are not dropped. The id is
     what render_tables screenshots, so this is the robust key.
@@ -276,6 +251,7 @@ def parse_tables(html_text: str) -> list:
     that old reading (`_legacy_caption`), the only thing that names the table an
     image placed before the fix shows."""
     out, seen = [], set()
+    sections = ef.source_sections(html_text)
     for m in _TID.finditer(html_text):
         fid = m.group(1)
         if fid in seen:
@@ -283,8 +259,12 @@ def parse_tables(html_text: str) -> list:
         seen.add(fid)
         num = int(m.group(2))
         cap = _table_caption(_element_body(html_text, m.start()), num)
-        out.append({"id": fid, "num": num, "caption": cap[:1900],
-                    "legacy_caption": _legacy_caption(html_text, m.start(), fid)})
+        table = {"id": fid, "num": num, "caption": cap[:1900],
+                 "legacy_caption": _legacy_caption(html_text, m.start(), fid)}
+        section = ef.enclosing_section(sections, m.start())
+        if section:
+            table["section"] = section
+        out.append(table)
     return out
 
 
@@ -343,17 +323,19 @@ def _table_anchor(label, blocks: list, fid: str = ""):
     return _table_mention(label, blocks) or ef.section_anchor(fid, blocks)
 
 
-def table_anchors(tables: list, blocks: list) -> dict:
+def table_anchors(tables: list, blocks: list, sections=None) -> dict:
     """{table id: (anchor block id or None, whether a citation chose it)}.
 
     A citation is evidence of where the table belongs; the section heading is a
     guess, and the relocation must not trade a placement for it (see
-    `plan_relocation`).
+    `plan_relocation`). `sections` is `ef.source_sections` of the source, which
+    lets the section fallback check the page's numbering against it.
     """
     out = {}
     for t in tables:
         hit = _table_mention(_mention_label(t, tables), blocks)
-        out[t["id"]] = (hit, True) if hit else (ef.section_anchor(t["id"], blocks), False)
+        out[t["id"]] = (hit, True) if hit else (
+            ef.section_anchor(t["id"], blocks, t.get("section"), sections), False)
     return out
 
 
@@ -610,7 +592,7 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     # place images grouped by anchor (first citation of the printed label), in
     # document order. render_tables keys by number, last one winning; mirror it.
     by_num = {t["num"]: t for t in tables}
-    anchors = table_anchors(all_tables, blocks)
+    anchors = table_anchors(all_tables, blocks, ef.source_sections(html_text))
     groups, order = {}, []
     for im in images:
         own = by_num.get(im["num"])
@@ -729,7 +711,16 @@ def _where_a_fallback_put_it(body: list, i: int) -> bool:
             or end == len(body) - 1)
 
 
-def plan_relocation(blocks: list, tables: list, me) -> dict:
+def _in_section_under(body: list, head: int, i: int) -> bool:
+    """Does block `i` sit in the section that heading `head` opens?"""
+    if i <= head:
+        return False
+    level = ef._level(body[head])
+    return not any(b.get("type", "").startswith("heading") and ef._level(b) <= level
+                   for b in body[head + 1:i])
+
+
+def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
     """Which table images to move where, and which captions to correct. Pure.
 
     A table image is in place when it sits in the run of images right after its
@@ -776,7 +767,7 @@ def plan_relocation(blocks: list, tables: list, me) -> dict:
     body = reference_section.body_blocks(blocks)
     where = {b["id"]: i for i, b in enumerate(body)}
     rank = {t["id"]: i for i, t in enumerate(tables)}
-    anchors = table_anchors(tables, body)
+    anchors = table_anchors(tables, body, sections)
     anchor = {tid: found for tid, (found, _) in anchors.items()}
     legacy = _legacy_keys(tables)
     plan = {"moves": [], "recaption": [], "left": []}
@@ -823,6 +814,9 @@ def plan_relocation(blocks: list, tables: list, me) -> dict:
         elif (not anchors[t["id"]][1]
               and not _where_a_fallback_put_it(body, where[b["id"]])):
             why = "no text cites it, and it follows text that may"
+        elif (not anchors[t["id"]][1]
+              and _in_section_under(body, where[anchor[t["id"]]], where[b["id"]])):
+            why = "no text cites it, and it is already in its own section"
         elif not ours:
             why = "written or edited by a person"
         elif not _image_url(b):
@@ -886,7 +880,8 @@ def relocate_tables(page_id: str, arxiv_id: str = None, apply: bool = False) -> 
     if why:
         rep["refused"] = why
         return rep
-    plan = plan_relocation(vs.fetch_blocks(page_id), parse_tables(html_text), me)
+    plan = plan_relocation(vs.fetch_blocks(page_id), parse_tables(html_text), me,
+                           sections=ef.source_sections(html_text))
     if "refused" in plan:
         rep["refused"] = plan["refused"]
         return rep
