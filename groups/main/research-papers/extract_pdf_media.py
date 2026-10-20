@@ -929,30 +929,10 @@ def _anchor_for(kind: str, num: int, blocks: list):
 
     if kind.startswith(ED_PREFIX):
         return _extended_data_anchor(base_kind(kind), num, blocks)
-    words = (r"그림|Figure|Fig\.?") if kind == "figure" else (r"표|Table")
-    # `\b` does not hold before a Korean particle — "Fig. 10에서" — because 에 is a
-    # word character, so every such mention was invisible and the figure was appended
-    # at the page end instead of beside the text citing it. Reject only a LONGER
-    # NUMBER, which is the thing that actually matters here.
-    # Case-insensitively: the translated body writes "fig. 5" and "[fig. 6]" as
-    # often as "Fig. 5", and matching only the capitalised form made those mentions
-    # invisible — the figure then fell to the end-of-body fallback while the text
-    # citing it sat chapters earlier.
-    # Not an Extended Data mention: "Extended Data Fig. 3" names a different
-    # figure than "Fig. 3", and anchoring on it put the main one in the wrong place.
-    ref = re.compile(rf"(?<!Data )(?:{words})\s*0*{num}(?![0-9])", re.I)
-    for b in blocks:
-        if b["type"] not in ef.TEXT_TYPES:
-            continue
-        text = ef._block_text(b)
-        # Another float's caption mentioning this number is a cross-reference.
-        # Anchoring to it puts the figure under an unrelated one — see
-        # `extract_paper_figures.caption_number`.
-        if ef._is_other_caption(text, kind, num):
-            continue
-        if ref.search(text):
-            return b["id"]
-    return None
+    # The same rule the HTML injectors read: a particle after the number, a
+    # lowercase "fig. 5", an Extended Data mention that names another figure, and
+    # another float's caption cross-referencing this one are all handled there.
+    return ef.first_mention(kind, num, blocks)
 
 
 # "Extended Data Fig. 3", "Extended Data Figs. 7–9", "Extended Data Table 1".

@@ -69,3 +69,38 @@ class TestJoiningFiguresAlreadyOnThePage:
 
     def test_a_number_already_placed_needs_no_spot(self):
         assert ef.neighbour_spot(4, self.PLACED) is None
+
+
+def para(bid, text):
+    return {"id": bid, "type": "paragraph",
+            "paragraph": {"rich_text": [{"plain_text": text}]}}
+
+
+def heading(bid, text, level=1):
+    kind = f"heading_{level}"
+    return {"id": bid, "type": kind, kind: {"rich_text": [{"plain_text": text}]}}
+
+
+class TestAnUncitedFigureKeepsReadingOrder:
+    """An uncited figure falls back to the heading of its own section — but
+    right under the heading it sat ABOVE a lower-numbered figure that the text
+    of that section cites further down."""
+
+    PAGE = [heading("h1", "1 Intro (서론)"), para("p1", "그림 1 참조."),
+            heading("h4", "4 Experiments (실험)"), para("p4a", "실험 설정."),
+            para("p4b", "그림 4에서 결과를 보인다."), para("p4c", "추가 분석.")]
+
+    def test_it_follows_the_cited_figure_of_its_section(self):
+        figs = [{"id": "S1.F1", "num": "1"}, {"id": "S4.F4", "num": "4"},
+                {"id": "S4.F5", "num": "5"}]
+        assert ef.figure_anchors(figs, self.PAGE) == {"1": "p1", "4": "p4b", "5": "p4b"}
+
+    def test_with_no_figure_cited_before_it_it_opens_its_section(self):
+        figs = [{"id": "S4.F3", "num": "3"}, {"id": "S4.F4", "num": "4"}]
+        assert ef.figure_anchors(figs, self.PAGE)["3"] == "h4"
+
+    def test_a_figure_cited_in_another_section_does_not_pull_it_there(self):
+        page = [heading("h1", "1 Intro (서론)"), para("p1", "그림 4를 미리 본다."),
+                heading("h4", "4 Experiments (실험)"), para("p4a", "실험 설정.")]
+        figs = [{"id": "S4.F4", "num": "4"}, {"id": "S4.F5", "num": "5"}]
+        assert ef.figure_anchors(figs, page)["5"] == "h4"
