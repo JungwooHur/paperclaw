@@ -336,16 +336,71 @@ def neighbour_spot(num, placed: dict):
 
 # The words a body uses to name a float: (Latin, Hangul). Each may not continue a
 # word of its own script, or "config 2" would mention Figure 2, "suitable 2" Table
-# 2, and 목표 1 ("goal 1") Table 1.
-_FLOAT_WORDS = {"figure": (r"(?:Figure|Fig\.?)", r"그림"),
-                "table": (r"Table", r"표")}
+# 2, and 목표 1 ("goal 1") Table 1. The plural opens a list ("Tables 2 and 3").
+_FLOAT_WORDS = {"figure": (r"(?:Figures?|Figs?\.?)", r"그림"),
+                "table": (r"(?:Tables?|Tabs?\.)", r"표")}
 
 ROMAN_VALUES = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7,
                 "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12, "xiii": 13,
                 "xiv": 14, "xv": 15}
 
+# One printed label: `A.1` / `S2`, `10` / `2.1`, or a roman numeral that no Latin
+# letter continues (`Table in` is not Table I). It must end there: a longer number
+# (`10`, `1.2`) is a different label, and a Hangul counter makes it a count —
+# 표 2개 is "two tables".
+_LABEL = (r"(?P<label>[A-Z]\.?[0-9]+(?:\.[0-9]+)*|[0-9]+(?:\.[0-9]+)*"
+          r"|[ivx]+(?![A-Za-z0-9]))(?![0-9]|\.[0-9]|[개장번차배명회줄행열층단쪽권편종])")
+# What joins the labels of one citation: a list, or a range (`2-4`, `2~4`, `2 to 4`).
+_JOIN = (r"(?:\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+|\s*(?:&|및|[와과])\s*"
+         r"|(?P<range>\s*[-–—~]\s*|\s+to\s+))")
+_CITATION = {kind: re.compile(
+    rf"(?<!Data )(?:(?<![A-Za-z]){latin}|(?<![가-힣]){hangul})[\s~]*{_LABEL}", re.I)
+    for kind, (latin, hangul) in _FLOAT_WORDS.items()}
+_NEXT_LABEL = re.compile(_JOIN + _LABEL, re.I)
+_MAX_RANGE = 30
 
-def mention_pattern(kind: str, num, roman: str = ""):
+
+def _label_key(label) -> str:
+    """`2` for "2" / "02" / 2, `a.1` for "A.1": how two labels compare."""
+    text = str(label).strip().lower()
+    return str(int(text)) if text.isdigit() else text
+
+
+def _is_roman(label: str) -> bool:
+    return bool(re.fullmatch(r"[ivx]+", label, re.I))
+
+
+def cited_labels(kind: str, text: str) -> set:
+    """Every `kind` label `text` cites, as `_label_key`s, lists and ranges expanded.
+
+    "Tables 2 and 3에" cites 2 and 3, "표 2–4" cites 2, 3 and 4. Reading only the
+    label after the word missed the rest of the list, and the relocation then
+    moved a table off the very sentence citing it.
+    """
+    out = set()
+    for found in _CITATION[kind].finditer(text or ""):
+        labels, at = [found.group("label")], found.end()
+        while True:
+            more = _NEXT_LABEL.match(text, at)
+            if not more:
+                break
+            low, high = labels[-1], more.group("label")
+            if _is_roman(high) != _is_roman(labels[0]):
+                break   # "Table 2 and I think": a pronoun, not Table I
+            if more.group("range"):
+                # Only an ascending run of numbers is a range; `2-1` is a label
+                # of its own (chapter 2, table 1), not a citation of table 1.
+                if not (low.isdigit() and high.isdigit()
+                        and 0 < int(high) - int(low) <= _MAX_RANGE):
+                    break
+                labels.extend(str(n) for n in range(int(low) + 1, int(high)))
+            labels.append(high)
+            at = more.end()
+        out.update(_label_key(label) for label in labels)
+    return out
+
+
+def mentions(kind: str, num, text: str, roman: str = "") -> bool:
     r"""The one rule for "this text mentions figure/table `num`".
 
     Figures and tables each had their own copy and they drifted: the figure copy
@@ -355,11 +410,12 @@ def mention_pattern(kind: str, num, roman: str = ""):
     The label must match as a WHOLE label — `Figure\s*2` must not match
     "Figure F.2" at the 2, which put appendix figures beside the body figure
     sharing their digit. And the boundary rejects only a LONGER NUMBER (`10`,
-    `1.2`), never a following word: a particle glues straight onto the number
-    (`Fig. 10에서`), 에 is a word character, and refusing it sent Fig 3, 10 and 15
-    to the appendix while the text citing them sat chapters earlier. A roman
-    numeral (`TABLE II`) also refuses a following Latin letter, or the roman 1
-    would read "Table in the appendix" as Table I.
+    `1.2`) or a counter (`표 2개`), never a following word: a particle glues
+    straight onto the number (`Fig. 10에서`), 에 is a word character, and refusing
+    it sent Fig 3, 10 and 15 to the appendix while the text citing them sat
+    chapters earlier. A roman numeral (`TABLE II`) also refuses a following
+    Latin letter, or the roman 1 would read "Table in the appendix" as Table I.
+    A list or range cites every label in it (`cited_labels`).
 
     Case-insensitive, since a translated body writes `fig. 5` as often as
     `Fig. 5`. "Extended Data Fig. 3" names a different figure than "Fig. 3".
@@ -367,14 +423,11 @@ def mention_pattern(kind: str, num, roman: str = ""):
     Args:
         kind: "figure" or "table".
         num: The printed label: 3, or "F.2" for an appendix figure.
+        text: The text to look in.
         roman: The label as a roman numeral too, lowercase ("ii"), or "".
     """
-    latin, hangul = _FLOAT_WORDS[kind]
-    alts = [rf"0*{re.escape(str(num))}(?![0-9]|\.[0-9])"]
-    if roman:
-        alts.append(rf"{re.escape(roman)}(?![0-9A-Za-z]|\.[0-9])")
-    return re.compile(rf"(?<!Data )(?:(?<![A-Za-z]){latin}|(?<![가-힣]){hangul})"
-                      rf"\s*(?:{'|'.join(alts)})", re.I)
+    cited = cited_labels(kind, text)
+    return _label_key(num) in cited or bool(roman and roman.lower() in cited)
 
 
 def first_mention(kind: str, num, blocks: list, roman: str = ""):
@@ -384,14 +437,13 @@ def first_mention(kind: str, num, blocks: list, roman: str = ""):
     is the first mention of 13 on the page, and anchoring there put Figure 13
     directly under Figure 1 (see `caption_number`).
     """
-    ref = mention_pattern(kind, num, roman)
     for b in blocks:
         if b["type"] not in TEXT_TYPES:
             continue
         text = _block_text(b)
         if _is_other_caption(text, kind, num):
             continue
-        if ref.search(text):
+        if mentions(kind, num, text, roman):
             return b["id"]
     return None
 

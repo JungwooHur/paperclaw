@@ -11,10 +11,11 @@ in headless Chromium (playwright) and screenshots each table element, preserving
 the paper's exact layout, column rules and color highlights + caption.
 
 Placement mirrors figures, through the same mention rule
-(`extract_paper_figures.mention_pattern`): the image goes right after the
-paragraph that first mentions the table number (`표 N` / `Table N`, a particle
-glued on or not), fallback the heading of the section the table sits in (the `S3`
-of `S3.T5`, never the heading numbered like the table), fallback end of body.
+(`extract_paper_figures.mentions`): the image goes right after the paragraph that
+first cites the table's PRINTED label (`표 N` / `Table N` / `Table A.1`, a particle
+glued on or not, alone or in a list), fallback the heading of the section the
+table sits in (the `S3` of `S3.T5`, never the heading numbered like the table),
+fallback end of body.
 Uploaded PRIVATELY via notion_upload.
 
 Safe removal (default)
@@ -135,6 +136,45 @@ def replaced_by(blocks: list, caption_keys: set) -> list:
     return out
 
 
+def _source_key(table: dict) -> str:
+    return _cap_key(placed_caption(table["num"], table["caption"]))
+
+
+def _legacy_keys(tables: list) -> dict:
+    """{caption key: table} for the captions the pre-fix parser wrote.
+
+    Only a key that names ONE table and is no table's caption today: the old
+    parser gave a table without a caption of its own the NEXT table's, and that
+    key is the next table's now — matching it would take that table's image.
+    """
+    current = {_source_key(t) for t in tables}
+    found = {}
+    for t in tables:
+        if "legacy_caption" in t:
+            key = _cap_key(placed_caption(t["num"], t["legacy_caption"]))
+            found.setdefault(key, []).append(t)
+    return {key: ts[0] for key, ts in found.items()
+            if len(ts) == 1 and key not in current}
+
+
+def forced_keys(placed: list, tables: list) -> set:
+    """Caption keys of the images a forced run's new copies of `placed` stand in for.
+
+    The caption each copy carries, and the one the pre-fix parser wrote for the
+    same table (`_legacy_keys`). A page placed before the caption fix shows a
+    long table as a bare `Table 5`; matching only the new caption kept that
+    image beside its replacement, and no tool could clear the pair, since
+    neither caption repeats.
+
+    Args:
+        placed: The source tables this run placed.
+        tables: Every table of the source (`parse_tables`).
+    """
+    ids = {t["id"] for t in placed}
+    return ({_source_key(t) for t in placed}
+            | {key for key, t in _legacy_keys(tables).items() if t["id"] in ids})
+
+
 def _element_span(html_text: str, at: int):
     """`(inner_start, inner_end, end)` of the element whose start tag holds `at`.
 
@@ -205,8 +245,26 @@ def _table_caption(body: str, num: int) -> str:
     return ""
 
 
+# The window the injector used to read a caption in, before it read the table's
+# own element. Kept only to recognise the captions it wrote that way.
+_LEGACY_WINDOW = 8000
+
+
+def _legacy_caption(html_text: str, at: int, fid: str) -> str:
+    """What the pre-fix parser read as the caption of the table whose id is at `at`.
+
+    The first `<figcaption>` within `_LEGACY_WINDOW` characters: empty for a long
+    table, a panel's "(a) …" for a composite one, the NEXT table's for one with
+    no caption of its own. Every page placed before the fix carries this text.
+    """
+    found = re.search(re.escape(fid) + r'".*?<figcaption[^>]*>(.*?)</figcaption>',
+                      html_text[at:at + _LEGACY_WINDOW], re.DOTALL | re.I)
+    return ef._clean(found.group(1))[:1900] if found else ""
+
+
 def parse_tables(html_text: str) -> list:
-    """Ordered list of {id, num, caption} for each table id `SnTm` / `AnTm`.
+    """Ordered list of {id, num, caption, legacy_caption} for each table id
+    `SnTm` / `AnTm`.
     Scans ids directly (not <figure> boundaries) so nested table-figures — which
     truncate a non-greedy `<figure>…</figure>` match — are not dropped. The id is
     what render_tables screenshots, so this is the robust key.
@@ -214,7 +272,9 @@ def parse_tables(html_text: str) -> list:
     The caption is read from the table's OWN element. It used to be the first
     `<figcaption>` within 8,000 characters of the id, so a long table (a page of
     prompt examples) had none — it was written as a bare `Table 5` — and a table
-    with no caption of its own borrowed the next table's."""
+    with no caption of its own borrowed the next table's. `legacy_caption` is
+    that old reading (`_legacy_caption`), the only thing that names the table an
+    image placed before the fix shows."""
     out, seen = [], set()
     for m in _TID.finditer(html_text):
         fid = m.group(1)
@@ -223,18 +283,78 @@ def parse_tables(html_text: str) -> list:
         seen.add(fid)
         num = int(m.group(2))
         cap = _table_caption(_element_body(html_text, m.start()), num)
-        out.append({"id": fid, "num": num, "caption": cap[:1900]})
+        out.append({"id": fid, "num": num, "caption": cap[:1900],
+                    "legacy_caption": _legacy_caption(html_text, m.start(), fid)})
     return out
 
 
-def _table_anchor(num, blocks: list, fid: str = ""):
-    """Where table `num` goes: the first block mentioning it (`표 N` / `Table N`,
-    roman too), else the heading of the section its id `fid` puts it in."""
-    if num is None:
+_PRINTED_LABEL = re.compile(
+    r"\s*table\s*([A-Z]\.?[0-9]+(?:\.[0-9]+)*|[0-9]+(?:\.[0-9]+)*"
+    r"|[ivx]+(?![A-Za-z0-9])|[A-Z](?![A-Za-z0-9]))", re.I)
+
+
+def printed_label(caption: str):
+    """The label a caption prints: 5, 2 for `TABLE II`, "A.1", "2.1", "A"; or None.
+
+    Any other token is returned as written, so the mention rule compares it as
+    a whole label and a letter-only one (`Table A`) matches nothing.
+    """
+    found = _PRINTED_LABEL.match(caption or "")
+    if not found:
         return None
-    roman = {v: k for k, v in _ROMAN.items()}.get(num, "")
-    return (ef.first_mention("table", num, blocks, roman)
-            or ef.section_anchor(fid, blocks))
+    token = found.group(1)
+    if token.isdigit():
+        return int(token)
+    return _ROMAN.get(token.lower(), token)
+
+
+def _mention_label(table: dict, tables: list):
+    """The label the body cites table `table` by, or None when it has none of its own.
+
+    The PRINTED label, never the id's counter: an appendix may restart it, so
+    `S2.T1` and `A1.T1` are both 1 while the second prints `Table A.1`, and
+    searching for "Table 1" put the appendix table beside the body's Table 1. The
+    counter stands in only for a caption that prints no label, and only when no
+    other table shares it. A label two tables print names neither.
+    """
+    label = printed_label(table["caption"])
+    if label is None:
+        shared = sum(1 for t in tables if t["num"] == table["num"]) > 1
+        return None if shared else table["num"]
+    printed = [printed_label(t["caption"]) for t in tables]
+    shared = sum(1 for other in printed if other is not None
+                 and ef._label_key(other) == ef._label_key(label)) > 1
+    return None if shared else label
+
+
+def _table_mention(label, blocks: list):
+    """The first block citing table `label` (roman too for a number), or None."""
+    if label is None:
+        return None
+    roman = ""
+    if isinstance(label, int):
+        roman = {v: k for k, v in _ROMAN.items()}.get(label, "")
+    return ef.first_mention("table", label, blocks, roman)
+
+
+def _table_anchor(label, blocks: list, fid: str = ""):
+    """Where the table printed as `label` goes: the first block citing it, else
+    the heading of the section its id `fid` puts it in."""
+    return _table_mention(label, blocks) or ef.section_anchor(fid, blocks)
+
+
+def table_anchors(tables: list, blocks: list) -> dict:
+    """{table id: (anchor block id or None, whether a citation chose it)}.
+
+    A citation is evidence of where the table belongs; the section heading is a
+    guess, and the relocation must not trade a placement for it (see
+    `plan_relocation`).
+    """
+    out = {}
+    for t in tables:
+        hit = _table_mention(_mention_label(t, tables), blocks)
+        out[t["id"]] = (hit, True) if hit else (ef.section_anchor(t["id"], blocks), False)
+    return out
 
 
 def _is_pure_table(text: str) -> bool:
@@ -475,9 +595,9 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         rep["would_place"] = [t["num"] for t in tables]
         if force:
             # render_tables keys captions by number, last one winning; mirror it.
-            caps = {t["num"]: t["caption"] for t in tables}
+            by_num = {t["num"]: t for t in tables}
             rep["would_replace"] = len(replaced_by(
-                blocks, {_cap_key(placed_caption(n, c)) for n, c in caps.items()}))
+                blocks, forced_keys(list(by_num.values()), all_tables)))
         rep["would_archive"] = sum(1 for b in blocks
                                    if b["type"] in ef.TEXT_TYPES
                                    and _is_pure_table(ef._block_text(b)))
@@ -487,16 +607,18 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     images = render_tables(arxiv_id, tables, outdir, html_src)  # [{num, caption, path}]
     rep["rendered"] = len(images)
 
-    # place images grouped by anchor (first `표 N` mention), in document order.
-    # render_tables keys by number, last one winning; mirror it for the id.
-    ids = {t["num"]: t["id"] for t in tables}
+    # place images grouped by anchor (first citation of the printed label), in
+    # document order. render_tables keys by number, last one winning; mirror it.
+    by_num = {t["num"]: t for t in tables}
+    anchors = table_anchors(all_tables, blocks)
     groups, order = {}, []
     for im in images:
-        anchor = _table_anchor(im["num"], blocks, ids.get(im["num"], "")) or "__end__"
+        own = by_num.get(im["num"])
+        anchor = (anchors[own["id"]][0] if own else None) or "__end__"
         groups.setdefault(anchor, []).append(im)
         if anchor not in order:
             order.append(anchor)
-    placed_caps = set()
+    placed = []
     for key in order:
         children, these = [], []
         for im in groups[key]:
@@ -504,7 +626,8 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
             if fid:
                 cap = placed_caption(im["num"], im["caption"])
                 children.append(ef._image_block(fid, cap))
-                these.append(_cap_key(cap))
+                if im["num"] in by_num:
+                    these.append(by_num[im["num"]])
                 time.sleep(0.2)
         if not children:
             continue
@@ -516,14 +639,14 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
             body["after"] = end_of_body
         notion("PATCH", f"/blocks/{page_id}/children", body)
         rep["placed"] += len(children)
-        placed_caps.update(these)
+        placed.extend(these)
         time.sleep(0.34)
 
     # --force REPLACES: archive the copies the new images stand in for, once the
     # new ones are in. It used to add beside them, so a forced run left two of
     # every table.
     if force:
-        for bid in replaced_by(blocks, placed_caps):
+        for bid in replaced_by(blocks, forced_keys(placed, all_tables)):
             try:
                 notion("PATCH", f"/blocks/{bid}", {"archived": True})
                 rep["replaced"] = rep.get("replaced", 0) + 1
@@ -568,30 +691,42 @@ def heal_tables(page_id: str, apply: bool = False) -> dict:
 # sweep (see groups/main/CLAUDE.md, "Repairs that are not on the healer").
 
 
-def _source_key(table: dict) -> str:
-    return _cap_key(placed_caption(table["num"], table["caption"]))
-
-
-def _which_table(caption: str, tables: list):
+def _which_table(caption: str, tables: list, legacy: dict):
     """The source table an image's caption names, or None when that is unclear.
 
-    The caption first, since the injector copies it verbatim; the number second,
-    for an image written with a bare `Table 5`. A number the source uses twice
-    (an appendix restarts the id counter) names nothing.
+    By the caption only, which the injector copies verbatim: the source's
+    caption today, else the one the pre-fix parser wrote (`legacy`, from
+    `_legacy_keys`), which is how a bare `Table 5` is recognised. Never by the
+    number alone. A source revised since the page was placed, or one that
+    numbers per chapter (`Table 2.1` reads as 2), gives the same number to a
+    different table, and the relocation then moved or recaptioned the wrong one.
     """
     key = _cap_key(caption)
     by_key = [t for t in tables if _source_key(t) == key]
-    if len(by_key) == 1:
-        return by_key[0]
-    num = caption_number(caption)
-    by_num = [t for t in (by_key or tables) if num is not None and t["num"] == num]
-    return by_num[0] if len(by_num) == 1 else None
+    if by_key:
+        return by_key[0] if len(by_key) == 1 else None
+    return legacy.get(key)
 
 
 def _image_url(block: dict) -> str:
     image = block.get("image") or {}
     return ((image.get("file") or {}).get("url")
             or (image.get("external") or {}).get("url") or "")
+
+
+def _where_a_fallback_put_it(body: list, i: int) -> bool:
+    """Does image `i` sit where a fallback, not a citation, would have put it?
+
+    That is the run of images right under a heading (the old rule's heading
+    numbered like the table) or the run that ends the body (its last resort).
+    """
+    start = end = i
+    while start > 0 and body[start - 1].get("type") == "image":
+        start -= 1
+    while end + 1 < len(body) and body[end + 1].get("type") == "image":
+        end += 1
+    return (start == 0 or body[start - 1].get("type", "").startswith("heading")
+            or end == len(body) - 1)
 
 
 def plan_relocation(blocks: list, tables: list, me) -> dict:
@@ -605,7 +740,14 @@ def plan_relocation(blocks: list, tables: list, me) -> dict:
     has edited since (`collect_papers._ours`, the rule `--clear-unprocessed`
     uses) is moved there; a move is a new image with the SOURCE caption, so a
     bare `Table 5` comes back with its caption. An image already in place whose
-    caption differs from the source's is recaptioned where it is.
+    caption differs from the source's is recaptioned where it is; the plan keeps
+    the caption it replaces, so that can be undone.
+
+    An image is matched to its table by caption alone (`_which_table`). A table
+    no text cites has only its section heading as an anchor, and that is a
+    guess: such an image is moved only off a spot a fallback put it in
+    (`_where_a_fallback_put_it`). One that follows a paragraph may follow the
+    sentence citing it in words the mention rule does not read.
 
     Left alone: anything after the injected reference list
     (`reference_section.body_blocks`), anchors there included; an image a person
@@ -620,11 +762,11 @@ def plan_relocation(blocks: list, tables: list, me) -> dict:
         me: This integration's user id; None means nothing counts as ours.
 
     Returns:
-        `{"moves": [{"after": id, "items": [...]}], "recaption": [...],
-        "left": [...]}`, or `{"refused": why}`. Each move is one insert: its
-        items go in source order, and an item names the old block, the table,
-        the caption to write and the image's file URL. Applying the plan and
-        planning again plans nothing.
+        `{"moves": [{"after": id, "items": [...]}], "recaption": [{"block",
+        "was", "caption"}], "left": [...]}`, or `{"refused": why}`. Each move
+        is one insert: its items go in source order, and an item names the old
+        block, the table, the caption to write and the image's file URL.
+        Applying the plan and planning again plans nothing.
     """
     import collect_papers
 
@@ -634,7 +776,9 @@ def plan_relocation(blocks: list, tables: list, me) -> dict:
     body = reference_section.body_blocks(blocks)
     where = {b["id"]: i for i, b in enumerate(body)}
     rank = {t["id"]: i for i, t in enumerate(tables)}
-    anchor = {t["id"]: _table_anchor(t["num"], body, t["id"]) for t in tables}
+    anchors = table_anchors(tables, body)
+    anchor = {tid: found for tid, (found, _) in anchors.items()}
+    legacy = _legacy_keys(tables)
     plan = {"moves": [], "recaption": [], "left": []}
 
     shown, claims = [], {}
@@ -644,7 +788,7 @@ def plan_relocation(blocks: list, tables: list, me) -> dict:
         caption = _image_caption(b)
         if not is_table_key(_cap_key(caption)):
             continue
-        t = _which_table(caption, tables)
+        t = _which_table(caption, tables, legacy)
         if t is None:
             plan["left"].append({"block": b["id"], "why": "not in the source"})
             continue
@@ -671,10 +815,14 @@ def plan_relocation(blocks: list, tables: list, me) -> dict:
             why = "several images show this table"
         elif b["id"] in in_place:
             if ours and _image_caption(b) != want[:2000]:
-                plan["recaption"].append({"block": b["id"], "caption": want})
+                plan["recaption"].append({"block": b["id"], "was": _image_caption(b),
+                                          "caption": want})
             continue
         elif not anchor[t["id"]]:
             why = "no anchor on the page"
+        elif (not anchors[t["id"]][1]
+              and not _where_a_fallback_put_it(body, where[b["id"]])):
+            why = "no text cites it, and it follows text that may"
         elif not ours:
             why = "written or edited by a person"
         elif not _image_url(b):
@@ -744,7 +892,7 @@ def relocate_tables(page_id: str, arxiv_id: str = None, apply: bool = False) -> 
         return rep
     rep["would_move"] = [{"table": it["table"], "block": it["old"], "after": mv["after"]}
                          for mv in plan["moves"] for it in mv["items"]]
-    rep["would_recaption"] = [fix["block"] for fix in plan["recaption"]]
+    rep["would_recaption"] = plan["recaption"]
     rep["left"] = plan["left"]
     if not apply:
         return rep
