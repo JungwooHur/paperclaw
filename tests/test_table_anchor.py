@@ -251,6 +251,38 @@ class TestAnOrdinalStillCites:
         assert not ef.mentions("table", 2, "표 2개를 비교한다.")
 
 
+class TestTheSameSyllableAfterAListCanBeAMeasure:
+    """`번` and `도` glue onto a label as well as onto a count: `그림 2와 3번에서`
+    cites figure 3, `3번째` is "third", `3번 반복` is "three times", and after a
+    comma `30도` is thirty degrees. A product (`3×3`) and a fraction (`3/4`) are
+    measures too. Read as labels, they anchored a float on prose."""
+
+    @pytest.mark.parametrize("kind, text, num", [
+        ("figure", "(그림 2, 3번째 행)", 3),
+        ("table", "(Table 1, 2번째 열 참조)", 2),
+        ("figure", "그림 2, 3번 반복한 결과", 3),
+        ("figure", "그림 2와 3번씩 반복했다.", 3),
+        ("figure", "(그림 2, 30도 회전)", 30),
+        ("table", "Table 2, 3×3 grid", 3),
+        ("table", "Table 2, 3 × 3 grid", 3),
+        ("table", "Tables 2, 3 x 3 grids", 3),
+        ("figure", "Figure 2, 3/4 of the runs", 3),
+    ])
+    def test_a_measure_ends_the_list(self, kind, text, num):
+        assert not ef.mentions(kind, num, text)
+
+    @pytest.mark.parametrize("kind, text, num", [
+        ("figure", "그림 2번에서 보듯이", 2),
+        ("figure", "그림 2와 3번에서", 3),
+        ("figure", "그림 2와 3번 참조.", 3),
+        ("figure", "(그림 2, 3번)", 3),
+        ("figure", "그림 2와 3도 함께 보면", 3),
+        ("table", "Table 2, 3에서 3×3 grid를 쓴다.", 3),
+    ])
+    def test_a_label_still_cites(self, kind, text, num):
+        assert ef.mentions(kind, num, text)
+
+
 # --- fallback: the float's own section, not its number --------------------
 
 

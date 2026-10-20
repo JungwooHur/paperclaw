@@ -371,19 +371,31 @@ _PARTICLE = re.compile(r"에|의|은|는|이(?![상하내])|가(?!지)|을|를|�
                        r"|으?로|처럼|보다|번|참조|및")
 
 
-def _a_quantity_follows(text: str, at: int, plural: bool) -> bool:
+def _a_quantity_follows(text: str, at: int, plural: bool, comma: bool = False) -> bool:
     """Does what follows the number ending at `at` make it a quantity, not a label?
 
     Only a list's later numbers are asked: after "Table 2, " the next number is
     as often a count or a measure as another table. `3D`, `3rd`, `5-shot`,
-    `30%`, a Hangul word that is no particle (`3절`, `3초`), and, after a
-    SINGULAR word, an English word (`Figure 2 and 3 epochs`, `Fig. 3, 4 m/s`):
-    a list of figures says "Figures".
+    `30%`, `3×3`, `3/4`, a Hangul word that is no particle (`3절`, `3초`), and,
+    after a SINGULAR word, an English word (`Figure 2 and 3 epochs`, `Fig. 3,
+    4 m/s`): a list of figures says "Figures".
+
+    Two particles are also units. `번` is "number" in `3번에서` and a count in
+    `3번째` (third), `3번씩` and `3번 반복` (three times). `도` is "also" in
+    `그림 2와 3도`, and degrees after a bare comma (`comma`): `(그림 2, 30도 회전)`.
     """
     if _NEXT_LABEL.match(text, at):
         return False            # the list goes on
     rest = text[at:]
-    if re.match(r"[A-Za-z%°]|\s*[-–—]\s*[A-Za-z가-힣]", rest):
+    if re.match(r"[A-Za-z%°]|\s*[-–—]\s*[A-Za-z가-힣]|\s*[×xX*/]\s*[0-9]", rest):
+        return True
+    if rest.startswith("번"):
+        after = rest[1:]
+        if re.match(r"[가-힣]", after):
+            return not _PARTICLE.match(after)
+        return bool(re.match(r"\s+[가-힣]", after)
+                    and not re.match(r"\s+(?:참조|참고)", after))
+    if rest.startswith("도") and comma:
         return True
     if re.match(r"[가-힣]", rest):
         return not _PARTICLE.match(rest)
@@ -421,8 +433,9 @@ def cited_labels(kind: str, text: str) -> set:
             low, high = labels[-1], more.group("label")
             if _is_roman(high) != _is_roman(labels[0]):
                 break   # "Table 2 and I think": a pronoun, not Table I
+            comma = text[at:more.start("label")].strip() == ","
             if (_NUMBER.fullmatch(high)
-                    and _a_quantity_follows(text, more.end(), plural)):
+                    and _a_quantity_follows(text, more.end(), plural, comma)):
                 break   # "Table 2와 3절", "Figure 2, 32 GPUs"
             if more.group("range"):
                 # Only an ascending run of numbers is a range; `2-1` is a label
