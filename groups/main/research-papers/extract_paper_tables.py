@@ -27,6 +27,11 @@ numeric residue may remain. Idempotent (skips if the page already has table
 images, detected by an image caption starting "Table").
 
   extract_paper_tables.py --page <id> --arxiv <id> [--dry-run] [--force] [--keep-text]
+
+Tables already placed are never re-placed, so an anchor fix does not reach them.
+`--relocate` moves them by hand (a plan unless `--apply`): see `plan_relocation`.
+
+  extract_paper_tables.py --page <id> --relocate [--arxiv <id>] [--apply]
 """
 import argparse
 import os
@@ -556,17 +561,257 @@ def heal_tables(page_id: str, apply: bool = False) -> dict:
     return inject_tables(page_id, aid, apply=apply)
 
 
+# --- relocating the tables already placed -------------------------------------
+# The injector places a table once and then skips its number for good, so fixing
+# the anchor rule never reaches a page placed before the fix. `--relocate` moves
+# those images, by hand: the healer only sees recent pages, and this is a one-off
+# sweep (see groups/main/CLAUDE.md, "Repairs that are not on the healer").
+
+
+def _source_key(table: dict) -> str:
+    return _cap_key(placed_caption(table["num"], table["caption"]))
+
+
+def _which_table(caption: str, tables: list):
+    """The source table an image's caption names, or None when that is unclear.
+
+    The caption first, since the injector copies it verbatim; the number second,
+    for an image written with a bare `Table 5`. A number the source uses twice
+    (an appendix restarts the id counter) names nothing.
+    """
+    key = _cap_key(caption)
+    by_key = [t for t in tables if _source_key(t) == key]
+    if len(by_key) == 1:
+        return by_key[0]
+    num = caption_number(caption)
+    by_num = [t for t in (by_key or tables) if num is not None and t["num"] == num]
+    return by_num[0] if len(by_num) == 1 else None
+
+
+def _image_url(block: dict) -> str:
+    image = block.get("image") or {}
+    return ((image.get("file") or {}).get("url")
+            or (image.get("external") or {}).get("url") or "")
+
+
+def plan_relocation(blocks: list, tables: list, me) -> dict:
+    """Which table images to move where, and which captions to correct. Pure.
+
+    A table image is in place when it sits in the run of images right after its
+    anchor (`_table_anchor`), after every table of that anchor that comes before
+    it in the source. Images of figures may sit in that run too: the figure
+    injector anchors on the same paragraphs, and whichever ran second inserted
+    its images first. Everything else that this integration wrote and no person
+    has edited since (`collect_papers._ours`, the rule `--clear-unprocessed`
+    uses) is moved there; a move is a new image with the SOURCE caption, so a
+    bare `Table 5` comes back with its caption. An image already in place whose
+    caption differs from the source's is recaptioned where it is.
+
+    Left alone: anything after the injected reference list
+    (`reference_section.body_blocks`), anchors there included; an image a person
+    wrote or edited; one the source does not have; one whose table the rule
+    gives no anchor, since moving it to the end of the body would trade one
+    guess for another. A page whose table captions repeat is refused outright —
+    that is `dedup_tables.py`'s pile, and moving it would only spread it.
+
+    Args:
+        blocks: The page's top-level blocks.
+        tables: `parse_tables` of the source, in document order.
+        me: This integration's user id; None means nothing counts as ours.
+
+    Returns:
+        `{"moves": [{"after": id, "items": [...]}], "recaption": [...],
+        "left": [...]}`, or `{"refused": why}`. Each move is one insert: its
+        items go in source order, and an item names the old block, the table,
+        the caption to write and the image's file URL. Applying the plan and
+        planning again plans nothing.
+    """
+    import collect_papers
+
+    if table_repeats(blocks) > 1:
+        return {"refused": "a table caption repeats on this page; "
+                           "clear the copies with dedup_tables.py first"}
+    body = reference_section.body_blocks(blocks)
+    where = {b["id"]: i for i, b in enumerate(body)}
+    rank = {t["id"]: i for i, t in enumerate(tables)}
+    anchor = {t["id"]: _table_anchor(t["num"], body, t["id"]) for t in tables}
+    plan = {"moves": [], "recaption": [], "left": []}
+
+    shown, claims = [], {}
+    for b in body:
+        if b.get("type") != "image" or b.get("archived") or b.get("in_trash"):
+            continue
+        caption = _image_caption(b)
+        if not is_table_key(_cap_key(caption)):
+            continue
+        t = _which_table(caption, tables)
+        if t is None:
+            plan["left"].append({"block": b["id"], "why": "not in the source"})
+            continue
+        shown.append((b, t))
+        claims[t["id"]] = claims.get(t["id"], 0) + 1
+    table_of = {b["id"]: t for b, t in shown if claims[t["id"]] == 1}
+
+    in_place, staying = set(), {}
+    for a in {a for a in anchor.values() if a}:
+        last, j = -1, where[a] + 1
+        while j < len(body) and body[j].get("type") == "image":
+            t = table_of.get(body[j]["id"])
+            if t and anchor[t["id"]] == a and rank[t["id"]] > last:
+                last = rank[t["id"]]
+                in_place.add(body[j]["id"])
+                staying.setdefault(a, []).append((last, body[j]["id"]))
+            j += 1
+
+    batches = {}
+    for b, t in shown:
+        want = placed_caption(t["num"], t["caption"])
+        ours = collect_papers._ours(b, me)
+        if b["id"] not in table_of:
+            why = "several images show this table"
+        elif b["id"] in in_place:
+            if ours and _image_caption(b) != want[:2000]:
+                plan["recaption"].append({"block": b["id"], "caption": want})
+            continue
+        elif not anchor[t["id"]]:
+            why = "no anchor on the page"
+        elif not ours:
+            why = "written or edited by a person"
+        elif not _image_url(b):
+            why = "no file to copy"
+        else:
+            a = anchor[t["id"]]
+            before = [bid for r, bid in staying.get(a, []) if r < rank[t["id"]]]
+            batches.setdefault(before[-1] if before else a, []).append(
+                (rank[t["id"]], {"old": b["id"], "table": t["id"], "num": t["num"],
+                                 "caption": want, "url": _image_url(b)}))
+            continue
+        plan["left"].append({"block": b["id"], "why": why})
+
+    for after in sorted(batches, key=lambda bid: where[bid]):
+        plan["moves"].append({"after": after,
+                              "items": [it for _, it in sorted(batches[after],
+                                                               key=lambda x: x[0])]})
+    return plan
+
+
+def relocation_refusal(page_id: str, page: dict, skip: set):
+    """Why `--relocate` must leave this page alone, or None.
+
+    `skip` is the owner's `heal_skip.txt` (dashless ids): a page they arrange by
+    hand. A page that is not a paper has no tables of a paper to place.
+    """
+    import page_kind
+
+    if page_id.replace("-", "") in skip:
+        return "listed in heal_skip.txt"
+    if not page_kind.is_paper(page):
+        return f"not a paper: {page_kind.venue(page)}"
+    return None
+
+
+def relocate_tables(page_id: str, arxiv_id: str = None, apply: bool = False) -> dict:
+    """Move a page's misplaced table images to their anchors (`plan_relocation`).
+
+    Dry run unless `apply`. Each move downloads the image from its own block,
+    uploads it privately, inserts it after the anchor, and archives the old block
+    only once that insert succeeded, so a failure leaves the old one where it was.
+    """
+    import time
+    import collect_papers
+    import verify_sections as vs
+    from heal_paper_pages import _skipped_pages
+    from translate_fulltext import notion
+
+    rep = {"page": page_id, "moved": 0, "recaptioned": 0}
+    why = relocation_refusal(page_id, notion("GET", f"/pages/{page_id}"),
+                             _skipped_pages())
+    arxiv_id = arxiv_id or (None if why else ef.arxiv_id_from_page(page_id))
+    if not why and not arxiv_id:
+        why = "no arxiv id in the page's Paper URL"
+    html_text = None if why else ef.fetch_html(arxiv_id)[0]
+    if not why and not html_text:
+        why = "no HTML source"
+    me = None if why else collect_papers._me_id()
+    if not why and not me:
+        why = "cannot read this integration's user id (GET /users/me)"
+    if why:
+        rep["refused"] = why
+        return rep
+    plan = plan_relocation(vs.fetch_blocks(page_id), parse_tables(html_text), me)
+    if "refused" in plan:
+        rep["refused"] = plan["refused"]
+        return rep
+    rep["would_move"] = [{"table": it["table"], "block": it["old"], "after": mv["after"]}
+                         for mv in plan["moves"] for it in mv["items"]]
+    rep["would_recaption"] = [fix["block"] for fix in plan["recaption"]]
+    rep["left"] = plan["left"]
+    if not apply:
+        return rep
+
+    fail = rep.setdefault("failed", [])
+    archived = rep.setdefault("archived", [])
+    for move in plan["moves"]:
+        children, olds = [], []
+        for it in move["items"]:
+            fid = ef.upload_image_from_url(it["url"])
+            if not fid:
+                fail.append(f"{it['table']}: could not copy the image")
+                continue
+            children.append(ef._image_block(fid, it["caption"]))
+            olds.append(it["old"])
+            time.sleep(0.2)
+        if not children:
+            continue
+        try:
+            notion("PATCH", f"/blocks/{page_id}/children",
+                   {"children": children, "after": move["after"]})
+        except Exception as e:
+            fail.append(f"insert after {move['after']}: {e}"[:200])
+            continue
+        time.sleep(0.34)
+        for old in olds:
+            try:
+                notion("PATCH", f"/blocks/{old}", {"archived": True})
+                archived.append(old)
+                rep["moved"] += 1
+            except Exception as e:
+                fail.append(f"archive {old}: {e}"[:200])
+            time.sleep(0.34)
+    for fix in plan["recaption"]:
+        try:
+            notion("PATCH", f"/blocks/{fix['block']}",
+                   {"image": {"caption": [{"type": "text",
+                                           "text": {"content": fix["caption"][:2000]}}]}})
+            rep["recaptioned"] += 1
+        except Exception as e:
+            fail.append(f"recaption {fix['block']}: {e}"[:200])
+        time.sleep(0.34)
+    return rep
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--page", required=True)
-    ap.add_argument("--arxiv", required=True, help="arxiv id (NNNN.NNNNN)")
+    ap.add_argument("--arxiv", help="arxiv id (NNNN.NNNNN); required except with "
+                                    "--relocate, which reads it from the Paper URL")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--keep-text", action="store_true",
                     help="inject images but do not archive any flattened-table text")
+    ap.add_argument("--relocate", action="store_true",
+                    help="move the table images already on the page to where the "
+                         "anchor rule puts them; prints the plan unless --apply")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --relocate: make the changes")
     a = ap.parse_args()
-    rep = inject_tables(a.page, a.arxiv, apply=not a.dry_run,
-                        force=a.force, keep_text=a.keep_text)
+    if a.relocate:
+        rep = relocate_tables(a.page, a.arxiv, apply=a.apply)
+    else:
+        if not a.arxiv:
+            ap.error("--arxiv is required unless --relocate is given")
+        rep = inject_tables(a.page, a.arxiv, apply=not a.dry_run,
+                            force=a.force, keep_text=a.keep_text)
     import json
     print(json.dumps(rep, ensure_ascii=False, indent=1))
     return 0
