@@ -53,9 +53,9 @@ runs `docker ps` again and compares the queue with its first read, and writes
 nothing if either changed (see still_quiet): an agent that started during the
 seconds-long NotebookLM probe writes the queue too.
 
-Idempotent and cheap. It writes nothing while the queue is still being worked or a
-container is up, and never schedules a second resume while one is already scheduled
-or ran within the cooldown. It writes in three cases only:
+Idempotent and cheap. It writes neither file while the queue is still being worked
+or a container is up, and never schedules a second resume while one is already
+scheduled or ran within the cooldown. It writes them in three cases only:
 
   * a stranded queue, no resume scheduled or recent: reconcile, trim, and schedule
     a resume;
@@ -64,11 +64,25 @@ or ran within the cooldown. It writes in three cases only:
   * no queue or a drained one, a non-empty backlog, no resume scheduled or recent:
     refill, and schedule a resume.
 
+A resume that settles no paper backs off. The auth probe runs `notebooklm list`,
+which still works while NotebookLM throttles its CHAT, so a throttled resume fails
+in minutes, leaves its papers pending and messages the owner, and without a
+backoff the next one would follow a cooldown later, all night. So each scheduled
+resume is recorded in SWEEP_STATE, a host-only file like the backlog: the batch it
+was handed and how many of its papers were settled then, `done` or `failed` for a
+reason of their own (an env-failed paper is retried, so it settles nothing). When
+the next stranded check finds the same batch with no more papers settled, the
+quiet time since that resume doubles per resume in a row that got nowhere
+(cooldown * 2**n, capped at BACKOFF_CAP_MIN). The check runs before the probe, so
+a backing-off sweep never drives the browser. A new batch, a drained queue, or a missing or unreadable
+state file counts from n=0, so the state can delay a resume but never block one.
+
   sweep_batch_queue.py [--dry-run] [--stale-min N] [--cooldown-min N]
 """
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import sqlite3
@@ -81,7 +95,15 @@ QUEUE = os.path.join(HERE, "papers_queue.json")
 # Papers waiting for a later session, {"papers": [...]}. Host-only: no agent prompt
 # names it, so an agent that deletes the queue at the end of a batch cannot lose it.
 BACKLOG = os.path.join(HERE, "papers_backlog.json")
+# What the last scheduled resume was handed, so the next sweep can tell whether it
+# got anywhere. Host-only, like the backlog: no agent prompt names it.
+SWEEP_STATE = os.path.join(HERE, "papers_sweep_state.json")
 DB = os.path.join(REPO, "store", "messages.db")
+
+# The longest quiet time the backoff asks for. However long a throttle lasts, a
+# resume is still tried twice a day, so the batch picks up within half a day of
+# the throttle lifting.
+BACKOFF_CAP_MIN = 12 * 60
 
 # Papers per resume session. A scheduled run is capped at 50 turns by the runner
 # (container/agent-runner/src/index.ts), and a paper costs the main agent about 5
@@ -172,6 +194,11 @@ def notebooklm_auth_ok():
     return True if p.returncode == 0 else None
 
 
+def _now():
+    """The one clock every time comparison here reads, so a test can move it."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
 class Unreadable(Exception):
     """A queue or backlog exists but cannot be parsed. Never write over it: the
     papers in it would be gone."""
@@ -184,7 +211,10 @@ def _load_json(path):
             data = json.load(f)
     except FileNotFoundError:
         return None
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+    # ValueError covers JSONDecodeError and UnicodeDecodeError, and also what
+    # json.load raises past Python's integer digit limit; deep nesting raises
+    # RecursionError.
+    except (ValueError, OSError, RecursionError) as e:
         raise Unreadable(f"{os.path.basename(path)}: {type(e).__name__}: {e}") from e
     if not isinstance(data, dict) or not isinstance(data.get("papers", []), list):
         raise Unreadable(f"{os.path.basename(path)}: not a {{\"papers\": [...]}} object")
@@ -301,7 +331,7 @@ def write_trimmed(q, backlog):
 
 
 def schedule_resume(conn, chat_jid):
-    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    now = _now().replace(microsecond=0)
     tid = "papers-batch-resume-" + now.strftime("%Y%m%dT%H%M%S")
     conn.execute(
         "INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt,"
@@ -354,16 +384,148 @@ def recent_resume(conn, cooldown_min: int) -> bool:
         " AND status = 'active' AND next_run IS NOT NULL LIMIT 1").fetchone()
     if row:
         return True
-    cutoff = (datetime.datetime.now(datetime.timezone.utc)
-              - datetime.timedelta(minutes=cooldown_min)).isoformat()
+    cutoff = (_now() - datetime.timedelta(minutes=cooldown_min)).isoformat()
     row = conn.execute(
         "SELECT 1 FROM scheduled_tasks WHERE id LIKE 'papers-batch-resume-%'"
         " AND last_run IS NOT NULL AND last_run > ? LIMIT 1", (cutoff,)).fetchone()
     return bool(row)
 
 
+def batch_id(q):
+    """What makes a queue the same batch from one session to the next: its
+    created_at, else the set of papers in it."""
+    created = (q or {}).get("created_at")
+    if created:
+        return f"created_at:{created}"
+    keys = sorted({k for k in map(paper_key, (q or {}).get("papers", [])) if k})
+    return "papers:" + " ".join(keys)
+
+
+def env_failed(p):
+    """A paper an environmental failure (dead NotebookLM session, rate limit)
+    buried as `failed`: retryable, not broken."""
+    return (p.get("status") == "failed"
+            and bool(_ENV_FAIL.search(str(p.get("error") or ""))))
+
+
+def settled_count(q):
+    """Papers of `q` no session will run again: `done`, or `failed` for a reason of
+    their own, such as a page verify_sections refused. An env-failed paper is
+    retried, so it is not settled; a throttled session settles nothing."""
+    return sum(1 for p in (q or {}).get("papers", [])
+               if p.get("status") == "done"
+               or (p.get("status") == "failed" and not env_failed(p)))
+
+
+def _is_count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _parse_time(s):
+    """An aware datetime from an ISO stamp (the DB's JS `...Z` form included), or
+    None for anything else."""
+    if not isinstance(s, str):
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+
+
+def load_state():
+    """The backoff state, or None when there is none to trust.
+
+    Never raises: a missing or broken file means n=0, which costs at most the
+    resumes the backoff would have saved, while raising would stop recovery."""
+    try:
+        with open(SWEEP_STATE, encoding="utf-8") as f:
+            s = json.load(f)
+    except FileNotFoundError:
+        print("sweep: no backoff state — counting this batch from n=0")
+        return None
+    except (ValueError, OSError, RecursionError) as e:    # as in _load_json
+        print(f"sweep: backoff state unreadable ({type(e).__name__}) — counting this "
+              f"batch from n=0")
+        return None
+    if not (isinstance(s, dict) and isinstance(s.get("batch"), str)
+            and _is_count(s.get("settled_at_resume"))
+            and _is_count(s.get("resumes_without_progress"))):
+        print("sweep: backoff state malformed — counting this batch from n=0")
+        return None
+    return s
+
+
+def save_state(q, n):
+    """Record what the resume just scheduled was handed. The resume is already in
+    the DB, so a failed write only costs the count, never the resume.
+
+    A failed write leaves the previous file in place (_write_json replaces it
+    whole or not at all). With n > 0 that file is this batch's, written by the
+    last resume with n - 1, so the next check counts n again: the wait stops
+    growing instead of starting over. With n == 0 whatever is there reads as
+    n=0 next time: no state, another batch's, or this batch's from before the
+    progress just counted."""
+    try:
+        _write_json(SWEEP_STATE, {
+            "batch": batch_id(q),
+            "settled_at_resume": settled_count(q),
+            "resumes_without_progress": n,
+            "resumed_at": _now().isoformat(),
+        })
+    except OSError as e:
+        then = (f"the last one stays, so the next check counts n={n} again, not "
+                f"n={n + 1}" if n else "the next check counts from n=0")
+        print(f"sweep: could not record the backoff state ({type(e).__name__}: {e})"
+              f" — {then}", file=sys.stderr)
+
+
+def clear_state():
+    """The batch is over: whatever comes next counts from n=0."""
+    try:
+        os.remove(SWEEP_STATE)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"sweep: could not clear the backoff state ({type(e).__name__}: {e})",
+              file=sys.stderr)
+
+
+def no_progress_streak(q, state):
+    """Resumes in a row, the last one included, that settled no paper of this
+    batch. Computed, not stored, so a sweep that only looks writes nothing."""
+    if state is None or state["batch"] != batch_id(q):
+        return 0
+    if settled_count(q) > state["settled_at_resume"]:
+        return 0
+    return state["resumes_without_progress"] + 1
+
+
+def backoff_min(cooldown_min, n):
+    """The quiet time owed after the last resume: the cooldown, doubled per resume
+    in a row that got nowhere, capped."""
+    return min(BACKOFF_CAP_MIN, cooldown_min * 2 ** min(n, 32))
+
+
+def backoff_left(conn, state, wait_min):
+    """Minutes of `wait_min` still to run since the last resume: when it ended
+    (`last_run`, the anchor recent_resume uses too) or, with no DB row left, when
+    it was scheduled. 0 when there is no anchor at all, which never blocks."""
+    row = conn.execute(
+        "SELECT MAX(last_run) FROM scheduled_tasks WHERE id LIKE 'papers-batch-resume-%'"
+        " AND last_run IS NOT NULL").fetchone()
+    stamps = [t for t in (_parse_time(row[0] if row else None),
+                          _parse_time(state.get("resumed_at"))) if t]
+    if not stamps:
+        return 0.0
+    since = (_now() - max(stamps)).total_seconds() / 60
+    return max(0.0, wait_min - since)
+
+
 def refill(q, backlog, a, snapshot) -> int:
     """No batch in flight: hand the next chunk of the backlog to a fresh session."""
+    if not a.dry_run:
+        clear_state()                               # the batch it described is over
     if not backlog:
         return 0                                    # nothing waiting
     if agent_container_running():
@@ -395,17 +557,19 @@ def refill(q, backlog, a, snapshot) -> int:
         # have kept the queue from counting as drained) and stay visible, as does
         # anything in a status this script does not know, rather than be dropped.
         kept = [p for p in (q or {}).get("papers", []) if p.get("status") != "done"]
-        _write_json(QUEUE, {
+        fresh = {
             "papers": kept + [as_pending(p) for p in chunk],
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "created_at": _now().isoformat(),
             "session_processed": 0,
             "backlog_remaining": len(rest),
-        })
+        }
+        _write_json(QUEUE, fresh)
         # Backlog -> queue, so the queue is written FIRST: a crash before this line
         # leaves the chunk in both files, never in neither.
         _write_json(BACKLOG, {"papers": rest})
 
         tid = schedule_resume(conn, chat_jid)
+        save_state(fresh, 0)
         print(f"sweep: queued {len(chunk)} papers, {len(rest)} left in the backlog, "
               f"scheduled {tid}")
         return 0
@@ -438,12 +602,11 @@ def main(argv=None) -> int:
     # Papers buried by an environmental failure (dead NotebookLM session, rate limit)
     # are retryable, not broken — count them as work so a queue that a bad session
     # marked "all failed" is still recovered once the environment is healthy again.
-    retryable = [p for p in papers
-                 if p.get("status") == "failed" and _ENV_FAIL.search(str(p.get("error") or ""))]
+    retryable = [p for p in papers if env_failed(p)]
     if not pending and not running and not retryable:
         return refill(q, backlog, a, snapshot)      # absent or drained
 
-    age_min = (datetime.datetime.now().timestamp() - os.path.getmtime(QUEUE)) / 60
+    age_min = (_now().timestamp() - os.path.getmtime(QUEUE)) / 60
     if age_min < a.stale_min:
         return 0                                    # someone is actively working it
 
@@ -475,12 +638,27 @@ def main(argv=None) -> int:
                           f"({left} waiting)")
             return 0
 
+        # A resume that settled nothing hit something the auth probe cannot see,
+        # such as a chat throttle, and the next one would fail the same way. Checked
+        # before the probe, so a sweep that is backing off never drives the browser.
+        state = load_state()
+        n = no_progress_streak(q, state)
+        if n:
+            wait = backoff_min(a.cooldown_min, n)
+            owed = backoff_left(conn, state, wait)
+            if owed > 0:
+                print(f"sweep: backing off — n={n} resume(s) in a row settled no "
+                      f"paper of this batch; next resume in {math.ceil(owed)}m of a "
+                      f"{wait:.0f}m wait, writing nothing")
+                return 0
+
         chat_jid = main_chat_jid(conn)
         if chat_jid is None:
             return 1
 
         print(f"sweep: STRANDED batch — {len(pending)} pending, {len(running)} in_progress, "
               f"{len(retryable)} env-failed, queue idle {age_min:.0f}m, no agent container"
+              f"{f', n={n} resume(s) without progress' if n else ''}"
               f"{' (dry-run)' if a.dry_run else ''}")
         if auth_expired() or a.dry_run or not still_quiet(snapshot):
             return 0
@@ -495,6 +673,7 @@ def main(argv=None) -> int:
         moved, left = write_trimmed(q, backlog)
 
         tid = schedule_resume(conn, chat_jid)
+        save_state(q, n)
         print(f"sweep: reconciled {len(running)} in_progress + {len(retryable)} env-failed "
               f"-> pending, moved {moved} to the backlog ({left} waiting), scheduled {tid}")
         return 0
