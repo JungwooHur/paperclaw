@@ -420,6 +420,15 @@ class TestTheSectionIsTheOneTheSourcePrintsItIn:
         # It already sits in that section: no reason to move it.
         assert et.plan_relocation(blocks, tables, ME, sections=sections)["moves"] == []
 
+    def test_a_paragraph_marked_as_a_section_is_not_one(self):
+        # Some renders mark a run-in paragraph `ltx_section` too.
+        html = section_html("A1", "Appendix A", "Appendix",
+                            '<section id="subsubsubsectionx3" class="ltx_section">'
+                            '<h5 class="ltx_title">Joint deviation</h5>'
+                            + table_html("A1.T11", "Table 11: Reward terms.") + '</section>',
+                            cls="ltx_appendix")
+        assert et.parse_tables(html)[0]["section"]["id"] == "A1"
+
 
 # --- the caption is the table's own -----------------------------------------
 
@@ -487,7 +496,7 @@ class TestAForcedRunReplacesWhatTheOldParserWrote:
         monkeypatch.setattr(vs, "fetch_blocks", lambda _p: blocks)
         monkeypatch.setattr(ef, "fetch_html", lambda _a: (html, "stub"))
         monkeypatch.setattr(et, "render_tables", lambda _a, tables, _o, _s: [
-            {"num": t["num"], "caption": t["caption"], "path": "x.png"}
+            {"id": t["id"], "num": t["num"], "caption": t["caption"], "path": "x.png"}
             for t in tables])
         monkeypatch.setattr(notion_upload, "upload_image", lambda _p: "upload-id")
         monkeypatch.setattr(translate_fulltext, "notion",
@@ -813,6 +822,162 @@ class TestAnAppendixThatRestartsTheNumbering:
         # No printed label, and the counter's 1 is the body table's too.
         source = [self.SOURCE[0], table("A1.T1", "")]
         assert et.table_anchors(source, self.PAGE)["A1.T1"] == ("ha", False)
+
+
+def appendix_html(rows_long: bool):
+    """`S3.T5` in the body and `A1.T5` in the appendix: the id counter restarts.
+    A long appendix table keeps its caption past the old parser's window."""
+    rows = "".join(f"<tr><td>prompt line {i} " + "x" * 80 + "</td></tr>"
+                   for i in range(120 if rows_long else 1))
+    return (section_html("S3", 3, "Results", table_html("S3.T5", "Table 5: Main results."))
+            + section_html("A1", "Appendix A", "Prompts",
+                           '<figure id="A1.T5" class="ltx_table"><table>' + rows
+                           + '</table><figcaption>Table A.5: Prompt used for evaluation.'
+                           '</figcaption></figure>', cls="ltx_appendix"))
+
+
+class TestAnImageTheOldRendererMadeForTwoTables:
+    """The old renderer made ONE image per id counter: the first table's picture
+    under the last one's caption. With a restarted counter that caption names
+    the appendix table while the picture shows the body's."""
+
+    @pytest.mark.parametrize("rows_long, caption", [
+        (True, "Table 5"),                                   # the old bare caption
+        (False, "Table A.5: Prompt used for evaluation."),  # the last table's own
+    ])
+    def test_it_is_left_where_it_is(self, rows_long, caption):
+        html = appendix_html(rows_long)
+        blocks = [heading("h3", "3 Results (결과)"),
+                  para("p3", "주요 결과는 Table 5에 있다."), img("i5", caption),
+                  para("p3b", "본문 " * 50),
+                  heading("ha", "Appendix A Prompts (부록 A)"),
+                  para("pa", "평가 prompt는 Table A.5에 있다.")]
+        plan = et.plan_relocation(blocks, et.parse_tables(html), ME,
+                                  sections=ef.source_sections(html))
+        assert plan["moves"] == [] and plan["recaption"] == []
+        assert [x["block"] for x in plan["left"]] == ["i5"]
+
+
+class TestANewPageWithARestartedCounter:
+    """The injector keyed the picture, the caption and the anchor on the id
+    counter: one image for `S3.T5` and `A1.T5` together, showing the body's
+    table, captioned and placed as the appendix's — and the appendix table was
+    never placed, since its number read as placed."""
+
+    def run_cycle(self, monkeypatch, page, html):
+        import notion_upload
+        import translate_fulltext
+        import verify_sections as vs
+
+        def notion(method, path, body=None):
+            if path.endswith("/children"):
+                new = [{"id": f"img-{len(page)}", "type": "image",
+                        "picture": c["image"]["file_upload"]["id"],
+                        "image": {"caption": [{"plain_text": x["text"]["content"]}
+                                             for x in c["image"]["caption"]]}}
+                       for c in body["children"]]
+                at = next(i for i, b in enumerate(page) if b["id"] == body["after"])
+                page[at + 1:at + 1] = new
+            return {}
+
+        monkeypatch.setattr(vs, "fetch_blocks", lambda _p: [dict(b) for b in page])
+        monkeypatch.setattr(ef, "fetch_html", lambda _a: (html, "stub"))
+        monkeypatch.setattr(et, "render_tables", lambda _a, tables, _o, _s: [
+            {"id": t["id"], "num": t["num"], "caption": t["caption"],
+             "path": "picture-of-" + t["id"]} for t in tables])
+        monkeypatch.setattr(notion_upload, "upload_image", lambda path: path)
+        monkeypatch.setattr(translate_fulltext, "notion", notion)
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        return et.inject_tables("page", "arxiv-id", apply=True, keep_text=True)
+
+    def test_each_table_gets_its_own_picture_caption_and_place(self, monkeypatch):
+        page = [heading("h3", "3 Results (결과)"),
+                para("p3", "주요 결과는 Table 5에 있다. " + "본문 " * 600),
+                heading("ha", "Appendix A Prompts (부록 A)"),
+                para("pa", "평가 prompt는 Table A.5에 있다.")]
+        html = appendix_html(True)
+        self.run_cycle(monkeypatch, page, html)
+        images = [(page[i - 1]["id"], b["picture"], b["image"]["caption"][0]["plain_text"])
+                  for i, b in enumerate(page) if b["type"] == "image"]
+        assert images == [
+            ("p3", "picture-of-S3.T5", "Table 5: Main results."),
+            ("pa", "picture-of-A1.T5", "Table A.5: Prompt used for evaluation.")]
+        assert self.run_cycle(monkeypatch, page, html)["skipped_existing"]
+
+
+class TestAContainerOfSeveralTables:
+    """One LaTeXML id can hold two captioned tables; the old renderer pictured
+    its largest one, so the image's caption cannot say which it shows."""
+
+    HTML = section_html("S5", 5, "Setup", (
+        '<figure id="S5.T8" class="ltx_table"><div class="ltx_flex_figure">'
+        '<figure id="S5.T8.fig1" class="ltx_figure ltx_figure_panel">'
+        '<figcaption class="ltx_caption">Table 7: Model sizes.</figcaption>'
+        '<table><tr><td>N</td></tr></table></figure>'
+        '<figure id="S5.T8.fig2" class="ltx_figure ltx_figure_panel">'
+        '<figcaption class="ltx_caption">Table 8: Fixed settings.</figcaption>'
+        '<table><tr><td>lr</td></tr></table></figure></div></figure>'))
+
+    def test_its_image_keeps_its_caption_and_place(self):
+        blocks = [heading("h5", "5 Setup"),
+                  para("p1", "Table 8 lists the fixed settings and Table 7 the model sizes."),
+                  img("i1", "Table 7: Model sizes."), para("p2", "More text.")]
+        plan = et.plan_relocation(blocks, et.parse_tables(self.HTML), ME)
+        assert plan["moves"] == [] and plan["recaption"] == []
+        assert [x["block"] for x in plan["left"]] == ["i1"]
+
+
+class TestACaptionThatAlreadyNamesItsTable:
+    """A caption is rewritten only when it is not the table's: bare, cut short,
+    or another table's. The source's own text can be noisier than what the
+    page shows — the current render prints a formula and its TeX twice."""
+
+    TEX = ('Table 1: Accuracy of every model on the held-out split, averaged over '
+           'five seeds and three prompts; models reach <math alttext="75\\%"><semantics>'
+           '<mn>75%</mn><annotation encoding="application/x-tex">75\\%</annotation>'
+           '</semantics></math> accuracy.')
+    CLEAN = ('Table 1: Accuracy of every model on the held-out split, averaged over '
+             'five seeds and three prompts; models reach 75% accuracy.')
+
+    def html(self):
+        return section_html("S4", 4, "Results", table_html("S4.T1", self.TEX))
+
+    def test_in_place_it_is_not_recaptioned(self):
+        blocks = [heading("h4", "4 Results"), para("p4", "Table 1에 결과가 있다."),
+                  img("i1", self.CLEAN)]
+        assert et.plan_relocation(blocks, et.parse_tables(self.html()), ME)["recaption"] == []
+
+    def test_a_move_keeps_it(self):
+        blocks = [heading("h4", "4 Results"), img("i1", self.CLEAN),
+                  para("p4", "Table 1에 결과가 있다.")]
+        plan = et.plan_relocation(blocks, et.parse_tables(self.html()), ME)
+        assert [it["caption"] for mv in plan["moves"] for it in mv["items"]] == [self.CLEAN]
+
+    def test_a_caption_cut_short_is_completed(self):
+        cut = ("Table 1: Accuracy of every model on the held-out split, averaged over "
+               "five seeds and three")
+        assert len(cut) > 80        # the caption key reads the first 80 characters
+        source = [table("S4.T1", self.CLEAN)]
+        blocks = [heading("h4", "4 Results"), para("p4", "Table 1에 결과가 있다."),
+                  img("i1", cut)]
+        assert [r["caption"] for r in et.plan_relocation(blocks, source, ME)["recaption"]] \
+            == [self.CLEAN]
+
+
+class TestAZeroWidthSpaceIsNoDifference:
+    """The current render puts U+200B into the maths of a caption; no caption on
+    a page carries one, so the key kept the image from being recognised."""
+
+    def test_the_image_is_its_table(self):
+        source = [table("S4.T4", "Table 4: F​1 score on the validation set.")]
+        blocks = [heading("h1", "1 Introduction"), para("p0", "본문."),
+                  img("i4", "Table 4: F1 score on the validation set."),
+                  heading("h4", "4 Experiments"), para("p4", "Table 4에 결과를 보고한다.")]
+        plan = et.plan_relocation(blocks, source, ME)
+        assert moved(plan) == {"i4": "p4"}
+        # ...and it keeps the caption it has: that one is the table's already.
+        assert plan["moves"][0]["items"][0]["caption"] == \
+            "Table 4: F1 score on the validation set."
 
 
 class TestWhichPagesItRefuses:

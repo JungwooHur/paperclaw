@@ -55,9 +55,17 @@ _TID = re.compile(r'\bid="((?:S|A)\d+\.T(\d+))"')
 _ROMAN = ef.ROMAN_VALUES
 
 
+_ZERO_WIDTH = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
+
+
 def _cap_key(cap: str) -> str:
-    """Normalised caption text — the label-agnostic identity of a placed float."""
-    return re.sub(r"\s+", " ", (cap or "")).strip().lower()[:80]
+    """Normalised caption text — the label-agnostic identity of a placed float.
+
+    Zero-width characters are dropped: the current render puts U+200B into a
+    caption's maths, and no caption stored on a page carries one.
+    """
+    text = _ZERO_WIDTH.sub("", cap or "")
+    return re.sub(r"\s+", " ", text).strip().lower()[:80]
 
 
 def caption_number(cap: str):
@@ -224,6 +232,17 @@ def _table_caption(body: str, num: int) -> str:
 _LEGACY_WINDOW = 8000
 
 
+def _holds_several_tables(body: str) -> bool:
+    """Does a table element hold several captioned tables (`Table 7`, `Table 8`)?
+
+    LaTeXML can give two tables of a flex row one id. The old renderer pictured
+    the largest, so an image made from such an id may show either table.
+    """
+    labels = {printed_label(ef._clean(c)) for c in ef._CAP.findall(body)
+              if _OPENS_AS_TABLE.match(ef._clean(c))}
+    return len(labels - {None}) > 1
+
+
 def _legacy_caption(html_text: str, at: int, fid: str) -> str:
     """What the pre-fix parser read as the caption of the table whose id is at `at`.
 
@@ -264,6 +283,8 @@ def parse_tables(html_text: str) -> list:
         section = ef.enclosing_section(sections, m.start())
         if section:
             table["section"] = section
+        if _holds_several_tables(_element_body(html_text, m.start())):
+            table["several_tables"] = True
         out.append(table)
     return out
 
@@ -286,6 +307,11 @@ def printed_label(caption: str):
     if token.isdigit():
         return int(token)
     return _ROMAN.get(token.lower(), token)
+
+
+def _printed_key(table: dict) -> str:
+    """The label the injector's caption for `table` prints, as `_label_key`."""
+    return ef._label_key(printed_label(placed_caption(table["num"], table["caption"])))
 
 
 def _mention_label(table: dict, tables: list):
@@ -394,16 +420,19 @@ _UNION_JS = """e => {
 
 def render_tables(arxiv_id: str, tables: list, outdir: str,
                   source_url: str = "") -> list:
-    """Return [{num, caption, path}], one crisp image per table number.
+    """Return [{id, num, caption, path}], one crisp image per table id.
+
+    Per id, not per number: the number is the id's counter, which an appendix
+    restarts, and keying on it gave `S3.T5` and `A1.T5` one image between them
+    — the first one's picture under the last one's caption.
 
     Pass 1 (preferred): element.screenshot() the substantial <table>/panel element
     — it paints ONLY that element, so no adjacent-column text or over-wide caption
     bleeds in, and tiny helper <table>s (fragmentation) are filtered by size.
-    Pass 2 (fallback): for any number left without an image — e.g. a transform-
+    Pass 2 (fallback): for any table left without an image — e.g. a transform-
     scaled panel whose box collapses — clip-screenshot the union of the nearest
     ancestor that actually holds table content."""
     from playwright.sync_api import sync_playwright
-    cap = {t["num"]: t["caption"] for t in tables}
     out = {}
     idx = 0
     with sync_playwright() as p:
@@ -424,7 +453,7 @@ def render_tables(arxiv_id: str, tables: list, outdir: str,
         except Exception:
             pg.goto(url, timeout=60000)
         pg.wait_for_timeout(150)
-        group_el, group_nums = {}, {}
+        group_el, group_ids = {}, {}
         for t in sorted(tables, key=lambda x: x["num"]):
             idel = pg.query_selector(f'[id="{t["id"]}"]')
             if not idel:
@@ -432,10 +461,10 @@ def render_tables(arxiv_id: str, tables: list, outdir: str,
             c = idel.evaluate_handle(_CONTENT_JS).as_element()
             wmid = c.evaluate(_GROUP_JS)
             group_el.setdefault(wmid, c)
-            group_nums.setdefault(wmid, []).append(t["num"])
+            group_ids.setdefault(wmid, []).append(t["id"])
         # pass 1: crisp element screenshots
         for wmid, c in group_el.items():
-            nums = sorted(group_nums[wmid])
+            ids = group_ids[wmid]       # in number order, as the loop above added them
             c.evaluate(_RESET_JS)
             pg.wait_for_timeout(50)
             raw = (c.query_selector_all("table")
@@ -455,10 +484,10 @@ def render_tables(arxiv_id: str, tables: list, outdir: str,
                     continue
                 if not os.path.exists(path) or os.path.getsize(path) < 300:
                     continue
-                out.setdefault(nums[i] if i < len(nums) else nums[-1], path)
-        # pass 2: page-clip fallback for any number still missing
+                out.setdefault(ids[i] if i < len(ids) else ids[-1], path)
+        # pass 2: page-clip fallback for any table still missing
         for t in tables:
-            if t["num"] in out:
+            if t["id"] in out:
                 continue
             node = pg.query_selector(f'[id="{t["id"]}"]')
             u = None
@@ -483,10 +512,10 @@ def render_tables(arxiv_id: str, tables: list, outdir: str,
             except Exception:
                 continue
             if os.path.exists(path) and os.path.getsize(path) >= 300:
-                out[t["num"]] = path
+                out[t["id"]] = path
         browser.close()
-    return [{"num": n, "caption": cap.get(n, ""), "path": pth}
-            for n, pth in sorted(out.items())]
+    return [{"id": t["id"], "num": t["num"], "caption": t["caption"], "path": out[t["id"]]}
+            for t in tables if t["id"] in out]
 
 
 
@@ -543,6 +572,10 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     # It re-injected those 7 tables on every 5-minute cycle for days: 750 copies of
     # each, 5,278 images on one page. A number that fails to parse must never read
     # as "not placed yet".
+    #
+    # The number compared is the PRINTED label, never the id's counter: an
+    # appendix restarts the counter, so `A1.T5` (printed `Table A.5`) read as
+    # placed the moment the body's `Table 5` was.
     existing, existing_caps = set(), set()
     for b in blocks:
         if b["type"] == "image":
@@ -550,9 +583,9 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
             key = _cap_key(cap)
             if key:
                 existing_caps.add(key)
-            n = caption_number(cap)
-            if n is not None:
-                existing.add(n)
+            label = printed_label(cap)
+            if label is not None:
+                existing.add(ef._label_key(label))
     # Backstop for the next variant of the same fault: one image per table caption
     # is the only correct state, so a repeated one means the idempotency key has
     # failed again. Refuse rather than add to the pile.
@@ -567,7 +600,7 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
         return rep
     all_tables = parse_tables(html_text)
     tables = [t for t in all_tables
-              if force or (t["num"] not in existing
+              if force or (_printed_key(t) not in existing
                            and _cap_key(t["caption"]) not in existing_caps)]
     rep["found"] = len(all_tables)
     if not tables:
@@ -576,26 +609,23 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     if not apply:
         rep["would_place"] = [t["num"] for t in tables]
         if force:
-            # render_tables keys captions by number, last one winning; mirror it.
-            by_num = {t["num"]: t for t in tables}
-            rep["would_replace"] = len(replaced_by(
-                blocks, forced_keys(list(by_num.values()), all_tables)))
+            rep["would_replace"] = len(replaced_by(blocks, forced_keys(tables, all_tables)))
         rep["would_archive"] = sum(1 for b in blocks
                                    if b["type"] in ef.TEXT_TYPES
                                    and _is_pure_table(ef._block_text(b)))
         return rep
 
     outdir = tempfile.mkdtemp(prefix="paper_tables_")
-    images = render_tables(arxiv_id, tables, outdir, html_src)  # [{num, caption, path}]
+    images = render_tables(arxiv_id, tables, outdir, html_src)  # [{id, num, caption, path}]
     rep["rendered"] = len(images)
 
     # place images grouped by anchor (first citation of the printed label), in
-    # document order. render_tables keys by number, last one winning; mirror it.
-    by_num = {t["num"]: t for t in tables}
+    # document order, each with its own table's caption.
+    by_id = {t["id"]: t for t in tables}
     anchors = table_anchors(all_tables, blocks, ef.source_sections(html_text))
     groups, order = {}, []
     for im in images:
-        own = by_num.get(im["num"])
+        own = by_id.get(im["id"])
         anchor = (anchors[own["id"]][0] if own else None) or "__end__"
         groups.setdefault(anchor, []).append(im)
         if anchor not in order:
@@ -608,8 +638,8 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
             if fid:
                 cap = placed_caption(im["num"], im["caption"])
                 children.append(ef._image_block(fid, cap))
-                if im["num"] in by_num:
-                    these.append(by_num[im["num"]])
+                if im["id"] in by_id:
+                    these.append(by_id[im["id"]])
                 time.sleep(0.2)
         if not children:
             continue
@@ -690,6 +720,14 @@ def _which_table(caption: str, tables: list, legacy: dict):
     return legacy.get(key)
 
 
+def _cut_short(caption: str, want: str) -> bool:
+    """Is `caption` the beginning of `want` and no more?"""
+    def flat(text):
+        return re.sub(r"\s+", " ", _ZERO_WIDTH.sub("", text or "")).strip()
+    has, full = flat(caption).rstrip(" .…"), flat(want).rstrip(" .…")
+    return len(has) < len(full) and full.startswith(has)
+
+
 def _image_url(block: dict) -> str:
     image = block.get("image") or {}
     return ((image.get("file") or {}).get("url")
@@ -711,15 +749,6 @@ def _where_a_fallback_put_it(body: list, i: int) -> bool:
             or end == len(body) - 1)
 
 
-def _in_section_under(body: list, head: int, i: int) -> bool:
-    """Does block `i` sit in the section that heading `head` opens?"""
-    if i <= head:
-        return False
-    level = ef._level(body[head])
-    return not any(b.get("type", "").startswith("heading") and ef._level(b) <= level
-                   for b in body[head + 1:i])
-
-
 def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
     """Which table images to move where, and which captions to correct. Pure.
 
@@ -729,10 +758,12 @@ def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
     injector anchors on the same paragraphs, and whichever ran second inserted
     its images first. Everything else that this integration wrote and no person
     has edited since (`collect_papers._ours`, the rule `--clear-unprocessed`
-    uses) is moved there; a move is a new image with the SOURCE caption, so a
-    bare `Table 5` comes back with its caption. An image already in place whose
-    caption differs from the source's is recaptioned where it is; the plan keeps
-    the caption it replaces, so that can be undone.
+    uses) is moved there. A caption that is not the table's own — a bare
+    `Table 5`, what the old parser read (`legacy_caption`), one cut short — is
+    replaced by the SOURCE caption, on a move or where the image already is; the
+    plan keeps the caption it replaces, so that can be undone. One the caption
+    key already identifies is kept, since the source's text can be noisier than
+    the page's (`75%75\\%`, a formula and its TeX).
 
     An image is matched to its table by caption alone (`_which_table`). A table
     no text cites has only its section heading as an anchor, and that is a
@@ -744,13 +775,19 @@ def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
     (`reference_section.body_blocks`), anchors there included; an image a person
     wrote or edited; one the source does not have; one whose table the rule
     gives no anchor, since moving it to the end of the body would trade one
-    guess for another. A page whose table captions repeat is refused outright —
-    that is `dedup_tables.py`'s pile, and moving it would only spread it.
+    guess for another; and one whose picture the caption cannot vouch for. The
+    old renderer made one image per id COUNTER — the first table's picture under
+    the last one's caption — so where two tables share the counter (an appendix
+    restarts it) the image may show the other table; and an id holding several
+    captioned tables (`several_tables`) was pictured by its largest one. A page
+    whose table captions repeat is refused outright — that is
+    `dedup_tables.py`'s pile, and moving it would only spread it.
 
     Args:
         blocks: The page's top-level blocks.
         tables: `parse_tables` of the source, in document order.
         me: This integration's user id; None means nothing counts as ours.
+        sections: `ef.source_sections` of the source (see `table_anchors`).
 
     Returns:
         `{"moves": [{"after": id, "items": [...]}], "recaption": [{"block",
@@ -770,6 +807,9 @@ def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
     anchors = table_anchors(tables, body, sections)
     anchor = {tid: found for tid, (found, _) in anchors.items()}
     legacy = _legacy_keys(tables)
+    counters = {}
+    for t in tables:
+        counters[t["num"]] = counters.get(t["num"], 0) + 1
     plan = {"moves": [], "recaption": [], "left": []}
 
     shown, claims = [], {}
@@ -780,8 +820,13 @@ def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
         if not is_table_key(_cap_key(caption)):
             continue
         t = _which_table(caption, tables, legacy)
-        if t is None:
-            plan["left"].append({"block": b["id"], "why": "not in the source"})
+        why = ("not in the source" if t is None
+               else "another table shares its id counter; the picture may show it"
+               if counters[t["num"]] > 1
+               else "its id holds several tables; the picture may show another"
+               if t.get("several_tables") else None)
+        if why:
+            plan["left"].append({"block": b["id"], "why": why})
             continue
         shown.append((b, t))
         claims[t["id"]] = claims.get(t["id"], 0) + 1
@@ -801,12 +846,15 @@ def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
     batches = {}
     for b, t in shown:
         want = placed_caption(t["num"], t["caption"])
+        has = _image_caption(b)
+        if _cap_key(has) == _source_key(t) and not _cut_short(has, want):
+            want = has
         ours = collect_papers._ours(b, me)
         if b["id"] not in table_of:
             why = "several images show this table"
         elif b["id"] in in_place:
-            if ours and _image_caption(b) != want[:2000]:
-                plan["recaption"].append({"block": b["id"], "was": _image_caption(b),
+            if ours and has != want[:2000]:
+                plan["recaption"].append({"block": b["id"], "was": has,
                                           "caption": want})
             continue
         elif not anchor[t["id"]]:
@@ -815,7 +863,7 @@ def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
               and not _where_a_fallback_put_it(body, where[b["id"]])):
             why = "no text cites it, and it follows text that may"
         elif (not anchors[t["id"]][1]
-              and _in_section_under(body, where[anchor[t["id"]]], where[b["id"]])):
+              and ef.in_section(body, where[anchor[t["id"]]], where[b["id"]])):
             why = "no text cites it, and it is already in its own section"
         elif not ours:
             why = "written or edited by a person"
