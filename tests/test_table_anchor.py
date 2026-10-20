@@ -278,6 +278,17 @@ class TestTheSameSyllableAfterAListCanBeAMeasure:
         ("figure", "(그림 2, 3번)", 3),
         ("figure", "그림 2와 3도 함께 보면", 3),
         ("table", "Table 2, 3에서 3×3 grid를 쓴다.", 3),
+        # `도` after a comma is "also" when the number carries the list on by one,
+        # or when the word says the list is of floats.
+        ("figure", "그림 2, 3도 참고", 3),
+        ("table", "표 1, 2도 참고하라.", 2),
+        ("table", "Tables 2, 3도 같은 경향을 보인다.", 3),
+        # `번` before a word is a count only before a word that counts repeats.
+        ("figure", "그림 2와 3번 결과를 비교한다.", 3),
+        ("table", "표 2와 3번 실험에서", 3),
+        ("figure", "그림 2, 3번 및 4번에서", 3),
+        ("figure", "그림 2, 3번 및 4번에서", 4),
+        ("figure", "그림 2번과 3번을 비교하면", 3),
     ])
     def test_a_label_still_cites(self, kind, text, num):
         assert ef.mentions(kind, num, text)

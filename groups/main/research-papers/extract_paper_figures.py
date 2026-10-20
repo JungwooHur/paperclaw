@@ -369,9 +369,12 @@ _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)*")
 # 3가지, 3년.
 _PARTICLE = re.compile(r"에|의|은|는|이(?![상하내])|가(?!지)|을|를|과|와|도|까지|부터"
                        r"|으?로|처럼|보다|번|참조|및")
+# A word after `3번 ` that makes it "three times", not "number 3".
+_REPEATS = re.compile(r"\s+(?:반복|시행|시도|실행|수행|측정|학습|돌려|돌린|돌렸|더\b)")
 
 
-def _a_quantity_follows(text: str, at: int, plural: bool, comma: bool = False) -> bool:
+def _a_quantity_follows(text: str, at: int, plural: bool, comma: bool = False,
+                        next_in_line: bool = False) -> bool:
     """Does what follows the number ending at `at` make it a quantity, not a label?
 
     Only a list's later numbers are asked: after "Table 2, " the next number is
@@ -380,9 +383,11 @@ def _a_quantity_follows(text: str, at: int, plural: bool, comma: bool = False) -
     after a SINGULAR word, an English word (`Figure 2 and 3 epochs`, `Fig. 3,
     4 m/s`): a list of figures says "Figures".
 
-    Two particles are also units. `번` is "number" in `3번에서` and a count in
-    `3번째` (third), `3번씩` and `3번 반복` (three times). `도` is "also" in
-    `그림 2와 3도`, and degrees after a bare comma (`comma`): `(그림 2, 30도 회전)`.
+    Two particles are also units. `번` is "number" in `3번에서` and `3번 결과` and
+    a count in `3번째` (third), `3번씩` and before a word that counts repeats
+    (`3번 반복`, three times). `도` is "also" in `그림 2와 3도`, and degrees after
+    a bare comma (`comma`): `(그림 2, 30도 회전)`, unless the word is plural or
+    the number carries the list on by one (`next_in_line`: `그림 2, 3도 참고`).
     """
     if _NEXT_LABEL.match(text, at):
         return False            # the list goes on
@@ -393,9 +398,8 @@ def _a_quantity_follows(text: str, at: int, plural: bool, comma: bool = False) -
         after = rest[1:]
         if re.match(r"[가-힣]", after):
             return not _PARTICLE.match(after)
-        return bool(re.match(r"\s+[가-힣]", after)
-                    and not re.match(r"\s+(?:참조|참고)", after))
-    if rest.startswith("도") and comma:
+        return bool(_REPEATS.match(after))
+    if rest.startswith("도") and comma and not (plural or next_in_line):
         return True
     if re.match(r"[가-힣]", rest):
         return not _PARTICLE.match(rest)
@@ -427,6 +431,8 @@ def cited_labels(kind: str, text: str) -> set:
         labels, at = [found.group("label")], found.end()
         plural = bool(_PLURAL.match(found.group("word")))
         while True:
+            if text.startswith("번", at):
+                at += 1     # "그림 2, 3번 및 4번": the list goes on past `번`
             more = _NEXT_LABEL.match(text, at)
             if not more:
                 break
@@ -434,8 +440,11 @@ def cited_labels(kind: str, text: str) -> set:
             if _is_roman(high) != _is_roman(labels[0]):
                 break   # "Table 2 and I think": a pronoun, not Table I
             comma = text[at:more.start("label")].strip() == ","
+            next_in_line = (low.isdigit() and high.isdigit()
+                            and int(high) == int(low) + 1)
             if (_NUMBER.fullmatch(high)
-                    and _a_quantity_follows(text, more.end(), plural, comma)):
+                    and _a_quantity_follows(text, more.end(), plural, comma,
+                                            next_in_line)):
                 break   # "Table 2와 3절", "Figure 2, 32 GPUs"
             if more.group("range"):
                 # Only an ascending run of numbers is a range; `2-1` is a label
