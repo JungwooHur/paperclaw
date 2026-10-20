@@ -33,6 +33,13 @@ It cannot restore text the translation never produced. A run that ends inside an
 unterminated environment stays truncated — the block is emitted and reported as
 such, because that needs the section re-translated, not re-parsed.
 
+Nor does it write a rebuild it would flag again. A run whose rebuilt paragraphs
+are still mangled is split, so the block that cannot converge is left out and the
+blocks beside it are still repaired, but only at a block break no formula crosses:
+half a formula written alone is broken LaTeX nothing flags. What stays mangled is
+left as it is and reported as `unconverged`: writing it would change nothing but
+the block ids, and it would happen again on every cycle.
+
   heal_mangled_math.py --page <id> [--dry-run]
 """
 import argparse
@@ -49,6 +56,74 @@ ENV = re.compile(r"\\begin\{(aligned|align|alignat|cases|matrix|bmatrix|pmatrix|
 TEXT_TYPES = ("paragraph", "quote", "bulleted_list_item", "numbered_list_item")
 
 
+# Commands whose argument is set in text mode, where Korean is legitimate.
+TEXT_MODE = re.compile(r"\\(?:text(?:rm|bf|it|tt|sf|normal)?|mathrm|mbox"
+                       r"|operatorname\*?)\s*")
+# One unbraced argument that is a control sequence: `\text\ldots`.
+_CONTROL = re.compile(r"\\(?:[A-Za-z]+|.)?", re.S)
+
+
+def _group_end(s: str, i: int):
+    """Index just past the brace group opening at s[i], or None when it never
+    closes. Escaped braces (`\\{`, `\\}`) do not count."""
+    depth = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _escaped(s: str, i: int) -> bool:
+    """True when the backslash at s[i] is itself escaped, i.e. the second half of
+    a `\\\\` line break: an odd run of backslashes precedes it."""
+    n = 0
+    while i - n > 0 and s[i - n - 1] == "\\":
+        n += 1
+    return n % 2 == 1
+
+
+def _argument_end(s: str, i: int):
+    """Index just past the one argument a command takes at s[i], the way LaTeX
+    reads it: a brace group, else a single token (`\\text 초` is valid). None
+    when the group never closes; s[i] itself when there is no argument."""
+    if i >= len(s) or s[i] == "}":
+        return i
+    if s[i] == "{":
+        return _group_end(s, i)
+    if s[i] == "\\":
+        return _CONTROL.match(s, i).end()
+    return i + 1
+
+
+def _without_text_mode(expr: str) -> str:
+    r"""EXPR with the argument of every text-mode command removed.
+
+    An unclosed group is left in place: it is a broken parse, not a text-mode
+    argument, so whatever Korean follows it still counts. Nor is `\\text{…}` a
+    command: the `\\` is a line break, and the letters after it are math."""
+    out, pos, at = [], 0, 0
+    while (m := TEXT_MODE.search(expr, at)):
+        if _escaped(expr, m.start()):
+            at = m.start() + 1
+            continue
+        end = _argument_end(expr, m.end())
+        if end is None:
+            break
+        out.append(expr[pos:m.start()] + " ")
+        pos = at = end
+    out.append(expr[pos:])
+    return "".join(out)
+
+
 def is_mangled(block: dict) -> bool:
     r"""True when this block's equation spans hold prose, or its text still carries
     `\(` / `\)` debris — the two fingerprints of the swapped parse."""
@@ -59,9 +134,11 @@ def is_mangled(block: dict) -> bool:
     for s in spans:
         if s.get("type") == "equation":
             expr = (s.get("equation") or {}).get("expression", "")
-            # A formula never contains Korean; a Korean run inside an equation span
-            # is prose that the parse swallowed.
-            if KOREAN.search(expr):
+            # A formula never contains Korean outside text mode; a Korean run
+            # there is prose that the parse swallowed. Inside `\text{…}` it is
+            # a legitimate label (`2\text{초}`), and flagging it looped: the
+            # rebuild wraps the label straight back into the same equation.
+            if KOREAN.search(_without_text_mode(expr)):
                 return True
             if re.search(r"\\{1,2}[()]", expr):
                 return True
@@ -81,7 +158,13 @@ def _balance_dollar_runs(text: str) -> str:
     r"""Extend a `$…$` run that stops inside an unclosed `(` so it takes its closing
     paren with it: `$\Theta_q(\mathbf{x}_q$, m)` -> `$\Theta_q(\mathbf{x}_q, m)$`.
     wrap_math is deliberately conservative and stops at the comma; left alone the
-    formula renders split across a plain-text tail."""
+    formula renders split across a plain-text tail.
+
+    It never crosses Korean: in `$s_t($상태)` the paren holds the formula's Korean
+    name, and carrying the run on to the `)` put that name inside the equation,
+    which is the very thing the healer repairs. Korean that a bare `\text` takes
+    as its argument is the exception: `$d(\text$ 초)` stopped there leaves a
+    command with no argument, which renders as an error."""
     out, pos = [], 0
     for m in re.finditer(r"\$([^$\n]+)\$", text):
         out.append(text[pos:m.start()])
@@ -97,7 +180,8 @@ def _balance_dollar_runs(text: str) -> str:
                     if need == 0:
                         take = i + 1
                         break
-                elif ch in "$\n":
+                elif ch in "$\n" or (KOREAN.match(ch) and KOREAN.search(
+                        _without_text_mode(expr + tail[:i + 1]))):
                     break
             if take:
                 expr += tail[:take]
@@ -150,6 +234,28 @@ def rebuild(text: str):
     return out, truncated
 
 
+def _converging_pieces(run: list, converges, separable) -> list:
+    """RUN split into [(blocks, converged)], so a block whose rebuild cannot
+    converge is left out instead of holding back the blocks beside it.
+
+    The whole run is tried first: Notion splits a long paragraph at its size limit,
+    so a formula can straddle two blocks and parse only when they are joined.
+    Failing that, the run is cut only where SEPARABLE(left, right) holds, i.e. the
+    two sides rebuild to what they do joined, and each piece is written when it
+    converges. A cut through a formula would write half of it, an unterminated
+    environment or a fraction missing its denominator, which nothing flags
+    afterwards, so it could never rejoin its stuck half to be rebuilt whole."""
+    if converges(run):
+        return [(run, True)]
+    pieces, start = [], 0
+    for c in range(1, len(run)):
+        if separable(run[start:c], run[c:]):
+            pieces.append(run[start:c])
+            start = c
+    pieces.append(run[start:])
+    return [(p, converges(p)) for p in pieces]
+
+
 def heal_page(page_id: str, apply: bool = False) -> dict:
     import time
     import verify_sections as vs
@@ -158,7 +264,7 @@ def heal_page(page_id: str, apply: bool = False) -> dict:
 
     blocks = vs.fetch_blocks(page_id)
     rep = {"page": page_id, "mangled_blocks": 0, "new_blocks": 0,
-           "truncated_runs": 0, "runs": []}
+           "truncated_runs": 0, "unconverged": 0, "runs": []}
 
     # Consecutive mangled blocks are ONE run: Notion splits a long paragraph at its
     # block size limit, so a formula can straddle the boundary and only the joined
@@ -172,36 +278,70 @@ def heal_page(page_id: str, apply: bool = False) -> dict:
     if cur:
         runs.append(cur)
 
+    built = {}
+
+    def build(piece):
+        """The rebuild of these blocks, as the children that would be written."""
+        key = tuple(piece)
+        if key not in built:
+            text = "".join(flatten(blocks[i]) for i in piece)
+            parts, truncated = rebuild(text)
+            children = []
+            for kind, c in parts:
+                if kind == "equation":
+                    children.append({"object": "block", "type": "equation",
+                                     "equation": {"expression": c[:1000]}})
+                else:
+                    children.append({"object": "block", "type": "paragraph",
+                                     "paragraph": {"rich_text": _inline_rich_text(c)}})
+            built[key] = (text, parts, truncated, children)
+        return built[key]
+
+    # Write a piece only when the next pass would leave it alone. A rebuild that
+    # is still mangled changes nothing but the block ids, and every write bumps
+    # the page's last-edited time, which keeps it in the healer's window: one
+    # such block was rewritten on every cycle for days.
+    def converges(piece):
+        return not any(is_mangled(ch) for ch in build(piece)[3])
+
+    def joined(piece):
+        """The rebuild as one string, with block breaks and blank space left out."""
+        return re.sub(r"\s+", "", "".join(
+            f"\x01{c}\x01" if kind == "equation" else c
+            for kind, c in build(piece)[1]))
+
+    def separable(left, right):
+        return joined(left + right) == joined(left) + joined(right)
+
     for run in runs:
-        text = "".join(flatten(blocks[i]) for i in run)
-        parts, truncated = rebuild(text)
-        if not parts:
-            continue
-        rep["mangled_blocks"] += len(run)
-        rep["new_blocks"] += len(parts)
-        rep["truncated_runs"] += 1 if truncated else 0
-        rep["runs"].append({"blocks": run, "chars": len(text),
-                            "paragraphs": sum(1 for k, _ in parts if k == "paragraph"),
-                            "equations": sum(1 for k, _ in parts if k == "equation"),
-                            "truncated": truncated})
-        if not apply:
-            continue
-        children = []
-        for kind, c in parts:
-            if kind == "equation":
-                children.append({"object": "block", "type": "equation",
-                                 "equation": {"expression": c[:1000]}})
-            else:
-                children.append({"object": "block", "type": "paragraph",
-                                 "paragraph": {"rich_text": _inline_rich_text(c)}})
-        # insert after the run, then archive the originals — never the other way
-        # round, so a failed insert can't leave the section empty.
-        notion("PATCH", f"/blocks/{page_id}/children",
-               {"children": children, "after": blocks[run[-1]]["id"]})
-        time.sleep(0.4)
-        for i in run:
-            notion("PATCH", f"/blocks/{blocks[i]['id']}", {"archived": True})
-            time.sleep(0.25)
+        for piece, ok in _converging_pieces(run, converges, separable):
+            text, parts, truncated, children = build(piece)
+            if not parts:
+                continue
+            # Positions are only this read's; the ids are what a hand edit can be
+            # aimed at, since any block inserted or archived above shifts them.
+            run_rep = {"blocks": piece, "ids": [blocks[i]["id"] for i in piece],
+                       "chars": len(text),
+                       "paragraphs": sum(1 for k, _ in parts if k == "paragraph"),
+                       "equations": sum(1 for k, _ in parts if k == "equation"),
+                       "truncated": truncated, "unconverged": not ok}
+            rep["runs"].append(run_rep)
+            if not ok:
+                rep["unconverged"] += 1
+                continue
+            rep["mangled_blocks"] += len(piece)
+            rep["new_blocks"] += len(parts)
+            rep["truncated_runs"] += 1 if truncated else 0
+            if not apply:
+                continue
+            # insert after the piece, then archive the originals — never the other
+            # way round, so a failed insert can't leave the section empty.
+            notion("PATCH", f"/blocks/{page_id}/children",
+                   {"children": children, "after": blocks[piece[-1]]["id"]})
+            time.sleep(0.4)
+            for i in piece:
+                notion("PATCH", f"/blocks/{blocks[i]['id']}", {"archived": True})
+                time.sleep(0.25)
     return rep
 
 
