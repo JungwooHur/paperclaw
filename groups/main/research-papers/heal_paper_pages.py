@@ -81,25 +81,24 @@ from link_references import heal_references
 
 
 def _post_retry(path, body, tries=5):
-    """api_post with retry — this runs unattended on a 5-minute timer, so a
-    transient Notion 429/5xx during the DB query must not abort the whole run."""
-    last = None
+    """api_post, also retrying a dropped connection.
+
+    This runs unattended on a 5-minute timer, so a transient failure during the
+    DB query must not abort the whole run. `api_post` already retries what
+    Notion answers (429 and 5xx, through `notion_retry`), so an HTTP error that
+    reaches here is final; retrying it again would multiply the attempts. Only
+    the network failures `api_post` leaves alone are retried here.
+    """
     for a in range(tries):
         try:
             return api_post(path, body)
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code in (429, 500, 502, 503, 504) and a < tries - 1:
-                time.sleep(float(e.headers.get("Retry-After", 2)) if e.code == 429 else 2 + 2 * a)
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last = e
-            if a < tries - 1:
-                time.sleep(2 + 2 * a)
-                continue
-            raise
-    raise last
+        except urllib.error.HTTPError:
+            raise  # A subclass of URLError: name it first so it is not retried.
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if a == tries - 1:
+                raise
+            time.sleep(2 + 2 * a)
+    raise RuntimeError("unreachable")  # The loop either returns or raises.
 
 
 # A page the agent is still writing must be left alone. Every healer here appends

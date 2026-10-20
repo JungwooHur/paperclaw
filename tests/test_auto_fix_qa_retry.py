@@ -203,3 +203,22 @@ class TestOnePageCannotEndTheScan:
         with pytest.raises(SystemExit):
             aq.main()
 
+
+class TestTheHealerQuery:
+    """`heal_paper_pages` queries the DB through this `api_post`."""
+
+    def test_a_rate_limit_is_not_retried_twice_over(self, notion):
+        # Its own wrapper used to retry every HTTP error `api_post` gave up
+        # on, so one throttled query made five times the attempts.
+        import heal_paper_pages as hp
+        tries = notion_retry.MAX_RETRIES
+        fake = notion(*([429] * (tries * 5)))
+        with pytest.raises(urllib.error.HTTPError):
+            hp._post_retry("/databases/db/query", {})
+        assert len(fake.requests) == tries
+
+    def test_a_dropped_connection_is_still_retried(self, notion):
+        import heal_paper_pages as hp
+        fake = notion(urllib.error.URLError("reset"), {"results": []})
+        assert hp._post_retry("/databases/db/query", {}) == {"results": []}
+        assert len(fake.requests) == 2
