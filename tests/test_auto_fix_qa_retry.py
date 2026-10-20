@@ -9,7 +9,9 @@ Notion refuses before applying anything: a 5xx can arrive after the write
 landed, and an append sent twice would be a duplicated callout.
 """
 import io
+import itertools
 import json
+import re
 import sys
 import urllib.error
 
@@ -222,3 +224,230 @@ class TestTheHealerQuery:
         fake = notion(urllib.error.URLError("reset"), {"results": []})
         assert hp._post_retry("/databases/db/query", {}) == {"results": []}
         assert len(fake.requests) == 2
+
+
+def _text(content):
+    return {"type": "text", "text": {"content": content}}
+
+
+def _paragraph(content):
+    return {"type": "paragraph", "paragraph": {"rich_text": [_text(content)]}}
+
+
+class _Workspace:
+    """An in-memory Notion holding block trees, so `main()` runs end to end.
+
+    `fail(method, path)` decides each request: None answers it, an exception is
+    raised before anything changes, and `("after", exc)` applies the request
+    and then raises, the way a 5xx or a timeout can follow a write that landed.
+    """
+
+    def __init__(self, *pages):
+        self.pages = list(pages)
+        self.blocks = {p: {"type": "page", "children": []} for p in pages}
+        self.requests = []
+        self.fail = lambda method, path: None
+        self._ids = itertools.count(1)
+
+    def add(self, parent, btype, payload, after=None):
+        bid = f"blk-{next(self._ids)}"
+        payload = dict(payload)
+        kids = payload.pop("children", [])
+        self.blocks[bid] = {"type": btype, btype: payload, "children": [],
+                            "parent": parent}
+        siblings = self.blocks[parent]["children"]
+        at = siblings.index(after) + 1 if after in siblings else len(siblings)
+        siblings.insert(at, bid)
+        for kid in kids:
+            self.add(bid, kid["type"], kid[kid["type"]])
+        return bid
+
+    def legacy_qa(self, page, question, answer):
+        """A broken Q&A: the question in a default-color callout's text."""
+        return self.add(page, "callout", {
+            "rich_text": [_text(question)], "color": "default",
+            "children": [_paragraph(answer)]})
+
+    def good_qa(self, page, question, answer):
+        return self.add(page, "callout", {
+            "rich_text": [], "color": "gray_background",
+            "children": [{"type": "toggle", "toggle": {
+                "rich_text": [_text(question)],
+                "children": [_paragraph(answer)]}}]})
+
+    def callouts(self, page):
+        """(color, question, answer) of each top-level callout, in order."""
+        out = []
+        for bid in self.blocks[page]["children"]:
+            b = self.blocks[bid]
+            if b["type"] != "callout":
+                continue
+            kids = [self.blocks[k] for k in b["children"]]
+            if kids and kids[0]["type"] == "toggle":
+                holder, answers = kids[0]["toggle"], kids[0]["children"]
+            else:
+                holder, answers = b["callout"], b["children"]
+            question = "".join(r["text"]["content"] for r in holder["rich_text"])
+            answer = "".join(r["text"]["content"]
+                             for k in answers
+                             for r in self.blocks[k]["paragraph"]["rich_text"])
+            out.append((b["callout"]["color"], question, answer))
+        return out
+
+    def _view(self, bid):
+        b = self.blocks[bid]
+        body = dict(b[b["type"]])
+        if "rich_text" in body:
+            body["rich_text"] = [
+                {"plain_text": r["text"]["content"], "annotations": {}}
+                for r in body["rich_text"]]
+        return {"id": bid, "type": b["type"], b["type"]: body,
+                "has_children": bool(b["children"])}
+
+    def _apply(self, method, path, body):
+        m = re.fullmatch(r"/blocks/([^/?]+)/children(?:\?.*)?", path)
+        if m and method == "GET":
+            kids = self.blocks[m.group(1)]["children"]
+            return {"results": [self._view(k) for k in kids], "has_more": False}
+        if m and method == "PATCH":
+            after, made = body.get("after"), []
+            for child in body["children"]:
+                after = self.add(m.group(1), child["type"],
+                                 child[child["type"]], after)
+                made.append(self._view(after))
+            return {"results": made}
+        m = re.fullmatch(r"/blocks/([^/?]+)", path)
+        if m and method == "DELETE":
+            bid = m.group(1)
+            self.blocks[self.blocks[bid]["parent"]]["children"].remove(bid)
+            return {}
+        if method == "POST" and path.endswith("/query"):
+            return {"results": [{"id": p} for p in self.pages],
+                    "has_more": False}
+        raise AssertionError(f"unexpected {method} {path}")
+
+    def __call__(self, req, timeout=None):
+        method, path = req.get_method(), req.full_url[len(aq.API):]
+        self.requests.append((method, path))
+        outcome = self.fail(method, path)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        body = json.loads(req.data) if req.data else None
+        result = self._apply(method, path, body)
+        if outcome is not None:
+            raise outcome[1]
+        return _Reply(result)
+
+    def pages_reached(self):
+        return {p for _, path in self.requests for p in self.pages
+                if path.startswith(f"/blocks/{p}/")}
+
+
+@pytest.fixture
+def workspace(monkeypatch):
+    """Runs `main()` against a `_Workspace`; returns (exit code, out, err)."""
+    monkeypatch.setenv("NOTION_TOKEN", "test-token")
+    monkeypatch.setenv("NOTION_RESEARCH_DB", "db")
+    monkeypatch.setattr(aq.time, "sleep", lambda seconds: None)
+
+    def install(*pages):
+        ws = _Workspace(*pages)
+        monkeypatch.setattr(aq.urllib.request, "urlopen", ws)
+        return ws
+
+    return install
+
+
+def _run(monkeypatch, capsys, *argv):
+    monkeypatch.setattr(sys, "argv", ["auto_fix_qa.py", *argv])
+    code = aq.main()
+    out = capsys.readouterr()
+    return code, out.out, out.err
+
+
+class TestNotionDownStopsTheRun:
+    """Containing each page must not turn an outage into hours of failures."""
+
+    @pytest.mark.parametrize("failure", [
+        TimeoutError("timed out"), _http_error(503), _http_error(401)],
+        ids=["timeout", "503", "401"])
+    def test_a_sweep_stops_once_pages_keep_failing(
+            self, workspace, monkeypatch, capsys, failure):
+        # The query answers and every block read then fails: the sweep of
+        # every page used to run to the end, each page through its own
+        # timeouts and back-offs, with the rest of qa-heal waiting behind it.
+        ws = workspace(*[f"p{i}" for i in range(40)])
+        for p in ws.pages:
+            ws.add(p, "paragraph", _paragraph("x")["paragraph"])
+        ws.fail = lambda method, path: (
+            None if path.endswith("/query") else failure)
+
+        code, out, err = _run(monkeypatch, capsys, "--all")
+
+        assert len(ws.pages_reached()) == aq.MAX_FAILURES_IN_A_ROW
+        assert code != 0
+        assert "already well-formed" not in out
+
+    def test_a_page_that_answers_resets_the_count(
+            self, monkeypatch, capsys):
+        # Failures that are not consecutive are single pages, not an outage.
+        pages = ["a", "b", "ok-1", "c", "d", "ok-2", "e", "f"]
+        healed = []
+
+        def heal_page(page_id, dry_run=False):
+            healed.append(page_id)
+            if not page_id.startswith("ok"):
+                raise _http_error(502)
+            return 0
+
+        monkeypatch.setattr(aq, "MAX_FAILURES_IN_A_ROW", 3)
+        monkeypatch.setattr(aq, "heal_page", heal_page)
+        monkeypatch.setattr(aq, "query_paper_pages", lambda: pages)
+        _run(monkeypatch, capsys, "--all")
+        assert healed == pages
+
+
+class TestTheSummaryIsHonest:
+
+    def test_a_failed_page_is_not_reported_well_formed(
+            self, monkeypatch, capsys):
+        def heal_page(page_id, dry_run=False):
+            if page_id == "page-b":
+                raise _http_error(401)
+            return 0
+
+        monkeypatch.setattr(aq, "heal_page", heal_page)
+        monkeypatch.setattr(aq, "query_paper_pages",
+                            lambda: ["page-a", "page-b"])
+        code, out, err = _run(monkeypatch, capsys, "--all")
+
+        assert "already well-formed" not in out
+        assert re.search(r"\b1\b[^\n]*fail", out)
+        assert code != 0
+
+    def test_a_clean_run_still_says_so(self, monkeypatch, capsys):
+        monkeypatch.setattr(aq, "heal_page", lambda page_id, dry_run=False: 0)
+        monkeypatch.setattr(aq, "query_paper_pages", lambda: ["page-a"])
+        code, out, err = _run(monkeypatch, capsys, "--all")
+        assert "already well-formed" in out
+        assert code == 0
+
+
+class TestABugKeepsItsTraceback:
+
+    def test_a_programming_error_shows_where_it_broke(
+            self, workspace, monkeypatch, capsys):
+        # A block without a "type": not Notion failing but this code.
+        ws = workspace("page-a", "page-b")
+        real = aq.fetch_children
+        monkeypatch.setattr(
+            aq, "fetch_children",
+            lambda pid: [{"id": "x"}] if pid == "page-a" else real(pid))
+
+        code, out, err = _run(monkeypatch, capsys, "--all")
+
+        assert "Traceback" in err
+        assert "find_qa_callouts" in err
+        assert "page-b" in ws.pages_reached()
+        assert "already well-formed" not in out
+        assert code != 0

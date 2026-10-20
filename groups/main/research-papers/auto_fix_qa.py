@@ -29,10 +29,12 @@ Usage: python3 auto_fix_qa.py [--page PAGE_ID] [--dry-run]
 """
 from __future__ import annotations
 import argparse, json, os, re, sys, time, urllib.request, urllib.error
+import http.client
+import traceback
 
 import notion_retry
 
-API ="https://api.notion.com/v1"
+API = "https://api.notion.com/v1"
 # Notion occasionally stops responding mid-request (observed: 502s followed by
 # a TCP-ESTABLISHED connection that hangs indefinitely on read). Without an
 # explicit timeout, systemd runs of this healer can block the whole qa-heal
@@ -521,7 +523,19 @@ def heal_page(page_id: str, dry_run: bool = False) -> int:
     return fixed
 
 
-def main() -> None:
+# Pages in a row that may fail before the run stops. Every request already
+# retries through `notion_retry`, so pages that keep failing mean Notion is down
+# or refusing the token, and each page after them would fail the same way: a
+# sweep of the whole DB spent hours on timeouts and back-offs like that while
+# the rest of the qa-heal unit waited behind it.
+MAX_FAILURES_IN_A_ROW = 3
+
+# What Notion failing raises: an HTTP error, a timeout or a dropped connection
+# (all OSError), or a reply cut off mid-read. Anything else is a bug here.
+_NOTION_ERRORS = (OSError, http.client.HTTPException)
+
+
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--page", help="Fix only this page (default: recently edited)")
     ap.add_argument("--since-hours", type=float, default=6.0,
@@ -537,24 +551,42 @@ def main() -> None:
         pages = query_paper_pages()
     else:
         pages = query_recent_paper_pages(args.since_hours)
-    total_fixed = 0
+    total_fixed = checked = failed = in_a_row = 0
     for p in pages:
-        # One page that keeps failing (a 429 past every retry, a timeout) must
-        # not stop the scan of the rest. A missing token is a SystemExit, which
-        # this lets through, so a run that cannot reach Notion still stops.
+        # One page that keeps failing (a 429 past every retry, a timeout, a
+        # block this code cannot read) must not stop the scan of the rest. A
+        # missing token is a SystemExit, which this lets through.
         try:
             n = heal_page(p, dry_run=args.dry_run)
         except Exception as e:  # pylint: disable=broad-except
             print(f"{p}: error {type(e).__name__} {e}", file=sys.stderr)
+            if not isinstance(e, _NOTION_ERRORS):
+                traceback.print_exc(file=sys.stderr)
+            failed += 1
+            in_a_row += 1
+            if in_a_row >= MAX_FAILURES_IN_A_ROW:
+                print(f"stopping: {in_a_row} pages in a row failed",
+                      file=sys.stderr)
+                break
             continue
+        in_a_row = 0
+        checked += 1
         if n:
             print(f"page {p}: fixed {n} callout(s)")
             total_fixed += n
-    if total_fixed == 0:
+    unreached = len(pages) - checked - failed
+    if total_fixed == 0 and not failed:
         print("all callouts already well-formed")
     else:
-        print(f"total: {total_fixed} callout(s) healed across {len(pages)} page(s)")
+        summary = (f"total: {total_fixed} callout(s) healed across {checked} "
+                   f"page(s) checked")
+        if failed:
+            summary += f"; {failed} page(s) failed"
+        if unreached:
+            summary += f", {unreached} not reached"
+        print(summary)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
