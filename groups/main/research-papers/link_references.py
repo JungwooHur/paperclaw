@@ -127,6 +127,27 @@ _SECTION = re.compile(r'<section[^>]+id="(S\d+)"[^>]*>.*?<h2[^>]*>(.*?)</h2>', r
 _ANCHOR = re.compile(r'href="#bib\.bibx?(\d+)"')
 
 
+def _unbracket(label: str) -> str:
+    """The label without ONE enclosing bracket pair, when it has one.
+
+    `[7]` and `[ACDE12]` lose their brackets; natbib's `Doe et al. [2021]` has
+    none around it and keeps the year's. Stripping every leading and trailing
+    bracket took the year's closing one too, so the list went out as
+    `[Doe et al. [2021] …`, which nothing recognised as a reference list: the
+    back-matter healer archived it and the injector wrote it again, every cycle.
+    """
+    if not (label.startswith("[") and label.endswith("]")):
+        return label.strip()
+    depth = 0
+    for i, c in enumerate(label):
+        depth += {"[": 1, "]": -1}.get(c, 0)
+        if depth == 0:
+            # The opening bracket closes here; only at the very end is it a pair
+            # around the whole label (`[A] and [B]` is two groups, not one).
+            return label[1:-1].strip() if i == len(label) - 1 else label.strip()
+    return label.strip()
+
+
 def parse_bibliography(html: str) -> list:
     """[{num, text}] for every entry in the source's reference list, in order."""
     out = []
@@ -138,7 +159,7 @@ def parse_bibliography(html: str) -> list:
             body = body[:tag[1]] + body[tag[2]:]
         text = ef._clean(body)
         if text:
-            mark = label.strip("[]").strip() or m.group(1)
+            mark = _unbracket(label) or m.group(1)
             # The id is the bibliography's internal order and need not be the
             # number the paper cites the entry by: `bib.bib15` can be `[1]`.
             # Keying on the id numbered the injected list 15, 20, 3 and compared
@@ -386,6 +407,76 @@ def _find_refs_heading(blocks: list):
     return None
 
 
+def own_unread_list(blocks: list, entries: list, readable: bool = False):
+    """(heading id, entry ids) of a list this tool wrote but cannot read, or None.
+
+    `_find_refs_heading` recognises a list by its labels. A list an older writer
+    put out with malformed labels is invisible to it, and `may_inject_references`
+    then rightly refuses to add a second one. Back-matter stripping removes such
+    a list only while it is under half the page, so a long one stayed for good,
+    and everything else read it as body.
+
+    This reads the TEXT instead. Each entry was written as `[<label>] <the
+    source's entry text>`, verbatim and in English, and a translated bibliography
+    does not match that. Only the heading and the paragraphs that match are
+    returned, so nothing else under the heading is touched.
+
+    A list the boundary still reads is not one of these. `_find_refs_heading`
+    counts paragraphs to the end of the page, so it misses a readable list with
+    a translation appended below it; replacing that one moved the list and left
+    links already in the body pointing at the archived copy.
+
+    Args:
+        blocks: The page's top-level blocks.
+        entries: The bibliography as parsed from the source.
+        readable: Return such a list as well. `--force` rebuilds whatever list
+            this tool wrote, and without it would append a second.
+    """
+    texts = {e["text"] for e in entries}
+
+    def written_by_us(text: str) -> bool:
+        at = text.find("] ") if text.startswith("[") else -1
+        while at != -1:
+            rest = text[at + 2:]
+            # 2000 characters is where the writer cut a long entry off.
+            if rest and (rest in texts or (
+                    len(text) >= 2000 and any(t.startswith(rest) for t in texts))):
+                return True
+            at = text.find("] ", at + 1)
+        return False
+
+    ours = set(reference_headings(blocks))
+    read = {start for start, _end in reference_section.list_spans(blocks)}
+    for i, b in enumerate(blocks):
+        if b["id"] not in ours or (i in read and not readable):
+            continue
+        run = []
+        for x in blocks[i + 1:]:
+            if HEADING_LEVEL.get(x["type"]):
+                break
+            if x["type"] == "paragraph" and block_text(x).strip():
+                run.append(x)
+        mine = [x["id"] for x in run if written_by_us(block_text(x))]
+        if mine and len(mine) >= reference_section.ENTRY_SHARE * len(run):
+            return b["id"], mine
+    return None
+
+
+def _archive(ids: list) -> list:
+    """Archive these blocks in order, stopping at the first that fails.
+
+    Returns:
+        The ids still live, the failing one first; empty when all were archived.
+    """
+    for i, bid in enumerate(ids):
+        try:
+            notion("PATCH", f"/blocks/{bid}", {"archived": True})
+        except Exception:
+            return ids[i:]
+        time.sleep(0.15)
+    return []
+
+
 _LABEL = re.compile(r"^.*?[\[(]\d{4}[a-z]?[\])]\s*")
 _CONNECTOR = {"and", "others", "et", "al", "van", "von", "de", "der", "den", "di",
               "da", "el", "bin", "ibn", "jr", "sr", "the"}
@@ -443,18 +534,63 @@ def _link(page_id: str, block_id: str, entry: str = "") -> str:
             f"#{block_id.replace('-', '')}")
 
 
+class UnreadableList(ValueError):
+    """The list would not be recognised as a reference list once written."""
+
+
+def written_label(entry: dict) -> str:
+    """The label an entry is written under: its own, or else its number.
+
+    Its own whenever the boundary reads it as a label, which every style in use
+    does. A label it would refuse (longer than a label may be, with no digit, a
+    corporate name over six letters) is written as the entry's number. The
+    boundary decides whether the list is ours by its labels, so a list it cannot
+    read is archived by back-matter stripping and written again by the healer,
+    every cycle.
+    """
+    label = entry.get("label") or str(entry["num"])
+    return label if reference_section.is_label(label) else str(entry["num"])
+
+
+def entry_texts(entries: list) -> list:
+    """The paragraph `inject_references` writes for each entry."""
+    return [f"[{written_label(e)}] {e['text']}"[:2000] for e in entries]
+
+
+def list_is_recognised(entries: list) -> bool:
+    """Would the boundary read the list written for these entries as one?
+
+    `written_label` makes every label readable. What can still fail is the
+    text, which is the source's own: an English bibliography can give an
+    author's name in Hangul. A list of fewer than three entries never reads
+    as one either.
+    """
+    return reference_section.looks_like_list(
+        [{"type": "paragraph", "paragraph": {"rich_text": [{"plain_text": text}]}}
+         for text in entry_texts(entries)])
+
+
 def inject_references(page_id: str, entries: list, apply: bool) -> dict:
-    """Append the English reference list; return {num: block_id}."""
+    """Append the English reference list; return {num: block_id}.
+
+    Raises:
+        UnreadableList: the boundary would not recognise the list once it is
+            written. Back-matter stripping would archive it as a translated
+            bibliography and the healer would write it again, on every cycle. A
+            copy count never sees that loop, because the old list is always gone
+            before the new one arrives, so it is refused here, before the write.
+    """
+    if not list_is_recognised(entries):
+        raise UnreadableList(f"{len(entries)} entries would not read as a "
+                             f"reference list once written")
     ids = {}
     blocks = [{"object": "block", "type": "heading_1",
                "heading_1": {"rich_text": [{"type": "text",
                                             "text": {"content": REFS_HEADING}}]}}]
-    for e in entries:
+    for text in entry_texts(entries):
         blocks.append({"object": "block", "type": "paragraph",
                        "paragraph": {"rich_text": [
-                           {"type": "text",
-                            "text": {"content":
-                                f"[{e.get('label') or e['num']}] {e['text']}"[:2000]}}]}})
+                           {"type": "text", "text": {"content": text}}]}})
     if not apply:
         return {}
     made = []
@@ -732,20 +868,36 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
                                      entries)
         rep["refs"] = f"already present ({len(ref_ids)})"
     else:
-        if not may_inject_references(blocks) and not force:
+        # The list to take down first: the one `--force` rebuilds, or one this
+        # tool wrote in a form nothing reads any more. The second is replaced
+        # without `--force`, because nothing else will ever remove it.
+        old = found or own_unread_list(blocks, entries, readable=force)
+        if not old and not may_inject_references(blocks) and not force:
             # A list is already there even if its entries did not parse. Appending
             # a second one is how a page runs away; refuse and say so.
             rep["refs"] = "already present (unparsed)"
             rep["warning"] = ("a reference heading is already on the page but its "
                               "entries were not recognised; refusing to append")
             return rep
-        if found and force and apply:
-            for bid in [found[0]] + found[1]:
-                try:
-                    notion("PATCH", f"/blocks/{bid}", {"archived": True})
-                except Exception:
-                    pass
-                time.sleep(0.15)
+        if not list_is_recognised(entries):
+            # Checked before anything is archived, so `--force` cannot trade a
+            # list for nothing.
+            rep["refs"] = "not written"
+            rep["warning"] = ("the list would not read as a reference list once "
+                              "written: back-matter stripping would archive it and "
+                              "this would write it again, every cycle")
+            return rep
+        if old:
+            rep["replaced"] = 1 + len(old[1])
+        if old and apply:
+            # The heading goes last: if an archive fails, the heading is still
+            # there, so the next run finds what is left and finishes the job.
+            left = _archive(old[1] + [old[0]])
+            if left:
+                # Writing anyway would leave two lists on the page.
+                rep["error"] = (f"archiving the old list stopped with {len(left)} "
+                                f"block(s) left; nothing written")
+                return rep
             blocks = vs.fetch_blocks(page_id)
         ref_ids = inject_references(page_id, entries, apply)
         rep["refs"] = f"{'injected' if apply else 'would inject'} {len(entries)}"
@@ -888,13 +1040,15 @@ def translated_at(blocks: list, me):
 
 # --- author-year papers -------------------------------------------------------
 # Half the papers here do not cite by number at all: the body says
-# "(Brohan et al. 2022)" and the reference list is labelled "Brohan et al. [2022]".
+# "(Doe et al. 2022)" and the reference list is labelled "Doe et al. [2022]".
 # The numeric path above can do nothing with that, so those pages got a reference
 # list and not one working link — on one of them, 73 citations.
 #
 # This needs no alignment and makes no assumption: the label IS the citation. Name
-# plus year identifies one entry outright, and the year's `a`/`b` suffix is what
-# separates an author's two papers in the same year, so it is part of the key.
+# plus year identifies one entry, and the year's `a`/`b` suffix is what separates
+# an author's two papers in the same year, so it is part of the key. A list can
+# still give two works the same label (a corporate author's two reports of one
+# year, with no suffix); such a key names neither, and is left unlinked.
 # The label is bracketed in one paper and parenthesised in the next —
 # "Belkhale et al. (2024)" and "Achiam et al. [2023]" are the same thing.
 _AY_LABEL = re.compile(r"^(.+?)\s*[\[(](\d{4}[a-z]?)[\])]")
@@ -930,17 +1084,56 @@ def label_pattern(labels: list):
 
 
 def _ay_key(name: str, year: str) -> tuple:
-    return (re.sub(r"[^a-z0-9 ]", "", name.lower()).strip(), year)
+    # Any run of whitespace is one space. Matching a literal space only, the
+    # non-breaking one in `et&nbsp;al.` was dropped with the punctuation, so a
+    # body that kept it keyed `doe etal` against the index's `doe et al`.
+    words = re.sub(r"[^a-z0-9\s]", "", name.lower()).split()
+    return (" ".join(words), year)
 
 
 def author_year_index(entries: list) -> dict:
-    """{(normalised name, year): reference number} from the bibliography labels."""
-    out = {}
+    """{(normalised name, year): reference number} from the bibliography labels.
+
+    Read from the entry's LABEL, which is where its name and year are. The parser
+    takes the label out of the entry's text, so the text opens with the full
+    author list, and an index read from it came out empty on every natbib page:
+    not one `(Doe et al., 2021)` in the body was linked.
+
+    A key two entries share is left out. The body cites either work by the same
+    words, so whichever entry the index kept, every citation of the other was
+    linked to the wrong work.
+    """
+    out, shared = {}, set()
     for e in entries:
-        m = _AY_LABEL.match(e["text"] or "")
+        m = _AY_LABEL.match(e.get("label") or "")
         if m:
-            out[_ay_key(m.group(1), m.group(2))] = e["num"]
+            key = _ay_key(m.group(1), m.group(2))
+            if key in out or key in shared:
+                shared.add(key)
+                out.pop(key, None)
+            else:
+                out[key] = e["num"]
     return out
+
+
+def is_stale_citation(span: dict, page_id: str, index: dict, ref_ids: dict) -> bool:
+    """Is this span an author-year citation linked to a block its entry has left?
+
+    Rebuilding the list gives every entry a new block, and a linker that skips
+    whatever is already linked leaves those citations pointing at archived
+    blocks, which reads exactly like a working link until one is clicked.
+
+    Only a span that IS one citation, linked into this page, qualifies. A link
+    someone put on prose is theirs, and one already on its entry stays as it is.
+    """
+    if span.get("type") != "text":
+        return False
+    url = span.get("href") or ((span.get("text") or {}).get("link") or {}).get("url")
+    if not url or f"{page_id.replace('-', '')}#" not in url:
+        return False
+    m = _AY_CITE.fullmatch((span.get("text") or {}).get("content", ""))
+    num = index.get(_ay_key(m.group(1), m.group(2))) if m else None
+    return num in ref_ids and not url.endswith("#" + ref_ids[num].replace("-", ""))
 
 
 def link_author_year(page_id: str, blocks: list, index: dict, ref_ids: dict,
@@ -954,8 +1147,11 @@ def link_author_year(page_id: str, blocks: list, index: dict, ref_ids: dict,
             continue
         out, hits = [], 0
         for sp in spans:
-            if sp.get("type") != "text" or sp.get("href"):
+            stale = is_stale_citation(sp, page_id, index, ref_ids)
+            if sp.get("type") != "text" or (sp.get("href") and not stale):
                 out.append(sp); continue
+            if stale:                      # drop the old target before relinking
+                sp = dict(sp, href=None, text=dict(sp.get("text") or {}, link=None))
             text, pos = sp["text"]["content"], 0
             for m in _AY_CITE.finditer(text):
                 num = index.get(_ay_key(m.group(1), m.group(2)))
@@ -997,13 +1193,17 @@ def ref_ids_from_texts(texts: dict, entries: list) -> dict:
     # Whitespace is dropped entirely on both sides: the source writes
     # `[VSP + 17]` and the translated body writes `[VSP+17]` for the same entry.
     tight = lambda text: re.sub(r"\s+", "", text)
-    by_label = {tight(e["label"]): e["num"] for e in entries if e.get("label")}
+    # Keyed on the label each entry was WRITTEN under, which is its number when
+    # the boundary would not have read its own.
+    by_label = {tight(written_label(e)): e["num"] for e in entries}
+    # The boundary's own label grammar, so a label is read back exactly as it was
+    # written: an inner `[2021]` closes the label, it does not end it early.
     found = {}
     for bid, text in texts.items():
-        head = re.match(r"\s*\[([^\]]{1,32})\]", text or "")
-        if not head:
+        head = reference_section.entry_label(text)
+        if head is None:
             continue
-        num = by_label.get(tight(head.group(1)))
+        num = by_label.get(tight(head))
         if num is not None:
             found[num] = bid
     return found
