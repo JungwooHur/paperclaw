@@ -16,8 +16,9 @@ arxiv-native / ar5iv LaTeXML gives every figure `<figure id="S3.F2">` where the
 `F<m>` is the figure NUMBER. The translated Notion body references each figure as
 `그림 <m>` / `Figure <m>` / `Fig. <m>` (NotebookLM keeps figure refs), and section
 headings keep their number (`4 GAM`, `부록 A`). So each figure is inserted right
-after the paragraph that first mentions its number; fallback to the numbered
-section heading; fallback to the page end. No NotebookLM round-trip needed.
+after the paragraph that first mentions its number; fallback to the heading of
+the section the figure sits in (the `S3` of `S3.F2`); fallback to the page end.
+No NotebookLM round-trip needed.
 
 Idempotent: if the page already has image blocks it is left alone (unless --force).
 Figures are uploaded PRIVATELY into Notion via notion_upload (never a public host).
@@ -333,42 +334,126 @@ def neighbour_spot(num, placed: dict):
     return (placed[min(higher)], "before") if higher else None
 
 
-def _anchor_for(num, blocks: list):
-    """Block id to insert a figure `num` after: first body mention of the figure
-    number, else the section heading whose number matches, else None (page end)."""
-    if num is None:
-        return None
-    # The label must match as a WHOLE label. `Figure\s*2` would otherwise match
-    # "Figure F.2" at the "2", which is how appendix figures ended up beside the
-    # body figure sharing their digit.
-    # The boundary must reject a LONGER NUMBER, not a following word: Korean glues a
-    # particle straight onto the reference ("Fig. 10에서"), and 에 is a word character,
-    # so `(?![\w.])` refused every such mention. Those figures found no anchor and were
-    # appended at the page end — which is the appendix — so Fig 3, 10 and 15 ended up
-    # there while the text that cites them sat chapters earlier.
-    ref = re.compile(rf"(?:그림|Figure|Fig\.?)\s*0*{re.escape(str(num))}(?![0-9]|\.[0-9])")
+# The words a body uses to name a float: (Latin, Hangul). Each may not continue a
+# word of its own script, or "config 2" would mention Figure 2, "suitable 2" Table
+# 2, and 목표 1 ("goal 1") Table 1.
+_FLOAT_WORDS = {"figure": (r"(?:Figure|Fig\.?)", r"그림"),
+                "table": (r"Table", r"표")}
+
+ROMAN_VALUES = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7,
+                "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12, "xiii": 13,
+                "xiv": 14, "xv": 15}
+
+
+def mention_pattern(kind: str, num, roman: str = ""):
+    r"""The one rule for "this text mentions figure/table `num`".
+
+    Figures and tables each had their own copy and they drifted: the figure copy
+    learned that `\b` does not hold before a Korean particle, the table copy never
+    did, so `Table 2에` was invisible and the table fell to a fallback.
+
+    The label must match as a WHOLE label — `Figure\s*2` must not match
+    "Figure F.2" at the 2, which put appendix figures beside the body figure
+    sharing their digit. And the boundary rejects only a LONGER NUMBER (`10`,
+    `1.2`), never a following word: a particle glues straight onto the number
+    (`Fig. 10에서`), 에 is a word character, and refusing it sent Fig 3, 10 and 15
+    to the appendix while the text citing them sat chapters earlier. A roman
+    numeral (`TABLE II`) also refuses a following Latin letter, or the roman 1
+    would read "Table in the appendix" as Table I.
+
+    Case-insensitive, since a translated body writes `fig. 5` as often as
+    `Fig. 5`. "Extended Data Fig. 3" names a different figure than "Fig. 3".
+
+    Args:
+        kind: "figure" or "table".
+        num: The printed label: 3, or "F.2" for an appendix figure.
+        roman: The label as a roman numeral too, lowercase ("ii"), or "".
+    """
+    latin, hangul = _FLOAT_WORDS[kind]
+    alts = [rf"0*{re.escape(str(num))}(?![0-9]|\.[0-9])"]
+    if roman:
+        alts.append(rf"{re.escape(roman)}(?![0-9A-Za-z]|\.[0-9])")
+    return re.compile(rf"(?<!Data )(?:(?<![A-Za-z]){latin}|(?<![가-힣]){hangul})"
+                      rf"\s*(?:{'|'.join(alts)})", re.I)
+
+
+def first_mention(kind: str, num, blocks: list, roman: str = ""):
+    """Id of the first text block that mentions this float, or None.
+
+    Another float's caption is skipped: one caption saying "compare with Figure 13"
+    is the first mention of 13 on the page, and anchoring there put Figure 13
+    directly under Figure 1 (see `caption_number`).
+    """
+    ref = mention_pattern(kind, num, roman)
     for b in blocks:
         if b["type"] not in TEXT_TYPES:
             continue
         text = _block_text(b)
-        if _is_other_caption(text, "figure", num):
-            continue          # a cross-reference, not where this figure belongs
+        if _is_other_caption(text, kind, num):
+            continue
         if ref.search(text):
             return b["id"]
+    return None
+
+
+def appendix_anchor(letter: str, blocks: list):
+    """The heading of appendix `letter` (`Appendix A …`, `부록 A …`), or None."""
+    app = re.compile(rf"(?:appendix|부록)\s*{re.escape(letter)}(?![A-Za-z0-9])", re.I)
+    for b in blocks:
+        if b["type"].startswith("heading") and app.search(_block_text(b)):
+            return b["id"]
+    return None
+
+
+def _top_level_number(heading_text: str):
+    """2 for "2 Method" / "2. Method" / "II. METHOD"; None for "2.1 …" or no label."""
+    import verify_sections as vs
+    key = vs.section_key(heading_text) or ""
+    if key.isdigit():
+        return int(key)
+    return ROMAN_VALUES.get(key.lower()) if re.fullmatch(r"[IVX]+", key) else None
+
+
+_OWN_SECTION = re.compile(r"(S|A)(\d+)\.")
+
+
+def section_anchor(fid: str, blocks: list):
+    """The heading of the section a float sits in, read from its LaTeXML id.
+
+    `S3.T5` is in section 3 and `A1.T6` in the first appendix, A. The fallback
+    used to be the heading whose number equals the FLOAT's number, which has
+    nothing to do with where the float is: Table 6 went under `6 Conclusion`
+    whatever section printed it, and a table with no section of its number
+    fell to the end of the body.
+
+    Returns None when the page has no such heading; the caller's own last
+    resort decides, which beats a confident wrong place.
+    """
+    m = _OWN_SECTION.match(fid or "")
+    if not m:
+        return None
+    n = int(m.group(2))
+    if m.group(1) == "A":
+        return appendix_anchor(chr(ord("A") + n - 1), blocks) if 1 <= n <= 26 else None
+    for b in blocks:
+        if b["type"].startswith("heading") and _top_level_number(_block_text(b)) == n:
+            return b["id"]
+    return None
+
+
+def _anchor_for(num, blocks: list, fid: str = ""):
+    """Block id to insert a figure `num` after: first body mention of the figure
+    number, else the heading of the section it sits in, else None (page end)."""
+    if num is None:
+        return None
+    found = first_mention("figure", num, blocks)
+    if found:
+        return found
     letter = re.match(r"([A-Za-z])\.", str(num))
     if letter:
         # An appendix figure belongs in its appendix, never in the body.
-        app = re.compile(rf"(?:appendix|부록)\s*{letter.group(1)}\b", re.I)
-        for b in blocks:
-            if b["type"].startswith("heading") and app.search(_block_text(b)):
-                return b["id"]
-        return None
-    # fallback: a numbered section heading `N ...` / `N.M ...` starting with num
-    head = re.compile(rf"^\s*{re.escape(str(num))}(?:[.\s])")
-    for b in blocks:
-        if b["type"].startswith("heading") and head.match(_block_text(b)):
-            return b["id"]
-    return None
+        return appendix_anchor(letter.group(1), blocks)
+    return section_anchor(fid, blocks)
 
 
 def _image_block(fid: str, caption: str) -> dict:
@@ -481,7 +566,7 @@ def inject_figures(page_id: str, arxiv_id: str, apply: bool = False,
     # lower-numbered figure that IS placed keeps the sequence readable; the page end
     # remains the last resort, for a figure with no placed neighbour at all.
     _sort_key = lambda f: _series_key(f["num"])
-    by_num = {f["num"]: _anchor_for(f["num"], blocks) for f in figs}
+    by_num = {f["num"]: _anchor_for(f["num"], blocks, f["id"]) for f in figs}
     by_num = fill_anchor_gaps([f["num"] for f in figs], by_num)
     resolved = {id(f): by_num.get(f["num"]) for f in figs}
     ordered_figs = sorted(figs, key=_sort_key)

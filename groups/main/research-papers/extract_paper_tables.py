@@ -10,9 +10,12 @@ elements, not images, so they must be *rendered*: this loads the real arxiv page
 in headless Chromium (playwright) and screenshots each table element, preserving
 the paper's exact layout, column rules and color highlights + caption.
 
-Placement mirrors figures: the image goes right after the paragraph that first
-mentions the table number (`표 N` / `Table N`), fallback numbered section heading,
-fallback page end. Uploaded PRIVATELY via notion_upload.
+Placement mirrors figures, through the same mention rule
+(`extract_paper_figures.mention_pattern`): the image goes right after the
+paragraph that first mentions the table number (`표 N` / `Table N`, a particle
+glued on or not), fallback the heading of the section the table sits in (the `S3`
+of `S3.T5`, never the heading numbered like the table), fallback end of body.
+Uploaded PRIVATELY via notion_upload.
 
 Safe removal (default)
 ----------------------
@@ -43,8 +46,7 @@ _TABLE_REF = None  # built per-number
 _TID = re.compile(r'\bid="((?:S|A)\d+\.T(\d+))"')
 
 
-_ROMAN = {"i":1,"ii":2,"iii":3,"iv":4,"v":5,"vi":6,"vii":7,"viii":8,"ix":9,"x":10,
-          "xi":11,"xii":12,"xiii":13,"xiv":14,"xv":15}
+_ROMAN = ef.ROMAN_VALUES
 
 
 def _cap_key(cap: str) -> str:
@@ -128,41 +130,106 @@ def replaced_by(blocks: list, caption_keys: set) -> list:
     return out
 
 
+def _element_span(html_text: str, at: int):
+    """`(inner_start, inner_end, end)` of the element whose start tag holds `at`.
+
+    Walks the nesting of that element's own tag, so a table figure that wraps its
+    panels in figures of their own ends at ITS closing tag, not the first one.
+    An element that is never closed runs to the end of the text.
+    """
+    start = html_text.rfind("<", 0, at + 1)
+    tag = re.match(r"<([A-Za-z][\w-]*)", html_text[start:]) if start >= 0 else None
+    open_end = html_text.find(">", at)
+    if not tag or open_end < 0:
+        return None
+    opener = re.compile(rf"<{tag.group(1)}\b", re.I)
+    closer = re.compile(rf"</{tag.group(1)}\s*>", re.I)
+    depth, i = 1, open_end + 1
+    while True:
+        close = closer.search(html_text, i)
+        if not close:
+            return open_end + 1, len(html_text), len(html_text)
+        nested = opener.search(html_text, i, close.start())
+        if nested:
+            depth, i = depth + 1, nested.end()
+            continue
+        depth -= 1
+        if not depth:
+            return open_end + 1, close.start(), close.end()
+        i = close.end()
+
+
+def _element_body(html_text: str, at: int) -> str:
+    """The markup inside the element whose start tag holds position `at`."""
+    span = _element_span(html_text, at)
+    return html_text[span[0]:span[1]] if span else ""
+
+
+_NESTED_FIGURE = re.compile(r"<figure\b", re.I)
+_OPENS_AS_TABLE = re.compile(r"\s*(?:table|표)\s*\S", re.I)
+
+
+def _without_nested_figures(body: str) -> str:
+    """`body` with every figure nested in it cut out, panels included."""
+    out, i = [], 0
+    while True:
+        m = _NESTED_FIGURE.search(body, i)
+        span = _element_span(body, m.start()) if m else None
+        if not span:
+            return "".join(out) + body[i:]
+        out.append(body[i:m.start()])
+        i = span[2]
+
+
+def _table_caption(body: str, num: int) -> str:
+    """The caption of the table whose element markup is `body`.
+
+    Its own `<figcaption>` is the one not inside a nested figure: a composite
+    table nests a figure per panel, each captioned "(a) …", and the table's own
+    caption — the one carrying its number — sits beside them.
+    """
+    own = [ef._clean(c) for c in ef._CAP.findall(_without_nested_figures(body))]
+    for cap in own:
+        if _OPENS_AS_TABLE.match(cap):
+            return cap
+    if own:
+        return own[0]
+    for cap in ef._CAP.findall(body):
+        if caption_number(ef._clean(cap)) == num:
+            return ef._clean(cap)
+    return ""
+
+
 def parse_tables(html_text: str) -> list:
     """Ordered list of {id, num, caption} for each table id `SnTm` / `AnTm`.
     Scans ids directly (not <figure> boundaries) so nested table-figures — which
     truncate a non-greedy `<figure>…</figure>` match — are not dropped. The id is
-    what render_tables screenshots, so this is the robust key."""
+    what render_tables screenshots, so this is the robust key.
+
+    The caption is read from the table's OWN element. It used to be the first
+    `<figcaption>` within 8,000 characters of the id, so a long table (a page of
+    prompt examples) had none — it was written as a bare `Table 5` — and a table
+    with no caption of its own borrowed the next table's."""
     out, seen = [], set()
     for m in _TID.finditer(html_text):
         fid = m.group(1)
         if fid in seen:
             continue
         seen.add(fid)
-        cap = ""
-        cm = re.search(re.escape(fid) + r'".*?<figcaption[^>]*>(.*?)</figcaption>',
-                       html_text[m.start():m.start() + 8000], re.DOTALL | re.I)
-        if cm:
-            cap = ef._clean(cm.group(1))[:1900]
-        out.append({"id": fid, "num": int(m.group(2)), "caption": cap})
+        num = int(m.group(2))
+        cap = _table_caption(_element_body(html_text, m.start()), num)
+        out.append({"id": fid, "num": num, "caption": cap[:1900]})
     return out
 
 
-def _table_anchor(num, blocks: list):
-    """First block mentioning `표 N` / `Table N`; fallback numbered section heading."""
+def _table_anchor(num, blocks: list, fid: str = ""):
+    """Where table `num` goes: the first block mentioning it (`표 N` / `Table N`,
+    roman too), else the heading of the section its id `fid` puts it in."""
     if num is None:
         return None
     roman = {v: k for k, v in _ROMAN.items()}.get(num, "")
-    alts = [rf"0*{num}"] + ([roman] if roman else [])
-    ref = re.compile(rf"(?:표|Table)\s*(?:{'|'.join(alts)})\b", re.I)
-    for b in blocks:
-        if b["type"] in ef.TEXT_TYPES and ref.search(ef._block_text(b)):
-            return b["id"]
-    head = re.compile(rf"^\s*{num}(?:[.\s])")
-    for b in blocks:
-        if b["type"].startswith("heading") and head.match(ef._block_text(b)):
-            return b["id"]
-    return None
+    return (ef.first_mention("table", num, blocks, roman)
+            or ef.section_anchor(fid, blocks))
 
 
 def _is_pure_table(text: str) -> bool:
@@ -415,10 +482,12 @@ def inject_tables(page_id: str, arxiv_id: str, apply: bool = False,
     images = render_tables(arxiv_id, tables, outdir, html_src)  # [{num, caption, path}]
     rep["rendered"] = len(images)
 
-    # place images grouped by anchor (first `표 N` mention), in document order
+    # place images grouped by anchor (first `표 N` mention), in document order.
+    # render_tables keys by number, last one winning; mirror it for the id.
+    ids = {t["num"]: t["id"] for t in tables}
     groups, order = {}, []
     for im in images:
-        anchor = _table_anchor(im["num"], blocks) or "__end__"
+        anchor = _table_anchor(im["num"], blocks, ids.get(im["num"], "")) or "__end__"
         groups.setdefault(anchor, []).append(im)
         if anchor not in order:
             order.append(anchor)
