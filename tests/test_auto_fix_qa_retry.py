@@ -214,7 +214,7 @@ class TestTheHealerQuery:
         # Its own wrapper used to retry every HTTP error `api_post` gave up
         # on, so one throttled query made five times the attempts.
         import heal_paper_pages as hp
-        tries = notion_retry.MAX_RETRIES
+        tries = hp.QUERY_ATTEMPTS
         fake = notion(*([429] * (tries * 5)))
         with pytest.raises(urllib.error.HTTPError):
             hp._post_retry("/databases/db/query", {})
@@ -225,6 +225,27 @@ class TestTheHealerQuery:
         fake = notion(urllib.error.URLError("reset"), {"results": []})
         assert hp._post_retry("/databases/db/query", {}) == {"results": []}
         assert len(fake.requests) == 2
+
+    def test_a_twenty_second_run_of_server_errors_is_outlasted(
+            self, monkeypatch):
+        # One failed query aborts every paper healer for the cycle. Its old
+        # wrapper waited 2+4+6+8 s between five sends; the shared ladder alone
+        # gives up after 7 s.
+        import heal_paper_pages as hp
+        clock = [0.0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def urlopen(req, timeout=None):
+            if clock[0] < 20:
+                raise _http_error(502)
+            return _Reply({"results": []})
+
+        monkeypatch.setenv("NOTION_TOKEN", "test-token")
+        monkeypatch.setattr(aq.time, "sleep", sleep)
+        monkeypatch.setattr(aq.urllib.request, "urlopen", urlopen)
+        assert hp._post_retry("/databases/db/query", {}) == {"results": []}
 
 
 def _text(content):

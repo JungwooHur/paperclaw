@@ -59,7 +59,8 @@ def headers() -> dict:
 _QUERY_PATH = re.compile(r"/databases/[^/?]+/query")
 
 
-def _send(req: urllib.request.Request, write: bool) -> bytes:
+def _send(req: urllib.request.Request, write: bool,
+          attempts: int = notion_retry.MAX_RETRIES) -> bytes:
     """Opens a Notion request, retrying what `notion_retry` says is worth it.
 
     These helpers had no retry while every other script's did, so a single 429
@@ -71,6 +72,7 @@ def _send(req: urllib.request.Request, write: bool) -> bytes:
         write: True when the request changes the page. Then only a 429 is
             retried: a 5xx can arrive after the write applied, and the insert
             of a rebuilt callout sent twice would leave two copies.
+        attempts: Sends allowed in all, the first included.
 
     Returns:
         The response body.
@@ -79,11 +81,12 @@ def _send(req: urllib.request.Request, write: bool) -> bytes:
         urllib.error.HTTPError: The last failure, once it is not worth retrying
             or the attempts are spent.
     """
-    for attempt in range(1, notion_retry.MAX_RETRIES + 1):
+    for attempt in range(1, attempts + 1):
         try:
             return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read()
         except urllib.error.HTTPError as err:
-            if not notion_retry.should_retry(err, attempt, write=write):
+            if not notion_retry.should_retry(err, attempt, attempts,
+                                             write=write):
                 raise
             time.sleep(notion_retry.retry_delay(err, attempt))
     raise RuntimeError("unreachable")  # The loop either returns or raises.
@@ -94,12 +97,15 @@ def api_get(path: str) -> dict:
     return json.loads(_send(req, write=False))
 
 
-def api_post(path: str, body: dict) -> dict:
+def api_post(path: str, body: dict, *,
+             attempts: int = notion_retry.MAX_RETRIES) -> dict:
+    """POSTs to Notion; `attempts` lets a caller stretch the retry ladder."""
     req = urllib.request.Request(
         API + path, method="POST",
         data=json.dumps(body).encode(), headers=headers(),
     )
-    return json.loads(_send(req, write=not _QUERY_PATH.fullmatch(path)))
+    return json.loads(_send(req, write=not _QUERY_PATH.fullmatch(path),
+                            attempts=attempts))
 
 
 def api_patch(path: str, body: dict) -> dict:

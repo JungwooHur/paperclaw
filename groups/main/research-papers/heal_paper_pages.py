@@ -80,18 +80,26 @@ from heal_verify import heal_verify
 from link_references import heal_references
 
 
+# Sends the DB query may make before a 429 or 5xx is final. One failed query
+# aborts every paper healer for the cycle, so it gets a longer ladder than a
+# single page's request: six sends wait 1+2+4+8+16 s, which outlasts the ~20 s
+# episode this query used to survive, where the shared four give up after 7 s.
+QUERY_ATTEMPTS = 6
+
+
 def _post_retry(path, body, tries=5):
     """api_post, also retrying a dropped connection.
 
     This runs unattended on a 5-minute timer, so a transient failure during the
-    DB query must not abort the whole run. `api_post` already retries what
-    Notion answers (429 and 5xx, through `notion_retry`), so an HTTP error that
-    reaches here is final; retrying it again would multiply the attempts. Only
-    the network failures `api_post` leaves alone are retried here.
+    DB query must not abort the whole run. `api_post` retries what Notion
+    answers (429 and 5xx, through `notion_retry`) over `QUERY_ATTEMPTS` sends,
+    so an HTTP error that reaches here is final; retrying it again would
+    multiply the attempts. Only the network failures `api_post` leaves alone
+    are retried here.
     """
     for a in range(tries):
         try:
-            return api_post(path, body)
+            return api_post(path, body, attempts=QUERY_ATTEMPTS)
         except urllib.error.HTTPError:
             raise  # A subclass of URLError: name it first so it is not retried.
         except (urllib.error.URLError, TimeoutError, OSError):
