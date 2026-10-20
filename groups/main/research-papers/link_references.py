@@ -677,14 +677,22 @@ def _clone(span: dict, content: str, link=None) -> dict:
 
 
 def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
-              force: bool = False, relink: bool = False) -> dict:
+              force: bool = False, relink: bool = False,
+              blocks: list = None) -> dict:
+    """Place the source's reference list on a page and link its citations.
+
+    `blocks` is the page's top-level blocks when the caller has already read
+    them (`heal_references` does, to date an old row's translation); otherwise
+    they are fetched here.
+    """
     rep = {"page": page_id, "entries": 0, "sections_linked": 0,
            "sections_skipped": 0, "slots_linked": 0, "refs": "kept"}
     # Cheap exit FIRST. This runs on the 5-minute healer against every recently
     # edited page, and fetching the paper's HTML to discover there is nothing to do
     # would put a network round-trip on each of them, every cycle. The reference
     # list is written once, with its links, so its presence means the work is done.
-    blocks = vs.fetch_blocks(page_id)
+    if blocks is None:
+        blocks = vs.fetch_blocks(page_id)
     # `relink` re-runs the citation pass over an existing reference list, which is
     # how an improvement to the alignment reaches pages that were already built.
     if not force and not relink and _find_refs_heading(blocks):
@@ -824,7 +832,57 @@ def link_page(page_id: str, arxiv_id: str = None, apply: bool = False,
 # Only pages built since this landed get a reference list on the healer. The
 # owner asked for it on NEW papers; back-filling 770 existing pages is a separate,
 # explicit decision (run the CLI on a page to do one by hand).
+#
+# "Built" means translated, not created. A DB row is often a reading-list entry
+# added months before the paper is sent, and the paper is translated into that
+# old row, so the page's own `created_time` says nothing about the translation.
+# Such a page is dated by the translation instead (`translated_at`).
 HEAL_MAX_AGE_DAYS = 7
+
+_HEADINGS = ("heading_1", "heading_2", "heading_3")
+_DATED = _HEADINGS + ("paragraph",)
+
+
+def _parse_time(stamp):
+    """A Notion timestamp as an aware datetime, or None when it does not parse."""
+    import datetime
+    try:
+        return datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def translated_at(blocks: list, me):
+    """When this integration put the translation on the page, or None.
+
+    The earliest `created_time` among the headings and paragraphs this
+    integration wrote and no person has edited since (`collect_papers._ours`).
+    Only those count: the owner annotates rows with blocks of their own, and one
+    written last week must not make a page translated long ago look new, nor one
+    written long ago make a fresh translation look old. The EARLIEST, and
+    paragraphs too, because the healers re-create headings on an old page: a
+    promoted title or a split heading is a new block, and once every title on a
+    page has been promoted only its paragraphs still carry the translation's date.
+    Rows are created with no body, so an old paragraph of ours is an old
+    translation. Saved Q&A is a callout, so it dates nothing. A page with no
+    heading of ours is not one of our translations at all.
+
+    Args:
+        blocks: The page's top-level blocks, as the API returns them.
+        me: This integration's user id; None means nothing is attributable.
+
+    Returns:
+        An aware datetime, or None when no heading on the page is this
+        integration's.
+    """
+    import collect_papers
+    ours = [b for b in blocks
+            if b.get("type") in _DATED and collect_papers._ours(b, me)]
+    if not any(b.get("type") in _HEADINGS for b in ours):
+        return None
+    stamps = [_parse_time(b.get("created_time")) for b in ours]
+    stamps = [t for t in stamps if t is not None]
+    return min(stamps) if stamps else None
 
 
 
@@ -1036,17 +1094,25 @@ def heal_references(page_id: str, apply: bool = False, created_time: str = None)
             created_time = None
     if created_time:
         import datetime
-        try:
-            made = datetime.datetime.fromisoformat(created_time.replace("Z", "+00:00"))
-        except ValueError:
+        made = _parse_time(created_time)
+        if made is None:
             return {"page": page_id, "skipped": "unparseable created_time"}
-        age = datetime.datetime.now(datetime.timezone.utc) - made
+        now = datetime.datetime.now(datetime.timezone.utc)
+        age = now - made
         # A page emptied for re-processing lost its list with the rest, and is being
         # built afresh like a new page, so it gets the list back like one — however
         # long ago the clear was, since the run that followed it may have failed.
         import collect_papers
         if age.days > HEAL_MAX_AGE_DAYS and not collect_papers.was_cleared(page_id):
-            return {"page": page_id, "skipped": f"page is {age.days}d old"}
+            # An EMPTY row is never cleared, so a paper translated today into a
+            # row added months ago reaches here; only the translation's own age
+            # can tell it from a page translated long ago. The blocks read for
+            # that are handed on, so the page is not fetched twice.
+            blocks = vs.fetch_blocks(page_id)
+            since = translated_at(blocks, collect_papers._me_id())
+            if since is None or (now - since).days > HEAL_MAX_AGE_DAYS:
+                return {"page": page_id, "skipped": f"page is {age.days}d old"}
+            return link_page(page_id, apply=apply, blocks=blocks)
     return link_page(page_id, apply=apply)
 
 
