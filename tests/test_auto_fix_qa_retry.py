@@ -1,4 +1,4 @@
-"""The Q&A healer outlasts a Notion rate limit, and never repeats a write twice.
+"""The Q&A healer outlasts a Notion rate limit without duplicating a callout.
 
 `auto_fix_qa` kept its own HTTP helpers after every other script moved onto
 `notion_retry`, so one 429 on a read crashed the healer and ended that cycle's
@@ -6,7 +6,8 @@ Q&A heal for every page after it. It did that about 40 times in a week.
 
 Reads retry what `notion_retry` retries. A write retries only a 429, which
 Notion refuses before applying anything: a 5xx can arrive after the write
-landed, and an append sent twice would be a duplicated callout.
+landed, and an append sent twice would be a duplicated callout. A later run can
+still meet such an insert, so it checks for the copy before rebuilding.
 """
 import io
 import itertools
@@ -451,3 +452,43 @@ class TestABugKeepsItsTraceback:
         assert "page-b" in ws.pages_reached()
         assert "already well-formed" not in out
         assert code != 0
+
+
+class TestAnInsertThatLandedIsNotMadeAgain:
+    """A 5xx or a timeout can follow an insert that Notion applied."""
+
+    @pytest.mark.parametrize("failure", [
+        _http_error(502), TimeoutError("timed out")], ids=["502", "timeout"])
+    def test_the_next_run_removes_the_original_instead(
+            self, workspace, monkeypatch, capsys, failure):
+        ws = workspace("page")
+        ws.add("page", "paragraph", _paragraph("intro")["paragraph"])
+        ws.legacy_qa("page", "Q: what is x", "x is y")
+        sent = []
+
+        def fail(method, path):
+            if method == "PATCH" and not sent:
+                sent.append(path)
+                return ("after", failure)
+            return None
+
+        ws.fail = fail
+        _run(monkeypatch, capsys, "--page", "page")
+        ws.fail = lambda method, path: None
+        _run(monkeypatch, capsys, "--page", "page")
+
+        assert ws.callouts("page") == [
+            ("gray_background", "Q: what is x", "x is y")]
+
+    def test_a_different_answer_to_the_same_question_is_kept(
+            self, workspace, monkeypatch, capsys):
+        # Same question, another answer: a second Q&A, not a leftover copy.
+        ws = workspace("page")
+        ws.good_qa("page", "Q: what is x", "x is y")
+        ws.legacy_qa("page", "Q: what is x", "x is z")
+
+        _run(monkeypatch, capsys, "--page", "page")
+
+        assert sorted(ws.callouts("page")) == [
+            ("gray_background", "Q: what is x", "x is y"),
+            ("gray_background", "Q: what is x", "x is z")]

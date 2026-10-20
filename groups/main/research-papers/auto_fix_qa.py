@@ -233,6 +233,22 @@ def extract_question_and_answer(callout: dict) -> tuple[str, list[dict]]:
     return question, [clone_with_children(k) for k in kids]
 
 
+def _tree_text(clones: list[dict]) -> str:
+    """The plain text of a cloned block tree, each block before its children."""
+    parts = []
+    for clone in clones:
+        body = clone[clone["type"]]
+        parts.append("".join(r["text"]["content"]
+                             for r in body.get("rich_text", [])))
+        parts.append(_tree_text(body.get("children", [])))
+    return "\n".join(parts)
+
+
+def _qa_key(question: str, answer_children: list[dict]) -> tuple[str, str]:
+    """What makes two Q&A callouts the same one, whatever their layout."""
+    return question[:2000].strip(), _tree_text(answer_children)
+
+
 def build_toggle_callout(question: str, answer_children: list[dict]) -> dict:
     return {
         "object": "block",
@@ -442,21 +458,40 @@ def query_paper_pages() -> list[str]:
 
 def heal_page(page_id: str, dry_run: bool = False) -> int:
     broken: list[tuple[dict, str, str | None]] = []
+    well_formed: list[dict] = []
     for co, parent_id, top_ancestor in find_qa_callouts(page_id):
         is_top = parent_id == page_id or parent_id.replace("-", "") == page_id.replace("-", "")
         if is_well_formed_qa_callout(co, is_top):
+            well_formed.append(co)
             continue
         broken.append((co, parent_id, top_ancestor))
 
     if not broken:
         return 0
 
+    # An insert that Notion applied but answered with a 5xx or a timeout leaves
+    # its rebuilt copy beside the original, and nothing in that run can tell it
+    # landed. The next run meets both, so it removes the original instead of
+    # inserting a second copy.
+    in_place = {_qa_key(*extract_question_and_answer(co)) for co in well_formed}
     page_children = fetch_children(page_id)
     fixed = 0
     for co, parent_id, top_ancestor in broken:
         q, ans = extract_question_and_answer(co)
         if not q:
             print(f"  SKIP {co['id']}: no question text extractable", file=sys.stderr)
+            continue
+        if _qa_key(q, ans) in in_place:
+            print(f"  drop {co['id'][-12:]} | {q[:70]} | rebuilt copy already on the page",
+                  file=sys.stderr)
+            if not dry_run:
+                try:
+                    api_delete(co["id"])
+                except urllib.error.HTTPError as e:
+                    print(f"    WARN delete old {co['id']}: {e.code}", file=sys.stderr)
+                    continue
+                page_children = fetch_children(page_id)
+            fixed += 1
             continue
 
         # Placement priority:
