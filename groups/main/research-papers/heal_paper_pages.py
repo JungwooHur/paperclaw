@@ -65,6 +65,7 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from auto_fix_qa import query_paper_pages, api_post
+import notion_retry
 from strip_backmatter import strip_backmatter
 from clean_source_urls import clean_page
 from wrap_math import wrap_math_page
@@ -80,26 +81,37 @@ from heal_verify import heal_verify
 from link_references import heal_references
 
 
-def _post_retry(path, body, tries=5):
-    """api_post with retry — this runs unattended on a 5-minute timer, so a
-    transient Notion 429/5xx during the DB query must not abort the whole run."""
-    last = None
-    for a in range(tries):
+# Sends the DB query may make in all before its failure is final, whatever mix
+# of 429s, 5xx and dropped connections it meets. One failed query aborts every
+# paper healer for the cycle, so it gets a longer ladder than a single page's
+# request: six sends wait 1+2+4+8+16 s, which outlasts the ~20 s episode this
+# query used to survive, where the shared four give up after 7 s. A Retry-After
+# can stretch a wait to 30 s.
+QUERY_ATTEMPTS = 6
+
+
+def _post_retry(path, body):
+    """api_post, retrying a 429, a 5xx and a dropped connection alike.
+
+    This runs unattended on a 5-minute timer, so a transient failure during the
+    DB query must not abort the whole run. Every failure spends one of the same
+    `QUERY_ATTEMPTS` sends, judged and spaced by `notion_retry`. With a ladder
+    inside `api_post` as well, each dropped connection started that ladder
+    again, and 502s alternating with timeouts came to 30 sends.
+    """
+    for attempt in range(1, QUERY_ATTEMPTS + 1):
         try:
-            return api_post(path, body)
-        except urllib.error.HTTPError as e:
-            last = e
-            if e.code in (429, 500, 502, 503, 504) and a < tries - 1:
-                time.sleep(float(e.headers.get("Retry-After", 2)) if e.code == 429 else 2 + 2 * a)
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last = e
-            if a < tries - 1:
-                time.sleep(2 + 2 * a)
-                continue
-            raise
-    raise last
+            return api_post(path, body, attempts=1)
+        except urllib.error.HTTPError as err:  # A URLError: name it first.
+            if not notion_retry.should_retry(err, attempt, QUERY_ATTEMPTS):
+                raise
+            wait = notion_retry.retry_delay(err, attempt)
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            if attempt == QUERY_ATTEMPTS:
+                raise
+            wait = notion_retry.retry_delay(err, attempt)
+        time.sleep(wait)
+    raise RuntimeError("unreachable")  # The loop either returns or raises.
 
 
 # A page the agent is still writing must be left alone. Every healer here appends

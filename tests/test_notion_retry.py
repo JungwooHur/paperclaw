@@ -55,3 +55,18 @@ class TestHowLongToWait:
     def test_the_wait_is_capped(self):
         # A retry that sleeps for minutes is a hang, not a retry.
         assert aq.retry_delay(Boom(429, retry_after="9999"), attempt=1) <= aq.MAX_RETRY_WAIT
+
+
+class TestRetryingAWrite:
+    """A write may be repeated only when Notion refused it before applying it."""
+
+    def test_a_rate_limit_is_retried(self):
+        assert aq.should_retry(Boom(429), attempt=1, write=True)
+
+    def test_a_server_error_is_not(self):
+        # A 5xx can arrive after the write landed; an append sent again would
+        # leave two copies of the block.
+        assert not aq.should_retry(Boom(502), attempt=1, write=True)
+
+    def test_it_still_gives_up_after_the_last_attempt(self):
+        assert not aq.should_retry(Boom(429), attempt=aq.MAX_RETRIES, write=True)

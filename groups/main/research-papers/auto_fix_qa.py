@@ -29,6 +29,10 @@ Usage: python3 auto_fix_qa.py [--page PAGE_ID] [--dry-run]
 """
 from __future__ import annotations
 import argparse, json, os, re, sys, time, urllib.request, urllib.error
+import http.client
+import traceback
+
+import notion_retry
 
 API = "https://api.notion.com/v1"
 # Notion occasionally stops responding mid-request (observed: 502s followed by
@@ -51,17 +55,57 @@ def headers() -> dict:
     }
 
 
+# The one POST here that changes nothing. Every other POST creates something.
+_QUERY_PATH = re.compile(r"/databases/[^/?]+/query")
+
+
+def _send(req: urllib.request.Request, write: bool,
+          attempts: int = notion_retry.MAX_RETRIES) -> bytes:
+    """Opens a Notion request, retrying what `notion_retry` says is worth it.
+
+    These helpers had no retry while every other script's did, so a single 429
+    on a read crashed the healer and ended that cycle's Q&A heal for every page
+    after it.
+
+    Args:
+        req: The request. A retry sends it again unchanged.
+        write: True when the request changes the page. Then only a 429 is
+            retried: a 5xx can arrive after the write applied, and the insert
+            of a rebuilt callout sent twice would leave two copies.
+        attempts: Sends allowed in all, the first included.
+
+    Returns:
+        The response body.
+
+    Raises:
+        urllib.error.HTTPError: The last failure, once it is not worth retrying
+            or the attempts are spent.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read()
+        except urllib.error.HTTPError as err:
+            if not notion_retry.should_retry(err, attempt, attempts,
+                                             write=write):
+                raise
+            time.sleep(notion_retry.retry_delay(err, attempt))
+    raise RuntimeError("unreachable")  # The loop either returns or raises.
+
+
 def api_get(path: str) -> dict:
     req = urllib.request.Request(API + path, headers=headers())
-    return json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+    return json.loads(_send(req, write=False))
 
 
-def api_post(path: str, body: dict) -> dict:
+def api_post(path: str, body: dict, *,
+             attempts: int = notion_retry.MAX_RETRIES) -> dict:
+    """POSTs to Notion; `attempts` caps the sends (1: the caller retries)."""
     req = urllib.request.Request(
         API + path, method="POST",
         data=json.dumps(body).encode(), headers=headers(),
     )
-    return json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+    return json.loads(_send(req, write=not _QUERY_PATH.fullmatch(path),
+                            attempts=attempts))
 
 
 def api_patch(path: str, body: dict) -> dict:
@@ -69,14 +113,14 @@ def api_patch(path: str, body: dict) -> dict:
         API + path, method="PATCH",
         data=json.dumps(body).encode(), headers=headers(),
     )
-    return json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+    return json.loads(_send(req, write=True))
 
 
 def api_delete(block_id: str) -> None:
     req = urllib.request.Request(
         f"{API}/blocks/{block_id}", method="DELETE", headers=headers()
     )
-    urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read()
+    _send(req, write=True)
 
 
 def fetch_children(pid: str) -> list[dict]:
@@ -128,23 +172,28 @@ def clone_with_children(b: dict) -> dict:
     return c
 
 
-def is_well_formed_qa_callout(b: dict, is_top_level: bool) -> bool:
+def _well_formed_toggle(b: dict, is_top_level: bool) -> dict | None:
+    """The question toggle of a well-formed Q&A callout, else None."""
     if b["type"] != "callout":
-        return False
+        return None
     co = b["callout"]
     if not is_top_level:
-        return False
+        return None
     if co.get("color") != "gray_background":
-        return False
+        return None
     if block_text(b):
-        return False
+        return None
     # Must have exactly a toggle as the single child
     if not b.get("has_children"):
-        return False
+        return None
     kids = fetch_children(b["id"])
     if len(kids) < 1 or kids[0]["type"] != "toggle":
-        return False
-    return True
+        return None
+    return kids[0]
+
+
+def is_well_formed_qa_callout(b: dict, is_top_level: bool) -> bool:
+    return _well_formed_toggle(b, is_top_level) is not None
 
 
 def find_qa_callouts(page_id: str) -> list[tuple[dict, str, str | None]]:
@@ -179,8 +228,8 @@ def find_qa_callouts(page_id: str) -> list[tuple[dict, str, str | None]]:
     return out
 
 
-def extract_question_and_answer(callout: dict) -> tuple[str, list[dict]]:
-    """Return (question_text, answer_children_clones) regardless of layout."""
+def _question_and_answer_blocks(callout: dict) -> tuple[str, list[dict]]:
+    """Return (question_text, answer blocks as Notion gave them), any layout."""
     co_text = block_text(callout)
     kids = fetch_children(callout["id"]) if callout.get("has_children") else []
 
@@ -188,11 +237,84 @@ def extract_question_and_answer(callout: dict) -> tuple[str, list[dict]]:
         toggle = kids[0]
         question = block_text(toggle).strip()
         ans_kids = fetch_children(toggle["id"]) if toggle.get("has_children") else []
-        return question, [clone_with_children(k) for k in ans_kids]
+        return question, ans_kids
 
     # Legacy: question in callout rich_text, answers are direct children
-    question = co_text.strip()
+    return co_text.strip(), kids
+
+
+def extract_question_and_answer(callout: dict) -> tuple[str, list[dict]]:
+    """Return (question_text, answer_children_clones) regardless of layout."""
+    question, kids = _question_and_answer_blocks(callout)
     return question, [clone_with_children(k) for k in kids]
+
+
+# What Notion failing raises: an HTTP error, a timeout or a dropped connection
+# (all OSError), or a reply cut off mid-read. Anything else is a bug here.
+_NOTION_ERRORS = (OSError, http.client.HTTPException)
+
+# Block types whose content the API does not show, so two of them can hold
+# different things and still read the same.
+_OPAQUE_TYPES = {"unsupported"}
+
+
+def _content(blocks: list[dict]) -> list | None:
+    """Everything a block tree holds, children included; None if not all shown.
+
+    The whole payload counts, not only its text: an equation's expression, an
+    image's url and caption, a block's type and its styling are not text, and a
+    copy that lacks them has lost them.
+    """
+    out = []
+    for b in blocks:
+        t = b["type"]
+        if t in _OPAQUE_TYPES:
+            return None
+        kids = (_content(fetch_children(b["id"])) if b.get("has_children")
+                else [])
+        if kids is None:
+            return None
+        out.append((t, json.dumps(b.get(t), sort_keys=True), kids))
+    return out
+
+
+def _has_landed_copy(question: str, answer: list[dict],
+                     toggles: list[dict]) -> bool:
+    """Does a well-formed Q&A on the page already hold exactly this one?
+
+    An insert that Notion applied but answered with a 5xx or a timeout leaves
+    its rebuilt copy beside the original, and nothing in that run can tell it
+    landed. The next run meets both, and removes the original instead of
+    inserting a second copy.
+
+    Only a Q&A asking the same question is read, so the other answers on the
+    page cost no request and one that cannot be read blocks nothing. A copy
+    that cannot be read is no proof, and neither is one that differs in
+    anything at all: the original is then rebuilt, because a duplicate can be
+    removed and an archived answer cannot be restored.
+
+    Args:
+        question: The broken callout's question.
+        answer: Its answer blocks, as Notion gave them.
+        toggles: The question toggle of each well-formed Q&A on the page.
+    """
+    asked = question[:2000].strip()
+    same = [t for t in toggles if block_text(t).strip() == asked]
+    if not same:
+        return False
+    try:
+        mine = _content(answer)
+        if mine is None:
+            return False
+        for toggle in same:
+            kids = (fetch_children(toggle["id"]) if toggle.get("has_children")
+                    else [])
+            if _content(kids) == mine:
+                return True
+    except _NOTION_ERRORS as e:
+        print(f"    cannot compare with a copy: {type(e).__name__} {e}",
+              file=sys.stderr)
+    return False
 
 
 def build_toggle_callout(question: str, answer_children: list[dict]) -> dict:
@@ -404,9 +526,12 @@ def query_paper_pages() -> list[str]:
 
 def heal_page(page_id: str, dry_run: bool = False) -> int:
     broken: list[tuple[dict, str, str | None]] = []
+    toggles: list[dict] = []  # the question toggle of each well-formed Q&A
     for co, parent_id, top_ancestor in find_qa_callouts(page_id):
         is_top = parent_id == page_id or parent_id.replace("-", "") == page_id.replace("-", "")
-        if is_well_formed_qa_callout(co, is_top):
+        toggle = _well_formed_toggle(co, is_top)
+        if toggle is not None:
+            toggles.append(toggle)
             continue
         broken.append((co, parent_id, top_ancestor))
 
@@ -416,10 +541,23 @@ def heal_page(page_id: str, dry_run: bool = False) -> int:
     page_children = fetch_children(page_id)
     fixed = 0
     for co, parent_id, top_ancestor in broken:
-        q, ans = extract_question_and_answer(co)
+        q, answer = _question_and_answer_blocks(co)
         if not q:
             print(f"  SKIP {co['id']}: no question text extractable", file=sys.stderr)
             continue
+        if _has_landed_copy(q, answer, toggles):
+            print(f"  drop {co['id'][-12:]} | {q[:70]} | rebuilt copy already on the page",
+                  file=sys.stderr)
+            if not dry_run:
+                try:
+                    api_delete(co["id"])
+                except urllib.error.HTTPError as e:
+                    print(f"    WARN delete old {co['id']}: {e.code}", file=sys.stderr)
+                    continue
+                page_children = fetch_children(page_id)
+            fixed += 1
+            continue
+        ans = [clone_with_children(k) for k in answer]
 
         # Placement priority:
         #  1. Already top-level and only format-broken → preserve exact position.
@@ -485,7 +623,15 @@ def heal_page(page_id: str, dry_run: bool = False) -> int:
     return fixed
 
 
-def main() -> None:
+# Pages in a row that may fail before the run stops. Every request already
+# retries through `notion_retry`, so pages that keep failing mean Notion is down
+# or refusing the token, and each page after them would fail the same way: a
+# sweep of the whole DB spent hours on timeouts and back-offs like that while
+# the rest of the qa-heal unit waited behind it.
+MAX_FAILURES_IN_A_ROW = 3
+
+
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--page", help="Fix only this page (default: recently edited)")
     ap.add_argument("--since-hours", type=float, default=6.0,
@@ -501,17 +647,42 @@ def main() -> None:
         pages = query_paper_pages()
     else:
         pages = query_recent_paper_pages(args.since_hours)
-    total_fixed = 0
+    total_fixed = checked = failed = in_a_row = 0
     for p in pages:
-        n = heal_page(p, dry_run=args.dry_run)
+        # One page that keeps failing (a 429 past every retry, a timeout, a
+        # block this code cannot read) must not stop the scan of the rest. A
+        # missing token is a SystemExit, which this lets through.
+        try:
+            n = heal_page(p, dry_run=args.dry_run)
+        except Exception as e:  # pylint: disable=broad-except
+            print(f"{p}: error {type(e).__name__} {e}", file=sys.stderr)
+            if not isinstance(e, _NOTION_ERRORS):
+                traceback.print_exc(file=sys.stderr)
+            failed += 1
+            in_a_row += 1
+            if in_a_row >= MAX_FAILURES_IN_A_ROW:
+                print(f"stopping: {in_a_row} pages in a row failed",
+                      file=sys.stderr)
+                break
+            continue
+        in_a_row = 0
+        checked += 1
         if n:
             print(f"page {p}: fixed {n} callout(s)")
             total_fixed += n
-    if total_fixed == 0:
+    unreached = len(pages) - checked - failed
+    if total_fixed == 0 and not failed:
         print("all callouts already well-formed")
     else:
-        print(f"total: {total_fixed} callout(s) healed across {len(pages)} page(s)")
+        summary = (f"total: {total_fixed} callout(s) healed across {checked} "
+                   f"page(s) checked")
+        if failed:
+            summary += f"; {failed} page(s) failed"
+        if unreached:
+            summary += f", {unreached} not reached"
+        print(summary)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
