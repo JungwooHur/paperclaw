@@ -172,23 +172,28 @@ def clone_with_children(b: dict) -> dict:
     return c
 
 
-def is_well_formed_qa_callout(b: dict, is_top_level: bool) -> bool:
+def _well_formed_toggle(b: dict, is_top_level: bool) -> dict | None:
+    """The question toggle of a well-formed Q&A callout, else None."""
     if b["type"] != "callout":
-        return False
+        return None
     co = b["callout"]
     if not is_top_level:
-        return False
+        return None
     if co.get("color") != "gray_background":
-        return False
+        return None
     if block_text(b):
-        return False
+        return None
     # Must have exactly a toggle as the single child
     if not b.get("has_children"):
-        return False
+        return None
     kids = fetch_children(b["id"])
     if len(kids) < 1 or kids[0]["type"] != "toggle":
-        return False
-    return True
+        return None
+    return kids[0]
+
+
+def is_well_formed_qa_callout(b: dict, is_top_level: bool) -> bool:
+    return _well_formed_toggle(b, is_top_level) is not None
 
 
 def find_qa_callouts(page_id: str) -> list[tuple[dict, str, str | None]]:
@@ -223,8 +228,8 @@ def find_qa_callouts(page_id: str) -> list[tuple[dict, str, str | None]]:
     return out
 
 
-def extract_question_and_answer(callout: dict) -> tuple[str, list[dict]]:
-    """Return (question_text, answer_children_clones) regardless of layout."""
+def _question_and_answer_blocks(callout: dict) -> tuple[str, list[dict]]:
+    """Return (question_text, answer blocks as Notion gave them), any layout."""
     co_text = block_text(callout)
     kids = fetch_children(callout["id"]) if callout.get("has_children") else []
 
@@ -232,27 +237,84 @@ def extract_question_and_answer(callout: dict) -> tuple[str, list[dict]]:
         toggle = kids[0]
         question = block_text(toggle).strip()
         ans_kids = fetch_children(toggle["id"]) if toggle.get("has_children") else []
-        return question, [clone_with_children(k) for k in ans_kids]
+        return question, ans_kids
 
     # Legacy: question in callout rich_text, answers are direct children
-    question = co_text.strip()
+    return co_text.strip(), kids
+
+
+def extract_question_and_answer(callout: dict) -> tuple[str, list[dict]]:
+    """Return (question_text, answer_children_clones) regardless of layout."""
+    question, kids = _question_and_answer_blocks(callout)
     return question, [clone_with_children(k) for k in kids]
 
 
-def _tree_text(clones: list[dict]) -> str:
-    """The plain text of a cloned block tree, each block before its children."""
-    parts = []
-    for clone in clones:
-        body = clone[clone["type"]]
-        parts.append("".join(r["text"]["content"]
-                             for r in body.get("rich_text", [])))
-        parts.append(_tree_text(body.get("children", [])))
-    return "\n".join(parts)
+# What Notion failing raises: an HTTP error, a timeout or a dropped connection
+# (all OSError), or a reply cut off mid-read. Anything else is a bug here.
+_NOTION_ERRORS = (OSError, http.client.HTTPException)
+
+# Block types whose content the API does not show, so two of them can hold
+# different things and still read the same.
+_OPAQUE_TYPES = {"unsupported"}
 
 
-def _qa_key(question: str, answer_children: list[dict]) -> tuple[str, str]:
-    """What makes two Q&A callouts the same one, whatever their layout."""
-    return question[:2000].strip(), _tree_text(answer_children)
+def _content(blocks: list[dict]) -> list | None:
+    """Everything a block tree holds, children included; None if not all shown.
+
+    The whole payload counts, not only its text: an equation's expression, an
+    image's url and caption, a block's type and its styling are not text, and a
+    copy that lacks them has lost them.
+    """
+    out = []
+    for b in blocks:
+        t = b["type"]
+        if t in _OPAQUE_TYPES:
+            return None
+        kids = (_content(fetch_children(b["id"])) if b.get("has_children")
+                else [])
+        if kids is None:
+            return None
+        out.append((t, json.dumps(b.get(t), sort_keys=True), kids))
+    return out
+
+
+def _has_landed_copy(question: str, answer: list[dict],
+                     toggles: list[dict]) -> bool:
+    """Does a well-formed Q&A on the page already hold exactly this one?
+
+    An insert that Notion applied but answered with a 5xx or a timeout leaves
+    its rebuilt copy beside the original, and nothing in that run can tell it
+    landed. The next run meets both, and removes the original instead of
+    inserting a second copy.
+
+    Only a Q&A asking the same question is read, so the other answers on the
+    page cost no request and one that cannot be read blocks nothing. A copy
+    that cannot be read is no proof, and neither is one that differs in
+    anything at all: the original is then rebuilt, because a duplicate can be
+    removed and an archived answer cannot be restored.
+
+    Args:
+        question: The broken callout's question.
+        answer: Its answer blocks, as Notion gave them.
+        toggles: The question toggle of each well-formed Q&A on the page.
+    """
+    asked = question[:2000].strip()
+    same = [t for t in toggles if block_text(t).strip() == asked]
+    if not same:
+        return False
+    try:
+        mine = _content(answer)
+        if mine is None:
+            return False
+        for toggle in same:
+            kids = (fetch_children(toggle["id"]) if toggle.get("has_children")
+                    else [])
+            if _content(kids) == mine:
+                return True
+    except _NOTION_ERRORS as e:
+        print(f"    cannot compare with a copy: {type(e).__name__} {e}",
+              file=sys.stderr)
+    return False
 
 
 def build_toggle_callout(question: str, answer_children: list[dict]) -> dict:
@@ -464,30 +526,26 @@ def query_paper_pages() -> list[str]:
 
 def heal_page(page_id: str, dry_run: bool = False) -> int:
     broken: list[tuple[dict, str, str | None]] = []
-    well_formed: list[dict] = []
+    toggles: list[dict] = []  # the question toggle of each well-formed Q&A
     for co, parent_id, top_ancestor in find_qa_callouts(page_id):
         is_top = parent_id == page_id or parent_id.replace("-", "") == page_id.replace("-", "")
-        if is_well_formed_qa_callout(co, is_top):
-            well_formed.append(co)
+        toggle = _well_formed_toggle(co, is_top)
+        if toggle is not None:
+            toggles.append(toggle)
             continue
         broken.append((co, parent_id, top_ancestor))
 
     if not broken:
         return 0
 
-    # An insert that Notion applied but answered with a 5xx or a timeout leaves
-    # its rebuilt copy beside the original, and nothing in that run can tell it
-    # landed. The next run meets both, so it removes the original instead of
-    # inserting a second copy.
-    in_place = {_qa_key(*extract_question_and_answer(co)) for co in well_formed}
     page_children = fetch_children(page_id)
     fixed = 0
     for co, parent_id, top_ancestor in broken:
-        q, ans = extract_question_and_answer(co)
+        q, answer = _question_and_answer_blocks(co)
         if not q:
             print(f"  SKIP {co['id']}: no question text extractable", file=sys.stderr)
             continue
-        if _qa_key(q, ans) in in_place:
+        if _has_landed_copy(q, answer, toggles):
             print(f"  drop {co['id'][-12:]} | {q[:70]} | rebuilt copy already on the page",
                   file=sys.stderr)
             if not dry_run:
@@ -499,6 +557,7 @@ def heal_page(page_id: str, dry_run: bool = False) -> int:
                 page_children = fetch_children(page_id)
             fixed += 1
             continue
+        ans = [clone_with_children(k) for k in answer]
 
         # Placement priority:
         #  1. Already top-level and only format-broken → preserve exact position.
@@ -570,10 +629,6 @@ def heal_page(page_id: str, dry_run: bool = False) -> int:
 # sweep of the whole DB spent hours on timeouts and back-offs like that while
 # the rest of the qa-heal unit waited behind it.
 MAX_FAILURES_IN_A_ROW = 3
-
-# What Notion failing raises: an HTTP error, a timeout or a dropped connection
-# (all OSError), or a reply cut off mid-read. Anything else is a bug here.
-_NOTION_ERRORS = (OSError, http.client.HTTPException)
 
 
 def main() -> int:

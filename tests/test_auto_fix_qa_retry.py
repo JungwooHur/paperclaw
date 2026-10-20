@@ -256,12 +256,43 @@ def _paragraph(content):
     return {"type": "paragraph", "paragraph": {"rich_text": [_text(content)]}}
 
 
+def _equation(expression):
+    return {"type": "equation", "equation": {"expression": expression}}
+
+
+def _image(url, caption):
+    return {"type": "image", "image": {
+        "type": "external", "external": {"url": url},
+        "caption": [_text(caption)]}}
+
+
+def _code(content):
+    return {"type": "code", "code": {
+        "rich_text": [_text(content)], "language": "python"}}
+
+
+def _answer_blocks(answer):
+    return [_paragraph(answer)] if isinstance(answer, str) else answer
+
+
+def _check_insert(children):
+    """Refuses what Notion refuses before applying any of an insert."""
+    for child in children:
+        body = child[child["type"]]
+        if child["type"] == "equation" and not body.get("expression"):
+            raise _http_error(400)
+        _check_insert(body.get("children", []))
+
+
 class _Workspace:
     """An in-memory Notion holding block trees, so `main()` runs end to end.
 
     `fail(method, path)` decides each request: None answers it, an exception is
     raised before anything changes, and `("after", exc)` applies the request
     and then raises, the way a 5xx or a timeout can follow a write that landed.
+    Reading the children of a block in `unreadable` answers 404, and an insert
+    holding an equation without its expression is refused whole, as Notion
+    refuses it.
     """
 
     def __init__(self, *pages):
@@ -269,6 +300,7 @@ class _Workspace:
         self.blocks = {p: {"type": "page", "children": []} for p in pages}
         self.requests = []
         self.fail = lambda method, path: None
+        self.unreadable = set()
         self._ids = itertools.count(1)
 
     def add(self, parent, btype, payload, after=None):
@@ -285,17 +317,44 @@ class _Workspace:
         return bid
 
     def legacy_qa(self, page, question, answer):
-        """A broken Q&A: the question in a default-color callout's text."""
+        """A broken Q&A: the question in a default-color callout's text.
+
+        `answer` is one paragraph's text or a list of blocks.
+        """
         return self.add(page, "callout", {
             "rich_text": [_text(question)], "color": "default",
-            "children": [_paragraph(answer)]})
+            "children": _answer_blocks(answer)})
 
     def good_qa(self, page, question, answer):
         return self.add(page, "callout", {
             "rich_text": [], "color": "gray_background",
             "children": [{"type": "toggle", "toggle": {
                 "rich_text": [_text(question)],
-                "children": [_paragraph(answer)]}}]})
+                "children": _answer_blocks(answer)}}]})
+
+    def shows(self, page):
+        """Every block type and every string a block holds, under `page`."""
+        found = set()
+
+        def strings(value):
+            if isinstance(value, str):
+                found.add(value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    strings(item)
+            elif isinstance(value, list):
+                for item in value:
+                    strings(item)
+
+        def walk(bid):
+            for kid in self.blocks[bid]["children"]:
+                b = self.blocks[kid]
+                found.add(b["type"])
+                strings(b[b["type"]])
+                walk(kid)
+
+        walk(page)
+        return found
 
     def callouts(self, page):
         """(color, question, answer) of each top-level callout, in order."""
@@ -329,9 +388,12 @@ class _Workspace:
     def _apply(self, method, path, body):
         m = re.fullmatch(r"/blocks/([^/?]+)/children(?:\?.*)?", path)
         if m and method == "GET":
+            if m.group(1) in self.unreadable:
+                raise _http_error(404)
             kids = self.blocks[m.group(1)]["children"]
             return {"results": [self._view(k) for k in kids], "has_more": False}
         if m and method == "PATCH":
+            _check_insert(body["children"])
             after, made = body.get("after"), []
             for child in body["children"]:
                 after = self.add(m.group(1), child["type"],
@@ -513,3 +575,89 @@ class TestAnInsertThatLandedIsNotMadeAgain:
         assert sorted(ws.callouts("page")) == [
             ("gray_background", "Q: what is x", "x is y"),
             ("gray_background", "Q: what is x", "x is z")]
+
+    @pytest.mark.parametrize("copy, original, kept", [
+        ([_paragraph("The loss is"), _equation(r"L = \sum_i x_i")],
+         [_paragraph("The loss is"), _equation(r"L = -\log p(y|x)")],
+         {r"L = -\log p(y|x)"}),
+        ([_paragraph("See below"), _image("https://e.test/5.png", "Figure 5")],
+         [_paragraph("See below"), _image("https://e.test/3.png", "Figure 3")],
+         {"https://e.test/3.png", "Figure 3"}),
+        ([_paragraph("See below"), _paragraph("")],
+         [_paragraph("See below"), _image("https://e.test/3.png", "Figure 3")],
+         {"https://e.test/3.png", "Figure 3"}),
+        ([_paragraph("use x = 1")], [_code("use x = 1")], {"code"}),
+    ], ids=["equation", "image", "image-vs-empty-paragraph", "block-type"])
+    def test_what_only_the_original_holds_is_not_archived(
+            self, workspace, monkeypatch, capsys, copy, original, kept):
+        # The same question and the same answer TEXT: an equation, an image or
+        # a block type is not text, and a copy that lacks it is not a copy.
+        ws = workspace("page")
+        ws.good_qa("page", "Q: what is the loss", copy)
+        ws.legacy_qa("page", "Q: what is the loss", original)
+
+        _run(monkeypatch, capsys, "--page", "page")
+
+        assert kept <= ws.shows("page")
+
+
+class TestOtherQAsAreNotRead:
+    """Only a Q&A asking the broken one's question can be its copy."""
+
+    def test_an_unreadable_answer_elsewhere_does_not_block_the_heal(
+            self, workspace, monkeypatch, capsys):
+        ws = workspace("page")
+        other = ws.good_qa("page", "Q: another question", "a")
+        toggle = ws.blocks[other]["children"][0]
+        answer = ws.blocks[toggle]["children"][0]
+        ws.add(answer, "paragraph", _paragraph("nested")["paragraph"])
+        ws.unreadable.add(answer)
+        ws.legacy_qa("page", "Q: what is x", "x is y")
+
+        code, out, err = _run(monkeypatch, capsys, "--page", "page")
+
+        assert code == 0
+        assert ws.callouts("page") == [
+            ("gray_background", "Q: another question", "a"),
+            ("gray_background", "Q: what is x", "x is y")]
+
+    def test_a_copy_that_cannot_be_read_is_no_proof(
+            self, workspace, monkeypatch, capsys):
+        # Unreadable, the copy cannot show it holds the answer, so the broken
+        # Q&A is rebuilt as before: a duplicate can be removed, a lost answer
+        # cannot be restored.
+        ws = workspace("page")
+        copy = ws.good_qa("page", "Q: what is x", "x is y")
+        ws.unreadable.add(ws.blocks[copy]["children"][0])
+        ws.legacy_qa("page", "Q: what is x", "x is y")
+
+        code, out, err = _run(monkeypatch, capsys, "--page", "page")
+
+        assert code == 0
+        assert [color for color, _, _ in ws.callouts("page")] == [
+            "gray_background", "gray_background"]
+
+    @pytest.mark.parametrize("broken", ["legacy", "no-question"])
+    def test_answers_to_other_questions_cost_no_request(
+            self, workspace, monkeypatch, capsys, broken):
+        # A page with one broken callout, healed or skipped, used to read the
+        # whole answer of every other Q&A on it, on every run.
+        ws = workspace("page")
+        toggles = []
+        for i in range(5):
+            callout = ws.good_qa("page", f"Q: question {i}",
+                                 [_paragraph(f"part {j}") for j in range(3)])
+            toggles.append(ws.blocks[callout]["children"][0])
+        if broken == "legacy":
+            ws.legacy_qa("page", "Q: what is x", "x is y")
+        else:
+            ws.add("page", "callout", {
+                "rich_text": [], "color": "default",
+                "children": [{"type": "toggle", "toggle": {
+                    "rich_text": [], "children": [_paragraph("y")]}}]})
+
+        _run(monkeypatch, capsys, "--page", "page")
+
+        read = {path for method, path in ws.requests if method == "GET"}
+        assert not [t for t in toggles
+                    if f"/blocks/{t}/children?page_size=100" in read]
