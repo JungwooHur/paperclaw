@@ -154,6 +154,8 @@ def _legacy_keys(tables: list) -> dict:
     Only a key that names ONE table and is no table's caption today: the old
     parser gave a table without a caption of its own the NEXT table's, and that
     key is the next table's now — matching it would take that table's image.
+    The tables `parse_tables` splits out of one id count as one: the old parser
+    read one caption for the id, and its image is the id's.
     """
     current = {_source_key(t) for t in tables}
     found = {}
@@ -162,7 +164,8 @@ def _legacy_keys(tables: list) -> dict:
             key = _cap_key(placed_caption(t["num"], t["legacy_caption"]))
             found.setdefault(key, []).append(t)
     return {key: ts[0] for key, ts in found.items()
-            if len(ts) == 1 and key not in current}
+            if len({t.get("container") or t["id"] for t in ts}) == 1
+            and key not in current}
 
 
 def forced_keys(placed: list, tables: list) -> set:
@@ -243,6 +246,61 @@ def _holds_several_tables(body: str) -> bool:
     return len(labels - {None}) > 1
 
 
+_CAPTION_OR_TABLE = re.compile(
+    r"<figcaption\b[^>]*>(?P<cap>.*?)</figcaption>|<(?P<close>/?)table\b(?P<attrs>[^>]*)>",
+    re.DOTALL | re.I)
+
+
+def _id_of(attrs: str):
+    found = re.search(r'\bid="([^"]+)"', attrs or "")
+    return found.group(1) if found else None
+
+
+def _tables_inside(body: str) -> list:
+    """[(element id, caption)] for each captioned table a table element holds,
+    or [] when the markup does not say which caption is whose.
+
+    LaTeXML gives two tables of a flex row one id. Each is pictured by its own
+    element: a panel figure holding one table caption and a table, else — the
+    same number of captions and top-level tables, each table with an id — the
+    k-th table under the k-th caption, which is how the panels, the caption
+    rows over table rows, and the caption-under-table layouts all read.
+
+    Args:
+        body: The markup inside the table element (`_element_body`).
+    """
+    captions = [ef._clean(c) for c in ef._CAP.findall(body)
+                if _OPENS_AS_TABLE.match(ef._clean(c))]
+    panels = []
+    for opening in _NESTED_FIGURE.finditer(body):
+        span = _element_span(body, opening.start())
+        inner = body[span[0]:span[1]] if span else ""
+        own = [ef._clean(c) for c in ef._CAP.findall(_without_nested_figures(inner))
+               if _OPENS_AS_TABLE.match(ef._clean(c))]
+        if len(own) == 1 and re.search(r"<table\b", inner, re.I):
+            tag = body[opening.start():body.find(">", opening.start()) + 1]
+            panels.append((_id_of(tag), own[0]))
+    if len(panels) == len(captions) > 1 and all(pid for pid, _ in panels):
+        return panels
+    order, depth = [], 0
+    for found in _CAPTION_OR_TABLE.finditer(body):
+        if found.group("cap") is not None:
+            cap = ef._clean(found.group("cap"))
+            if _OPENS_AS_TABLE.match(cap):
+                order.append(("caption", cap))
+        elif found.group("close"):
+            depth -= 1
+        else:
+            if depth == 0:
+                order.append(("table", _id_of(found.group("attrs"))))
+            depth += 1
+    caps = [x for kind, x in order if kind == "caption"]
+    ids = [x for kind, x in order if kind == "table"]
+    if len(caps) == len(ids) > 1 and all(ids):
+        return list(zip(ids, caps))
+    return []
+
+
 def _legacy_caption(html_text: str, at: int, fid: str) -> str:
     """What the pre-fix parser read as the caption of the table whose id is at `at`.
 
@@ -268,7 +326,12 @@ def parse_tables(html_text: str) -> list:
     prompt examples) had none — it was written as a bare `Table 5` — and a table
     with no caption of its own borrowed the next table's. `legacy_caption` is
     that old reading (`_legacy_caption`), the only thing that names the table an
-    image placed before the fix shows."""
+    image placed before the fix shows.
+
+    An id holding several captioned tables (`several_tables`) is one entry per
+    table when `_tables_inside` can tell them apart: `id` is the element that
+    pictures it, `container` the id it shares. Otherwise it stays one entry,
+    which `render_tables` pictures whole, every caption in it."""
     out, seen = [], set()
     sections = ef.source_sections(html_text)
     for m in _TID.finditer(html_text):
@@ -277,14 +340,19 @@ def parse_tables(html_text: str) -> list:
             continue
         seen.add(fid)
         num = int(m.group(2))
-        cap = _table_caption(_element_body(html_text, m.start()), num)
-        table = {"id": fid, "num": num, "caption": cap[:1900],
+        body = _element_body(html_text, m.start())
+        table = {"id": fid, "num": num, "caption": _table_caption(body, num)[:1900],
                  "legacy_caption": _legacy_caption(html_text, m.start(), fid)}
         section = ef.enclosing_section(sections, m.start())
         if section:
             table["section"] = section
-        if _holds_several_tables(_element_body(html_text, m.start())):
+        if _holds_several_tables(body):
             table["several_tables"] = True
+            parts = _tables_inside(body)
+            if parts:
+                out.extend(dict(table, id=pid, caption=cap[:1900], container=fid)
+                           for pid, cap in parts)
+                continue
         out.append(table)
     return out
 
@@ -431,7 +499,13 @@ def render_tables(arxiv_id: str, tables: list, outdir: str,
     bleeds in, and tiny helper <table>s (fragmentation) are filtered by size.
     Pass 2 (fallback): for any table left without an image — e.g. a transform-
     scaled panel whose box collapses — clip-screenshot the union of the nearest
-    ancestor that actually holds table content."""
+    ancestor that actually holds table content.
+
+    An id holding several captioned tables used to be pictured by its largest
+    one, under the id's caption and beside its citation, whichever table that
+    was. Each table `parse_tables` split out of one is pictured by its own
+    element; one it could not split goes straight to pass 2, which pictures the
+    whole element, every caption in it, so the caption it is given is in it."""
     from playwright.sync_api import sync_playwright
     out = {}
     idx = 0
@@ -453,8 +527,34 @@ def render_tables(arxiv_id: str, tables: list, outdir: str,
         except Exception:
             pg.goto(url, timeout=60000)
         pg.wait_for_timeout(150)
+        # One table of a container (`parse_tables`): its own element, never an
+        # ancestor, which holds the container's other table too.
+        for t in tables:
+            el = pg.query_selector(f'[id="{t["id"]}"]') if "container" in t else None
+            if not el:
+                continue
+            is_table = el.evaluate("e => e.tagName === 'TABLE'")
+            (el.evaluate_handle("e => e.parentElement || e").as_element()
+             if is_table else el).evaluate(_RESET_JS)
+            pg.wait_for_timeout(50)
+            boxes = [(tg.bounding_box(), tg)
+                     for tg in ([el] if is_table else el.query_selector_all("table"))]
+            boxes = [(b["width"] * b["height"], tg) for b, tg in boxes
+                     if b and b["width"] >= 10 and b["height"] >= 10]
+            if not boxes:
+                continue
+            path = os.path.join(outdir, f"table_{idx}.png")
+            idx += 1
+            try:
+                max(boxes, key=lambda x: x[0])[1].screenshot(path=path)
+            except Exception:
+                continue
+            if os.path.exists(path) and os.path.getsize(path) >= 300:
+                out[t["id"]] = path
         group_el, group_ids = {}, {}
         for t in sorted(tables, key=lambda x: x["num"]):
+            if t.get("several_tables"):
+                continue    # a container's part above; one not split, whole below
             idel = pg.query_selector(f'[id="{t["id"]}"]')
             if not idel:
                 continue
@@ -821,10 +921,10 @@ def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
             continue
         t = _which_table(caption, tables, legacy)
         why = ("not in the source" if t is None
-               else "another table shares its id counter; the picture may show it"
-               if counters[t["num"]] > 1
                else "its id holds several tables; the picture may show another"
-               if t.get("several_tables") else None)
+               if t.get("several_tables")
+               else "another table shares its id counter; the picture may show it"
+               if counters[t["num"]] > 1 else None)
         if why:
             plan["left"].append({"block": b["id"], "why": why})
             continue

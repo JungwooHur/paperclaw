@@ -1019,6 +1019,177 @@ class TestAContainerOfSeveralTables:
         plan = et.plan_relocation(blocks, et.parse_tables(self.HTML), ME)
         assert plan["moves"] == [] and plan["recaption"] == []
         assert [x["block"] for x in plan["left"]] == ["i1"]
+        assert plan["left"][0]["why"].startswith("its id holds several tables")
+
+
+class TestEachTableOfAContainerIsItsOwn:
+    """A new page pictures each table of a container by its own element, under
+    its own caption, beside its own citation. One image per id showed the
+    largest panel under the id's caption, cited where the OTHER table was."""
+
+    PANELS = TestAContainerOfSeveralTables.HTML
+
+    # The tables follow their captions in flex cells of their own.
+    CAPTIONS_THEN_TABLES = section_html("S4", 4, "Results", (
+        '<figure id="S4.T4" class="ltx_table"><div class="ltx_flex_figure">'
+        '<figure id="S4.T4.fig1" class="ltx_figure ltx_figure_panel">'
+        '<figcaption>Table 3: Tracking.</figcaption></figure>'
+        '<figure id="S4.T4.fig2" class="ltx_figure ltx_figure_panel">'
+        '<figcaption>Table 4: Memory.</figcaption></figure>'
+        '<div class="ltx_flex_cell"><table id="S4.T4.2"><tr><td>a</td></tr></table></div>'
+        '<div class="ltx_flex_cell"><table id="S4.T4.3"><tr><td>b</td></tr></table></div>'
+        '</div></figure>'))
+
+    # Each caption follows its table.
+    TABLES_THEN_CAPTIONS = section_html("S4", 4, "Results", (
+        '<figure id="S4.T5" class="ltx_table"><div class="ltx_flex_figure">'
+        '<table id="S4.T5.3"><tr><td>a</td></tr></table></div>'
+        '<figcaption>Table 4: Single models.</figcaption>'
+        '<div class="ltx_flex_figure"><table id="S4.T5.12"><tr><td>b</td></tr></table></div>'
+        '<figcaption>Table 5: Ensembles.</figcaption></figure>'))
+
+    def parts(self, html):
+        return [(t["id"], t["caption"], t.get("container")) for t in et.parse_tables(html)]
+
+    def test_panels_with_their_own_captions(self):
+        assert self.parts(self.PANELS) == [
+            ("S5.T8.fig1", "Table 7: Model sizes.", "S5.T8"),
+            ("S5.T8.fig2", "Table 8: Fixed settings.", "S5.T8")]
+
+    def test_captions_then_tables(self):
+        assert self.parts(self.CAPTIONS_THEN_TABLES) == [
+            ("S4.T4.2", "Table 3: Tracking.", "S4.T4"),
+            ("S4.T4.3", "Table 4: Memory.", "S4.T4")]
+
+    def test_tables_then_captions(self):
+        assert self.parts(self.TABLES_THEN_CAPTIONS) == [
+            ("S4.T5.3", "Table 4: Single models.", "S4.T5"),
+            ("S4.T5.12", "Table 5: Ensembles.", "S4.T5")]
+
+    def test_what_the_old_parser_wrote_for_the_id_still_names_it(self):
+        # The old parser wrote one caption per id, a bare `Table 5` for a long
+        # one; both parts carry it, and it still says the image is the id's.
+        parts = [dict(table("S4.T5", "Table 4: Single models.", legacy=""),
+                      id=pid, several_tables=True, container="S4.T5")
+                 for pid in ("S4.T5.3", "S4.T5.12")]
+        parts[1]["caption"] = "Table 5: Ensembles."
+        blocks = [heading("h4", "4 Results (결과)"), para("p4", "Table 5에 있다."),
+                  img("i5", "Table 5")]
+        plan = et.plan_relocation(blocks, parts, ME)
+        assert [(x["block"], x["why"].split(";")[0]) for x in plan["left"]] == [
+            ("i5", "its id holds several tables")]
+
+    def test_two_captions_and_one_table_stay_one_picture(self):
+        # Which caption the table belongs to cannot be read off the markup.
+        html = ('<figure id="A9.T2" class="ltx_table"><figcaption>Table 1: Robustness.'
+                '</figcaption><table id="A9.T2.5"><tr><td>1</td></tr></table>'
+                '<figcaption>Table 2: Arithmetic.</figcaption></figure>')
+        tables = et.parse_tables(html)
+        assert [(t["id"], t.get("several_tables"), t.get("container")) for t in tables] \
+            == [("A9.T2", True, None)]
+
+    def test_a_new_page_gets_each_one(self, monkeypatch):
+        page = [heading("h5", "5 Setup (설정)"),
+                para("p1", "모델 크기는 Table 7에 있다. " + "본문 " * 300),
+                para("p2", "고정 설정은 Table 8에 있다. " + "본문 " * 300)]
+        run = TestANewPageWithARestartedCounter().run_cycle
+        run(monkeypatch, page, self.PANELS)
+        images = [(page[i - 1]["id"], b["picture"], b["image"]["caption"][0]["plain_text"])
+                  for i, b in enumerate(page) if b["type"] == "image"]
+        assert images == [
+            ("p1", "picture-of-S5.T8.fig1", "Table 7: Model sizes."),
+            ("p2", "picture-of-S5.T8.fig2", "Table 8: Fixed settings.")]
+        assert run(monkeypatch, page, self.PANELS)["skipped_existing"]
+
+
+def _rendered_heights(html, tmp_path):
+    """{table id: picture height} from the real renderer on a local file."""
+    pytest.importorskip("playwright.sync_api")
+    src = tmp_path / "src.html"
+    src.write_text(html)
+    try:
+        images = et.render_tables("arxiv-id", et.parse_tables(html), str(tmp_path),
+                                  "file://" + str(src))
+    except Exception as e:   # no browser installed
+        pytest.skip(f"no browser: {e}")
+    heights = {}
+    for im in images:
+        with open(im["path"], "rb") as fh:
+            heights[im["id"]] = int.from_bytes(fh.read(24)[20:24], "big")
+    return heights
+
+
+class TestTheRendererPicturesEachPart:
+    """Runs the real renderer where a browser is installed: each part of a
+    container is pictured by itself, so a tall table's picture is tall."""
+
+    HTML = ('<html><body><section id="S5" class="ltx_section">'
+            '<h2 class="ltx_title">5 Setup</h2>'
+            '<figure id="S5.T8" class="ltx_table"><div class="ltx_flex_figure">'
+            '<figure id="S5.T8.fig1" class="ltx_figure ltx_figure_panel">'
+            '<figcaption class="ltx_caption">Table 7: Model sizes.</figcaption>'
+            '<table border="1"><tr><td>' + "N" * 40 + '</td><td>d</td></tr>'
+            + '<tr><td>1</td><td>2</td></tr>' * 20 + '</table></figure>'
+            '<figure id="S5.T8.fig2" class="ltx_figure ltx_figure_panel">'
+            '<figcaption class="ltx_caption">Table 8: Fixed settings.</figcaption>'
+            '<table border="1"><tr><td>' + "l" * 40 + '</td><td>1e-3</td></tr>'
+            '<tr><td>bs</td><td>64</td></tr></table></figure>'
+            '</div></figure></section></body></html>')
+
+    TALL = ('<table border="1" id="{}"><tr><td>' + "N" * 40 + '</td><td>d</td></tr>'
+            + '<tr><td>1</td><td>2</td></tr>' * 20 + '</table>')
+    SHORT = ('<table border="1" id="{}"><tr><td>' + "l" * 40 + '</td><td>1e-3</td></tr>'
+             '<tr><td>bs</td><td>64</td></tr></table>')
+
+    def page(self, figure):
+        return ('<html><body><section id="S4" class="ltx_section">'
+                f'<h2 class="ltx_title">4 Results</h2>{figure}</section></body></html>')
+
+    def test_each_panel_by_itself(self, tmp_path):
+        heights = _rendered_heights(self.HTML, tmp_path)
+        assert set(heights) == {"S5.T8.fig1", "S5.T8.fig2"}
+        assert heights["S5.T8.fig1"] > 3 * heights["S5.T8.fig2"]
+
+    def test_each_table_under_a_row_of_captions(self, tmp_path):
+        html = self.page(
+            '<figure id="S4.T4" class="ltx_table"><div class="ltx_flex_figure">'
+            '<div class="ltx_flex_cell"><figure id="S4.T4.fig1" class="ltx_figure '
+            'ltx_figure_panel"><figcaption>Table 3: Tracking.</figcaption></figure></div>'
+            '<div class="ltx_flex_cell"><figure id="S4.T4.fig2" class="ltx_figure '
+            'ltx_figure_panel"><figcaption>Table 4: Memory.</figcaption></figure></div>'
+            '<div class="ltx_flex_break"></div>'
+            f'<div class="ltx_flex_cell">{self.SHORT.format("S4.T4.2")}</div>'
+            '<div class="ltx_flex_break"></div>'
+            f'<div class="ltx_flex_cell">{self.TALL.format("S4.T4.3")}</div>'
+            '</div></figure>')
+        heights = _rendered_heights(html, tmp_path)
+        assert set(heights) == {"S4.T4.2", "S4.T4.3"}
+        assert heights["S4.T4.3"] > 3 * heights["S4.T4.2"]
+
+    def test_each_table_over_its_caption(self, tmp_path):
+        html = self.page(
+            '<figure id="S4.T5" class="ltx_table">'
+            f'<div class="ltx_flex_figure"><div class="ltx_flex_cell">{self.SHORT.format("S4.T5.3")}'
+            '</div></div><figcaption>Table 4: Single models.</figcaption>'
+            f'<div class="ltx_flex_figure"><div class="ltx_flex_cell">{self.TALL.format("S4.T5.12")}'
+            '</div></div><figcaption>Table 5: Ensembles.</figcaption></figure>')
+        heights = _rendered_heights(html, tmp_path)
+        assert set(heights) == {"S4.T5.3", "S4.T5.12"}
+        assert heights["S4.T5.12"] > 3 * heights["S4.T5.3"]
+
+    def test_one_that_cannot_be_split_is_pictured_whole(self, tmp_path):
+        # Its captions go into the picture, so the one it is captioned with is
+        # there whichever table it names.
+        alone = self.page('<figure id="S4.T1" class="ltx_table">'
+                          + self.SHORT.format("S4.T1.1") + '</figure>')
+        whole = self.page('<figure id="S4.T2" class="ltx_table">'
+                          '<figcaption>Table 1: Robustness.</figcaption>'
+                          + self.SHORT.format("S4.T2.5")
+                          + '<figcaption>Table 2: Arithmetic.</figcaption></figure>')
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        table_only = _rendered_heights(alone, tmp_path / "a")["S4.T1"]
+        assert _rendered_heights(whole, tmp_path / "b")["S4.T2"] > table_only + 40
 
 
 class TestACaptionThatAlreadyNamesItsTable:
