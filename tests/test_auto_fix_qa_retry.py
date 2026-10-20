@@ -247,6 +247,28 @@ class TestTheHealerQuery:
         monkeypatch.setattr(aq.urllib.request, "urlopen", urlopen)
         assert hp._post_retry("/databases/db/query", {}) == {"results": []}
 
+    @pytest.mark.parametrize("code", [502, 429])
+    def test_dropped_connections_and_errors_share_one_budget(
+            self, monkeypatch, code):
+        # Every dropped connection used to restart the HTTP ladder: five
+        # errors, a timeout, five errors again... came to 30 sends.
+        import heal_paper_pages as hp
+        sent = []
+
+        def urlopen(req, timeout=None):
+            sent.append(req)
+            if len(sent) % 6 == 0:
+                raise TimeoutError("timed out")
+            raise _http_error(code, retry_after="30" if code == 429 else None)
+
+        monkeypatch.setenv("NOTION_TOKEN", "test-token")
+        monkeypatch.setattr(aq.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(hp.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(aq.urllib.request, "urlopen", urlopen)
+        with pytest.raises(OSError):
+            hp._post_retry("/databases/db/query", {})
+        assert len(sent) <= hp.QUERY_ATTEMPTS
+
 
 def _text(content):
     return {"type": "text", "text": {"content": content}}

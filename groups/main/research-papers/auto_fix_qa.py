@@ -99,7 +99,7 @@ def api_get(path: str) -> dict:
 
 def api_post(path: str, body: dict, *,
              attempts: int = notion_retry.MAX_RETRIES) -> dict:
-    """POSTs to Notion; `attempts` lets a caller stretch the retry ladder."""
+    """POSTs to Notion; `attempts` caps the sends (1: the caller retries)."""
     req = urllib.request.Request(
         API + path, method="POST",
         data=json.dumps(body).encode(), headers=headers(),
