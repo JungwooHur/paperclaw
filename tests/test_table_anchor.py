@@ -361,6 +361,39 @@ class TestOnlyATopLevelHeadingIsTheSection:
         assert et.table_anchors([table("S4.T2", "TABLE II: Mixture.")],
                                 blocks)["S4.T2"] == ("hIV", False)
 
+    def test_a_local_item_of_another_section_is_not_the_section(self):
+        # Section 4 shows only as `4.1`/`4.2`; the `4.` is the fourth item of
+        # section 2, and taking it moved an uncited table of section 4 there.
+        blocks = [heading("h1", "1 Introduction (서론)"), para("p1", "서론."),
+                  heading("h2", "2 Method (방법)"), para("p2", "방법."),
+                  heading("i1", "1. Backbone (백본)", 3), heading("i2", "2. Goal (목표)", 3),
+                  heading("i4", "4. Flexibility (유연성)", 3), para("q4", "본문."),
+                  heading("h3", "3 Training (학습)"), para("p3", "학습."),
+                  heading("h41", "4.1 Setup (설정)", 2), para("p41", "설정."),
+                  heading("h42", "4.2 Results (결과)", 2), para("p42", "결과."),
+                  heading("h5", "5 Conclusion (결론)"), para("p5", "결론.")]
+        assert et.table_anchors([table("S4.T2", "Table 2: Ablation.")],
+                                blocks)["S4.T2"] == ("h41", False)
+        assert ef._anchor_for("3", blocks, "S4.F3") == "h41"
+
+    def test_nor_one_of_a_later_section(self):
+        blocks = [heading("h3", "3 Training (학습)"), para("p3", "학습."),
+                  heading("h41", "4.1 Setup (설정)", 2), para("p41", "설정."),
+                  heading("h5", "5 Conclusion (결론)"), para("p5", "결론."),
+                  heading("k", "핵심 요약", 2),
+                  heading("i3", "3. Cost (비용)", 3), heading("i4", "4. Limits (한계)", 3)]
+        assert et.table_anchors([table("S4.T2", "Table 2: Ablation.")],
+                                blocks)["S4.T2"] == ("h41", False)
+
+    def test_nor_a_heading_out_of_order_with_its_neighbours(self):
+        # Between `2` and `4`, a `6.` is not where section 6 begins.
+        blocks = [heading("h1", "1 Introduction (서론)"), para("p1", "서론."),
+                  heading("h2", "2 Related Work (관련 연구)"), para("p2", "본문."),
+                  heading("g6", "6. 요약"), para("q6", "본문."),
+                  heading("g4", "4. 요약"), para("q4", "본문.")]
+        assert et.table_anchors([table("S6.T9", "Table 9: Results.")],
+                                blocks)["S6.T9"] == (None, False)
+
     def test_a_section_the_page_opens_at_its_first_subsection(self):
         blocks = [heading("h5", "5 Post-Training"), para("p5", "본문."),
                   heading("h61", "6.1 Dense features", 3), para("p61", "본문."),

@@ -746,11 +746,49 @@ def _numbering_mirrors(blocks: list, sections: list) -> bool:
     return len(agree) >= 2
 
 
+def _heading_number(text: str):
+    """The section a heading's label names: 4 for `4 …`, `4.2 …` or `IV-A …`."""
+    n = _top_level_number(text)
+    return n if n is not None else _subsection_of(text)
+
+
+def _opens_section(headings: list, numbers: list, i: int, n: int) -> bool:
+    """Can heading `i`, labelled `n`, be where section `n` opens?
+
+    Not when a numbered heading sits above it in the outline (before it, and
+    shallower): that makes it an item of that section — a `4.` under `2 Method`
+    is the fourth item of section 2, and under `4.1` the fourth of 4.1. Nor
+    when it is out of order with the numbered headings of its own level on
+    either side: between `2` and `4`, a `6.` is not where section 6 begins.
+
+    Args:
+        headings: The page's headings, in page order.
+        numbers: `_heading_number` of each.
+        i: The heading asked about.
+        n: Its label.
+    """
+    level = above = _level(headings[i])
+    for j in range(i - 1, -1, -1):
+        if _level(headings[j]) < above:
+            above = _level(headings[j])
+            if numbers[j] is not None:
+                return False
+    same = [j for j in range(len(headings))
+            if j != i and _level(headings[j]) == level and numbers[j] is not None]
+    before = [numbers[j] for j in same if j < i]
+    after = [numbers[j] for j in same if j > i]
+    return (not before or before[-1] <= n) and (not after or after[0] >= n)
+
+
 def _numbered_heading(n: int, blocks: list):
-    """The heading of section `n`: the shallowest heading labelled `n`, else the
-    first of its subsections (a page may open the section at `6.1`)."""
+    """The heading of section `n`: the shallowest heading labelled `n` that can
+    open it (`_opens_section`), else the first of its subsections (a page may
+    open the section at `6.1`)."""
     headings = [b for b in blocks if b["type"].startswith("heading")]
-    found = _shallowest([b for b in headings if _top_level_number(_block_text(b)) == n])
+    numbers = [_heading_number(_block_text(b)) for b in headings]
+    found = _shallowest([b for i, b in enumerate(headings)
+                         if _top_level_number(_block_text(b)) == n
+                         and _opens_section(headings, numbers, i, n)])
     if found:
         return found
     return next((b["id"] for b in headings if _subsection_of(_block_text(b)) == n), None)
