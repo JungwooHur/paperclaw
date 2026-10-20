@@ -30,7 +30,9 @@ Usage: python3 auto_fix_qa.py [--page PAGE_ID] [--dry-run]
 from __future__ import annotations
 import argparse, json, os, re, sys, time, urllib.request, urllib.error
 
-API = "https://api.notion.com/v1"
+import notion_retry
+
+API ="https://api.notion.com/v1"
 # Notion occasionally stops responding mid-request (observed: 502s followed by
 # a TCP-ESTABLISHED connection that hangs indefinitely on read). Without an
 # explicit timeout, systemd runs of this healer can block the whole qa-heal
@@ -51,9 +53,43 @@ def headers() -> dict:
     }
 
 
+# The one POST here that changes nothing. Every other POST creates something.
+_QUERY_PATH = re.compile(r"/databases/[^/?]+/query")
+
+
+def _send(req: urllib.request.Request, write: bool) -> bytes:
+    """Opens a Notion request, retrying what `notion_retry` says is worth it.
+
+    These helpers had no retry while every other script's did, so a single 429
+    on a read crashed the healer and ended that cycle's Q&A heal for every page
+    after it.
+
+    Args:
+        req: The request. A retry sends it again unchanged.
+        write: True when the request changes the page. Then only a 429 is
+            retried: a 5xx can arrive after the write applied, and the insert
+            of a rebuilt callout sent twice would leave two copies.
+
+    Returns:
+        The response body.
+
+    Raises:
+        urllib.error.HTTPError: The last failure, once it is not worth retrying
+            or the attempts are spent.
+    """
+    for attempt in range(1, notion_retry.MAX_RETRIES + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read()
+        except urllib.error.HTTPError as err:
+            if not notion_retry.should_retry(err, attempt, write=write):
+                raise
+            time.sleep(notion_retry.retry_delay(err, attempt))
+    raise RuntimeError("unreachable")  # The loop either returns or raises.
+
+
 def api_get(path: str) -> dict:
     req = urllib.request.Request(API + path, headers=headers())
-    return json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+    return json.loads(_send(req, write=False))
 
 
 def api_post(path: str, body: dict) -> dict:
@@ -61,7 +97,7 @@ def api_post(path: str, body: dict) -> dict:
         API + path, method="POST",
         data=json.dumps(body).encode(), headers=headers(),
     )
-    return json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+    return json.loads(_send(req, write=not _QUERY_PATH.fullmatch(path)))
 
 
 def api_patch(path: str, body: dict) -> dict:
@@ -69,14 +105,14 @@ def api_patch(path: str, body: dict) -> dict:
         API + path, method="PATCH",
         data=json.dumps(body).encode(), headers=headers(),
     )
-    return json.loads(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read())
+    return json.loads(_send(req, write=True))
 
 
 def api_delete(block_id: str) -> None:
     req = urllib.request.Request(
         f"{API}/blocks/{block_id}", method="DELETE", headers=headers()
     )
-    urllib.request.urlopen(req, timeout=HTTP_TIMEOUT).read()
+    _send(req, write=True)
 
 
 def fetch_children(pid: str) -> list[dict]:
@@ -503,7 +539,14 @@ def main() -> None:
         pages = query_recent_paper_pages(args.since_hours)
     total_fixed = 0
     for p in pages:
-        n = heal_page(p, dry_run=args.dry_run)
+        # One page that keeps failing (a 429 past every retry, a timeout) must
+        # not stop the scan of the rest. A missing token is a SystemExit, which
+        # this lets through, so a run that cannot reach Notion still stops.
+        try:
+            n = heal_page(p, dry_run=args.dry_run)
+        except Exception as e:  # pylint: disable=broad-except
+            print(f"{p}: error {type(e).__name__} {e}", file=sys.stderr)
+            continue
         if n:
             print(f"page {p}: fixed {n} callout(s)")
             total_fixed += n

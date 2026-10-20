@@ -23,19 +23,28 @@ MAX_RETRY_WAIT = 30.0
 # spends the window a real retry needs.
 RETRY_CODES = (429, 500, 502, 503, 504)
 
+# A write is repeated only on a rate limit, which Notion refuses before applying
+# anything. A 5xx can arrive AFTER the write applied, and an append sent again
+# then leaves two copies of the block.
+WRITE_RETRY_CODES = (429,)
 
-def should_retry(err, attempt: int, max_retries: int = MAX_RETRIES) -> bool:
+
+def should_retry(err, attempt: int, max_retries: int = MAX_RETRIES, *,
+                 write: bool = False) -> bool:
     """Is this failure worth trying again?
 
     Args:
         err: The `HTTPError` that was raised.
         attempt: Which attempt just failed, counting from 1.
         max_retries: How many attempts the caller allows in total.
+        write: True when the request changes something (a PATCH, a DELETE, a
+            POST that creates). Only a rate limit is retried then.
 
     Returns:
         True when the code is transient and attempts remain.
     """
-    return attempt < max_retries and getattr(err, 'code', None) in RETRY_CODES
+    codes = WRITE_RETRY_CODES if write else RETRY_CODES
+    return attempt < max_retries and getattr(err, 'code', None) in codes
 
 
 def retry_delay(err, attempt: int) -> float:
