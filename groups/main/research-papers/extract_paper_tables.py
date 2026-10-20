@@ -359,6 +359,7 @@ def parse_tables(html_text: str) -> list:
             if parts:
                 out.extend(dict(table, id=pid, caption=cap[:1900], container=fid)
                            for pid, cap in parts)
+                seen.update(pid for pid, _ in parts)
                 continue
         out.append(table)
     return out

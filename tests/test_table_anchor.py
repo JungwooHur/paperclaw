@@ -1076,6 +1076,10 @@ class TestEachTableOfAContainerIsItsOwn:
             ("S4.T5.3", "Table 4: Single models.", "S4.T5"),
             ("S4.T5.12", "Table 5: Ensembles.", "S4.T5")]
 
+    def test_a_part_is_not_parsed_twice(self):
+        html = self.TABLES_THEN_CAPTIONS.replace('id="S4.T5.3"', 'id="S4.T4"')
+        assert [t["id"] for t in et.parse_tables(html)] == ["S4.T4", "S4.T5.12"]
+
     def test_what_the_old_parser_wrote_for_the_id_still_names_it(self):
         # The old parser wrote one caption per id, a bare `Table 5` for a long
         # one; both parts carry it, and it still says the image is the id's.
