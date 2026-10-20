@@ -422,12 +422,41 @@ class TestTheSectionIsTheOneTheSourcePrintsItIn:
 
     def test_a_number_on_a_page_that_shows_it_numbers_as_the_source(self):
         page = [heading("e1", "1 Introduction (서론)"), heading("e2", "2 관련 연구"),
+                heading("e3", "3 Architecture (구조)"),
                 heading("e4", "4 데이터셋"), para("q4", "본문.")]
         tables = et.parse_tables(self.SUMMARY_HTML)
         sections = ef.source_sections(self.SUMMARY_HTML)
         anchors = et.table_anchors(tables, page, sections)
         assert anchors["S4.T3"] == ("e4", False)
         assert anchors["S2.T1"] == ("e2", False)
+
+    def test_one_agreeing_heading_is_not_enough(self):
+        # A summary opens with `1. Introduction` as the paper does and numbers
+        # the rest itself: its `4.` is a conclusion, not the source's dataset.
+        page = [heading("g1", "1. Introduction (서론)"), para("q1", "본문."),
+                heading("g2", "2. 핵심 아이디어"), para("q2", "본문."),
+                heading("g3", "3. 주요 실험 결과"), para("q3", "본문."),
+                heading("g4", "4. 결론 및 한계"), para("q4", "본문.")]
+        tables = et.parse_tables(self.SUMMARY_HTML)
+        sections = ef.source_sections(self.SUMMARY_HTML)
+        assert not ef._numbering_mirrors(page, sections)
+        assert et.table_anchors(tables, page, sections)["S4.T3"] == (None, False)
+        assert et.plan_relocation(page + [img("i3", "Table 3: Clip scenarios.")],
+                                  tables, ME, sections=sections)["moves"] == []
+
+    def test_a_heading_that_shortens_a_long_title_agrees_with_it(self):
+        html = "".join(section_html(f"S{n}", n, title,
+                                    table_html("S2.T1", "Table 1: Benchmark.") if n == 2 else "")
+                       for n, title in [(1, "Introduction"), (2, "Embodied Reasoning"),
+                                        (3, "Robot Actions"),
+                                        (4, "Specializing and Adapting the Model for "
+                                            "New Embodiments")])
+        page = [heading("m1", "1. Introduction (서론)"), para("q1", "본문."),
+                heading("m2", "2. 모델 제품군"), para("q2", "본문."),
+                heading("m4", "4. Specializing and Adapting the Model"), para("q4", "본문.")]
+        sections = ef.source_sections(html)
+        assert ef._numbering_mirrors(page, sections)
+        assert et.table_anchors(et.parse_tables(html), page, sections)["S2.T1"] == ("m2", False)
 
     def test_a_title_in_the_bracket_counts_too(self):
         page = [heading("g1", "1. 기존 연구의 한계"), heading("g3", "3. 인과 데이터셋 (Causal Dataset)")]

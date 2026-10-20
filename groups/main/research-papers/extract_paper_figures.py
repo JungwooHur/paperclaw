@@ -699,32 +699,51 @@ def _section_number(section: dict):
     return int(found.group(1)) if found else None
 
 
+_SHORTENED_TITLE = 16
+
+
+def _same_title(a: str, b: str) -> bool:
+    """Are title keys `a` and `b` one title, one perhaps cut short?
+
+    The shorter must keep `_SHORTENED_TITLE` characters, so a generic word
+    (`introduction`, `experiments`) is never the start of a longer title.
+    """
+    short, long_ = sorted((a, b), key=len)
+    return a == b or (len(short) >= _SHORTENED_TITLE and long_.startswith(short))
+
+
 def _numbering_mirrors(blocks: list, sections: list) -> bool:
     """Does the page number its sections as the source does?
 
-    Only on evidence: a numbered heading carrying the title the source prints
-    under the same number, and none carrying one it prints under another. A
-    page that summarises a paper numbers its own sections — its `3.` may be the
-    source's 4 — and a heading in Korean alone says nothing either way.
+    Only on evidence: numbered headings of two sections carrying the titles the
+    source prints under the same numbers, and none carrying one it prints under
+    another. A page that summarises a paper numbers its own sections — its `3.`
+    may be the source's 4 — and a heading in Korean alone says nothing either
+    way. One heading is not enough: a summary opens with `1. Introduction` as
+    the paper does, and then numbers the rest itself. A heading that shortens a
+    long title (`4. Specializing and Adapting X` for the source's `… X for New
+    Embodiments`) carries it as well (`_same_title`).
     """
     numbers = {}
     for s in sections:
         n, key = _section_number(s), _title_key(s.get("title"))
         if n is not None and len(key) >= 4:
             numbers[key] = n
-    agree = False
+    agree = set()
     for b in blocks:
         if not b["type"].startswith("heading"):
             continue
         text = _block_text(b)
         n = _top_level_number(text)
-        found = {numbers[k] for k in _heading_title_keys(text) if k in numbers}
+        keys = _heading_title_keys(text)
+        found = {num for key, num in numbers.items()
+                 if any(_same_title(key, k) for k in keys)}
         if n is None or not found:
             continue
         if n not in found:
             return False
-        agree = True
-    return agree
+        agree.add(n)
+    return len(agree) >= 2
 
 
 def _numbered_heading(n: int, blocks: list):
