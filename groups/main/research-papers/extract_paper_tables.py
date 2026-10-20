@@ -216,7 +216,10 @@ def _table_caption(body: str, num: int) -> str:
 
     Its own `<figcaption>` is the one not inside a nested figure: a composite
     table nests a figure per panel, each captioned "(a) …", and the table's own
-    caption — the one carrying its number — sits beside them.
+    caption — the one carrying its number — sits beside them. Without one, the
+    only table caption nested in it is its own: a rotated table puts its id on
+    a wrapper around the figure that holds it (`Table SI-2`, which no counter
+    matches).
     """
     own = [ef._clean(c) for c in ef._CAP.findall(_without_nested_figures(body))]
     for cap in own:
@@ -224,9 +227,13 @@ def _table_caption(body: str, num: int) -> str:
             return cap
     if own:
         return own[0]
-    for cap in ef._CAP.findall(body):
-        if caption_number(ef._clean(cap)) == num:
-            return ef._clean(cap)
+    nested = [ef._clean(c) for c in ef._CAP.findall(body)]
+    labelled = [cap for cap in nested if _OPENS_AS_TABLE.match(cap)]
+    if len(labelled) == 1:
+        return labelled[0]
+    for cap in nested:
+        if caption_number(cap) == num:
+            return cap
     return ""
 
 

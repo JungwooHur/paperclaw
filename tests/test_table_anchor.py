@@ -555,6 +555,16 @@ class TestTheCaptionIsTheTablesOwn:
                 '<figcaption>Table 3: Both halves.</figcaption></figure>')
         assert et.parse_tables(html)[0]["caption"] == "Table 3: Both halves."
 
+    def test_a_figure_the_id_wraps_carries_its_caption(self):
+        # A rotated table: the id is on a wrapper, the figure with the caption
+        # inside it, and the label is none the id's counter could match.
+        html = ('<div id="S2.T2" class="ltx_table ltx_transformed_outer">'
+                '<div class="ltx_transformed_inner"><figure>'
+                '<figcaption>Table SI-2: Every training run.</figcaption>'
+                '<object id="S2.T2.g1" class="ltx_graphics"></object>'
+                '</figure></div></div>')
+        assert et.parse_tables(html)[0]["caption"] == "Table SI-2: Every training run."
+
     def test_what_the_old_parser_read_is_kept_beside_it(self):
         # Pages placed before the fix carry THAT caption, and only it says which
         # table such an image shows.
