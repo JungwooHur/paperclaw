@@ -119,9 +119,11 @@ paperclaw/
 │   ├── agent-runner/              # Code that runs inside the container
 │   │   ├── package.json
 │   │   ├── tsconfig.json
-│   │   └── src/
-│   │       ├── index.ts           # Entry point (query loop, IPC polling, session resume)
-│   │       └── ipc-mcp-stdio.ts   # Stdio-based MCP server for host communication
+│   │   ├── src/
+│   │   │   ├── index.ts           # Entry point (query loop, IPC polling, session resume)
+│   │   │   ├── turn-attribution.ts # Which inputs each result answered
+│   │   │   └── ipc-mcp-stdio.ts   # Stdio-based MCP server for host communication
+│   │   └── test/                  # Its tests, kept out of src/ (compiled at every start)
 │   └── skills/
 │       └── agent-browser.md       # Browser automation skill
 │
@@ -420,6 +422,17 @@ Scheduled runs are deferred instead; see [How Scheduling Works](#how-scheduling-
 The refusal and the error messages are worded by the CLI bundled with the agent SDK, which the SDK spawns from beside its own module, not by the global `claude-code` the image also installs. It runs non-interactive under the SDK (its stdout is a pipe), and words its errors for that mode. `container/agent-runner/package.json` pins the SDK to one exact version, and `src/usage-limit-cli-sentences.json` lists, read out of that version's bundle by `scripts/extract-usage-limit-sentences.ts`, every refusal it can write and every error message it can return as a result, the latter as templates whose filled-in parts are marked. `src/usage-limit.ts` builds its error check from those templates; `src/usage-limit-cli.test.ts` checks the classifier against every refusal and every error, and that no error is an answer. The test fails for any pin the list was not read from, so an SDK bump stays red until `npx tsx scripts/extract-usage-limit-sentences.ts <cli.js>` reads the list again from the new bundle; a reworded refusal then fails the classifier check instead of going out as a reply.
 
 `API Error: Rate limit reached` is deliberately not treated as a usage limit. It is a 429 without the account's usage headers, a request-rate throttle rather than a quota window, and the hour's hold for an unknown reset would delay messages far longer than such a throttle. It stays an error sent as the reply.
+
+### Turn Attribution
+
+The runner reports which inputs each result answered, so the host can settle exactly those messages (#114). The host ignores it for now; reading it is the next step.
+
+- **Input ids.** An IPC input file may carry `ref` beside `type` and `text`. Its id is that `ref`, or its file name when it has none. The stdin prompt's id is `ContainerInput.promptRef`, or `stdin`. Files already waiting when a container starts are drained into its first prompt, and that prompt's ids are `[promptRef, ...files]`.
+- **`turn`.** Every output the runner makes from an SDK result carries `turn: {inputs, nudge?}`, a textless one (`result: null`) included: the ids of the inputs that result's turn took, in the order the CLI took them. `nudge: true` marks a turn that took the runner's background-task reminder, which is no input, so a turn only the nudge started has `inputs: []`. The session-update marker written after a query and the runner's error outputs carry no `turn`, which tells a textless answer from the marker.
+- **How it is known.** A `result` names no input, so the runner starts the CLI with `--replay-user-messages`. Each push goes out under a fresh uuid (the CLI silently drops one it has seen) and comes back once, as a replayed user message, when the CLI takes it, whether as a turn's prompt or merged into a running turn. The acknowledgements since the previous result belong to the next result. A follow-up sent while a tool runs is merged into that turn; one sent during the turn's last API call is the next turn's.
+- **When it is missing or short.** A success result with no acknowledged input means replay is not working: the runner drops `turn` for the rest of that container and logs it once, so a missing `turn` means unknown, never "answered nothing". A group whose runner copy predates this writes no `turn` at all (see [Per-Group Copies Are Seeded Once](#per-group-copies-are-seeded-once)). A turn the CLI fails before it yields any message (`error_during_execution`) acknowledges nothing, so its result has `inputs: []` although it took its input. When a query ends, the runner logs every input no result answered (`Input no result answered`). An input whose turn kept no answer, a failed or a textless one, is sent to the model again inside the next turn's request.
+
+`container/agent-runner/test/turn-attribution-probe.test.ts` checks these cases against a fixture recorded from the compiled runner, offline, with the CLI the runner pins, and fails for any other SDK version. After an SDK bump, rebuild the image and run `scripts/probe-turn-attribution.sh` again.
 
 ---
 
