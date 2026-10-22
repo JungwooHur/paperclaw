@@ -73,6 +73,57 @@ interface OpenPrompt {
   cursor: string;
   /** The input file it was piped in as; the first prompt has none. */
   file?: string;
+  /**
+   * The id the runner reports it by in a result's `turn`: the cursor range
+   * its messages cover (inputRef). Missing only from a record an older
+   * process saved.
+   */
+  ref?: string;
+  /** A result's `turn` named it, but an older prompt is still open. */
+  answered?: boolean;
+}
+
+/**
+ * The input id of the messages after cursor `from`, up to cursor `to`. It
+ * names its own range, so an id from a file an earlier container left, which
+ * the next container drains at start-up, is still recognised.
+ */
+function inputRef(from: string, to: string): string {
+  return `${from}|${to}`;
+}
+
+/** The cursor range an input id names, or null for an id that is no range. */
+function refRange(ref: string): { from: string; to: string } | null {
+  const bar = ref.indexOf('|');
+  if (bar < 0) return null;
+  return { from: ref.slice(0, bar), to: ref.slice(bar + 1) };
+}
+
+/**
+ * Drops the answered prompts off the front of `prompts`. Returns the cursor
+ * at the end of the last one dropped, or undefined when none was.
+ */
+function shiftAnswered(prompts: OpenPrompt[]): string | undefined {
+  let cursor: string | undefined;
+  while (prompts.length > 0 && prompts[0].answered) {
+    cursor = prompts.shift()!.cursor;
+  }
+  return cursor;
+}
+
+/**
+ * Marks the prompts a result's turn names answered. Returns the ids it names
+ * that are no open prompt of this container: a file an earlier container
+ * left, drained into this one's first prompt, answers no prompt here.
+ */
+function markAnswered(prompts: OpenPrompt[], inputs: string[]): string[] {
+  const unknown: string[] = [];
+  for (const id of inputs) {
+    const prompt = prompts.find((p) => p.ref === id);
+    if (prompt) prompt.answered = true;
+    else unknown.push(id);
+  }
+  return unknown;
 }
 // Per group with a message container running: its open prompts, oldest first.
 const openPrompts: Record<string, OpenPrompt[]> = {};
@@ -256,7 +307,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // after it puts back only the messages that came later. Not the cursor at
   // the time, which a follow-up piped in mid-answer has already moved on.
   let answeredCursor = previousCursor;
-  const prompts: OpenPrompt[] = [{ cursor: lastAgentTimestamp[chatJid] }];
+  const promptRef = inputRef(previousCursor, lastAgentTimestamp[chatJid]);
+  const prompts: OpenPrompt[] = [
+    { cursor: lastAgentTimestamp[chatJid], ref: promptRef },
+  ];
   openPrompts[chatJid] = prompts;
   // This container was never refused, whatever the last run left behind.
   closingOnRefusal.delete(chatJid);
@@ -266,15 +320,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // stdin, idle timer and pipes belong to its next container: a late callback
   // delivers what it carries and writes none of them.
   let runEnded = false;
+  // Whether this container's results say which inputs they answered (`turn`,
+  // docs/SPEC.md "Turn Attribution"): unknown until its first result. Off for
+  // good once a result with text comes without one: a runner that predates
+  // it, or one whose guard found replay broken. A textless output without one
+  // says nothing either way: it is the session marker, or a textless result
+  // that cannot be told from it. (Cast, or the checks after the run would
+  // read it as never reassigned.)
+  let attribution = 'unknown' as 'unknown' | 'on' | 'off';
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
+  const onOutput = async (result: ContainerOutput): Promise<void> => {
     // Streaming output callback — called for each agent result
     let closed = false;
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
+    const raw = result.result
+      ? typeof result.result === 'string'
+        ? result.result
+        : JSON.stringify(result.result)
+      : null;
+    if (!runEnded && attribution !== 'off') {
+      if (result.turn) attribution = 'on';
+      else if (raw !== null) attribution = 'off';
+    }
+    const turn = attribution === 'on' ? result.turn : undefined;
+    if (raw !== null) {
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (runEnded) {
         logger.warn(
@@ -285,6 +353,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const limit = recordUsageLimit(raw);
       if (limit) {
         // The CLI's refusal, not an answer: hold the request for the reset.
+        // The refused turn's inputs stay unanswered.
         if (!runEnded) {
           usageLimited = true;
           // Put the unanswered messages back now, not when the container
@@ -305,21 +374,34 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // A request got through: an open window is over. The held messages it
       // releases run at the end, below.
       closed = closeUsageLimitOnAnswer(raw);
-      if (!runEnded) {
-        // A result ends a turn, and turns take prompts in the order they were
-        // given. A turn answered only through send_message counts too.
-        const settled = prompts.shift();
-        if (settled !== undefined) answeredCursor = settled.cursor;
-        if (usageLimited) {
-          // A turn after a refusal (extra usage, say): save what the exit
-          // will, so a restart before it leaves the same messages pending.
-          // Not an exact cursor: the turn settles the oldest open prompt,
-          // which is the refused one, whichever prompt it answered (#114).
-          lastAgentTimestamp[chatJid] = answeredCursor;
-          saveState();
-          rememberRefusedInput(chatJid, prompts);
-        }
+    }
+    if (!runEnded && (turn || raw !== null)) {
+      if (turn) {
+        // Exactly the prompts its turn took, textless or not. A turn only
+        // the runner or the CLI started (`internal`, no inputs) settles none.
+        const unknown = markAnswered(prompts, turn.inputs);
+        if (unknown.length > 0)
+          logUnknownInputs(group, previousCursor, unknown);
+      } else if (prompts.length > 0) {
+        // No `turn`: a result ends a turn, and turns take prompts in the
+        // order they were given, so it settles the oldest open prompt. A
+        // turn answered only through send_message counts too. Wrong when a
+        // follow-up was merged into a turn, or a turn took no prompt (#114).
+        prompts[0].answered = true;
       }
+      const settled = shiftAnswered(prompts);
+      if (settled !== undefined) answeredCursor = settled;
+      if (usageLimited) {
+        // A turn after a refusal (extra usage, say): save what the exit
+        // will, so a restart before it leaves the same messages pending.
+        // Without `turn` not an exact cursor: the turn settles the oldest
+        // open prompt, which is the refused one, whichever it answered.
+        lastAgentTimestamp[chatJid] = answeredCursor;
+        saveState();
+        rememberRefusedInput(chatJid, prompts);
+      }
+    }
+    if (raw !== null) {
       // Single outbound path: formatOutbound strips <internal> blocks AND the
       // trailing "shall I save this to Notion?" offer. This used to inline only
       // the <internal> strip, so the offer-stripping rule silently did not apply
@@ -350,7 +432,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // on this container has closed it, and they wait for the next one
     // instead of holding the task up for another turn.
     if (closed) usageLimitLifted();
-  });
+  };
+  const output = await runAgent(group, prompt, chatJid, promptRef, onOutput);
   runEnded = true;
 
   await channel.setTyping?.(chatJid, false);
@@ -403,10 +486,38 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   return true;
 }
 
+/**
+ * A result's turn named inputs that are no open prompt of its container. One
+ * whose range ends at or before the cursor the container started from is a
+ * file an earlier container left, drained into this one's first prompt: its
+ * messages are already behind the cursor. Neither settles anything.
+ */
+function logUnknownInputs(
+  group: RegisteredGroup,
+  startCursor: string,
+  ids: string[],
+): void {
+  for (const id of ids) {
+    const range = refRange(id);
+    if (range && range.to <= startCursor) {
+      logger.debug(
+        { group: group.name, input: id },
+        'Turn answered a file an earlier container left',
+      );
+    } else {
+      logger.warn(
+        { group: group.name, input: id },
+        'Turn names an input this container was never given',
+      );
+    }
+  }
+}
+
 async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  promptRef: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
@@ -475,6 +586,7 @@ async function runAgent(
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
+        promptRef,
       },
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -630,15 +742,17 @@ function pipeToActiveContainer(
   // on top of the messages being pending. Pending is enough; they are held
   // while the window is open, and start the next container once it closes.
   if (usageLimitHeldUntil() || closingOnRefusal.has(chatJid)) return false;
-  const file = queue.sendMessage(chatJid, formatMessages(messages));
+  const to = messages[messages.length - 1].timestamp;
+  const ref = inputRef(lastAgentTimestamp[chatJid] || '', to);
+  const file = queue.sendMessage(chatJid, formatMessages(messages), ref);
   if (!file) return false;
   logger.debug(
     { chatJid, count: messages.length },
     'Piped messages to active container',
   );
-  lastAgentTimestamp[chatJid] = messages[messages.length - 1].timestamp;
+  lastAgentTimestamp[chatJid] = to;
   saveState();
-  openPrompts[chatJid]?.push({ cursor: lastAgentTimestamp[chatJid], file });
+  openPrompts[chatJid]?.push({ cursor: to, file, ref });
   // Show typing indicator while the container processes the piped message
   channel
     .setTyping?.(chatJid, true)
