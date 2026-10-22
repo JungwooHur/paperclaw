@@ -20,6 +20,8 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { sourceHash } from './source-hash.mjs';
+
 const RUNNER = '/tmp/dist/index.js';
 const SDK_PACKAGE = '/app/node_modules/@anthropic-ai/claude-agent-sdk/package.json';
 const SDK_MODULE = '/app/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs';
@@ -652,7 +654,9 @@ server.listen(PORT, '127.0.0.1', async () => {
   }
   clearTimeout(timer);
   const sdkVersion = JSON.parse(fs.readFileSync(SDK_PACKAGE, 'utf-8')).version;
-  const fixture = { sdkVersion, outputs, runnerNotes: notes, reusedUuid, cliShutdownPrompt: cliShutdownPrompt() };
+  // The runner source this compiled (mounted at /app/src) and this probe.
+  const hash = sourceHash({ src: '/app/src', probe: path.dirname(new URL(import.meta.url).pathname) });
+  const fixture = { sdkVersion, sourceHash: hash, outputs, runnerNotes: notes, reusedUuid, cliShutdownPrompt: cliShutdownPrompt() };
   process.stdout.write(JSON.stringify(fixture, null, 2) + '\n');
   server.close();
   process.exit(0);

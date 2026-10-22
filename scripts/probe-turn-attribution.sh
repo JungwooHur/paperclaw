@@ -9,9 +9,10 @@
 # directly to record what the CLI does with a reused uuid, and reads the
 # prompt the CLI injects to shut an agent team down out of its bundle.
 # container/agent-runner/test/turn-attribution-probe.test.ts checks the fixture
-# came from the pinned SDK and holds what the protocol promises, so rerun this
-# after an SDK bump, once the image is rebuilt. Takes about 3 minutes: one case
-# waits out the runner's 60 s background-task nudge.
+# came from the pinned SDK, the checkout's runner source and this probe, and
+# holds what the protocol promises, so rerun this after a change to the runner
+# or the probe, and after an SDK bump once the image is rebuilt. Takes about 3
+# minutes: one case waits out the runner's 60 s background-task nudge.
 #
 #   scripts/probe-turn-attribution.sh            # writes the fixture
 #   PROBE_VERBOSE=1 scripts/probe-turn-attribution.sh   # also logs the runner

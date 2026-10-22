@@ -6,7 +6,9 @@
  * against a fake Messages API. It must come from the SDK the runner pins, so an
  * SDK bump fails here until the probe is run again, and a CLI that acknowledges
  * input differently then fails the cases below instead of misattributing
- * answers in production.
+ * answers in production. It must also come from this checkout's runner source,
+ * so a runner change that alters what it writes cannot stay green on an old
+ * recording.
  */
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -14,6 +16,7 @@ import { fileURLToPath } from 'url';
 import { describe, expect, it } from 'vitest';
 
 import { isTeamPrompt, type Turn } from '../src/turn-attribution.js';
+import { sourceHash } from './probe/source-hash.mjs';
 
 interface ProbeOutput {
   case: string;
@@ -31,6 +34,7 @@ function readJson<T>(relative: string): T {
 
 const fixture = readJson<{
   sdkVersion: string;
+  sourceHash: string;
   outputs: ProbeOutput[];
   runnerNotes: string[];
   reusedUuid?: { events: string[]; modelSaw: string[] };
@@ -54,6 +58,16 @@ describe('the turn attribution probe', () => {
     // On an SDK bump: rebuild the image, then scripts/probe-turn-attribution.sh
     expect(fixture.sdkVersion).toBe(
       runnerPackage.dependencies['@anthropic-ai/claude-agent-sdk'],
+    );
+  });
+
+  it('ran the runner and the probe this checkout has', () => {
+    // The fixture pins what this runner writes, so a runner change fails here
+    // too until scripts/probe-turn-attribution.sh runs again.
+    const dir = (relative: string) =>
+      fileURLToPath(new URL(relative, import.meta.url));
+    expect(fixture.sourceHash).toBe(
+      sourceHash({ src: dir('../src'), probe: dir('./probe') }),
     );
   });
 

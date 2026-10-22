@@ -1,5 +1,6 @@
 {
   "sdkVersion": "0.2.34",
+  "sourceHash": "773e1e89164cbf99fc82ba5fdf5ef7adab6d69f66ed3c5b376deb9cafdec8ee4",
   "outputs": [
     {
       "case": "start-up drain",
