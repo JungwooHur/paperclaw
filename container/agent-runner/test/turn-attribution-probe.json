@@ -1,0 +1,118 @@
+{
+  "sdkVersion": "0.2.34",
+  "outputs": [
+    {
+      "case": "start-up drain",
+      "status": "success",
+      "result": "ANSWER PROBE-LEFTOVER",
+      "turn": {
+        "inputs": [
+          "r-start",
+          "r-leftover"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "plain",
+      "status": "success",
+      "result": "ANSWER PROBE-PLAIN",
+      "turn": {
+        "inputs": [
+          "0001-plain.json"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "start-up drain, resumed session",
+      "status": "success",
+      "result": "ANSWER PROBE-LEFTOVER",
+      "turn": {
+        "inputs": [
+          "r-resume",
+          "r-leftover-2"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "merged follow-up",
+      "status": "success",
+      "result": "ANSWER after-tool",
+      "turn": {
+        "inputs": [
+          "r-tool",
+          "r-merged"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "turn running when a follow-up came",
+      "status": "success",
+      "result": "ANSWER PROBE-SLOW",
+      "turn": {
+        "inputs": [
+          "r-slow"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "follow-up as its own turn",
+      "status": "success",
+      "result": "ANSWER PROBE-OWN",
+      "turn": {
+        "inputs": [
+          "r-own"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "textless",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": [
+          "r-empty"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "error before any message",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": []
+      },
+      "subtype": "error_during_execution"
+    },
+    {
+      "case": "background dispatch",
+      "status": "success",
+      "result": "ANSWER after-tool",
+      "turn": {
+        "inputs": [
+          "r-bg"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "nudge-only",
+      "status": "success",
+      "result": "ANSWER none",
+      "turn": {
+        "inputs": [],
+        "nudge": true
+      },
+      "subtype": "success"
+    }
+  ],
+  "runnerNotes": [
+    "Input no result answered: [\"r-nothing\"] (never acknowledged)"
+  ]
+}
