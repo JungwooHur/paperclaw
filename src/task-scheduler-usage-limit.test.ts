@@ -12,6 +12,7 @@ import {
   startSchedulerLoop,
 } from './task-scheduler.js';
 import { ScheduledTask } from './types.js';
+import { recordUsageLimit, usageLimitHeldUntil } from './usage-limit.js';
 
 const LIMIT = "You've hit your limit · resets Oct 14, 10am (Asia/Seoul)";
 const NOW = Date.parse('2026-10-13T12:00:00.000Z'); // 21:00 in Seoul
@@ -56,6 +57,7 @@ function addDueTask(
 
 async function runDueTasks(
   sendMessage: (jid: string, text: string) => Promise<void>,
+  onUsageLimitLifted: () => void = () => {},
 ) {
   const queue = {
     enqueueTask: (_jid: string, _id: string, fn: () => Promise<void>) => {
@@ -78,6 +80,7 @@ async function runDueTasks(
     queue: queue as any,
     onProcess: () => {},
     sendMessage,
+    onUsageLimitLifted,
   });
   await vi.advanceTimersByTimeAsync(10);
   return queue;
@@ -128,7 +131,7 @@ describe('a scheduled run that hits the usage limit', () => {
     expect(deferredPastReset(task)).toBe(true);
   });
 
-  it('tells the user once, however many runs hit the same window', async () => {
+  it('tells the user once, and starts no other run into the window', async () => {
     addDueTask('first', 'cron', '30 23 * * *');
     addDueTask('second', 'interval', String(60 * 60_000));
     agentAnswers(LIMIT);
@@ -138,11 +141,15 @@ describe('a scheduled run that hits the usage limit', () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0].at(0)).toBe(CHAT);
 
-    // A later hit in the same window says nothing new.
+    // A later run in the same window says nothing new, and does not start.
     vi.setSystemTime(NOW + 30 * 60_000);
     addDueTask('third', 'cron', '30 23 * * *');
     await runDueTasks(sendMessage);
     expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(runContainerAgent).toHaveBeenCalledTimes(1);
+    for (const id of ['first', 'second', 'third']) {
+      expect(deferredPastReset(getTaskById(id)), id).toBe(true);
+    }
   });
 
   it('closes and idles nothing from a callback that runs after the run', async () => {
@@ -235,5 +242,89 @@ describe('a scheduled run that hits the usage limit', () => {
     const task = getTaskById('nightly');
     expect(deferredPastReset(task)).toBe(false);
     expect(Date.parse(task!.next_run!)).toBeGreaterThan(deferredTo);
+  });
+});
+
+describe('a scheduled run while a usage-limit window is open', () => {
+  beforeEach(() => {
+    _initTestDatabase();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.mocked(runContainerAgent).mockReset();
+  });
+
+  afterEach(() => {
+    _resetSchedulerLoopForTests();
+    vi.useRealTimers();
+  });
+
+  it('starts no container and moves the run past the reset', async () => {
+    // A message was refused a minute ago; the window it opened is announced.
+    recordUsageLimit(LIMIT);
+    addDueTask('nightly', 'cron', '30 23 * * *');
+    addDueTask('one-off', 'once', '2026-10-13T11:59:00.000Z');
+    agentAnswers('Batch done: 3 papers uploaded.');
+    const sendMessage = vi.fn(async () => {});
+
+    await runDueTasks(sendMessage);
+
+    expect(runContainerAgent).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    for (const id of ['nightly', 'one-off']) {
+      const task = getTaskById(id);
+      expect(task?.status, id).toBe('active');
+      expect(deferredPastReset(task), id).toBe(true);
+      expect(task?.last_result, id).toMatch(/^Error: .*usage limit/i);
+    }
+  });
+
+  it('closes the window when a run started before it answers', async () => {
+    addDueTask('nightly', 'cron', '30 23 * * *');
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _onProcess, onOutput) => {
+        // A message is refused while this run is under way...
+        recordUsageLimit(LIMIT);
+        // ...and then this run's request gets through.
+        await onOutput?.({
+          status: 'success',
+          result: 'Batch done: 3 papers uploaded.',
+          newSessionId: 'session-1',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-1' };
+      },
+    );
+    const lifted = vi.fn();
+
+    await runDueTasks(
+      vi.fn(async () => {}),
+      lifted,
+    );
+
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(lifted).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the window open when the run gets an API error instead', async () => {
+    addDueTask('nightly', 'cron', '30 23 * * *');
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _onProcess, onOutput) => {
+        recordUsageLimit(LIMIT);
+        await onOutput?.({
+          status: 'success',
+          result: 'API Error: Rate limit reached',
+          newSessionId: 'session-1',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-1' };
+      },
+    );
+    const lifted = vi.fn();
+
+    await runDueTasks(
+      vi.fn(async () => {}),
+      lifted,
+    );
+
+    expect(usageLimitHeldUntil()).not.toBeNull();
+    expect(lifted).not.toHaveBeenCalled();
   });
 });

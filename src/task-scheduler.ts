@@ -26,9 +26,11 @@ import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 import {
+  closeUsageLimitOnAnswer,
   deferredTaskRun,
   isAgentAnswer,
   recordUsageLimit,
+  usageLimitResetsAt,
 } from './usage-limit.js';
 
 // After a query turn ends, close the task container promptly. Tasks are
@@ -47,6 +49,11 @@ export interface SchedulerDependencies {
     groupFolder: string,
   ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
+  /**
+   * A run's answer closed the usage-limit window: run the held messages now
+   * rather than at the reset the window had.
+   */
+  onUsageLimitLifted: () => void;
 }
 
 async function runTask(
@@ -61,6 +68,28 @@ async function runTask(
       { taskId: queuedTask.id, status: task?.status ?? 'deleted' },
       'Skipping queued task that is no longer active',
     );
+    return;
+  }
+
+  // A usage-limit window is open, so the run would only be refused. Start
+  // nothing, and move this run past the reset as a refused run is moved.
+  const openReset = usageLimitResetsAt();
+  if (openReset) {
+    const deferredTo = deferredTaskRun(openReset);
+    const error = `Usage limit window open, deferred to ${deferredTo.toISOString()}`;
+    logger.info(
+      { taskId: task.id, deferredTo },
+      'Usage limit window open, task deferred',
+    );
+    logTaskRun({
+      task_id: task.id,
+      run_at: new Date().toISOString(),
+      duration_ms: 0,
+      status: 'error',
+      result: null,
+      error,
+    });
+    updateTaskAfterRun(task.id, deferredTo.toISOString(), `Error: ${error}`);
     return;
   }
 
@@ -184,6 +213,10 @@ async function runTask(
           } else {
             result = streamedOutput.result;
             if (isAgentAnswer(streamedOutput.result)) answered = true;
+            // A request got through: an open window is over.
+            if (closeUsageLimitOnAnswer(streamedOutput.result)) {
+              deps.onUsageLimitLifted();
+            }
             // Forward result to user (sendMessage handles formatting)
             await deps.sendMessage(task.chat_jid, streamedOutput.result);
           }

@@ -56,6 +56,7 @@ describe('task scheduler', () => {
       queue: { enqueueTask } as any,
       onProcess: () => {},
       sendMessage: async () => {},
+      onUsageLimitLifted: () => {},
     });
 
     await vi.advanceTimersByTimeAsync(10);
@@ -98,6 +99,7 @@ describe('task scheduler', () => {
         queue: { enqueueTask } as any,
         onProcess: () => {},
         sendMessage: async () => {},
+        onUsageLimitLifted: () => {},
       });
       await vi.advanceTimersByTimeAsync(10);
       expect(queuedRun).toBeDefined();
@@ -166,6 +168,7 @@ describe('task scheduler', () => {
       queue: queue as any,
       onProcess: () => {},
       sendMessage: async () => {},
+      onUsageLimitLifted: () => {},
     });
 
     await vi.advanceTimersByTimeAsync(10);

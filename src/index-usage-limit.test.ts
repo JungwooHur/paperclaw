@@ -387,6 +387,60 @@ describe('startup recovery', () => {
   });
 });
 
+describe('an answer inside an open window', () => {
+  /**
+   * Runs m1 in a container that answers with `result` after the window opened
+   * under it (a scheduled run refused meanwhile), with m2 held, not piped.
+   */
+  async function answeredInsideWindow(result: string): Promise<void> {
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        expect(recordUsageLimit(LIMIT)?.notice).toBeTruthy();
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(false);
+        await onOutput?.({
+          status: 'success',
+          result,
+          newSessionId: 'session-new',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+  }
+
+  it('closes the window and runs the held messages now, not at the reset', async () => {
+    await answeredInsideWindow('It describes the method.');
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
+
+    agentReplies('It covers the experiments.');
+    await _processGroupMessages(CHAT);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+    expect(promptOfRun(1)).toContain('and section 3?');
+    expect(sentTexts()).toContain('It covers the experiments.');
+  });
+
+  it('costs one refused retry when the limit still holds, and no second notice', async () => {
+    await answeredInsideWindow('It describes the method.');
+    agentReplies(LIMIT);
+    await _processGroupMessages(CHAT);
+    expect(sentTexts()).toEqual(['It describes the method.']);
+    expect(usageLimitHeldUntil()).not.toBeNull();
+
+    // Held again: nothing starts until the reset.
+    await _processGroupMessages(CHAT);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the window open on an API error', async () => {
+    await answeredInsideWindow('API Error: 500 {"type":"error"}');
+    expect(usageLimitHeldUntil()).not.toBeNull();
+    expect(enqueueMessageCheck).not.toHaveBeenCalled();
+  });
+});
+
 /**
  * Runs m1 into a refusal, with m2 piped just before it, then the container's
  * later turns `after` (extra usage, say). Returns while the container is

@@ -7,16 +7,21 @@
  * result. Taken at face value, that sentence goes out as the reply and the work
  * counts as done. This module recognises it and keeps the window it opens in
  * router_state, so the message path and the scheduler can both hold their work
- * until the reset, across a restart, and the user is told once per window.
+ * until the reset, across a restart, and the user is told once per window. An
+ * answer inside the window shows the limit has lifted and closes it.
  */
 import { OUTPUT_LANGUAGE, TIMEZONE } from './config.js';
 import { getRouterState, setRouterState } from './db.js';
 
 export interface UsageLimit {
   resetsAt: Date;
+  /** False when the text gave no reset that could be read: a guess. */
+  stated: boolean;
 }
 
-export interface UsageLimitHit extends UsageLimit {
+export interface UsageLimitHit {
+  /** The window's reset as recorded. */
+  resetsAt: Date;
   /** The notice to send, or null when this window was already announced. */
   notice: string | null;
 }
@@ -101,9 +106,12 @@ export function classifyUsageLimit(
   if (!isUsageLimit(text)) return null;
   const match = RESET_PATTERN.exec(text);
   const resetsAt = match ? parseReset(match, now, tz) : null;
-  return {
-    resetsAt: resetsAt ?? new Date(now.getTime() + UNKNOWN_RESET_HOLD_MS),
-  };
+  return resetsAt
+    ? { resetsAt, stated: true }
+    : {
+        resetsAt: new Date(now.getTime() + UNKNOWN_RESET_HOLD_MS),
+        stated: false,
+      };
 }
 
 /**
@@ -119,19 +127,27 @@ export function recordUsageLimit(
   const limit = classifyUsageLimit(text, now, tz);
   if (!limit) return null;
 
-  // A reset the CLI places in the past cannot be right — the request was just
-  // refused — and trusting it would send the same work straight back into the
-  // limit every couple of minutes.
-  const resetsAt =
-    limit.resetsAt.getTime() > now.getTime()
-      ? limit.resetsAt
-      : new Date(now.getTime() + UNKNOWN_RESET_HOLD_MS);
+  // A reset the text states, still ahead, is the CLI's own word: it replaces
+  // the open window, earlier or later. Otherwise the reset is a guess, an hour
+  // on. A reset the CLI places in the past cannot be right, since the request
+  // was just refused, and trusting it would send the same work straight back
+  // into the limit every couple of minutes. A guess knows less than the window
+  // already open, so it never ends one sooner, though it extends one that
+  // ends before it: a stated reset that has passed, or an earlier guess.
+  let resetsAt = limit.resetsAt;
+  if (!limit.stated || resetsAt.getTime() <= now.getTime()) {
+    const guess = now.getTime() + UNKNOWN_RESET_HOLD_MS;
+    const open = usageLimitResetsAt(now)?.getTime() ?? 0;
+    resetsAt = new Date(Math.max(guess, open));
+  }
   setRouterState(LIMITED_UNTIL_KEY, resetsAt.toISOString());
 
   // One notice per window. A refusal that moves the reset more than an hour
   // past the announced one opens a new window, as far as the user can tell:
   // without a word they wait on a time that has passed. A smaller move is the
-  // guessed hold starting again from a later refusal.
+  // guessed hold starting again from a later refusal, and a reset earlier
+  // than the announced one only means the work resumes sooner than they were
+  // told.
   const announced = readTime(ANNOUNCED_KEY);
   if (
     announced !== null &&
@@ -149,10 +165,33 @@ export function recordUsageLimit(
  * closes a little after the reset.
  */
 export function usageLimitHeldUntil(now: Date = new Date()): Date | null {
+  const reset = usageLimitResetsAt(now);
+  return reset && new Date(reset.getTime() + MESSAGE_RESUME_MARGIN_MS);
+}
+
+/** The open window's reset, or null when no window is open. */
+export function usageLimitResetsAt(now: Date = new Date()): Date | null {
   const reset = readTime(LIMITED_UNTIL_KEY);
   if (reset === null) return null;
-  const until = reset + MESSAGE_RESUME_MARGIN_MS;
-  return now.getTime() < until ? new Date(until) : null;
+  return now.getTime() < reset + MESSAGE_RESUME_MARGIN_MS
+    ? new Date(reset)
+    : null;
+}
+
+/**
+ * Closes the open window on an answer: a request got through, so the limit no
+ * longer holds (extra usage, or quota back before the stated reset). Returns
+ * whether it closed one, so the caller can run the held work now. The
+ * announced reset stays: if the close was wrong, the next refusal reopens the
+ * same window without telling the user again.
+ */
+export function closeUsageLimitOnAnswer(
+  text: string | null | undefined,
+  now: Date = new Date(),
+): boolean {
+  if (!isAgentAnswer(text) || usageLimitResetsAt(now) === null) return false;
+  setRouterState(LIMITED_UNTIL_KEY, '');
+  return true;
 }
 
 /** When a scheduled run refused by the limit should run instead. */

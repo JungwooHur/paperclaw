@@ -3,9 +3,11 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { _initTestDatabase } from './db.js';
 import {
   classifyUsageLimit,
+  closeUsageLimitOnAnswer,
   isAgentAnswer,
   recordUsageLimit,
   usageLimitHeldUntil,
+  usageLimitResetsAt,
 } from './usage-limit.js';
 
 // What the bundled CLI actually sends back when the account is out of quota.
@@ -314,6 +316,63 @@ describe('recordUsageLimit', () => {
     ).not.toBeNull();
   });
 
+  it('does not let a guessed reset shorten an open window', () => {
+    // The window runs to 10am tomorrow. A later refusal that states no reset
+    // knows less than that, and an hour's guess would resume work hours early.
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    const later = new Date(now.getTime() + 10 * 60_000);
+    const guessed = recordUsageLimit(
+      "You've hit your limit",
+      later,
+      SEOUL,
+      'en',
+    );
+    expect(guessed?.resetsAt.getTime()).toBe(reset);
+    expect(guessed?.notice).toBeNull();
+    expect(usageLimitResetsAt(later)?.getTime()).toBe(reset);
+
+    // Nor does a stated reset already in the past, which is a guess as well.
+    const past = "You've hit your limit · resets Oct 13, 8pm (Asia/Seoul)";
+    expect(recordUsageLimit(past, later, SEOUL, 'en')?.resetsAt.getTime()).toBe(
+      reset,
+    );
+    expect(usageLimitResetsAt(later)?.getTime()).toBe(reset);
+  });
+
+  it('lets a guessed reset extend an open window that ends sooner', () => {
+    const text = "You've hit your limit";
+    recordUsageLimit(text, now, SEOUL, 'en');
+    const later = new Date(now.getTime() + 40 * 60_000);
+    recordUsageLimit(text, later, SEOUL, 'en');
+    expect(usageLimitResetsAt(later)?.getTime()).toBe(later.getTime() + HOUR);
+  });
+
+  it('takes a stated reset as the window, earlier or later, and says nothing on an earlier one', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en'); // 10am tomorrow
+    const later = new Date(now.getTime() + 60_000);
+    const earlier = recordUsageLimit(
+      "You've hit your session limit · resets 11pm (Asia/Seoul)",
+      later,
+      SEOUL,
+      'en',
+    );
+    const elevenPm = Date.parse('2026-10-13T14:00:00.000Z');
+    expect(earlier?.resetsAt.getTime()).toBe(elevenPm);
+    expect(earlier?.notice).toBeNull();
+    expect(usageLimitResetsAt(later)?.getTime()).toBe(elevenPm);
+
+    const weekly = recordUsageLimit(
+      "You've hit your weekly limit · resets Oct 16, 11pm (Asia/Seoul)",
+      later,
+      SEOUL,
+      'en',
+    );
+    expect(usageLimitResetsAt(later)?.toISOString()).toBe(
+      '2026-10-16T14:00:00.000Z',
+    );
+    expect(weekly?.notice).toContain('Oct 16');
+  });
+
   it('writes the notice in Korean for ko, with the reset in the configured zone', () => {
     // 10am in New York is 11pm in Seoul.
     const hit = recordUsageLimit(
@@ -332,5 +391,44 @@ describe('recordUsageLimit', () => {
     expect(hit?.notice).not.toMatch(/[가-힣]/);
     expect(hit?.notice).toMatch(/10:00\sAM/);
     expect(hit?.notice).not.toContain("You've hit your limit");
+  });
+});
+
+describe('closeUsageLimitOnAnswer', () => {
+  beforeEach(() => {
+    _initTestDatabase();
+  });
+
+  const now = new Date('2026-10-13T12:00:00.000Z'); // 21:00 in Seoul
+  const later = new Date(now.getTime() + 10 * 60_000);
+
+  it('closes an open window when a request gets through', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    expect(closeUsageLimitOnAnswer('Section 3 is uploaded.', later)).toBe(true);
+    expect(usageLimitHeldUntil(later)).toBeNull();
+    expect(usageLimitResetsAt(later)).toBeNull();
+  });
+
+  it('leaves the window open on a refusal or an API error', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    expect(closeUsageLimitOnAnswer(WITH_DATE, later)).toBe(false);
+    expect(
+      closeUsageLimitOnAnswer('API Error: Rate limit reached', later),
+    ).toBe(false);
+    expect(closeUsageLimitOnAnswer(null, later)).toBe(false);
+    expect(usageLimitHeldUntil(later)).not.toBeNull();
+  });
+
+  it('reports nothing closed when no window is open', () => {
+    expect(closeUsageLimitOnAnswer('Section 3 is uploaded.', now)).toBe(false);
+  });
+
+  it('does not announce the window again when the next request is refused', () => {
+    // A close on a stray answer costs one refused retry, and only that.
+    expect(recordUsageLimit(WITH_DATE, now, SEOUL, 'en')?.notice).toBeTruthy();
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const again = recordUsageLimit(WITH_DATE, later, SEOUL, 'en');
+    expect(again?.notice).toBeNull();
+    expect(usageLimitHeldUntil(later)).not.toBeNull();
   });
 });

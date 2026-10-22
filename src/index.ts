@@ -48,6 +48,7 @@ import { logHeartbeat } from './liveness-log.js';
 import { logger } from './logger.js';
 import { qaFollowupCommand, worthFilingCheck } from './qa-followup.js';
 import {
+  closeUsageLimitOnAnswer,
   isUsageLimit,
   recordUsageLimit,
   usageLimitHeldUntil,
@@ -309,6 +310,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (resumeAt) resumeAfterUsageLimit(resumeAt);
         return;
       }
+      // A request got through: an open window is over.
+      if (closeUsageLimitOnAnswer(raw)) usageLimitLifted();
       if (!runEnded) {
         // A result ends a turn, and turns take prompts in the order they were
         // given. A turn answered only through send_message counts too.
@@ -682,6 +685,22 @@ function resumeAfterUsageLimit(heldUntil: Date): void {
 }
 
 /**
+ * An answer closed the usage-limit window: run the held messages now, not at
+ * the reset the window had. If the limit still holds, the first of them is
+ * refused and reopens the window without a second notice. Only a container
+ * already running when it reopens can answer into it, so this cannot repeat
+ * on its own.
+ */
+function usageLimitLifted(): void {
+  if (usageLimitRecoveryTimer) {
+    clearTimeout(usageLimitRecoveryTimer);
+    usageLimitRecoveryTimer = null;
+  }
+  logger.info('Usage limit window closed by an answer, resuming held work');
+  recoverPendingMessages();
+}
+
+/**
  * Startup recovery: check for unprocessed messages in registered groups.
  * Handles crash between advancing lastTimestamp and processing messages.
  * While a usage-limit window is open it only arms itself for the window's end,
@@ -782,6 +801,7 @@ async function main(): Promise<void> {
       const text = formatOutbound(rawText);
       if (text) await channel.sendMessage(jid, text);
     },
+    onUsageLimitLifted: usageLimitLifted,
   });
   startIpcWatcher({
     sendMessage: (jid, text) => {
