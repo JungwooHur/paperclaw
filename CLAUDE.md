@@ -94,6 +94,10 @@ depends on `noEmitOnError` in `tsconfig.json`: by default tsc writes every
 output despite a type error, so the bot would start on the NEW, failing code
 and the WARN would never fire.
 
+The same build stages the agent runner in `dist/agent-runner-src/`, and groups are
+refreshed from that copy, so a runner change goes live with the restart too, and a
+failed build holds back both (docs/SPEC.md, "Per-Group Copies: Settings and Runner").
+
 No systemd PATH has the right node, so `scripts/paperclaw-node.sh` resolves it:
 `PAPERCLAW_NODE` first, which setup writes into a drop-in beside the unit
 (`paperclaw.service.d/node.conf`, the node setup ran with, so the one that built
