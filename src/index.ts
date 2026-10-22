@@ -182,6 +182,9 @@ const openPrompts: Record<string, OpenPrompt[]> = {};
 // Groups whose message container is closing on a usage-limit refusal, until it
 // exits. That can outlast the window, so the window alone does not cover it.
 const closingOnRefusal = new Set<string>();
+// Groups whose running message container turned attribution off: its open
+// prompts are settled the old way, and a restart puts none of them back.
+const attributionOff = new Set<string>();
 // router_state key: per group, the piped prompts the latest usage-limit
 // refusal put back, so a restart before the container exits can still drop
 // the files it left. Cleared once the files are dealt with.
@@ -199,6 +202,11 @@ const PUT_BACK_KEY = 'turn_put_back';
 // it are kept here, so the retry runs only what is unanswered. Dropped once a
 // run ends, without a refusal, with the cursor past them.
 const ANSWERED_AHEAD_KEY = 'answered_ahead';
+// router_state key: per group with a message container running, the start of
+// its oldest prompt no turn has answered yet, taken or still in its file. A
+// restart stops that container, so start-up puts the cursor back there; the
+// answered prompts past it are in answered_ahead by then. Cleared at exit.
+const OPEN_FROM_KEY = 'turn_open_from';
 
 /**
  * Files a paper Q&A right after the answer goes out, so it does not wait for the
@@ -334,10 +342,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages);
 
+  const previousCursor = lastAgentTimestamp[chatJid] || '';
+  const end = deliveryEnd(pending);
+  // Files an earlier container left: this one drains them into its first
+  // prompt, so they are its oldest prompts, and the cursor can go back to
+  // where they start.
+  const leftovers = leftoverPrompts(group);
+  const startCursor = leftovers.length
+    ? refRange(leftovers[0].ref!)!.from
+    : previousCursor;
+  const promptRef = inputRef(previousCursor, end);
+  const prompts: OpenPrompt[] = [...leftovers, { cursor: end, ref: promptRef }];
+  // Unknown until this container's first result, whatever the last one said.
+  attributionOff.delete(chatJid);
+  // Where a restart puts the cursor back to, saved before the cursor moves.
+  trackOpenPrompts(chatJid, prompts);
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] = deliveryEnd(pending);
+  lastAgentTimestamp[chatJid] = end;
   saveState();
 
   logger.info(
@@ -363,22 +385,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
   let usageLimited = false;
-  // Files an earlier container left: this one drains them into its first
-  // prompt, so they are its oldest prompts, and the cursor can go back to
-  // where they start.
-  const leftovers = leftoverPrompts(group);
-  const startCursor = leftovers.length
-    ? refRange(leftovers[0].ref!)!.from
-    : previousCursor;
   // The cursor at the end of the last prompt a turn finished on: a usage limit
   // after it puts back only the messages that came later. Not the cursor at
   // the time, which a follow-up piped in mid-answer has already moved on.
   let answeredCursor = startCursor;
-  const promptRef = inputRef(previousCursor, lastAgentTimestamp[chatJid]);
-  const prompts: OpenPrompt[] = [
-    ...leftovers,
-    { cursor: lastAgentTimestamp[chatJid], ref: promptRef },
-  ];
   openPrompts[chatJid] = prompts;
   // This container was never refused, whatever the last run left behind.
   closingOnRefusal.delete(chatJid);
@@ -413,6 +423,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (result.attribution === 'off') attribution = 'off';
       else if (result.turn) attribution = 'on';
       else if (raw !== null) attribution = 'off';
+      if (attribution === 'off') {
+        // As before attribution, a restart puts nothing back.
+        attributionOff.add(chatJid);
+        trackOpenPrompts(chatJid, prompts);
+      }
     }
     const turn = attribution === 'on' ? result.turn : undefined;
     if (raw !== null) {
@@ -469,6 +484,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       }
       const settled = shiftAnswered(prompts);
       if (settled !== undefined) answeredCursor = settled;
+      trackOpenPrompts(chatJid, prompts);
       if (usageLimited) {
         // A turn after a refusal (extra usage, say): save what the exit
         // will, so a restart before it leaves the same messages pending.
@@ -540,12 +556,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // writes a file. It must land in prompts, or be refused after a refusal.
   if (openPrompts[chatJid] === prompts) delete openPrompts[chatJid];
   closingOnRefusal.delete(chatJid);
+  attributionOff.delete(chatJid);
 
   if (usageLimited) {
     // The unanswered messages are back (since the refusal). No retry: it
     // would hit the same limit; they run when the window closes. The
     // container is gone, so the files it never drained can go too.
     putCursorBack(chatJid, answeredCursor, prompts);
+    rememberOpenFrom(chatJid, undefined);
     discardRefusedInput(chatJid, prompts);
     rememberRefusedInput(chatJid, []);
     logger.warn(
@@ -628,6 +646,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   };
   const done = settleExit();
+  // The exit settled the cursor itself: a restart now has nothing to redo.
+  rememberOpenFrom(chatJid, undefined);
   // Behind the cursor wherever the exit left it, so no rollback reaches them.
   pruneAnsweredAhead(chatJid);
   return done;
@@ -939,9 +959,13 @@ function pipeToActiveContainer(
     { chatJid, count: messages.length },
     'Piped messages to active container',
   );
+  const prompts = openPrompts[chatJid];
+  if (prompts) {
+    prompts.push({ cursor: end, file, ref });
+    trackOpenPrompts(chatJid, prompts);
+  }
   lastAgentTimestamp[chatJid] = end;
   saveState();
-  openPrompts[chatJid]?.push({ cursor: end, file, ref });
   // Show typing indicator while the container processes the piped message
   channel
     .setTyping?.(chatJid, true)
@@ -1041,6 +1065,43 @@ function putCursorBack(
   );
   lastAgentTimestamp[chatJid] = from;
   saveState();
+}
+
+function readOpenFrom(): Record<string, string> {
+  try {
+    return JSON.parse(getRouterState(OPEN_FROM_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+/** Persists where a restart puts the group's cursor back to (undefined: none). */
+function rememberOpenFrom(chatJid: string, from: string | undefined): void {
+  const all = readOpenFrom();
+  if (all[chatJid] === from) return;
+  if (from === undefined) delete all[chatJid];
+  else all[chatJid] = from;
+  setRouterState(OPEN_FROM_KEY, JSON.stringify(all));
+}
+
+/**
+ * Keeps what a restart needs while a message container runs: the start of
+ * its oldest prompt no turn has answered, and the answered prompts past it,
+ * kept as answered first. Nothing once the container turned attribution off.
+ */
+function trackOpenPrompts(chatJid: string, prompts: OpenPrompt[]): void {
+  const oldest = prompts.find((p) => !p.answered);
+  const range = oldest?.ref ? refRange(oldest.ref) : null;
+  if (!range || attributionOff.has(chatJid)) {
+    rememberOpenFrom(chatJid, undefined);
+    return;
+  }
+  const answered = answeredRanges(prompts, range.from);
+  if (answered.length > 0) {
+    const kept = readAnsweredAhead()[chatJid] ?? [];
+    rememberAnsweredAhead(chatJid, mergeRanges([...kept, ...answered]));
+  }
+  rememberOpenFrom(chatJid, range.from);
 }
 
 /** Drops the group's answered ranges that its cursor has passed. */
@@ -1170,14 +1231,43 @@ function recoverPendingMessages(): void {
 
 /**
  * Startup, after the database opens and before any container starts, in the
- * order the refused-input sweep needs: stop the last process's containers, so
- * none can still drain a file; load the cursors the files are judged against;
- * then drop the files a refusal put back.
+ * order the input-file sweeps need: stop the last process's containers, so
+ * none can still drain a file; load the cursors the files are judged against,
+ * and put back what those containers left unanswered; then drop the files
+ * whose messages are pending, and those a refusal put back.
  */
 function restoreStartupState(): void {
   cleanupOrphans();
   loadState();
+  restoreOpenPrompts();
   discardRefusedInputAfterRestart();
+}
+
+/**
+ * Startup: the last process stopped with message containers running, which
+ * cleanupOrphans has stopped. Each group's cursor goes back to the oldest
+ * prompt no turn answered (turn_open_from); the answered ones past it stay
+ * answered. An input file whose messages are pending then goes, so the next
+ * container does not also drain it; one behind the cursor stays for it.
+ */
+function restoreOpenPrompts(): void {
+  for (const [chatJid, from] of Object.entries(readOpenFrom())) {
+    if (from < (lastAgentTimestamp[chatJid] || '')) {
+      logger.warn(
+        { chatJid, from },
+        'Restart stopped a container with input no turn answered, putting it back',
+      );
+      lastAgentTimestamp[chatJid] = from;
+    }
+  }
+  saveState();
+  for (const [chatJid, group] of Object.entries(registeredGroups)) {
+    const cursor = lastAgentTimestamp[chatJid] || '';
+    for (const { file, cursor: end } of leftoverPrompts(group)) {
+      if (end > cursor) fs.rmSync(file!, { force: true });
+    }
+  }
+  setRouterState(OPEN_FROM_KEY, '{}');
 }
 
 /** What the scheduler is started with: this process's queue and channels. */
