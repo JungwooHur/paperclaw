@@ -43,6 +43,8 @@ import {
   _loadState,
   _pollNewMessages,
   _processGroupMessages,
+  _recoverPendingMessages,
+  _restoreStartupState,
   _schedulerDependencies,
   _setChannels,
   _setRegisteredGroups,
@@ -247,6 +249,20 @@ function cursor(): string | undefined {
   return JSON.parse(getRouterState('last_agent_timestamp') || '{}')[CHAT];
 }
 
+/**
+ * The new process after a restart: state from the database only, as main()
+ * starts, with the last process's containers stopped.
+ */
+function restart(): void {
+  _restoreStartupState();
+  _setRegisteredGroups({ [CHAT]: MAIN_GROUP });
+}
+
+/** Per chat, the ranges past its cursor a turn already answered. */
+function answeredAhead(): Record<string, [string, string][]> {
+  return JSON.parse(getRouterState('answered_ahead') || '{}');
+}
+
 function timesIn(text: string, part: string): number {
   return text.split(part).length - 1;
 }
@@ -428,6 +444,54 @@ describe('a result that names the inputs it answered', () => {
   });
 });
 
+describe('a refusal with a prompt answered after the refused one', () => {
+  it('holds only the refused prompt for the reset', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    // Sent during m1's last API call: its own turn, after m1's.
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [a.startIds[0]] });
+    // Extra usage let m2's turn through, answered through send_message.
+    await a.result(null, { inputs: [p2] });
+    await a.exit();
+
+    // Not dropped after a refusal: the reset's run still needs it.
+    expect(answeredAhead()).toEqual({
+      [CHAT]: [[expect.any(String), m2.timestamp]],
+    });
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    expect(cursor()).toBe(m2.timestamp);
+    expect(answeredAhead()).toEqual({});
+    await nothingRunsAgain();
+  });
+
+  it('holds a failed prompt and the refused one, not one answered between them', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(null, { inputs: [p2] });
+    await userSays('m3', M3, NOW - 20_000);
+    const [p3] = a.drain();
+    await a.result(LIMIT, { inputs: [p3] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('Both answered.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+});
+
 describe('a container that exits with input no result answered', () => {
   it('has it delivered again, once', async () => {
     const m1 = await userSays('m1', M1, NOW - 60_000);
@@ -461,23 +525,97 @@ describe('a container that exits with input no result answered', () => {
     await b.exit();
   });
 
-  it('runs an answered follow-up again behind an unanswered prompt (until #114 slice 3)', async () => {
-    // A duplicate, never a loss: the cursor goes back to the oldest prompt
-    // no result answered, and everything after it is pending again.
-    await userSays('m1', M1, NOW - 60_000);
+  it('runs only the unanswered prompt again, not an answered follow-up after it', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
     // The CLI failed the turn before it acknowledged anything.
+    await a.result(null, { inputs: [] });
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+
+    // The cursor goes back to m1, and m2's range is kept as answered.
+    expect(cursor()).toBe('');
+    expect(answeredAhead()).toEqual({
+      [CHAT]: [[m1.timestamp, m2.timestamp]],
+    });
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    // The delivery moves the cursor past the answered message too.
+    expect(cursor()).toBe(m2.timestamp);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+
+    // Behind the cursor now, so the range is dropped.
+    expect(answeredAhead()).toEqual({});
+    await nothingRunsAgain();
+  });
+
+  it('keeps answered ranges across a restart before the retry', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+
+    // The service restarts before the queue's retry: recovery runs instead.
+    restart();
+    _recoverPendingMessages();
+    await vi.advanceTimersByTimeAsync(0);
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('lets the message loop skip an answered range', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
     await a.result(null, { inputs: [] });
     await userSays('m2', M2, NOW - 40_000);
     const [p2] = a.drain();
     await a.result('It covers the experiments.', { inputs: [p2] });
     await a.exit();
 
-    const b = await containerOnRetry();
+    // A new message before the retry starts the next container itself.
+    const m3 = await userSays('m3', M3, NOW - 20_000);
+    const b = containers[1];
     expect(timesIn(b.prompt, M1)).toBe(1);
-    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
     await b.result('Both answered.', { inputs: [b.startIds[0]] });
     await b.exit();
+    expect(cursor()).toBe(m3.timestamp);
+    expect(answeredAhead()).toEqual({});
+    await nothingRunsAgain();
+  });
+
+  it('pipes a follow-up from past an answered range', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+    const b = await containerOnRetry();
+
+    await userSays('m3', M3, NOW - 20_000);
+    const [p3] = b.drain();
+    // Its range starts after m2, which no prompt here carries.
+    expect(p3.startsWith(`${m2.timestamp}|`)).toBe(true);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.result('It covers the appendix.', { inputs: [p3] });
+    await b.exit();
+    expect(answeredAhead()).toEqual({});
+    await nothingRunsAgain();
   });
 
   it('has the prompt of a turn that failed after the runner took it delivered again', async () => {
@@ -497,13 +635,27 @@ describe('a container that exits with input no result answered', () => {
     runner.turnStarted();
     runner.ack(u2);
     await a.result('It covers the experiments.', runner.result('success'));
+    // Later questions in the same session, each answered by its own turn.
+    for (const [id, text, at] of [
+      ['m3', M3, NOW - 30_000],
+      ['m4', M4, NOW - 20_000],
+    ] as const) {
+      await userSays(id, text, at);
+      const [p] = a.drain();
+      const u = runner.push(text, [p]);
+      runner.turnStarted();
+      runner.ack(u);
+      await a.result('Answered.', runner.result('success'));
+    }
     await a.exit();
 
+    // Only the failed turn's input runs again.
     const b = await containerOnRetry();
     expect(timesIn(b.prompt, M1)).toBe(1);
-    // Behind m1, until #114 slice 3.
-    expect(timesIn(b.prompt, M2)).toBe(1);
-    await b.result('Both answered.', { inputs: [b.startIds[0]] });
+    for (const answered of [M2, M3, M4]) {
+      expect(b.prompt).not.toContain(answered);
+    }
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
     await b.exit();
     await nothingRunsAgain();
   });
