@@ -1,6 +1,6 @@
 {
   "sdkVersion": "0.2.34",
-  "sourceHash": "f7a95fffbf9882078af7598d11e7b46ae5073adb1fbbf5a94a0bddc639934c8d",
+  "sourceHash": "705ea45706221c26d090914da257fb2dc1fbb62a2559514cb4ce3ddce85fcb70",
   "outputs": [
     {
       "case": "start-up drain",
@@ -365,6 +365,46 @@
       "turn": {
         "inputs": [
           "r-cost-after-broken"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "answer before a refusal",
+      "status": "success",
+      "result": "ANSWER PROBE-BEFORELIMIT",
+      "turn": {
+        "inputs": [
+          "r-before-limit"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "usage-limit refusal",
+      "status": "success",
+      "result": "You've hit your limit · resets 6:38pm (UTC)",
+      "turn": {
+        "inputs": [
+          "r-refused"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "error after a refusal",
+      "status": "error",
+      "result": null,
+      "turn": null,
+      "subtype": null
+    },
+    {
+      "case": "resumed after a refusal",
+      "status": "success",
+      "result": "ANSWER PROBE-RESENT after: user PROBE-BEFORELIMIT, assistant PROBE-BEFORELIMIT, user PROBE-REFUSED+PROBE-RESENT",
+      "turn": {
+        "inputs": [
+          "r-resent"
         ]
       },
       "subtype": "success"
