@@ -203,7 +203,9 @@ function refresh(
   const markerPath = seedMarkerPath(copyDir);
   const bundleHash = hashTree(bundleDir);
 
-  if (!fs.existsSync(copyDir)) {
+  // An empty directory holds no edit. It is also what the container runtime
+  // leaves when it mounts a copy that did not exist (a start without a bundle).
+  if (!fs.existsSync(copyDir) || fs.readdirSync(copyDir).length === 0) {
     const installed = installBundle(bundleDir, copyDir, group);
     writeMarker(markerPath, installed);
     logger.info(

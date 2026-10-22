@@ -419,4 +419,16 @@ describe('refreshRunnerCopy', () => {
     expect(siblings()).toEqual([]);
     expect(logger.warn).toHaveBeenCalledTimes(1);
   });
+
+  it('seeds an empty copy, which is what a start without a bundle leaves', () => {
+    // The container runtime creates a missing bind-mount source as an empty
+    // directory, so a group that started once without a bundle has one. Read
+    // as an edit, it would never be seeded.
+    fs.mkdirSync(copy);
+
+    expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('seeded');
+
+    expect(read(copy)).toEqual(read(bundle));
+    expect(markerHash()).toBe(hashTree(bundle));
+  });
 });
