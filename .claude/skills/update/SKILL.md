@@ -134,11 +134,15 @@ or anything under `container/agent-runner/` outside `src/` (`package*.json`,
 `tsconfig.json`), rebuild the image now, before 7b restarts the bot. The image
 bakes those in, the restart's build stages the new runner, and a runner needing
 what the old image lacks fails every container at start.
+Build the host first and stop if it fails (fix it as step 8 says): a failed
+build stages no runner, so the restart would pin the old runner against the new
+image. The running host has pinned its runner, so this build reaches no group
+before the restart.
 Prune first (CLAUDE.md, "Container Build Cache"): `--no-cache` alone keeps stale
 COPY steps.
 
 ```bash
-docker builder prune -f && ./container/build.sh
+npm run build && docker builder prune -f && ./container/build.sh
 ```
 
 ## 7b. Re-sync systemd units
