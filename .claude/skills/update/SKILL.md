@@ -127,6 +127,19 @@ Parse the JSON output. It contains: `migrationsRun` (count), `results` (array of
 
 **If no migrations found:** This is normal (most updates won't have migrations). Continue silently.
 
+## 7a. Rebuild the agent image
+
+If `filesChanged` (step 3) or a conflict you resolved includes `container/Dockerfile`
+or `container/agent-runner/package.json` / `package-lock.json`, rebuild the image
+now, before 7b restarts the bot. The restart's build stages the new runner, and
+a runner needing a package the old image lacks fails every container at start.
+Prune first (CLAUDE.md, "Container Build Cache"): `--no-cache` alone keeps stale
+COPY steps.
+
+```bash
+docker builder prune -f && ./container/build.sh
+```
+
 ## 7b. Re-sync systemd units
 
 If the pull touched `groups/main/research-papers/systemd/*.service` or `*.timer`
