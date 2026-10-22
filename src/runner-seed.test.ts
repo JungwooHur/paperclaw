@@ -160,6 +160,32 @@ describe('refreshRunnerCopy', () => {
     expect(fields.from).not.toBe(fields.to);
   });
 
+  it('records what it installed, so a bundle that moved during the copy is refreshed next start', () => {
+    refreshRunnerCopy(bundle, copy, GROUP);
+    write(bundle, { 'index.ts': 'v2 index\n' });
+    // A `git pull` lands one runner file after the bundle was hashed and
+    // before it was copied, and another after the copy: what gets installed
+    // is a tree nobody edited and that matches neither hash taken so far.
+    const realCp = fs.cpSync.bind(fs);
+    vi.spyOn(fs, 'cpSync').mockImplementationOnce((src, dst, opts) => {
+      write(bundle, { 'index.ts': 'v3 index\n' });
+      realCp(src, dst, opts);
+      write(bundle, { 'ipc.ts': 'v3 ipc\n' });
+    });
+    expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('refreshed');
+    expect(read(copy)).toEqual({
+      'index.ts': 'v3 index\n',
+      'ipc.ts': 'v1 ipc\n',
+    });
+    expect(markerHash()).toBe(hashTree(copy));
+    vi.clearAllMocks();
+
+    expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('refreshed');
+
+    expect(read(copy)).toEqual(read(bundle));
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it('drops files from a replaced copy that the bundle no longer has', () => {
     write(bundle, { 'old-tool.ts': 'gone soon\n' });
     refreshRunnerCopy(bundle, copy, GROUP);

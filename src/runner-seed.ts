@@ -117,14 +117,21 @@ function writeMarker(markerPath: string, hash: string): void {
  * group runs at a time (`group-queue.ts`). A sibling left by a crash is removed
  * first; it only ever holds a bundle or an unedited copy, since an edited copy
  * is never swapped out.
+ *
+ * Returns the hash of the tree it installed, taken from the copy and not from
+ * the bundle: the bundle can change while it is copied (a `git pull` writing the
+ * runner files), and the marker has to describe what is actually in place, or
+ * an unedited copy reads as edited from then on.
  */
-function installBundle(bundleDir: string, copyDir: string): void {
+function installBundle(bundleDir: string, copyDir: string): string {
   const next = `${copyDir}.next`;
   const prev = `${copyDir}.prev`;
   fs.rmSync(next, { recursive: true, force: true });
   fs.rmSync(prev, { recursive: true, force: true });
+  let installed: string;
   try {
     fs.cpSync(bundleDir, next, { recursive: true });
+    installed = hashTree(next);
   } catch (err) {
     fs.rmSync(next, { recursive: true, force: true });
     throw err;
@@ -143,6 +150,7 @@ function installBundle(bundleDir: string, copyDir: string): void {
   } catch {
     // The new copy is in place; the next install removes the leftover.
   }
+  return installed;
 }
 
 function refresh(
@@ -155,10 +163,10 @@ function refresh(
   const bundleHash = hashTree(bundleDir);
 
   if (!fs.existsSync(copyDir)) {
-    installBundle(bundleDir, copyDir);
-    writeMarker(markerPath, bundleHash);
+    const installed = installBundle(bundleDir, copyDir);
+    writeMarker(markerPath, installed);
     logger.info(
-      { group, hash: short(bundleHash) },
+      { group, hash: short(installed) },
       'Seeded the agent-runner copy from the bundled runner',
     );
     return 'seeded';
@@ -181,10 +189,10 @@ function refresh(
   }
 
   if (copyHash === seededHash) {
-    installBundle(bundleDir, copyDir);
-    writeMarker(markerPath, bundleHash);
+    const installed = installBundle(bundleDir, copyDir);
+    writeMarker(markerPath, installed);
     logger.info(
-      { group, from: short(copyHash), to: short(bundleHash) },
+      { group, from: short(copyHash), to: short(installed) },
       'Refreshed the unedited agent-runner copy from the bundled runner',
     );
     return 'refreshed';
