@@ -435,6 +435,33 @@ describe('closeUsageLimitOnAnswer', () => {
     expect(recordUsageLimit(WITH_DATE, after, SEOUL, 'en')?.notice).toBeNull();
   });
 
+  it('reopens the closed window, not a fresh hour, on a retry that states no reset', () => {
+    // Otherwise the held work would be retried, and silently refused, every
+    // hour until the reset the user was told.
+    const reset = Date.parse('2026-10-14T01:00:00.000Z');
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en'); // 10am tomorrow
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const retry = new Date(later.getTime() + 5 * 60_000);
+    const hit = recordUsageLimit("You've hit your limit", retry, SEOUL, 'en');
+    expect(hit?.notice).toBeNull();
+    expect(hit?.resetsAt.getTime()).toBe(reset);
+    expect(usageLimitResetsAt(retry)?.getTime()).toBe(reset);
+  });
+
+  it('guesses an hour for a window that opens well after the close', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const reopened = new Date(later.getTime() + 11 * 60_000);
+    const hit = recordUsageLimit(
+      "You've hit your limit",
+      reopened,
+      SEOUL,
+      'en',
+    );
+    expect(hit?.resetsAt.getTime()).toBe(reopened.getTime() + HOUR);
+    expect(hit?.notice).toBeTruthy();
+  });
+
   it('announces a window that opens well after an answer closed the last one', () => {
     // The user saw the bot answer again; without a word, a new window would
     // look like it had stopped. Its reset is still before the announced one.

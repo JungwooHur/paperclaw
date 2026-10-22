@@ -81,16 +81,23 @@ const MESSAGE_RESUME_MARGIN_MS = 2 * MINUTE_MS;
 const TASK_RESUME_MARGIN_MS = 5 * MINUTE_MS;
 /**
  * A refusal this soon after an answer closed the window is the retry a close
- * on a stray answer costs: it reopens that window. One later opens a new
- * window, to a user who has seen the bot answer again since.
+ * on a stray answer costs: it reopens that window, reset and all. One later
+ * opens a new window, to a user who has seen the bot answer again since.
  */
 const CLOSE_GRACE_MS = 10 * MINUTE_MS;
 
-// router_state keys: the open window's reset, the reset of the window the user
-// has already been told about, and when an answer last closed a window.
+// router_state keys: the open window's reset (empty when none is open), the
+// reset of the window the user has already been told about, and the last close
+// an answer made, as JSON: when ({at}) and the reset of the window it closed
+// ({resetsAt}). Cleared by the next refusal.
 const LIMITED_UNTIL_KEY = 'usage_limited_until';
 const ANNOUNCED_KEY = 'usage_limit_announced';
-const CLOSED_KEY = 'usage_limit_closed_at';
+const CLOSED_KEY = 'usage_limit_closed';
+
+interface Close {
+  at: number;
+  resetsAt: number;
+}
 
 export function isUsageLimit(text: string): boolean {
   return LIMIT_PATTERN.test(text);
@@ -152,6 +159,9 @@ export function recordUsageLimit(
 ): UsageLimitHit | null {
   const limit = classifyUsageLimit(text, now, tz);
   if (!limit) return null;
+  const closed = readClose();
+  const retryAfterClose =
+    closed !== null && now.getTime() - closed.at <= CLOSE_GRACE_MS;
 
   // A reset the text states, still ahead, is the CLI's own word: it replaces
   // the open window, earlier or later. Otherwise the reset is a guess, an hour
@@ -159,11 +169,14 @@ export function recordUsageLimit(
   // was just refused, and trusting it would send the same work straight back
   // into the limit every couple of minutes. A guess knows less than the window
   // already open, so it never ends one sooner, though it extends one that
-  // ends before it: a stated reset that has passed, or an earlier guess.
+  // ends before it: a stated reset that has passed, or an earlier guess. The
+  // retry of a close counts the window it closed as open.
   let resetsAt = limit.resetsAt;
   if (!limit.stated || resetsAt.getTime() <= now.getTime()) {
     const guess = now.getTime() + UNKNOWN_RESET_HOLD_MS;
-    const open = usageLimitResetsAt(now)?.getTime() ?? 0;
+    const open =
+      usageLimitResetsAt(now)?.getTime() ??
+      (retryAfterClose ? closed.resetsAt : 0);
     resetsAt = new Date(Math.max(guess, open));
   }
   setRouterState(LIMITED_UNTIL_KEY, resetsAt.toISOString());
@@ -176,10 +189,9 @@ export function recordUsageLimit(
   // told. So does a refusal well after an answer closed the window, whatever
   // its reset: the window is open again, so the close is over.
   const announced = readTime(ANNOUNCED_KEY);
-  const closed = readTime(CLOSED_KEY);
   if (closed !== null) setRouterState(CLOSED_KEY, '');
   if (
-    (closed === null || now.getTime() - closed <= CLOSE_GRACE_MS) &&
+    (closed === null || retryAfterClose) &&
     announced !== null &&
     now.getTime() < announced + MESSAGE_RESUME_MARGIN_MS &&
     resetsAt.getTime() <= announced + UNKNOWN_RESET_HOLD_MS
@@ -212,17 +224,22 @@ export function usageLimitResetsAt(now: Date = new Date()): Date | null {
  * Closes the open window on an answer: a request got through, so the limit no
  * longer holds (extra usage, or quota back before the stated reset). Returns
  * whether it closed one, so the caller can run the held work now. The
- * announced reset stays, and the close is recorded: if it was wrong, the
- * refusal of the retry, which comes within CLOSE_GRACE_MS, reopens the same
- * window without telling the user again.
+ * announced reset stays, and the close is recorded with the window's reset:
+ * if it was wrong, the refusal of the retry, which comes within
+ * CLOSE_GRACE_MS, reopens the same window without telling the user again.
  */
 export function closeUsageLimitOnAnswer(
   text: string | null | undefined,
   now: Date = new Date(),
 ): boolean {
-  if (!isAgentAnswer(text) || usageLimitResetsAt(now) === null) return false;
+  if (!isAgentAnswer(text)) return false;
+  const resetsAt = usageLimitResetsAt(now);
+  if (resetsAt === null) return false;
   setRouterState(LIMITED_UNTIL_KEY, '');
-  setRouterState(CLOSED_KEY, now.toISOString());
+  setRouterState(
+    CLOSED_KEY,
+    JSON.stringify({ at: now.toISOString(), resetsAt: resetsAt.toISOString() }),
+  );
   return true;
 }
 
@@ -243,6 +260,18 @@ function usageLimitNotice(resetsAt: Date, tz: string, lang: string): string {
   return korean
     ? `Claude 사용 한도에 도달했습니다. 대기 중인 작업은 한도가 초기화되는 ${when} (${tz}) 이후에 자동으로 처리됩니다.`
     : `Claude usage limit reached. Pending work will run automatically after the limit resets at ${when} (${tz}).`;
+}
+
+function readClose(): Close | null {
+  try {
+    const { at, resetsAt } = JSON.parse(getRouterState(CLOSED_KEY) || '{}');
+    const close = { at: Date.parse(at), resetsAt: Date.parse(resetsAt) };
+    return Number.isNaN(close.at) || Number.isNaN(close.resetsAt)
+      ? null
+      : close;
+  } catch {
+    return null;
+  }
 }
 
 function readTime(key: string): number | null {
