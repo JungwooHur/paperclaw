@@ -6,7 +6,12 @@ vi.mock('./container-runner.js', () => ({
 }));
 
 import { ContainerOutput, runContainerAgent } from './container-runner.js';
-import { _initTestDatabase, createTask, getTaskById } from './db.js';
+import {
+  _getTaskRunLogs,
+  _initTestDatabase,
+  createTask,
+  getTaskById,
+} from './db.js';
 import {
   _resetSchedulerLoopForTests,
   startSchedulerLoop,
@@ -275,6 +280,11 @@ describe('a scheduled run while a usage-limit window is open', () => {
       expect(task?.status, id).toBe('active');
       expect(deferredPastReset(task), id).toBe(true);
       expect(task?.last_result, id).toMatch(/^Error: .*usage limit/i);
+      // The run log says why the run did not happen.
+      const logs = _getTaskRunLogs(id);
+      expect(logs, id).toHaveLength(1);
+      expect(logs[0].status, id).toBe('error');
+      expect(logs[0].error, id).toMatch(/usage limit window open/i);
     }
   });
 
