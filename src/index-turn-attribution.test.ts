@@ -300,7 +300,24 @@ const RUN_STATE_KEYS = [
   'turn_open_from',
   'turn_put_back',
   'usage_limit_refused_input',
+  'held_command',
 ];
+
+/** Messages stored while no process polls: start-up recovery finds them. */
+function storedBeforeStart(
+  messages: [id: string, content: string, at: number][],
+): void {
+  for (const [id, content, at] of messages) {
+    storeMessage({
+      id,
+      chat_jid: CHAT,
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content,
+      timestamp: new Date(at).toISOString(),
+    });
+  }
+}
 
 /**
  * What the process leaves behind if it dies now: its router_state and the
@@ -1398,6 +1415,161 @@ describe('a batch whose newest message is a slash command', () => {
       await a.exit();
       await nothingRunsAgain();
     });
+
+    it('runs a command sent without the trigger after a triggered question', async () => {
+      // On its own it would not start the agent, but the batch it ended did.
+      await usersSay([
+        ['m1', `@${ASSISTANT_NAME} ${M1}`, NOW - 60_000],
+        ['m2', CMD, NOW - 50_000],
+      ]);
+      const a = containers[0];
+      expect(timesIn(a.prompt, M1)).toBe(1);
+      expect(a.prompt).not.toContain(CMD);
+      await userSays('m3', 'lunch at noon?', NOW - 45_000);
+      await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+      expect(waitingTexts()).toEqual([CMD]);
+      const [command] = a.drain();
+      await a.result('The skill ran.', { inputs: [command] });
+      // Chatter after the command is still context, not a request.
+      expect(waitingTexts()).toEqual([]);
+      await a.exit();
+      await nothingRunsAgain();
+    });
+
+    it('runs such a command after a restart stopped it in its file', async () => {
+      setRegisteredGroup(CHAT, TEAM);
+      await usersSay([
+        ['m1', `@${ASSISTANT_NAME} ${M1}`, NOW - 60_000],
+        ['m2', CMD, NOW - 50_000],
+      ]);
+      const a = containers[0];
+      await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+      expect(waitingTexts()).toEqual([CMD]); // never drained
+      const deadState = crashState();
+      await a.exit('error');
+      deadState();
+      _restoreStartupState();
+      _recoverPendingMessages();
+      await vi.advanceTimersByTimeAsync(0);
+
+      const b = containers[1];
+      expect(b.prompt).toBe(CMD);
+      await b.result('The skill ran.', { inputs: [b.startIds[0]] });
+      await b.exit();
+      await nothingRunsAgain();
+    });
+  });
+
+  it('goes as the command alone when it shares the second of the message before it', async () => {
+    // WhatsApp stamps whole seconds, and the cursor cannot stop between two
+    // messages that share a timestamp: the batch goes whole, as before.
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 60_000],
+    ]);
+    const a = containers[0];
+    expect(a.prompt).toBe(CMD);
+    await a.result('The skill ran.', { inputs: [a.startIds[0]] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('goes as the command alone at start-up too when it shares that second', async () => {
+    storedBeforeStart([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 60_000],
+    ]);
+    restart();
+    _recoverPendingMessages();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const a = containers[0];
+    expect(a.prompt).toBe(CMD);
+    await a.result('The skill ran.', { inputs: [a.startIds[0]] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs the newer of two held commands that share a second', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', '/probe-skill first', NOW - 50_000],
+      ['m3', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    expect(a.prompt).not.toContain('/probe-skill');
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('keeps the command a prompt of its own when a message comes before the question is answered', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    await userSays('m3', M2, NOW - 40_000);
+    // Nothing goes past the command while it waits.
+    expect(waitingTexts()).toEqual([]);
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    const [later] = waitingTexts();
+    expect(timesIn(later, M2)).toBe(1);
+    expect(later).not.toContain(CMD);
+    const [p3] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p3] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('keeps the command a prompt of its own across a restart, with a message after it', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    await userSays('m3', M2, NOW - 40_000);
+    await restartWhileRunning(a);
+
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(CMD);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = b.drain();
+    await b.result('The skill ran.', { inputs: [command] });
+    const [p3] = b.drain();
+    await b.result('It covers the experiments.', { inputs: [p3] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('waits for a question piped with it, not only for the turn running then', async () => {
+    await userSays('m0', M3, NOW - 70_000);
+    const a = containers[0];
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    expect(waitingTexts()).toHaveLength(1);
+    expect(waitingTexts()[0]).not.toContain(CMD);
+    const [p1] = a.drain();
+    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
+    // The question is still open: the command would be merged into its turn.
+    expect(waitingTexts()).toEqual([]);
+    await a.result('It describes the method.', { inputs: [p1] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.exit();
+    await nothingRunsAgain();
   });
 
   it('runs the messages before it first, then the command as its own prompt', async () => {
@@ -1415,6 +1587,8 @@ describe('a batch whose newest message is a slash command', () => {
     const [command] = a.drain();
     await a.result('The skill ran.', { inputs: [command] });
     await a.exit();
+    // Passed by the cursor, so the run's end forgets it.
+    expect(JSON.parse(getRouterState('held_command') || '{}')).toEqual({});
     await nothingRunsAgain();
   });
 
@@ -1459,27 +1633,6 @@ describe('a batch whose newest message is a slash command', () => {
     expect(b.prompt).toBe(CMD);
     await b.result('The skill ran.', { inputs: [b.startIds[0]] });
     await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('waits for a question piped with it, not only for the turn running then', async () => {
-    await userSays('m0', M3, NOW - 70_000);
-    const a = containers[0];
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    expect(waitingTexts()).toHaveLength(1);
-    expect(waitingTexts()[0]).not.toContain(CMD);
-    const [p1] = a.drain();
-    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
-    // The question is still open: the command would be merged into its turn.
-    expect(waitingTexts()).toEqual([]);
-    await a.result('It describes the method.', { inputs: [p1] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    await a.exit();
     await nothingRunsAgain();
   });
 });

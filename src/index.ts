@@ -215,6 +215,14 @@ const ANSWERED_AHEAD_KEY = 'answered_ahead';
 // restart stops that container, so start-up puts the cursor back there; the
 // answered prompts past it are in answered_ahead by then. Cleared at exit.
 const OPEN_FROM_KEY = 'turn_open_from';
+// router_state key: per group, the newest of the commands a delivery held
+// back for prompts of their own, behind the messages before them in the same
+// batch (nextDelivery). While the cursor is behind it, those commands go
+// before anything newer, one per prompt, and start the agent without the
+// trigger, as the batch they ended did. Persisted, so a put-back or a restart
+// that makes the batch pending again does not turn them into plain text.
+// Dropped once a run ends with the cursor past it.
+const HELD_COMMAND_KEY = 'held_command';
 // router_state key: per group, the session a usage-limit refusal left its
 // refused prompts in, and the ranges of the messages those took. The session
 // keeps them, so a delivery into it marks those messages as sent again
@@ -340,7 +348,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const missedMessages = pending.messages;
 
   if (missedMessages.length === 0) return true;
-  if (!startsAgent(group, missedMessages)) return true;
+  if (!startsAgent(chatJid, group, missedMessages)) return true;
 
   // A usage-limit window is open: leave the messages pending rather than start
   // a container the limit would refuse. They run when the window closes.
@@ -355,7 +363,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   // A command at the end of the batch waits for a prompt of its own.
-  const delivery = nextDelivery(pending, group);
+  const delivery = nextDelivery(chatJid, pending, group);
   const prompt = formatMessages(delivery.messages, resentIn(chatJid));
 
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -681,6 +689,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Behind the cursor wherever the exit left it, so no rollback reaches them.
   pruneAnsweredAhead(chatJid);
   pruneRefusedTurn(chatJid);
+  pruneHeldCommand(chatJid);
   if (done) queueHeldBack(chatJid, group);
   return done;
 }
@@ -919,7 +928,7 @@ function pollNewMessages(): void {
 
       // Non-trigger messages accumulate in DB and get pulled as
       // context when a trigger eventually arrives.
-      if (!startsAgent(group, groupMessages)) continue;
+      if (!startsAgent(chatJid, group, groupMessages)) continue;
 
       // Pull all messages since lastAgentTimestamp so non-trigger
       // context that accumulated between triggers is included.
@@ -935,13 +944,23 @@ function pollNewMessages(): void {
 
 /**
  * Whether these messages start the agent: any message in the main group, or
- * in a group that needs no trigger; elsewhere only one with the trigger.
+ * in a group that needs no trigger; elsewhere only one with the trigger, or a
+ * command held back from a batch that had one (held_command).
  */
-function startsAgent(group: RegisteredGroup, messages: NewMessage[]): boolean {
+function startsAgent(
+  chatJid: string,
+  group: RegisteredGroup,
+  messages: NewMessage[],
+): boolean {
   if (group.folder === MAIN_GROUP_FOLDER || group.requiresTrigger === false) {
     return true;
   }
-  return messages.some((m) => TRIGGER_PATTERN.test(m.content.trim()));
+  const held = heldCommand(chatJid);
+  return messages.some(
+    (m) =>
+      TRIGGER_PATTERN.test(m.content.trim()) ||
+      (held !== undefined && m.timestamp <= held),
+  );
 }
 
 /**
@@ -957,7 +976,11 @@ function deliverMessages(
   group: RegisteredGroup,
   pending: Pending,
 ): void {
-  const delivery = nextDelivery(pending, group);
+  // A command held back goes once every prompt before it is settled
+  // (deliverHeldBack), since a running turn would take it as plain text, and
+  // nothing newer goes ahead of it.
+  if (heldCommand(chatJid) && openPrompts[chatJid]?.length) return;
+  const delivery = nextDelivery(chatJid, pending, group);
   if (
     !pipeToActiveContainer(chatJid, channel, delivery.messages, delivery.end)
   ) {
@@ -977,8 +1000,8 @@ function deliverHeldBack(
 ): void {
   const pending = pendingMessages(chatJid);
   if (pending.messages.length === 0) return;
-  if (!startsAgent(group, pending.messages)) return;
-  const delivery = nextDelivery(pending, group);
+  if (!startsAgent(chatJid, group, pending.messages)) return;
+  const delivery = nextDelivery(chatJid, pending, group);
   pipeToActiveContainer(chatJid, channel, delivery.messages, delivery.end);
 }
 
@@ -991,7 +1014,9 @@ function queueHeldBack(chatJid: string, group: RegisteredGroup): void {
   if (usageLimitHeldUntil()) return;
   const pending = pendingMessages(chatJid);
   if (pending.messages.length === 0) return;
-  if (startsAgent(group, pending.messages)) queue.enqueueMessageCheck(chatJid);
+  if (startsAgent(chatJid, group, pending.messages)) {
+    queue.enqueueMessageCheck(chatJid);
+  }
 }
 
 /**
@@ -1084,28 +1109,87 @@ function pendingMessages(chatJid: string): Pending {
 }
 
 /**
- * The pending messages the next prompt carries (firstPrompt), and where
- * delivering them moves the cursor: past the newest message they reach,
- * answered or not, so an answered range among them is behind it. Not past a
- * command held back for a prompt of its own, which stays pending. In a group
- * that needs the trigger, messages before a command that would not start the
- * agent are context, not a request: sent alone they would draw a reply, so
- * the batch goes whole, as the command alone, as before.
+ * The pending messages the next prompt carries, and where delivering them
+ * moves the cursor: past the newest message they reach, answered or not, so
+ * an answered range among them is behind it, but not to the first pending
+ * message they leave, which stays pending.
+ *
+ * Commands held back earlier (held_command) go first, one per prompt, and
+ * nothing newer goes with them. Commands at the end of a batch are held back
+ * for prompts of their own (firstPrompt), and remembered, only where the
+ * cursor can stop between them and the messages before them, and only when
+ * those messages start the agent. Otherwise the batch goes whole, as the
+ * command alone, as before: when the last of those messages shares the
+ * command's timestamp (WhatsApp stamps whole seconds), and in a group that
+ * needs the trigger, when they are context, not a request, and sent alone
+ * would draw a reply.
  */
 function nextDelivery(
+  chatJid: string,
   pending: Pending,
   group: RegisteredGroup,
 ): {
   messages: NewMessage[];
   end: string;
 } {
-  const first = firstPrompt(pending.messages);
-  const messages = startsAgent(group, first) ? first : pending.messages;
-  const held = pending.messages[messages.length];
-  const reached = held
-    ? pending.all.filter((m) => m.timestamp < held.timestamp)
-    : pending.all;
-  return { messages, end: reached[reached.length - 1].timestamp };
+  const held = heldCommand(chatJid);
+  const upToHeld = held
+    ? pending.messages.filter((m) => m.timestamp <= held)
+    : [];
+  const batch = upToHeld.length > 0 ? upToHeld : pending.messages;
+  const first = firstPrompt(batch);
+  const command = batch[first.length];
+  const split =
+    command !== undefined &&
+    command.timestamp > first[first.length - 1].timestamp &&
+    startsAgent(chatJid, group, first);
+  const messages = split ? first : batch;
+  // Before the cursor moves, so a crash cannot leave the commands pending
+  // and forgotten.
+  if (split) rememberHeldCommand(chatJid, batch[batch.length - 1].timestamp);
+  const next = pending.messages[messages.length];
+  let end = messages[messages.length - 1].timestamp;
+  for (const m of pending.all) {
+    if (m.timestamp > end && (!next || m.timestamp < next.timestamp)) {
+      end = m.timestamp;
+    }
+  }
+  return { messages, end };
+}
+
+function readHeldCommands(): Record<string, string> {
+  try {
+    return JSON.parse(getRouterState(HELD_COMMAND_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The newest command a delivery held back for a prompt of its own, while the
+ * group's cursor is still behind it; otherwise undefined.
+ */
+function heldCommand(chatJid: string): string | undefined {
+  const at = readHeldCommands()[chatJid];
+  return at !== undefined && at > (lastAgentTimestamp[chatJid] || '')
+    ? at
+    : undefined;
+}
+
+/** Persists the newest command held back for the group (undefined: none). */
+function rememberHeldCommand(chatJid: string, at: string | undefined): void {
+  const all = readHeldCommands();
+  if (all[chatJid] === at) return;
+  if (at === undefined) delete all[chatJid];
+  else all[chatJid] = at;
+  setRouterState(HELD_COMMAND_KEY, JSON.stringify(all));
+}
+
+/** Drops the group's held command once its cursor has passed it. */
+function pruneHeldCommand(chatJid: string): void {
+  if (readHeldCommands()[chatJid] !== undefined && !heldCommand(chatJid)) {
+    rememberHeldCommand(chatJid, undefined);
+  }
 }
 
 function readAnsweredAhead(): Record<string, Range[]> {
@@ -1360,7 +1444,7 @@ function recoverPendingMessages(): void {
         'Recovery: found unprocessed messages',
       );
       const channel = findChannel(channels, chatJid);
-      if (channel && startsAgent(group, pending.messages)) {
+      if (channel && startsAgent(chatJid, group, pending.messages)) {
         deliverMessages(chatJid, channel, group, pending);
       } else {
         queue.enqueueMessageCheck(chatJid);
