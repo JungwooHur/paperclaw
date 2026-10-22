@@ -198,8 +198,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
   const missedMessages = getMessagesSince(
     chatJid,
@@ -208,14 +206,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
 
   if (missedMessages.length === 0) return true;
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const hasTrigger = missedMessages.some((m) =>
-      TRIGGER_PATTERN.test(m.content.trim()),
-    );
-    if (!hasTrigger) return true;
-  }
+  if (!startsAgent(group, missedMessages)) return true;
 
   // A usage-limit window is open: leave the messages pending rather than start
   // a container the limit would refuse. They run when the window closes.
@@ -557,18 +548,9 @@ async function startMessageLoop(): Promise<void> {
             continue;
           }
 
-          const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const hasTrigger = groupMessages.some((m) =>
-              TRIGGER_PATTERN.test(m.content.trim()),
-            );
-            if (!hasTrigger) continue;
-          }
+          if (!startsAgent(group, groupMessages)) continue;
 
           // Pull all messages since lastAgentTimestamp so non-trigger
           // context that accumulated between triggers is included.
@@ -580,16 +562,41 @@ async function startMessageLoop(): Promise<void> {
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
 
-          if (!pipeToActiveContainer(chatJid, channel, messagesToSend)) {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
+          deliverMessages(chatJid, channel, messagesToSend);
         }
       }
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+  }
+}
+
+/**
+ * Whether these messages start the agent: any message in the main group, or
+ * in a group that needs no trigger; elsewhere only one with the trigger.
+ */
+function startsAgent(group: RegisteredGroup, messages: NewMessage[]): boolean {
+  if (group.folder === MAIN_GROUP_FOLDER || group.requiresTrigger === false) {
+    return true;
+  }
+  return messages.some((m) => TRIGGER_PATTERN.test(m.content.trim()));
+}
+
+/**
+ * Hands a group's pending messages to its running container, or queues a
+ * check that starts one when no container takes them. A check for a group
+ * whose container is running only marks it, and that container takes the
+ * messages only once it closes, on idle after half an hour: so the message
+ * loop and recovery both deliver this way.
+ */
+function deliverMessages(
+  chatJid: string,
+  channel: Channel,
+  messages: NewMessage[],
+): void {
+  if (!pipeToActiveContainer(chatJid, channel, messages)) {
+    queue.enqueueMessageCheck(chatJid);
   }
 }
 
@@ -714,7 +721,9 @@ function usageLimitChanged(): void {
  * Startup recovery: check for unprocessed messages in registered groups.
  * Handles crash between advancing lastTimestamp and processing messages.
  * While a usage-limit window is open it only arms itself for the window's end,
- * which is also how held messages get picked up after the reset.
+ * which is also how held messages get picked up after the reset. Messages a
+ * window held while the group's container kept running go into that
+ * container, as the message loop would have put them.
  */
 function recoverPendingMessages(): void {
   const heldUntil = usageLimitHeldUntil();
@@ -731,7 +740,12 @@ function recoverPendingMessages(): void {
         { group: group.name, pendingCount: pending.length },
         'Recovery: found unprocessed messages',
       );
-      queue.enqueueMessageCheck(chatJid);
+      const channel = findChannel(channels, chatJid);
+      if (channel && startsAgent(group, pending)) {
+        deliverMessages(chatJid, channel, pending);
+      } else {
+        queue.enqueueMessageCheck(chatJid);
+      }
     }
   }
 }

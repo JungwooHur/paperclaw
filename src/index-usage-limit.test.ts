@@ -4,6 +4,15 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The group queue writes follow-ups and the close sentinel under DATA_DIR;
+// keep them out of the checkout's data/.
+const { dataDir } = vi.hoisted(() => ({
+  dataDir: `${process.env.TMPDIR || '/tmp'}/usage-limit-data-${process.pid}`,
+}));
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  DATA_DIR: dataDir,
+}));
 vi.mock('./container-runner.js', () => ({
   runContainerAgent: vi.fn(),
   writeTasksSnapshot: vi.fn(),
@@ -131,11 +140,15 @@ let inputDir: string;
 // builds it: the host's prompt plus every input file it drains at start-up.
 let bootPrompts: string[];
 
-/** Pipes write real input files, the way GroupQueue.sendMessage does. */
-function pipesWriteFiles(): void {
+/**
+ * Pipes write real input files, the way GroupQueue.sendMessage does while the
+ * group's container runs. Restore the spy once it no longer does.
+ */
+function pipesWriteFiles() {
   let written = 0;
-  vi.spyOn(GroupQueue.prototype, 'sendMessage').mockImplementation(
-    (_jid, text) => {
+  return vi
+    .spyOn(GroupQueue.prototype, 'sendMessage')
+    .mockImplementation((_jid, text) => {
       written++;
       const file = path.join(
         inputDir,
@@ -143,8 +156,7 @@ function pipesWriteFiles(): void {
       );
       fs.writeFileSync(file, JSON.stringify({ type: 'message', text }));
       return file;
-    },
-  );
+    });
 }
 
 function inputFiles(): string[] {
@@ -192,6 +204,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   fs.rmSync(inputDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
 describe('a message answered with the usage limit', () => {
@@ -291,7 +304,7 @@ describe('a message answered with the usage limit', () => {
 
   it('keeps a follow-up piped in during the answer pending when the limit refuses it', async () => {
     userSays('m1', 'what is section 2 about?', NOW - 60_000);
-    pipesWriteFiles();
+    const pipes = pipesWriteFiles();
     vi.mocked(runContainerAgent).mockImplementationOnce(
       async (_group, _input, _onProcess, onOutput) => {
         // The follow-up arrives while the first answer is being written, and
@@ -314,6 +327,8 @@ describe('a message answered with the usage limit', () => {
     );
     await _processGroupMessages(CHAT);
     expect(sentTexts()).toContain('It describes the method.');
+    // The container is gone, so recovery finds none to pipe into.
+    pipes.mockRestore();
 
     await vi.advanceTimersByTimeAsync(RESET + 5 * 60_000 - Date.now());
     expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
@@ -448,6 +463,118 @@ describe('an answer inside an open window', () => {
     await answeredInsideWindow('API Error: 500 {"type":"error"}');
     expect(usageLimitHeldUntil()).not.toBeNull();
     expect(enqueueMessageCheck).not.toHaveBeenCalled();
+  });
+});
+
+// Through the module's own queue, as main() runs it: a check for a group whose
+// container is still running only marks it pending, and that container takes
+// it only when it closes, half an hour after its last answer if it idles.
+describe('messages held for a container that is still running', () => {
+  const { queue } = _schedulerDependencies();
+  const m2Text = 'and section 3?';
+  let exitContainer: () => void;
+
+  beforeEach(() => {
+    enqueueMessageCheck.mockRestore();
+    queue.setProcessMessagesFn(_processGroupMessages);
+  });
+
+  afterEach(async () => {
+    exitContainer?.();
+    await vi.advanceTimersByTimeAsync(0);
+    queue.setProcessMessagesFn(async () => true);
+  });
+
+  /** What the queue has piped into the group's running container. */
+  function pipedTexts(): string[] {
+    const dir = path.join(dataDir, 'ipc', MAIN_GROUP.folder, 'input');
+    if (!fs.existsSync(dir)) return [];
+    return fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')).text);
+  }
+
+  /**
+   * Starts m1 through the queue in a container that runs `turn` and then
+   * stays up, idle, until the test ends it.
+   */
+  async function containerRunning(
+    turn: (
+      onOutput: (output: ContainerOutput) => Promise<void>,
+    ) => Promise<void>,
+  ): Promise<void> {
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, onProcess, onOutput) => {
+        onProcess({} as never, 'paperclaw-main-1');
+        await turn(onOutput!);
+        await new Promise<void>((resolve) => {
+          exitContainer = resolve;
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    queue.enqueueMessageCheck(CHAT);
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  /** m2 arrives while the window is open, and the message loop queues it. */
+  function heldWhileOpen(): NewMessage {
+    const m2 = userSays('m2', m2Text, Date.now());
+    expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(false);
+    queue.enqueueMessageCheck(CHAT);
+    return m2;
+  }
+
+  async function answer(
+    onOutput: (output: ContainerOutput) => Promise<void>,
+    result: string,
+  ): Promise<void> {
+    await onOutput({ status: 'success', result, newSessionId: 'session-new' });
+    await onOutput({
+      status: 'success',
+      result: null,
+      newSessionId: 'session-new',
+    });
+  }
+
+  it('go into it at once when its own answer closes the window', async () => {
+    let m2!: NewMessage;
+    await containerRunning(async (onOutput) => {
+      // Another group is refused while m1 is in flight: the window opens.
+      recordUsageLimit(LIMIT);
+      m2 = heldWhileOpen();
+      await answer(onOutput, 'It describes the method.');
+    });
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(pipedTexts()).toEqual([expect.stringContaining(m2Text)]);
+    // The cursor moves past it, as a pipe from the message loop moves it.
+    expect(getRouterState('last_agent_timestamp')).toContain(m2.timestamp);
+
+    // The check the loop queued finds nothing left once the container exits:
+    // m2 is not run again.
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runContainerAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('go into it at once when the window ends at its reset', async () => {
+    const reset = NOW + 10 * 60_000; // 9:10pm in Seoul
+    await containerRunning((onOutput) =>
+      answer(onOutput, 'It describes the method.'),
+    );
+    // Then another group is refused, and its run arms recovery for the reset.
+    recordUsageLimit("You've hit your limit · resets 9:10pm (Asia/Seoul)");
+    _recoverPendingMessages();
+    heldWhileOpen();
+    expect(pipedTexts()).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(reset + 3 * 60_000 - Date.now());
+    expect(pipedTexts()).toEqual([expect.stringContaining(m2Text)]);
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runContainerAgent).toHaveBeenCalledTimes(1);
   });
 });
 
