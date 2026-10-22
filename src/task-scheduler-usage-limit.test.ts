@@ -62,7 +62,7 @@ function addDueTask(
 
 async function runDueTasks(
   sendMessage: (jid: string, text: string) => Promise<void>,
-  onUsageLimitLifted: () => void = () => {},
+  onUsageLimitChanged: () => void = () => {},
 ) {
   const queue = {
     enqueueTask: (_jid: string, _id: string, fn: () => Promise<void>) => {
@@ -85,7 +85,7 @@ async function runDueTasks(
     queue: queue as any,
     onProcess: () => {},
     sendMessage,
-    onUsageLimitLifted,
+    onUsageLimitChanged,
   });
   await vi.advanceTimersByTimeAsync(10);
   return queue;
@@ -123,6 +123,19 @@ describe('a scheduled run that hits the usage limit', () => {
     const task = getTaskById('nightly');
     expect(task?.status).toBe('active');
     expect(deferredPastReset(task)).toBe(true);
+  });
+
+  it('reports the window its refusal set, so held messages follow it', async () => {
+    addDueTask('nightly', 'cron', '30 23 * * *');
+    agentAnswers(LIMIT);
+    const changed = vi.fn();
+
+    await runDueTasks(
+      vi.fn(async () => {}),
+      changed,
+    );
+
+    expect(changed).toHaveBeenCalledTimes(1);
   });
 
   it('keeps a once task active and defers it the same way', async () => {

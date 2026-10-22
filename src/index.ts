@@ -701,6 +701,16 @@ function usageLimitLifted(): void {
 }
 
 /**
+ * A scheduled run changed the usage-limit window. Held messages follow it: a
+ * refusal can state an earlier reset than the one recovery is armed for, and
+ * an answer that closed the window runs them now.
+ */
+function usageLimitChanged(): void {
+  if (usageLimitHeldUntil()) recoverPendingMessages();
+  else usageLimitLifted();
+}
+
+/**
  * Startup recovery: check for unprocessed messages in registered groups.
  * Handles crash between advancing lastTimestamp and processing messages.
  * While a usage-limit window is open it only arms itself for the window's end,
@@ -755,7 +765,7 @@ function schedulerDependencies(): SchedulerDependencies {
       const text = formatOutbound(rawText);
       if (text) await channel.sendMessage(jid, text);
     },
-    onUsageLimitLifted: usageLimitLifted,
+    onUsageLimitChanged: usageLimitChanged,
   };
 }
 

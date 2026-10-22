@@ -387,7 +387,7 @@ When the account behind the token runs out of quota, the CLI bundled with the ag
 
 - The refused messages become pending again, and the group keeps its session, so a follow-up after the reset still has the earlier context.
 - The window lives in `router_state` (`usage_limited_until`), so it survives a restart. While it is open, no container is started for messages or for scheduled runs; they wait.
-- Held messages run two minutes after the reset, without a new message to trigger them.
+- Held messages run two minutes after the reset, without a new message to trigger them, and follow the window when a scheduled run's refusal moves its reset.
 - The group is told once per window when work will resume. A later refusal that moves the reset more than an hour past the announced time sends a corrected notice; one that moves it earlier sends none.
 - A reset the text states, still ahead, sets the window, earlier or later than the one open. A reset the text does not state, or one already in the past, is a guess of an hour from now, and a guess never ends an open window sooner.
 - An answer while the window is open closes it, and the held messages run at once instead of at the reset. An answer is result text that is neither the refusal nor one of the CLI's error messages (`API Error: …` and the like), which the runner forwards as successes. Only a container already running can answer into an open window. If the close was wrong, the first held message is refused again and reopens the window without a second notice.

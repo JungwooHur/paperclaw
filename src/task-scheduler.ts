@@ -50,10 +50,11 @@ export interface SchedulerDependencies {
   ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
   /**
-   * A run's answer closed the usage-limit window: run the held messages now
-   * rather than at the reset the window had.
+   * A run's result changed the usage-limit window: a refusal opened or moved
+   * it, or an answer closed it. Held messages follow the window, so they run
+   * at its new end, or at once when it closed.
    */
-  onUsageLimitLifted: () => void;
+  onUsageLimitChanged: () => void;
 }
 
 async function runTask(
@@ -208,6 +209,9 @@ async function runTask(
           if (limit) {
             // Not an answer: the work did not run. Hold it until the reset.
             limitResetsAt = limit.resetsAt;
+            // A reset the refusal states can end the window sooner than the
+            // one held messages are waiting for.
+            deps.onUsageLimitChanged();
             if (limit.notice)
               await deps.sendMessage(task.chat_jid, limit.notice);
           } else {
@@ -215,7 +219,7 @@ async function runTask(
             if (isAgentAnswer(streamedOutput.result)) answered = true;
             // A request got through: an open window is over.
             if (closeUsageLimitOnAnswer(streamedOutput.result)) {
-              deps.onUsageLimitLifted();
+              deps.onUsageLimitChanged();
             }
             // Forward result to user (sendMessage handles formatting)
             await deps.sendMessage(task.chat_jid, streamedOutput.result);

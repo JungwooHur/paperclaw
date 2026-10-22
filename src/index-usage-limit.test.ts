@@ -48,7 +48,11 @@ import {
   startSchedulerLoop,
 } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
-import { recordUsageLimit, usageLimitHeldUntil } from './usage-limit.js';
+import {
+  recordUsageLimit,
+  usageLimitHeldUntil,
+  usageLimitResetsAt,
+} from './usage-limit.js';
 
 const LIMIT = "You've hit your limit · resets Oct 14, 10am (Asia/Seoul)";
 const NOW = Date.parse('2026-10-13T12:00:00.000Z'); // 21:00 in Seoul
@@ -502,6 +506,24 @@ describe('the scheduler, started as main() starts it', () => {
     });
 
     expect(usageLimitHeldUntil()).toBeNull();
+    expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
+  });
+
+  it('runs the held messages at an earlier reset a scheduled refusal states', async () => {
+    const sessionReset = Date.parse('2026-10-13T14:00:00.000Z'); // 11pm Seoul
+    await runScheduledTask(async (turn) => {
+      // A message is refused while the run is under way: held, with recovery
+      // armed for the window's end, 10am tomorrow.
+      userSays('m1', 'translate the new paper', NOW - 30_000);
+      recordUsageLimit(LIMIT);
+      _recoverPendingMessages();
+      // The run is refused too, by a limit that resets sooner.
+      await turn("You've hit your session limit · resets 11pm (Asia/Seoul)");
+    });
+    expect(usageLimitResetsAt()?.getTime()).toBe(sessionReset);
+    expect(enqueueMessageCheck).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(sessionReset + 3 * 60_000 - Date.now());
     expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
   });
 });
