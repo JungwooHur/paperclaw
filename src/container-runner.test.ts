@@ -375,6 +375,8 @@ describe('container-runner agent-runner copy', () => {
 
     const copy =
       '/tmp/paperclaw-test-data/sessions/test-group/agent-runner-src';
+    // The host runs its sources here, as under npm run dev, so it reads the
+    // checkout; compiled, it reads dist/agent-runner-src (stage-runner.test.ts).
     expect(refreshRunnerCopy).toHaveBeenCalledWith(
       `${process.cwd()}/container/agent-runner/src`,
       copy,

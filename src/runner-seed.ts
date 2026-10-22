@@ -13,7 +13,13 @@
  * match was edited in place and is kept: an agent's edit is never overwritten.
  *
  * The marker lives beside the copy, not inside it, because the copy is mounted
- * into the container writable and the agent must not see or edit the marker.
+ * into the container writable. Outside the mount, no agent can edit it. The main
+ * group can still read it, like all of `data/`, through its read-only mount of
+ * the project root.
+ *
+ * The bundle is the runner the host's build staged (stage-runner.ts), so a
+ * runner change reaches groups with the restart that builds it, as a host change
+ * does.
  */
 import crypto from 'crypto';
 import fs from 'fs';
@@ -33,7 +39,7 @@ export type RunnerSeedOutcome =
   | 'refreshed'
   /** The copy differs from what was seeded, or nothing was recorded: kept. */
   | 'edited'
-  /** No bundled runner to seed from. */
+  /** No bundled runner to seed from: the copy was left as it was. */
   | 'no-bundle'
   /** Hashing, copying or swapping failed: the copy was left as it was. */
   | 'failed';
@@ -185,7 +191,15 @@ function refresh(
   copyDir: string,
   group: string,
 ): RunnerSeedOutcome {
-  if (!fs.existsSync(bundleDir)) return 'no-bundle';
+  if (!fs.existsSync(bundleDir)) {
+    logger.warn(
+      { group, bundle: bundleDir },
+      `No bundled agent runner at ${bundleDir}, so this group's copy is used ` +
+        `as it is. A host running from dist/ reads the runner its build ` +
+        `staged: run \`npm run build\` and restart.`,
+    );
+    return 'no-bundle';
+  }
   const markerPath = seedMarkerPath(copyDir);
   const bundleHash = hashTree(bundleDir);
 

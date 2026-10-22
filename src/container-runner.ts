@@ -34,6 +34,7 @@ import {
 } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { refreshRunnerCopy } from './runner-seed.js';
+import { runnerBundleDir } from './stage-runner.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -252,7 +253,8 @@ function buildVolumeMounts(
   // Copy agent-runner source into a per-group writable location so agents
   // can customize it (add tools, change behavior) without affecting other
   // groups. Recompiled on container startup via entrypoint.sh. An unedited
-  // copy follows the bundled runner; an edited one is kept (runner-seed.ts).
+  // copy follows the runner this host's build staged; an edited one is kept
+  // (runner-seed.ts, stage-runner.ts).
   const agentRunnerSrc = path.join(
     projectRoot,
     'container',
@@ -265,7 +267,11 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  refreshRunnerCopy(agentRunnerSrc, groupAgentRunnerDir, group.folder);
+  refreshRunnerCopy(
+    runnerBundleDir(import.meta.url, agentRunnerSrc),
+    groupAgentRunnerDir,
+    group.folder,
+  );
   mounts.push({
     hostPath: groupAgentRunnerDir,
     containerPath: '/app/src',

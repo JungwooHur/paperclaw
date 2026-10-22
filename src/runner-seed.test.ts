@@ -115,7 +115,7 @@ describe('refreshRunnerCopy', () => {
     expect(read(copy)).toEqual(read(bundle));
     expect(markerHash()).toBe(hashTree(bundle));
     // Beside the copy, not inside it: the copy is mounted into the container
-    // writable, and the agent must not see or edit the marker.
+    // writable, and no agent may edit the marker.
     expect(path.relative(copy, seedMarkerPath(copy))).toMatch(/^\.\./);
     expect(siblings()).toEqual([
       'agent-runner-src',
@@ -390,11 +390,33 @@ describe('refreshRunnerCopy', () => {
     expect(read(copy)).toEqual(old);
   });
 
-  it('does nothing without a bundled runner', () => {
+  it('keeps the copy as it is, and warns, when there is no bundled runner', () => {
+    refreshRunnerCopy(bundle, copy, GROUP);
+    const old = read(copy);
+    const seeded = markerHash();
+    fs.rmSync(bundle, { recursive: true });
+    vi.clearAllMocks();
+
+    expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('no-bundle');
+
+    expect(read(copy)).toEqual(old);
+    expect(markerHash()).toBe(seeded);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    const [fields, message] = vi.mocked(logger.warn).mock
+      .calls[0] as unknown as [{ group: string }, string];
+    expect(fields.group).toBe(GROUP);
+    // A compiled host reads the bundle its build staged: say where it looked
+    // and how it gets there.
+    expect(message).toContain(bundle);
+    expect(message).toContain('npm run build');
+  });
+
+  it('seeds nothing without a bundled runner', () => {
     fs.rmSync(bundle, { recursive: true });
 
     expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('no-bundle');
 
     expect(siblings()).toEqual([]);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
   });
 });
