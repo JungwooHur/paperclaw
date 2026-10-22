@@ -11,7 +11,7 @@
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   classifyUsageLimit,
@@ -139,5 +139,31 @@ describe('every error message that CLI can write as a result', () => {
     ]) {
       expect(isAgentAnswer(text), text).toBe(true);
     }
+  });
+});
+
+describe('the "API Error:" head', () => {
+  afterEach(() => {
+    vi.doUnmock('./usage-limit-cli-sentences.json');
+    vi.resetModules();
+  });
+
+  it('keeps an error from passing for an answer without the bundle templates', async () => {
+    // Today the bundle's "API Error: {message}" covers every text the head
+    // does. A bundle that drops it leaves the head as the guard, so the head
+    // is checked here on its own.
+    vi.resetModules();
+    vi.doMock('./usage-limit-cli-sentences.json', () => ({
+      default: { ...fixture, errors: [] },
+    }));
+    const { isAgentAnswer: headOnly } = await import('./usage-limit.js');
+    for (const text of [
+      'API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}',
+      'API Error: ',
+      'API Error:',
+    ]) {
+      expect(headOnly(text), text).toBe(false);
+    }
+    expect(headOnly('It describes the method.')).toBe(true);
   });
 });
