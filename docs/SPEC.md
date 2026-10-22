@@ -394,6 +394,10 @@ When the account behind the token runs out of quota, the CLI bundled with the ag
 
 Scheduled runs are deferred instead; see [How Scheduling Works](#how-scheduling-works). Any other error result from the SDK is still sent as the reply. The rollback is exact only while each result answers one prompt; the cases where it is not are tracked in #114.
 
+The refusal is worded by the CLI bundled with the agent SDK, which the SDK spawns from beside its own module, not by the global `claude-code` the image also installs. `container/agent-runner/package.json` pins the SDK to one exact version, and `src/usage-limit-cli.test.ts` checks the classifier against every refusal that version's CLI can write, listed in `src/usage-limit-cli-sentences.json`. The test fails for any pin the list was not read from, so an SDK bump stays red until `npx tsx scripts/extract-usage-limit-sentences.ts <cli.js>` reads the list again from the new bundle; a reworded refusal then fails the classifier check instead of going out as a reply.
+
+`API Error: Rate limit reached` is deliberately not treated as a usage limit. It is a 429 without the account's usage headers, a request-rate throttle rather than a quota window, and the hour's hold for an unknown reset would delay messages far longer than such a throttle. It stays an error sent as the reply.
+
 ---
 
 ## Commands
