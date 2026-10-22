@@ -940,6 +940,52 @@ describe('a container that exits with input no result answered', () => {
     expect(containers.filter((c) => c.prompt.includes(M1))).toHaveLength(2);
   });
 
+  it('gives up only what went back, not a message that joined its retry', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await a.exit();
+    // Stored before the retry starts: it goes in the same prompt as m1.
+    const m2 = await userSays('m2', M2, NOW - 30_000);
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    await b.result(null, { inputs: [] });
+    await b.exit();
+
+    // m1 is given up; m2 never went back, so it does now.
+    expect(cursor()).toBe(m1.timestamp);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(containers).toHaveLength(3);
+    const c = containers[2];
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result(null, { inputs: [] });
+    await c.exit();
+
+    // Its own retry failed it too: given up in turn.
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('gives up the whole prompt by a put-back cursor an older process saved', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await a.exit();
+    // Saved without the end of what went back.
+    setRouterState('turn_put_back', JSON.stringify({ [CHAT]: '' }));
+    const m2 = await userSays('m2', M2, NOW - 30_000);
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    await b.result(null, { inputs: [] });
+    await b.exit();
+
+    // As before: m2 is given up with m1.
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+
   it('puts back a failed prompt with a newer one taken after it, when neither went back before', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];

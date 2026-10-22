@@ -152,6 +152,14 @@ function unansweredStarts(prompts: OpenPrompt[]): string[] {
 /** A cursor range `(from, to]`: the messages after `from`, up to `to`. */
 type Range = [from: string, to: string];
 
+/** The end of the unanswered prompt that starts at `from`. */
+function promptEnd(prompts: OpenPrompt[], from: string): string {
+  const prompt = prompts.find(
+    (p) => !p.answered && p.ref && refRange(p.ref)?.from === from,
+  );
+  return prompt ? prompt.cursor : from;
+}
+
 /** The ranges of the answered prompts that start at or after `from`. */
 function answeredRanges(prompts: OpenPrompt[], from: string): Range[] {
   const ranges: Range[] = [];
@@ -190,12 +198,14 @@ const attributionOff = new Set<string>();
 // refusal put back, so a restart before the container exits can still drop
 // the files it left. Cleared once the files are dealt with.
 const REFUSED_INPUT_KEY = 'usage_limit_refused_input';
-// router_state key: per group, the cursor a container's exit last put back to
-// for a prompt no result answered, until an exit leaves nothing unanswered.
-// When the oldest prompt the next exit finds unanswered starts there, the
-// retry failed it the same way: that prompt is not put back a third time,
-// but a newer one is. Persisted, so a restart in between does not buy it
-// another run.
+// router_state key: per group, the range a container's exit last put back for
+// a prompt no result answered, `[from, to]`: from its start to the cursor the
+// exit found, until an exit leaves nothing unanswered. When the oldest prompt
+// the next exit finds unanswered starts at `from`, the retry failed it the
+// same way: what went back is not put back a third time, but a message
+// after `to`, which joined the retry's prompt or came later, is. An older
+// process saved `from` alone. Persisted, so a restart in between does not buy
+// it another run.
 const PUT_BACK_KEY = 'turn_put_back';
 // router_state key: per group, the ranges a turn already answered after the
 // group's oldest unanswered prompt, `[[from, to], ...]` oldest first. A
@@ -605,27 +615,33 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // loss. The answered prompts after it stay answered (answered_ahead), so
       // the retry runs only what no result answered.
       const starts = unansweredStarts(prompts);
-      const putBack = readPutBack();
+      const putBack = readPutBack()[chatJid];
       if (starts.length === 0) {
-        if (chatJid in putBack) rememberPutBack(chatJid, undefined);
+        if (putBack) rememberPutBack(chatJid, undefined);
         return true;
       }
-      if (starts[0] === putBack[chatJid]) {
+      // The end of everything this container was given.
+      const end = lastAgentTimestamp[chatJid] || '';
+      if (putBack && starts[0] === putBack[0]) {
         // Put back once already, and its retry answered it neither: a prompt
         // that fails every time would otherwise run on, and take every later
-        // unanswered message along. It is given up. A newer prompt never went
-        // back, so it still does; with none, the exit ends as it did before
-        // attribution, below.
+        // unanswered message along. What went back is given up. A message
+        // after it never went back, whether it joined the retry's prompt or
+        // came in a newer one, so it still does; with none, the exit ends as
+        // it did before attribution, below.
         logger.error(
           { group: group.name, from: starts[0] },
           'Input no result answered again after it was put back, not putting it back again',
         );
-        starts.shift();
+        const to = putBack[1];
+        const joined = to !== undefined && to < promptEnd(prompts, starts[0]);
+        if (joined) starts[0] = to;
+        else starts.shift();
       }
       const from = starts[0];
       if (from !== undefined) {
         putCursorBack(chatJid, from, prompts);
-        rememberPutBack(chatJid, from);
+        rememberPutBack(chatJid, [from, end]);
         discardRefusedInput(chatJid, prompts);
         logger.warn(
           { group: group.name, error: output === 'error' || hadError },
@@ -1264,15 +1280,28 @@ function pruneAnsweredAhead(chatJid: string): void {
   );
 }
 
-function readPutBack(): Record<string, string> {
-  return readGroupRecord(PUT_BACK_KEY, isString);
+/** What a group's exit last put back: `[from, to]`, or `[from]` (older). */
+type PutBack = [from: string, to?: string];
+
+function isPutBack(value: unknown): value is string | Range {
+  return isString(value) || isRanges([value]);
 }
 
-/** Persists where a group's exit put back to (undefined: forget the group). */
-function rememberPutBack(chatJid: string, from: string | undefined): void {
+function readPutBack(): Record<string, PutBack> {
+  const all: Record<string, PutBack> = {};
+  for (const [chatJid, value] of Object.entries(
+    readGroupRecord(PUT_BACK_KEY, isPutBack),
+  )) {
+    all[chatJid] = isString(value) ? [value] : value;
+  }
+  return all;
+}
+
+/** Persists what a group's exit put back (undefined: forget the group). */
+function rememberPutBack(chatJid: string, range: Range | undefined): void {
   const all = readPutBack();
-  if (from === undefined) delete all[chatJid];
-  else all[chatJid] = from;
+  if (range === undefined) delete all[chatJid];
+  else all[chatJid] = range;
   setRouterState(PUT_BACK_KEY, JSON.stringify(all));
 }
 

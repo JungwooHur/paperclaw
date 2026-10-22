@@ -128,8 +128,11 @@ grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
 #   `turn_open_from`             while a message container runs, the start of
 #                                its oldest prompt no turn answered: a restart
 #                                puts the cursor back there. Cleared at exit
-#   `turn_put_back`              the cursor an exit last put back to: a prompt
-#                                that starts there and fails again is given up
+#   `turn_put_back`              what an exit last put back, `[from, to]`: a
+#                                prompt that starts at `from` and fails again
+#                                is given up up to `to`, and what joined it
+#                                after `to` goes back. A bare `from` (older)
+#                                gives up the whole prompt
 sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key IN ('last_timestamp', 'last_agent_timestamp', 'answered_ahead', 'turn_open_from', 'turn_put_back');"
 grep -E 'putting it back|Restart stopped a container|not putting it back again|router_state value of the wrong shape' logs/paperclaw.log | tail -5
 
