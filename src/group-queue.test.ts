@@ -517,6 +517,53 @@ describe('GroupQueue', () => {
     }
   });
 
+  it('sendMessage writes the ref the runner reports the input by', async () => {
+    // The runner names an input file in a result's turn by its ref, so the
+    // host can tell which piped messages that result answered.
+    const fs = await import('fs');
+    const actual = await vi.importActual<typeof import('fs')>('fs');
+    const ipcDir = path.join('/tmp/paperclaw-test-data', 'ipc');
+    actual.mkdirSync(ipcDir, { recursive: true });
+    const folderDir = actual.mkdtempSync(path.join(ipcDir, 'send-'));
+    vi.mocked(fs.default.mkdirSync).mockImplementationOnce(actual.mkdirSync);
+    vi.mocked(fs.default.writeFileSync).mockImplementationOnce(
+      actual.writeFileSync,
+    );
+    vi.mocked(fs.default.renameSync).mockImplementationOnce(actual.renameSync);
+
+    let resolveProcess: () => void;
+    queue.setProcessMessagesFn(
+      vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveProcess = resolve;
+        });
+        return true;
+      }),
+    );
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+    queue.registerProcess(
+      'group1@g.us',
+      {} as any,
+      'container-1',
+      path.basename(folderDir),
+    );
+
+    try {
+      const ref = '2026-10-22T10:00:00.000Z|2026-10-22T10:01:00.000Z';
+      const file = queue.sendMessage('group1@g.us', 'hello', ref);
+      expect(JSON.parse(actual.readFileSync(file!, 'utf-8'))).toEqual({
+        type: 'message',
+        text: 'hello',
+        ref,
+      });
+    } finally {
+      actual.rmSync(folderDir, { recursive: true, force: true });
+      resolveProcess!();
+      await vi.advanceTimersByTimeAsync(10);
+    }
+  });
+
   it('sendMessage writes nothing for task containers so user messages queue up', async () => {
     let resolveTask: () => void;
 
