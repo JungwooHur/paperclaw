@@ -5,19 +5,25 @@
  * Input protocol:
  *   Stdin: Full ContainerInput JSON (read until EOF, like before)
  *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
- *          Files: {type:"message", text:"..."}.json — polled and consumed
+ *          Files: {type:"message", text:"...", ref?:"..."}.json — polled and consumed
  *          Sentinel: /workspace/ipc/input/_close — signals session end
  *
  * Stdout protocol:
  *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
  *   Multiple results may be emitted (one per agent teams result).
+ *   Each output made from an SDK result carries `turn`: the ids of the inputs
+ *   that result answered (see turn-attribution.ts). An input's id is its
+ *   `ref` (stdin: `promptRef`), else its file name (stdin: "stdin").
  *   Final marker after loop ends signals completion.
  */
 
+import { type UUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+
+import { ipcInputId, startupInputIds, type Turn, TurnAttribution } from './turn-attribution.js';
 
 interface ContainerInput {
   prompt: string;
@@ -28,6 +34,8 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  /** The stdin prompt's input id; "stdin" when absent. */
+  promptRef?: string;
 }
 
 interface ContainerOutput {
@@ -35,6 +43,8 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /** Only on outputs made from an SDK result. */
+  turn?: Turn;
 }
 
 interface SessionEntry {
@@ -53,6 +63,13 @@ interface SDKUserMessage {
   message: { role: 'user'; content: string };
   parent_tool_use_id: null;
   session_id: string;
+  uuid: UUID;
+}
+
+/** An input read from the IPC dir. */
+interface IpcInput {
+  id: string;
+  text: string;
 }
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
@@ -88,12 +105,13 @@ class MessageStream {
   private waiting: (() => void) | null = null;
   private done = false;
 
-  push(text: string): void {
+  push(text: string, uuid: UUID): void {
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
       parent_tool_use_id: null,
       session_id: '',
+      uuid,
     });
     this.waiting?.();
   }
@@ -318,21 +336,21 @@ function shouldClose(): boolean {
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
  */
-function drainIpcInput(): string[] {
+function drainIpcInput(): IpcInput[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
     const files = fs.readdirSync(IPC_INPUT_DIR)
       .filter(f => f.endsWith('.json'))
       .sort();
 
-    const messages: string[] = [];
+    const messages: IpcInput[] = [];
     for (const file of files) {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         fs.unlinkSync(filePath);
         if (data.type === 'message' && data.text) {
-          messages.push(data.text);
+          messages.push({ id: ipcInputId(file, data), text: data.text });
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
@@ -348,9 +366,9 @@ function drainIpcInput(): string[] {
 
 /**
  * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
+ * Returns the messages as a single prompt with their ids, or null if _close.
  */
-function waitForIpcMessage(): Promise<string | null> {
+function waitForIpcMessage(): Promise<{ text: string; ids: string[] } | null> {
   return new Promise((resolve) => {
     const poll = () => {
       if (shouldClose()) {
@@ -359,7 +377,10 @@ function waitForIpcMessage(): Promise<string | null> {
       }
       const messages = drainIpcInput();
       if (messages.length > 0) {
-        resolve(messages.join('\n'));
+        resolve({
+          text: messages.map(m => m.text).join('\n'),
+          ids: messages.map(m => m.id),
+        });
         return;
       }
       setTimeout(poll, IPC_POLL_MS);
@@ -376,6 +397,8 @@ function waitForIpcMessage(): Promise<string | null> {
  */
 async function runQuery(
   prompt: string,
+  promptIds: string[],
+  attribution: TurnAttribution,
   sessionId: string | undefined,
   mcpServerPath: string,
   containerInput: ContainerInput,
@@ -383,7 +406,7 @@ async function runQuery(
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
-  stream.push(prompt);
+  stream.push(prompt, attribution.push(promptIds));
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
@@ -410,9 +433,9 @@ async function runQuery(
       return;
     }
     const messages = drainIpcInput();
-    for (const text of messages) {
+    for (const { id, text } of messages) {
       log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
+      stream.push(text, attribution.push([id]));
       parked = false; // real input starts its own turn; don't nudge on top of it
     }
 
@@ -428,7 +451,7 @@ async function runQuery(
       log(
         `Nudging agent (#${totalNudges}/${MAX_NUDGES}): ${pendingBgTasks} background task(s) pending while parked`,
       );
-      stream.push(BG_NUDGE_TEXT);
+      stream.push(BG_NUDGE_TEXT, attribution.push([], true));
       parked = false; // a new turn will start; re-arm only after its result
     }
 
@@ -485,6 +508,9 @@ async function runQuery(
         'mcp__paperclaw__*'
       ],
       env: sdkEnv,
+      // The CLI echoes each pushed message back as it consumes it, which is
+      // how a result is tied to its inputs (turn-attribution.ts).
+      extraArgs: { 'replay-user-messages': null },
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
@@ -508,6 +534,13 @@ async function runQuery(
       ...(containerInput.isScheduledTask ? { maxTurns: 50 } : {}),
     }
   })) {
+    // An echoed push is an acknowledgement, not conversation: it is recorded
+    // and kept out of the counts, the log and the nudge state below.
+    if (message.type === 'user' && (message as { isReplay?: boolean }).isReplay) {
+      attribution.ack((message as { uuid?: string }).uuid);
+      continue;
+    }
+
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
@@ -551,11 +584,13 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const turn = attribution.result(message.subtype);
+      log(`Result #${resultCount}: subtype=${message.subtype}${turn ? ` inputs=${JSON.stringify(turn.inputs)}${turn.nudge ? ' +nudge' : ''}` : ''}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       writeOutput({
         status: 'success',
         result: textResult || null,
-        newSessionId
+        newSessionId,
+        ...(turn ? { turn } : {}),
       });
       // Turn ended. If background work is still outstanding the agent is now
       // parked; arm the nudge timer (pollIpcDuringQuery checks the elapsed time).
@@ -565,6 +600,9 @@ async function runQuery(
   }
 
   ipcPolling = false;
+  for (const push of attribution.endQuery()) {
+    log(`Input no result answered: ${JSON.stringify(push.inputs)}${push.nudge ? ' +nudge' : ''} (${push.acked ? 'acknowledged, but no result followed' : 'never acknowledged'})`);
+  }
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
@@ -626,8 +664,10 @@ async function main(): Promise<void> {
   const pending = drainIpcInput();
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.join('\n');
+    prompt += '\n' + pending.map(m => m.text).join('\n');
   }
+  let promptIds = startupInputIds(containerInput.promptRef, pending.map(m => m.id));
+  const attribution = new TurnAttribution(log);
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
@@ -635,7 +675,7 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = await runQuery(prompt, promptIds, attribution, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
@@ -663,8 +703,9 @@ async function main(): Promise<void> {
         break;
       }
 
-      log(`Got new message (${nextMessage.length} chars), starting new query`);
-      prompt = nextMessage;
+      log(`Got new message (${nextMessage.text.length} chars), starting new query`);
+      prompt = nextMessage.text;
+      promptIds = nextMessage.ids;
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
