@@ -88,13 +88,24 @@ export function stageRunner(projectRoot: string): string {
   return staged;
 }
 
-// Only when run by the build, not when a host module or a test imports it.
-const isDirectRun =
-  process.argv[1] &&
-  new URL(import.meta.url).pathname ===
-    new URL(`file://${process.argv[1]}`).pathname;
+/**
+ * Whether node was asked to run this file, rather than a host module or a test
+ * importing it.
+ *
+ * Compared as real paths: `import.meta.url` escapes `#` and `%` where argv
+ * does not, and names the file behind a symlink where argv names the link.
+ * Compared as URLs, either made a build skip staging and still exit 0.
+ */
+function isDirectRun(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
 
-if (isDirectRun) {
+if (isDirectRun()) {
   const projectRoot = path.join(
     path.dirname(fileURLToPath(import.meta.url)),
     '..',

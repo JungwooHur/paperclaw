@@ -121,14 +121,17 @@ describe('npm run build', () => {
     fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf-8'),
   ).scripts.build;
 
-  /** A project with this module, one host module, and runner sources. */
-  function project(): string {
+  /** A project in `dir` with this module, one host module, and runner sources. */
+  function project(dir = root): string {
+    if (dir !== root) {
+      fs.cpSync(source, runnerSourceDir(dir), { recursive: true });
+    }
     fs.writeFileSync(
-      path.join(root, 'package.json'),
+      path.join(dir, 'package.json'),
       JSON.stringify({ type: 'module', scripts: { build: buildScript } }),
     );
     fs.writeFileSync(
-      path.join(root, 'tsconfig.json'),
+      path.join(dir, 'tsconfig.json'),
       JSON.stringify({
         extends: path.join(repoRoot, 'tsconfig.json'),
         compilerOptions: { rootDir: './src', outDir: './dist' },
@@ -137,15 +140,15 @@ describe('npm run build', () => {
     );
     fs.symlinkSync(
       path.join(repoRoot, 'node_modules'),
-      path.join(root, 'node_modules'),
+      path.join(dir, 'node_modules'),
     );
-    fs.mkdirSync(path.join(root, 'src'));
+    fs.mkdirSync(path.join(dir, 'src'));
     fs.copyFileSync(
       path.join(repoRoot, 'src', 'stage-runner.ts'),
-      path.join(root, 'src', 'stage-runner.ts'),
+      path.join(dir, 'src', 'stage-runner.ts'),
     );
-    write(path.join(root, 'src'), { 'probe.ts': 'export const n = 1;\n' });
-    return root;
+    write(path.join(dir, 'src'), { 'probe.ts': 'export const n = 1;\n' });
+    return dir;
   }
 
   /** Runs the build script the way npm does: `sh -c`, local bins first. */
@@ -165,6 +168,40 @@ describe('npm run build', () => {
     const dir = project();
 
     const result = build(dir);
+
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    expect(hashTree(staged)).toBe(hashTree(source));
+  }, 30_000);
+
+  // A URL spells these characters escaped and a path does not, so a check
+  // that compares the two skips staging, silently, with the build exiting 0.
+  it.each(['pc#1', 'pc%41'])(
+    'stages the runner from a checkout whose path holds %s',
+    (name) => {
+      const dir = project(path.join(root, name));
+
+      const result = build(dir);
+
+      expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+      expect(hashTree(stagedRunnerDir(path.join(dir, 'dist')))).toBe(
+        hashTree(runnerSourceDir(dir)),
+      );
+    },
+    30_000,
+  );
+
+  it('stages the runner when node is handed a symlinked path to the script', () => {
+    const dir = project();
+    expect(build(dir).status).toBe(0);
+    write(source, { 'index.ts': 'v2 index\n' });
+    const link = path.join(dir, 'via-link');
+    fs.symlinkSync(dir, link);
+
+    const result = spawnSync(
+      process.execPath,
+      [path.join(link, 'dist', 'stage-runner.js')],
+      { encoding: 'utf-8' },
+    );
 
     expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
     expect(hashTree(staged)).toBe(hashTree(source));
