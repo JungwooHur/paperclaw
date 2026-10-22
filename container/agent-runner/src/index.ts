@@ -671,7 +671,7 @@ async function main(): Promise<void> {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
     prompt += '\n' + pending.map(m => m.text).join('\n');
   }
-  let promptIds = startupInputIds(containerInput.promptRef, pending.map(m => m.id));
+  let promptIds = startupInputIds(containerInput, pending.map(m => m.id));
   const attribution = new TurnAttribution(log);
 
   // Query loop: run query → wait for IPC message → run new query → repeat

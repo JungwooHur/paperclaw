@@ -90,12 +90,19 @@ function replayText(content: unknown): string {
     .join('');
 }
 
-/** Ids of the start-up push: the stdin prompt, then the IPC files drained into it. */
+/**
+ * Ids of the start-up push: the stdin prompt, by the `promptRef` of the input
+ * the host wrote to stdin, then the IPC files drained into it.
+ */
 export function startupInputIds(
-  promptRef: string | undefined,
+  input: { promptRef?: unknown },
   drained: string[],
 ): string[] {
-  return [promptRef || STDIN_INPUT_ID, ...drained];
+  const promptRef =
+    typeof input.promptRef === 'string' && input.promptRef !== ''
+      ? input.promptRef
+      : STDIN_INPUT_ID;
+  return [promptRef, ...drained];
 }
 
 /** An IPC input file's id: the `ref` it carries, else its file name. */

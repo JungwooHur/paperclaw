@@ -48,6 +48,20 @@ import {
 } from './index.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 
+/**
+ * The runner's own input-id readers, so the fake below reports each input by
+ * the id the runner would read off what the host wrote: a field renamed on
+ * either side fails here. Loaded by a path tsc does not follow, since the
+ * runner is outside this package's rootDir.
+ */
+const RUNNER_IDS = '../container/agent-runner/src/turn-attribution.js';
+const { ipcInputId, startupInputIds } = (await import(
+  /* @vite-ignore */ RUNNER_IDS
+)) as {
+  ipcInputId(file: string, data: { ref?: unknown }): string;
+  startupInputIds(input: { promptRef?: unknown }, drained: string[]): string[];
+};
+
 const LIMIT = "You've hit your limit · resets Oct 14, 10am (Asia/Seoul)";
 const NOW = Date.parse('2026-10-13T12:00:00.000Z'); // 21:00 in Seoul
 const RESET = Date.parse('2026-10-14T01:00:00.000Z');
@@ -106,16 +120,13 @@ function inputFiles(): string[] {
     .sort();
 }
 
-/** The runner's drain: every input file, by its `ref` or else its name. */
+/** The runner's drain: every input file, by the id the runner reads off it. */
 function drainFiles(): { id: string; text: string }[] {
   return inputFiles().map((file) => {
     const filePath = path.join(inputDir, file);
     const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
     fs.unlinkSync(filePath);
-    return {
-      id: typeof data.ref === 'string' ? data.ref : file,
-      text: data.text,
-    };
+    return { id: ipcInputId(file, data), text: data.text };
   });
 }
 
@@ -130,7 +141,10 @@ function runnerStarts(): void {
       });
       const emit = (output: ContainerOutput) => onOutput!(output);
       const container: FakeContainer = {
-        startIds: [input.promptRef ?? 'stdin', ...drained.map((d) => d.id)],
+        startIds: startupInputIds(
+          input,
+          drained.map((d) => d.id),
+        ),
         prompt: [input.prompt, ...drained.map((d) => d.text)].join('\n'),
         drain: () => drainFiles().map((d) => d.id),
         result: (text, turn) =>

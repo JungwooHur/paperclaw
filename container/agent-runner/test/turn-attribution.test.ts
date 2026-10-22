@@ -502,9 +502,14 @@ describe('the end of a query', () => {
 
 describe('input ids', () => {
   it('name the stdin prompt by its ref, then the files drained into it', () => {
-    expect(startupInputIds('r0', ['f1', 'f2'])).toEqual(['r0', 'f1', 'f2']);
-    expect(startupInputIds(undefined, ['f1'])).toEqual(['stdin', 'f1']);
-    expect(startupInputIds(undefined, [])).toEqual(['stdin']);
+    expect(startupInputIds({ promptRef: 'r0' }, ['f1', 'f2'])).toEqual([
+      'r0',
+      'f1',
+      'f2',
+    ]);
+    expect(startupInputIds({}, ['f1'])).toEqual(['stdin', 'f1']);
+    expect(startupInputIds({}, [])).toEqual(['stdin']);
+    expect(startupInputIds({ promptRef: '' }, [])).toEqual(['stdin']);
   });
 
   it('name an IPC file by its ref, else by its file name', () => {
