@@ -28,7 +28,11 @@ import path from 'path';
 
 /** The inputs one result answered. Written on every output made from a result. */
 export interface Turn {
-  /** Input ids: the turn's prompt, then what was merged into it, in order. */
+  /**
+   * Input ids: the turn's prompt, then what was merged into it, in order,
+   * after the inputs of failed turns the CLI sent to the model again in it.
+   * None for a failed turn: it answered nothing.
+   */
   inputs: string[];
   /**
    * The turn took something the host never sent: the runner's background-task
@@ -43,6 +47,8 @@ export interface UnsettledPush {
   nudge: boolean;
   /** The CLI took it into a turn, but that turn produced no result. */
   acked: boolean;
+  /** Its turn's result was a failure, and no result came after it. */
+  failed?: true;
 }
 
 /** The stdin prompt's id when the host gave none. */
@@ -136,6 +142,12 @@ export class TurnAttribution {
   private foreignTeam = false;
   private foreignOther = false;
   private off = false;
+  /**
+   * Inputs of the query's failed turns since its last success. The CLI sends
+   * them to the model again inside the next turn's request, so the next
+   * success answers them.
+   */
+  private failedInputs: string[] = [];
 
   constructor(
     private readonly log: (message: string) => void = () => {},
@@ -233,6 +245,7 @@ export class TurnAttribution {
       this.off = true;
       this.pushes.clear();
       this.own.clear();
+      this.failedInputs = [];
       this.log(
         'Turn attribution off for this container: a success result followed no replayed input, so replay is not working',
       );
@@ -251,6 +264,15 @@ export class TurnAttribution {
     // Replays no host input explains: a message the CLI queued itself. A
     // command's own replay is one, under the CLI's uuid, and it is explained.
     if (foreign && !hostInput) turn.internal = true;
+    // A failed turn (error_during_execution) answered nothing, though it
+    // took its inputs: they go with the next success of this query.
+    if (subtype !== 'success') {
+      this.failedInputs.push(...turn.inputs);
+      turn.inputs = [];
+    } else if (this.failedInputs.length > 0) {
+      turn.inputs.unshift(...this.failedInputs);
+      this.failedInputs = [];
+    }
     return turn;
   }
 
@@ -259,11 +281,20 @@ export class TurnAttribution {
    * the next query talks to a new CLI. Nothing once attribution is off.
    */
   endQuery(): UnsettledPush[] {
-    const unsettled = [...this.pushes].map(([uuid, push]) => ({
+    const unsettled: UnsettledPush[] = [...this.pushes].map(([uuid, push]) => ({
       inputs: push.inputs,
       nudge: push.nudge,
       acked: this.acked.includes(uuid),
     }));
+    if (this.failedInputs.length > 0) {
+      unsettled.push({
+        inputs: this.failedInputs,
+        nudge: false,
+        acked: true,
+        failed: true,
+      });
+    }
+    this.failedInputs = [];
     this.pushes.clear();
     this.own.clear();
     this.acked = [];

@@ -606,7 +606,7 @@ async function runQuery(
 
   ipcPolling = false;
   for (const push of attribution.endQuery()) {
-    log(`Input no result answered: ${JSON.stringify(push.inputs)}${push.nudge ? ' +nudge' : ''} (${push.acked ? 'acknowledged, but no result followed' : 'never acknowledged'})`);
+    log(`Input no result answered: ${JSON.stringify(push.inputs)}${push.nudge ? ' +nudge' : ''} (${push.failed ? 'its turn failed, and no result followed' : push.acked ? 'acknowledged, but no result followed' : 'never acknowledged'})`);
   }
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
   return { newSessionId, lastAssistantUuid, closedDuringQuery };

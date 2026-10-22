@@ -152,6 +152,45 @@ describe('a result', () => {
     attribution.ack(b);
     expect(attribution.result('success')).toEqual({ inputs: ['b'] });
   });
+
+  it('answers nothing when its turn fails after taking its input', () => {
+    // The CLI acknowledged the prompt, then failed the turn (an API error
+    // after a tool call). The CLI sends that input to the model again inside
+    // the next turn's request, so the next result answers it.
+    const attribution = new TurnAttribution();
+    const a = attribution.push('a', ['a']);
+    attribution.turnStarted();
+    attribution.ack(a);
+    expect(attribution.result('error_during_execution')).toEqual({
+      inputs: [],
+    });
+    const b = attribution.push('b', ['b']);
+    attribution.turnStarted();
+    attribution.ack(b);
+    expect(attribution.result('success')).toEqual({ inputs: ['a', 'b'] });
+    const c = attribution.push('c', ['c']);
+    attribution.turnStarted();
+    attribution.ack(c);
+    expect(attribution.result('success')).toEqual({ inputs: ['c'] });
+  });
+
+  it('leaves the inputs of failed turns in a row to the next success', () => {
+    const attribution = new TurnAttribution();
+    for (const id of ['a', 'b']) {
+      const uuid = attribution.push(id, [id]);
+      attribution.turnStarted();
+      attribution.ack(uuid);
+      expect(attribution.result('error_during_execution')).toEqual({
+        inputs: [],
+      });
+    }
+    const c = attribution.push('c', ['c']);
+    attribution.turnStarted();
+    attribution.ack(c);
+    expect(attribution.result('success')).toEqual({
+      inputs: ['a', 'b', 'c'],
+    });
+  });
 });
 
 describe('a turn the CLI started itself', () => {
@@ -399,13 +438,17 @@ describe('a slash command', () => {
     expect(attribution.result('success')).toEqual({ inputs: ['y'] });
   });
 
-  it('is answered even when its turn fails', () => {
+  it('is answered by the next result when its turn fails', () => {
     const attribution = new TurnAttribution();
     attribution.push('/probe-skill x', ['r0']);
     attribution.turnStarted();
     expect(attribution.result('error_during_execution')).toEqual({
-      inputs: ['r0'],
+      inputs: [],
     });
+    const b = attribution.push('b', ['b']);
+    attribution.turnStarted();
+    attribution.ack(b);
+    expect(attribution.result('success')).toEqual({ inputs: ['r0', 'b'] });
   });
 
   it('has the shape the router sends bare', () => {
@@ -484,6 +527,22 @@ describe('the end of a query', () => {
       { inputs: ['never-taken'], nudge: false, acked: false },
       { inputs: ['taken-without-result'], nudge: false, acked: true },
     ]);
+  });
+
+  it('reports the inputs of a failed turn no later result answered', () => {
+    const attribution = new TurnAttribution();
+    const a = attribution.push('a', ['a']);
+    attribution.turnStarted();
+    attribution.ack(a);
+    attribution.result('error_during_execution');
+    expect(attribution.endQuery()).toEqual([
+      { inputs: ['a'], nudge: false, acked: true, failed: true },
+    ]);
+    // The next query is a new CLI, which never saw them.
+    const b = attribution.push('b', ['b']);
+    attribution.turnStarted();
+    attribution.ack(b);
+    expect(attribution.result('success')).toEqual({ inputs: ['b'] });
   });
 
   it('starts the next query clean', () => {
