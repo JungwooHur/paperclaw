@@ -347,7 +347,10 @@ function crashState(): () => void {
  */
 async function restartWhileRunning(container: FakeContainer): Promise<void> {
   const deadState = crashState();
+  // The dead process starts nothing once its container is gone.
+  queue.setProcessMessagesFn(async () => true);
   await container.exit('error');
+  queue.setProcessMessagesFn(_processGroupMessages);
   deadState();
   restart();
   _recoverPendingMessages();
@@ -1633,6 +1636,164 @@ describe('a batch whose newest message is a slash command', () => {
     expect(b.prompt).toBe(CMD);
     await b.result('The skill ran.', { inputs: [b.startIds[0]] });
     await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs a refused question and its command once an answer closes the window before the exit', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    await a.result(LIMIT, { inputs: [a.startIds[0]] });
+    // A turn the CLI started itself gets through: the window closes while
+    // the refused container is still closing.
+    await a.result('Background work finished.', {
+      inputs: [],
+      internal: true,
+    });
+    await a.exit('error');
+    await vi.advanceTimersByTimeAsync(0);
+
+    const b = containers[1];
+    expect(b).toBeDefined();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(CMD);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = b.drain();
+    await b.result('The skill ran.', { inputs: [command] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs the command after the turn ahead of it failed, without waiting for the idle close', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    // The question's turn fails after the CLI took it: it answers nothing,
+    // and no later turn of this container answers the question.
+    await a.result(null, { inputs: [] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    // Nothing waits behind the command any more.
+    await userSays('m3', M2, NOW - 40_000);
+    const [later] = waitingTexts();
+    expect(timesIn(later, M2)).toBe(1);
+    const [p3] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p3] });
+    await a.exit();
+
+    // Only the failed question goes back.
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(CMD);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs a message that waited behind the command after the turn ahead of it failed', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    await userSays('m3', M2, NOW - 40_000);
+    expect(waitingTexts()).toEqual([]);
+    await a.result(null, { inputs: [] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    const [later] = waitingTexts();
+    expect(timesIn(later, M2)).toBe(1);
+    expect(later).not.toContain(CMD);
+    const [p3] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p3] });
+    await a.exit();
+
+    // The message marked the group for its next container, so that one
+    // need not wait for the retry.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(containers).toHaveLength(2);
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs the command after a failed start-up turn that took a file an earlier container left', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', 'off');
+    await userSays('m2', M2, NOW - 55_000);
+    await a.exit();
+    expect(inputFiles()).toHaveLength(1);
+    await usersSay([
+      ['m3', M3, NOW - 50_000],
+      ['m4', CMD, NOW - 40_000],
+    ]);
+    const b = containers[1];
+    expect(b.startIds).toHaveLength(2);
+    expect(b.prompt).not.toContain(CMD);
+    // One push, the leftover with the start-up prompt, and its turn failed.
+    await b.result(null, { inputs: [] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = b.drain();
+    await b.result('The skill ran.', { inputs: [command] });
+    await b.exit();
+
+    const c = await containerOnRetry();
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(timesIn(c.prompt, M3)).toBe(1);
+    expect(c.prompt).not.toContain(CMD);
+    await c.result('Both answered.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs the command after a turn of a runner that reports no turn, with a follow-up merged into it', async () => {
+    await userSays('m0', M3, NOW - 70_000);
+    const a = containers[0];
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    expect(waitingTexts()).toHaveLength(1);
+    a.drain(); // merged into the running turn
+    await userSays('m3', M2, NOW - 40_000);
+    expect(waitingTexts()).toEqual([]);
+    // One result for both, without `turn`: the question never settles.
+    await a.result('Appendix and section 2 answered together.');
+    expect(waitingTexts()).toEqual([CMD]);
+    a.drain();
+    await a.result('The skill ran.');
+    const [later] = waitingTexts();
+    expect(timesIn(later, M2)).toBe(1);
+    a.drain();
+    await a.result('It covers the experiments.');
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs the command after a textless result from a runner that reports no turn', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    // Answered only through send_message: no text and no `turn`.
+    await a.result(null);
+    expect(waitingTexts()).toEqual([CMD]);
+    a.drain();
+    await a.result('The skill ran.');
+    await a.exit();
     await nothingRunsAgain();
   });
 });

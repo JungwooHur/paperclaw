@@ -87,6 +87,11 @@ interface OpenPrompt {
   /** A result's `turn` named it, but an older prompt is still open. */
   answered?: boolean;
   /**
+   * The turn that took it failed (`inputs: []`): no later turn of this
+   * container answers it, though its exit still puts it back.
+   */
+  failed?: boolean;
+  /**
    * A file an earlier container left, which this one drained into its
    * first prompt (leftoverPrompts).
    */
@@ -134,6 +139,25 @@ function markAnswered(prompts: OpenPrompt[], inputs: string[]): string[] {
     else unknown.push(id);
   }
   return unknown;
+}
+
+/**
+ * Marks failed the prompt a failed turn took: the oldest one still waiting
+ * for a turn, and with a file an earlier container left, the whole start-up
+ * push it went in, as the no-`turn` rule settles it.
+ */
+function markFailed(prompts: OpenPrompt[]): void {
+  let i = prompts.findIndex(awaitsTurn);
+  if (i < 0) return;
+  while (i < prompts.length - 1 && prompts[i].leftover) {
+    prompts[i++].failed = true;
+  }
+  prompts[i].failed = true;
+}
+
+/** Whether a turn of its container may still take or answer the prompt. */
+function awaitsTurn(prompt: OpenPrompt): boolean {
+  return !prompt.answered && !prompt.failed;
 }
 
 /**
@@ -501,6 +525,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const unknown = markAnswered(prompts, turn.inputs);
         if (unknown.length > 0)
           logUnknownInputs(group, previousCursor, unknown);
+        // A failed turn names nothing, though it took its prompt.
+        if (turn.inputs.length === 0 && !turn.internal) markFailed(prompts);
       } else if (prompts.length > 0) {
         // No `turn`: a result ends a turn, and turns take prompts in the
         // order they were given, so it settles the oldest open prompt. A
@@ -549,10 +575,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!runEnded) {
       if (result.status === 'success') {
         queue.notifyIdle(chatJid);
-        // Every prompt settled: a command held back behind them goes now.
-        // After notifyIdle, so a task waiting on this container has closed
-        // it, and the command waits for the next one (queueHeldBack).
-        if (prompts.length === 0 && (raw !== null || result.turn)) {
+        // A turn ended with no prompt left for a later one: a command held
+        // back behind them goes now. Without `turn`, a follow-up merged into
+        // a turn, or a turn answered only through send_message, never
+        // settles, so there any output lets it go once a turn ends, as
+        // before the hold. After notifyIdle, so a task waiting on this
+        // container has closed it, and the command waits for the next one
+        // (queueHeldBack).
+        if (
+          attribution === 'on'
+            ? (raw !== null || result.turn) && !prompts.some(awaitsTurn)
+            : true
+        ) {
           deliverHeldBack(chatJid, channel, group);
         }
       }
@@ -976,10 +1010,14 @@ function deliverMessages(
   group: RegisteredGroup,
   pending: Pending,
 ): void {
-  // A command held back goes once every prompt before it is settled
+  // A command held back goes once the prompts before it are settled
   // (deliverHeldBack), since a running turn would take it as plain text, and
-  // nothing newer goes ahead of it.
-  if (heldCommand(chatJid) && openPrompts[chatJid]?.length) return;
+  // nothing newer goes ahead of it. Marked for the group's next container,
+  // in case this one exits first without delivering them.
+  if (heldCommandWaits(chatJid)) {
+    queue.enqueueMessageCheck(chatJid);
+    return;
+  }
   const delivery = nextDelivery(chatJid, pending, group);
   if (
     !pipeToActiveContainer(chatJid, channel, delivery.messages, delivery.end)
@@ -1174,6 +1212,18 @@ function heldCommand(chatJid: string): string | undefined {
   return at !== undefined && at > (lastAgentTimestamp[chatJid] || '')
     ? at
     : undefined;
+}
+
+/**
+ * Whether the group's held command still waits for a prompt of its running
+ * container that a turn may yet take or answer. It goes when one ends
+ * (deliverHeldBack).
+ */
+function heldCommandWaits(chatJid: string): boolean {
+  return (
+    heldCommand(chatJid) !== undefined &&
+    (openPrompts[chatJid]?.some(awaitsTurn) ?? false)
+  );
 }
 
 /** Persists the newest command held back for the group (undefined: none). */
