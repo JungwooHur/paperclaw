@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { pathToFileURL } from 'url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -9,7 +10,14 @@ vi.mock('./logger.js', () => ({
 }));
 
 import { logger } from './logger.js';
-import { hashTree, refreshRunnerCopy, seedMarkerPath } from './runner-seed.js';
+import {
+  hashTree,
+  hostRunnerBundle,
+  pinRunnerBundle,
+  refreshRunnerCopy,
+  seedMarkerPath,
+} from './runner-seed.js';
+import { stagedRunnerDir } from './stage-runner.js';
 
 const GROUP = 'some-group';
 
@@ -430,5 +438,117 @@ describe('refreshRunnerCopy', () => {
 
     expect(read(copy)).toEqual(read(bundle));
     expect(markerHash()).toBe(hashTree(bundle));
+  });
+});
+
+/**
+ * The runner a compiled host hands out is the one staged when it started. A
+ * build restages it while the host runs (setup, a manual build, a recipe that
+ * builds before it rebuilds the image), and groups must not take that runner
+ * before the restart that also runs the host built with it.
+ */
+describe('pinRunnerBundle', () => {
+  let staged: string;
+  let pin: string;
+
+  beforeEach(() => {
+    staged = stagedRunnerDir(path.join(root, 'dist'));
+    pin = path.join(root, 'data', 'runner-bundle');
+    write(staged, { 'index.ts': 'v1 index\n', 'ipc.ts': 'v1 ipc\n' });
+  });
+
+  it('holds the runner staged when the host started, whatever a later build stages', () => {
+    expect(pinRunnerBundle(staged, pin)).toBe(pin);
+    const atStart = read(staged);
+    write(staged, { 'index.ts': 'v2 index\n', 'new-tool.ts': 'v2 tool\n' });
+
+    expect(refreshRunnerCopy(pin, copy, GROUP)).toBe('seeded');
+
+    expect(read(copy)).toEqual(atStart);
+  });
+
+  it('takes what is staged at the next host start, without the files it dropped', () => {
+    pinRunnerBundle(staged, pin);
+    refreshRunnerCopy(pin, copy, GROUP);
+    fs.rmSync(path.join(staged, 'ipc.ts'));
+    write(staged, { 'index.ts': 'v2 index\n' });
+
+    pinRunnerBundle(staged, pin);
+
+    expect(read(pin)).toEqual(read(staged));
+    expect(refreshRunnerCopy(pin, copy, GROUP)).toBe('refreshed');
+    expect(read(copy)).toEqual(read(staged));
+  });
+
+  it('takes the copy again when a build swaps the staged runner during it', () => {
+    const realCp = fs.cpSync.bind(fs);
+    const cp = vi
+      .spyOn(fs, 'cpSync')
+      .mockImplementationOnce((src, dst, opts) => {
+        realCp(src, dst, opts);
+        // The swap lands midway: v1's index.ts beside v2's ipc.ts.
+        write(String(dst), { 'ipc.ts': 'v2 ipc\n' });
+        write(staged, { 'index.ts': 'v2 index\n', 'ipc.ts': 'v2 ipc\n' });
+      });
+
+    expect(pinRunnerBundle(staged, pin)).toBe(pin);
+
+    expect(cp).toHaveBeenCalledTimes(2);
+    expect(read(pin)).toEqual(read(staged));
+  });
+
+  it('pins nothing when the staged runner never holds still, so each start warns', () => {
+    pinRunnerBundle(staged, pin);
+    const realCp = fs.cpSync.bind(fs);
+    let version = 1;
+    vi.spyOn(fs, 'cpSync').mockImplementation((src, dst, opts) => {
+      realCp(src, dst, opts);
+      version += 1;
+      write(staged, { 'index.ts': `v${version} index\n` });
+    });
+    vi.mocked(logger.error).mockClear();
+
+    expect(pinRunnerBundle(staged, pin)).toBe(pin);
+
+    expect(fs.existsSync(pin)).toBe(false);
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
+    expect(refreshRunnerCopy(pin, copy, GROUP)).toBe('no-bundle');
+  });
+
+  it('drops an earlier pin when nothing is staged, rather than hand it out', () => {
+    pinRunnerBundle(staged, pin);
+    fs.rmSync(staged, { recursive: true });
+
+    expect(pinRunnerBundle(staged, pin)).toBe(pin);
+
+    expect(fs.existsSync(pin)).toBe(false);
+    expect(refreshRunnerCopy(pin, copy, GROUP)).toBe('no-bundle');
+  });
+});
+
+describe('hostRunnerBundle', () => {
+  it('reads the checkout itself under npm run dev, and pins nothing', () => {
+    const pin = path.join(root, 'data', 'runner-bundle');
+    const moduleUrl = pathToFileURL(
+      path.join(root, 'src', 'container-runner.ts'),
+    ).href;
+
+    expect(hostRunnerBundle(moduleUrl, bundle, pin)).toBe(bundle);
+
+    expect(fs.existsSync(pin)).toBe(false);
+  });
+
+  it('pins the runner its build staged when the host runs compiled', () => {
+    const dist = path.join(root, 'dist');
+    write(stagedRunnerDir(dist), { 'index.ts': 'staged index\n' });
+    const pin = path.join(root, 'data', 'runner-bundle');
+    const moduleUrl = pathToFileURL(
+      path.join(dist, 'container-runner.js'),
+    ).href;
+
+    expect(hostRunnerBundle(moduleUrl, bundle, pin)).toBe(pin);
+
+    expect(read(pin)).toEqual(read(stagedRunnerDir(dist)));
   });
 });

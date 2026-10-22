@@ -10,11 +10,14 @@
  * still running the old `dist/`.
  *
  * So the last step of `npm run build` stages a copy of the runner sources in
- * `dist/agent-runner-src/`, and a host running from `dist/` refreshes groups from
- * that copy. The build script runs this only after tsc succeeded, and a failed
- * tsc writes nothing (`noEmitOnError`), so a failed build leaves the previous
- * host and the previous runner in place together. `npm run dev` runs the
- * sources and keeps reading the checkout.
+ * `dist/agent-runner-src/`. A host running from `dist/` pins that copy when it
+ * starts and refreshes groups from the pin (runner-seed.ts), so a build while it
+ * runs changes nothing before the restart. The build script runs this only
+ * after tsc succeeded, and a failed tsc writes nothing (`noEmitOnError`), so a
+ * failed tsc leaves the previous host and the previous runner in place
+ * together. A failure here comes after tsc wrote the new host, which then runs
+ * beside the previous runner; the startup WARN names the runner files it lacks.
+ * `npm run dev` runs the sources and keeps reading the checkout.
  *
  * The host's tsc does not compile the runner; the image does, at every
  * container start. So a runner that does not even parse (a merge conflict left
@@ -98,9 +101,10 @@ export function checkRunnerSyntax(dir: string): void {
 /**
  * Copies the runner sources of `projectRoot` to its staged runner, whole.
  *
- * The copy goes to a sibling and is swapped in by rename, so a host starting a
- * container meanwhile reads either the old copy or the new one, never half of
- * one, and a failed copy leaves the old one as it was. Throws when the sources
+ * The copy goes to a sibling and is swapped in by rename, so a failed copy
+ * leaves the old one as it was. A reader can still see half of each during the
+ * swap; the one reader, a starting host, checks its pin against this copy and
+ * takes it again on a mismatch (runner-seed.ts). Throws when the sources
  * are missing, do not parse, or cannot be copied, so the build fails and says
  * why. Returns the staged directory.
  */

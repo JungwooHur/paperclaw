@@ -17,15 +17,16 @@
  * group can still read it, like all of `data/`, through its read-only mount of
  * the project root.
  *
- * The bundle is the runner the host's build staged (stage-runner.ts), so a
- * runner change reaches groups with the restart that builds it, as a host change
- * does.
+ * The bundle is the runner the host's build staged (stage-runner.ts), pinned
+ * when the host starts (pinRunnerBundle), so a runner change reaches groups with
+ * the restart that runs its build, as a host change does.
  */
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
 import { logger } from './logger.js';
+import { runnerBundleDir } from './stage-runner.js';
 
 /** What a container start did to a group's runner copy. */
 export type RunnerSeedOutcome =
@@ -195,8 +196,9 @@ function refresh(
     logger.warn(
       { group, bundle: bundleDir },
       `No bundled agent runner at ${bundleDir}, so this group's copy is used ` +
-        `as it is. A host running from dist/ reads the runner its build ` +
-        `staged: run \`npm run build\` and restart.`,
+        `as it is. A host running from dist/ hands out the runner its build ` +
+        `staged, as it was when the host started: run \`npm run build\` and ` +
+        `restart.`,
     );
     return 'no-bundle';
   }
@@ -265,6 +267,74 @@ function refresh(
     );
   }
   return 'edited';
+}
+
+/** How often a pin is taken again when a build restages the runner during it. */
+const PIN_ATTEMPTS = 3;
+
+/**
+ * Pins the runner a compiled host hands to groups: copies the runner its build
+ * staged to `pinDir`, and returns `pinDir` for every refreshRunnerCopy of this
+ * process.
+ *
+ * `npm run build` restages the runner whenever it runs, also while a host is up:
+ * setup and `/update` build, and so do recipes that build before they rebuild
+ * the image and restart. Read from the staged runner at each container start,
+ * unedited groups took that runner at once, beside a host still running its
+ * old modules and before the image it may need. Copied once, when the host
+ * starts, it changes only with a restart, as the host does.
+ *
+ * The copy is compared with the staged runner after it is taken, and taken again
+ * on a mismatch: a build that swaps the staged runner during the copy would
+ * leave files of both versions. When nothing is staged, or no whole copy can be
+ * taken, the pin is removed instead, so each start warns (`no-bundle`) rather
+ * than hand out a runner an earlier host pinned. Never throws.
+ */
+export function pinRunnerBundle(stagedDir: string, pinDir: string): string {
+  const label = '(host runner pin)';
+  let failure: unknown = null;
+  if (fs.existsSync(stagedDir)) {
+    for (let attempt = 1; attempt <= PIN_ATTEMPTS; attempt++) {
+      try {
+        const pinned = installBundle(stagedDir, pinDir, label);
+        if (pinned === hashTree(stagedDir)) {
+          logger.info(
+            { hash: short(pinned), pin: pinDir },
+            'Pinned the staged agent runner for this host',
+          );
+          return pinDir;
+        }
+        failure = new Error('the staged runner changed while it was copied');
+      } catch (err) {
+        failure = err;
+      }
+    }
+  }
+  removeLeftover(pinDir, label);
+  if (failure) {
+    logger.error(
+      { err: failure, staged: stagedDir, pin: pinDir },
+      'Could not pin the staged agent runner, so groups keep their copies ' +
+        'as they are until a restart pins one',
+    );
+  }
+  return pinDir;
+}
+
+/**
+ * The runner directory a host refreshes groups from, for its whole life. Call
+ * it once, when the host starts.
+ *
+ * Under `npm run dev` the host runs its sources and reads the checkout at every
+ * start, as it always did. Compiled, it pins what its build staged.
+ */
+export function hostRunnerBundle(
+  moduleUrl: string,
+  checkoutDir: string,
+  pinDir: string,
+): string {
+  const bundle = runnerBundleDir(moduleUrl, checkoutDir);
+  return bundle === checkoutDir ? bundle : pinRunnerBundle(bundle, pinDir);
 }
 
 /**

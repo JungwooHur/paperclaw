@@ -55,8 +55,9 @@ vi.mock('./mount-security.js', () => ({
   validateAdditionalMounts: vi.fn(() => []),
 }));
 
-// The runner copy has its own suite (runner-seed.test.ts); here only the call.
+// The runner copy has its own suite (runner-seed.test.ts); here only the calls.
 vi.mock('./runner-seed.js', () => ({
+  hostRunnerBundle: vi.fn(() => '/pinned/agent-runner-src'),
   refreshRunnerCopy: vi.fn(() => 'current'),
 }));
 
@@ -102,8 +103,12 @@ import {
   runContainerAgent,
   ContainerOutput,
 } from './container-runner.js';
-import { refreshRunnerCopy } from './runner-seed.js';
+import { hostRunnerBundle, refreshRunnerCopy } from './runner-seed.js';
 import type { RegisteredGroup } from './types.js';
+
+// Taken now, before any test clears the mocks: importing the module is when
+// the host starts.
+const runnerBundleCallsAtStart = [...vi.mocked(hostRunnerBundle).mock.calls];
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
@@ -375,10 +380,8 @@ describe('container-runner agent-runner copy', () => {
 
     const copy =
       '/tmp/paperclaw-test-data/sessions/test-group/agent-runner-src';
-    // The host runs its sources here, as under npm run dev, so it reads the
-    // checkout; compiled, it reads dist/agent-runner-src (stage-runner.test.ts).
     expect(refreshRunnerCopy).toHaveBeenCalledWith(
-      `${process.cwd()}/container/agent-runner/src`,
+      '/pinned/agent-runner-src',
       copy,
       'test-group',
     );
@@ -388,5 +391,29 @@ describe('container-runner agent-runner copy', () => {
     expect(
       vi.mocked(refreshRunnerCopy).mock.invocationCallOrder[0],
     ).toBeLessThan(vi.mocked(spawn).mock.invocationCallOrder[0]);
+  });
+
+  // A build while the host runs restages the runner; read at each start, it
+  // reached groups before the restart that runs the host built with it.
+  it('settles the runner once, when the host starts, not at each container start', async () => {
+    expect(runnerBundleCallsAtStart).toEqual([
+      [
+        expect.stringMatching(/container-runner\.ts$/),
+        `${process.cwd()}/container/agent-runner/src`,
+        '/tmp/paperclaw-test-data/runner-bundle',
+      ],
+    ]);
+    vi.mocked(hostRunnerBundle).mockClear();
+
+    for (let i = 0; i < 2; i++) {
+      fakeProc = createFakeProcess();
+      const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+      fakeProc.emit('close', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      await resultPromise;
+    }
+
+    expect(hostRunnerBundle).not.toHaveBeenCalled();
+    expect(refreshRunnerCopy).toHaveBeenCalledTimes(2);
   });
 });

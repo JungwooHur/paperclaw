@@ -33,9 +33,16 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
-import { refreshRunnerCopy } from './runner-seed.js';
-import { runnerBundleDir } from './stage-runner.js';
+import { hostRunnerBundle, refreshRunnerCopy } from './runner-seed.js';
 import { RegisteredGroup } from './types.js';
+
+// What unedited runner copies follow, settled when the host starts, so a build
+// while it runs reaches no group before the restart (runner-seed.ts).
+const runnerBundle = hostRunnerBundle(
+  import.meta.url,
+  path.join(process.cwd(), 'container', 'agent-runner', 'src'),
+  path.join(DATA_DIR, 'runner-bundle'),
+);
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---PAPERCLAW_OUTPUT_START---';
@@ -253,25 +260,14 @@ function buildVolumeMounts(
   // Copy agent-runner source into a per-group writable location so agents
   // can customize it (add tools, change behavior) without affecting other
   // groups. Recompiled on container startup via entrypoint.sh. An unedited
-  // copy follows the runner this host's build staged; an edited one is kept
-  // (runner-seed.ts, stage-runner.ts).
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
+  // copy follows runnerBundle; an edited one is kept (runner-seed.ts).
   const groupAgentRunnerDir = path.join(
     DATA_DIR,
     'sessions',
     group.folder,
     'agent-runner-src',
   );
-  refreshRunnerCopy(
-    runnerBundleDir(import.meta.url, agentRunnerSrc),
-    groupAgentRunnerDir,
-    group.folder,
-  );
+  refreshRunnerCopy(runnerBundle, groupAgentRunnerDir, group.folder);
   mounts.push({
     hostPath: groupAgentRunnerDir,
     containerPath: '/app/src',
