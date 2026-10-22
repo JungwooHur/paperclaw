@@ -153,6 +153,7 @@ function unansweredStarts(prompts: OpenPrompt[]): string[] {
   }
   return starts;
 }
+
 /** A cursor range `(from, to]`: the messages after `from`, up to `to`. */
 type Range = [from: string, to: string];
 
@@ -623,8 +624,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (starts[0] === putBack[chatJid]) {
         // Put back once already, and its retry answered it neither: a prompt
         // that fails every time would otherwise run on, and take every later
-        // unanswered message along. It is given up. A newer prompt never went back, so
-        // it still does; with none, the exit ends as it did before
+        // unanswered message along. It is given up. A newer prompt never went
+        // back, so it still does; with none, the exit ends as it did before
         // attribution, below.
         logger.error(
           { group: group.name, from: starts[0] },
