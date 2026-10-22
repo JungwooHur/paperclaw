@@ -46,7 +46,24 @@ export function firstPrompt(messages: NewMessage[]): NewMessage[] {
   return messages.slice(0, n);
 }
 
-export function formatMessages(messages: NewMessage[]): string {
+/**
+ * Put before a message sent again after a usage limit refused the turn that
+ * took it. The refused prompt stays in the session, and the request that
+ * resumes it carries that copy in the same user message as this one
+ * (docs/SPEC.md, "Usage Limits"): without a word, it reads as the same
+ * question asked twice.
+ */
+export const RESENT_PREFIX =
+  '[Sent again: a usage limit stopped the earlier copy before any answer] ';
+
+/**
+ * `resent` names the messages to mark with RESENT_PREFIX. A command sent
+ * bare is never marked: the CLI runs it only at the very start of a prompt.
+ */
+export function formatMessages(
+  messages: NewMessage[],
+  resent: (message: NewMessage) => boolean = () => false,
+): string {
   // Only the newest message counts. An older command followed by ordinary chat
   // is a conversation that has moved on, and re-invoking the skill there would
   // restart something the user is in the middle of.
@@ -59,7 +76,7 @@ export function formatMessages(messages: NewMessage[]): string {
   }
   const lines = messages.map(
     (m) =>
-      `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`,
+      `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${resent(m) ? RESENT_PREFIX : ''}${escapeXml(m.content)}</message>`,
   );
   return `<messages>\n${lines.join('\n')}\n</messages>`;
 }

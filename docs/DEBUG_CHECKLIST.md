@@ -102,6 +102,11 @@ grep -E 'Starting container|Container active|concurrency limit' logs/paperclaw.l
 #   `usage_limit_refused_input`  JSON per chat: input files a refusal put back;
 #                                deleted, and the entry dropped, when that
 #                                container exits or at the next startup
+#   `usage_limit_refused_turn`   JSON per chat {session, ranges}: the session a
+#                                refusal left its refused prompts in, and the
+#                                message ranges they took; a delivery into that
+#                                session marks those messages as sent again.
+#                                Dropped once a run ends with the cursor past them
 sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key LIKE 'usage_limit%';"
 grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
 

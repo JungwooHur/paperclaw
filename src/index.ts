@@ -212,6 +212,12 @@ const ANSWERED_AHEAD_KEY = 'answered_ahead';
 // restart stops that container, so start-up puts the cursor back there; the
 // answered prompts past it are in answered_ahead by then. Cleared at exit.
 const OPEN_FROM_KEY = 'turn_open_from';
+// router_state key: per group, the session a usage-limit refusal left its
+// refused prompts in, and the ranges of the messages those took. The session
+// keeps them, so a delivery into it marks those messages as sent again
+// (RESENT_PREFIX). Dropped once a run ends, without a refusal, with the
+// cursor past them.
+const REFUSED_TURN_KEY = 'usage_limit_refused_turn';
 
 /**
  * Files a paper Q&A right after the answer goes out, so it does not wait for the
@@ -347,7 +353,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // A command at the end of the batch waits for a prompt of its own.
   const delivery = nextDelivery(pending);
-  const prompt = formatMessages(delivery.messages);
+  const prompt = formatMessages(delivery.messages, resentIn(chatJid));
 
   const previousCursor = lastAgentTimestamp[chatJid] || '';
   const end = delivery.end;
@@ -451,6 +457,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // The refused turn's inputs stay unanswered.
         if (!runEnded) {
           usageLimited = true;
+          // Its prompts stay in the session the turn ran in.
+          rememberRefusedTurn(
+            chatJid,
+            result.newSessionId,
+            turn
+              ? turn.inputs.map(refRange)
+              : [prompts[0]?.ref ? refRange(prompts[0].ref) : null],
+          );
           // Put the unanswered messages back now, not when the container
           // exits: the window is already persisted, so a restart in between
           // would keep a cursor past messages nothing answered, and recovery
@@ -663,6 +677,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   rememberOpenFrom(chatJid, undefined);
   // Behind the cursor wherever the exit left it, so no rollback reaches them.
   pruneAnsweredAhead(chatJid);
+  pruneRefusedTurn(chatJid);
   if (done) queueHeldBack(chatJid, group);
   return done;
 }
@@ -992,7 +1007,11 @@ function pipeToActiveContainer(
   // while the window is open, and start the next container once it closes.
   if (usageLimitHeldUntil() || closingOnRefusal.has(chatJid)) return false;
   const ref = inputRef(lastAgentTimestamp[chatJid] || '', end);
-  const file = queue.sendMessage(chatJid, formatMessages(messages), ref);
+  const file = queue.sendMessage(
+    chatJid,
+    formatMessages(messages, resentIn(chatJid)),
+    ref,
+  );
   if (!file) return false;
   logger.debug(
     { chatJid, count: messages.length },
@@ -1151,6 +1170,67 @@ function trackOpenPrompts(chatJid: string, prompts: OpenPrompt[]): void {
     rememberAnsweredAhead(chatJid, mergeRanges([...kept, ...answered]));
   }
   rememberOpenFrom(chatJid, range.from);
+}
+
+function readRefusedTurns(): Record<
+  string,
+  { session: string; ranges: Range[] }
+> {
+  try {
+    return JSON.parse(getRouterState(REFUSED_TURN_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Records the messages a refused turn took, in the session it ran in: added
+ * to those of an earlier refusal in the same session, in place of another's.
+ */
+function rememberRefusedTurn(
+  chatJid: string,
+  session: string | undefined,
+  ranges: ({ from: string; to: string } | null)[],
+): void {
+  if (!session) return;
+  const taken = ranges
+    .filter((r): r is { from: string; to: string } => r !== null)
+    .map((r): Range => [r.from, r.to]);
+  if (taken.length === 0) return;
+  const all = readRefusedTurns();
+  const earlier = all[chatJid]?.session === session ? all[chatJid].ranges : [];
+  all[chatJid] = { session, ranges: mergeRanges([...earlier, ...taken]) };
+  setRouterState(REFUSED_TURN_KEY, JSON.stringify(all));
+}
+
+/**
+ * Which of the group's messages a delivery marks as sent again: those a
+ * refused turn took, while the group still keeps the session it ran in. A
+ * session the host never stored (a new one whose first turn was refused) is
+ * not resumed, so nothing in it is marked.
+ */
+function resentIn(chatJid: string): (message: NewMessage) => boolean {
+  const refused = readRefusedTurns()[chatJid];
+  const group = registeredGroups[chatJid];
+  if (!refused || !group || sessions[group.folder] !== refused.session) {
+    return () => false;
+  }
+  return (m) =>
+    refused.ranges.some(
+      ([from, to]) => m.timestamp > from && m.timestamp <= to,
+    );
+}
+
+/** Drops the refused ranges the group's cursor has passed. */
+function pruneRefusedTurn(chatJid: string): void {
+  const all = readRefusedTurns();
+  const refused = all[chatJid];
+  if (!refused) return;
+  const cursor = lastAgentTimestamp[chatJid] || '';
+  const ranges = refused.ranges.filter(([, to]) => to > cursor);
+  if (ranges.length > 0) all[chatJid] = { ...refused, ranges };
+  else delete all[chatJid];
+  setRouterState(REFUSED_TURN_KEY, JSON.stringify(all));
 }
 
 /** Drops the group's answered ranges that its cursor has passed. */

@@ -34,6 +34,7 @@ import {
 } from './container-runner.js';
 import {
   _initTestDatabase,
+  deleteSession,
   getRouterState,
   setRegisteredGroup,
   setRouterState,
@@ -51,6 +52,7 @@ import {
   _setChannels,
   _setRegisteredGroups,
 } from './index.js';
+import { RESENT_PREFIX } from './router.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 
 /**
@@ -568,6 +570,79 @@ describe('a refusal with a prompt answered after the refused one', () => {
     await b.result('Both answered.', { inputs: [b.startIds[0]] });
     await b.exit();
     await nothingRunsAgain();
+  });
+});
+
+describe('a message a refusal held, sent again after the reset', () => {
+  // Measured (container/agent-runner/test/turn-attribution-probe.test.ts):
+  // the refused prompt stays in the session, and the request that resumes it
+  // carries it in the same user message as the copy sent again.
+  it('is marked as sent again when the session it was refused in resumes', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [p2] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, `${RESENT_PREFIX}${M2}`)).toBe(1);
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    // Answered: a later delivery is no retry.
+    expect(getRouterState('usage_limit_refused_turn')).toBe('{}');
+  });
+
+  it('marks only the refused message, not one the window held', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [p2] });
+    await a.exit();
+    // Sent during the window: never refused, so no earlier copy exists.
+    await userSays('m3', M3, NOW - 20_000);
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, `${RESENT_PREFIX}${M2}`)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(b.prompt).not.toContain(`${RESENT_PREFIX}${M3}`);
+    await b.exit();
+  });
+
+  it('is not marked when the refused session is not the one the group keeps', async () => {
+    // A new session whose first turn was refused: the host stores none, so
+    // the next container starts another, with no copy in it.
+    deleteSession('main');
+    _loadState();
+    _setRegisteredGroups({ [CHAT]: MAIN_GROUP });
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(LIMIT, { inputs: [a.startIds[0]] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(RESENT_PREFIX);
+    await b.exit();
+  });
+
+  it('leaves a command bare, so the CLI still runs it', async () => {
+    const command = '/probe-skill run it';
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', command, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [p2] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(b.prompt).toBe(command);
+    await b.exit();
   });
 });
 
