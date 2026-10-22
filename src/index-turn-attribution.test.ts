@@ -573,22 +573,44 @@ describe('a container that exits with input no result answered', () => {
     expect(sent.filter((t) => t === 'It covers the appendix.')).toHaveLength(1);
   });
 
-  it('leaves a follow-up it never drained to the next container', async () => {
-    await userSays('m1', M1, NOW - 60_000);
+  it('puts back a follow-up it never drained, without waiting for the next message', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
     await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    const m2 = await userSays('m2', M2, NOW - 40_000); // never drained
+    await userSays('m2', M2, NOW - 40_000); // never drained
     await a.exit();
 
-    expect(cursor()).toBe(m2.timestamp);
-    expect(inputFiles()).toHaveLength(1);
-    await nothingRunsAgain();
-
-    await userSays('m3', M3, NOW - 20_000);
-    const b = containers[1];
+    // The container is gone, so nothing drains the file any more: m2 is
+    // pending again, and the file goes, so the retry delivers it once.
+    expect(cursor()).toBe(m1.timestamp);
+    expect(inputFiles()).toEqual([]);
+    const b = await containerOnRetry();
     expect(timesIn(b.prompt, M2)).toBe(1);
-    expect(timesIn(b.prompt, M3)).toBe(1);
-    await b.result('Both answered.', { inputs: b.startIds });
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: b.startIds });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('puts back a follow-up piped while it winds down after a clean exit', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    let release!: () => void;
+    typingHold = new Promise<void>((resolve) => (release = resolve));
+    await a.exit();
+    // The queue still counts the container active, so m2 is piped.
+    await userSays('m2', M2, NOW - 40_000);
+    expect(inputFiles()).toHaveLength(1);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(cursor()).toBe(m1.timestamp);
+    expect(inputFiles()).toEqual([]);
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: b.startIds });
     await b.exit();
   });
 
@@ -657,9 +679,12 @@ describe('an input file an earlier container left', () => {
   it('settles nothing else when the next container names it', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    // With attribution off, an exit leaves a file it never drained to the
+    // next container, as before attribution.
+    await a.result('It describes the method.', 'off');
     await userSays('m2', M2, NOW - 50_000); // left for the next container
     await a.exit();
+    expect(inputFiles()).toHaveLength(1);
 
     await userSays('m3', M3, NOW - 40_000);
     const b = containers[1];

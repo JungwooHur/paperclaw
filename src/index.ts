@@ -128,20 +128,15 @@ function markAnswered(prompts: OpenPrompt[], inputs: string[]): string[] {
 
 /**
  * Where a container's exit puts the cursor back to: the start of the oldest
- * prompt it took that no result answered. After a clean exit, not one whose
- * file is still on disk: the container never took it, and the group's next
- * container drains it, so putting it back would deliver it twice. After an
- * error it counts (`undrained`): no retry would start for it, and the put-back
- * deletes its file. Call only once the container has exited, so that file can
- * no longer go.
+ * prompt no result answered, whether the container took it or never drained
+ * its file. Left on disk, that file would wait for the group's next container,
+ * which starts only on the user's next message; the put-back deletes it, so
+ * the retry delivers its messages once. Call only once the container has
+ * exited, so that file can no longer go.
  */
-function unansweredFrom(
-  prompts: OpenPrompt[],
-  undrained: boolean,
-): string | undefined {
+function unansweredFrom(prompts: OpenPrompt[]): string | undefined {
   for (const prompt of prompts) {
     if (prompt.answered) continue;
-    if (!undrained && prompt.file && fs.existsSync(prompt.file)) continue;
     const range = prompt.ref ? refRange(prompt.ref) : null;
     if (range) return range.from;
   }
@@ -515,11 +510,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     );
   } else if (attribution === 'on') {
     // Every result said what it answered, so the exit knows what was not:
-    // a prompt the container took and no result answered goes back, on an
-    // error or not, and the queue retries it. A duplicate beats a silent
+    // a prompt no result answered goes back, taken or still in its file, on
+    // an error or not, and the queue retries it. A duplicate beats a silent
     // loss. Whatever came after it goes back too, answered or not: that
     // reruns an answered follow-up behind an unanswered prompt (#114).
-    const from = unansweredFrom(prompts, output === 'error' || hadError);
+    const from = unansweredFrom(prompts);
     const putBack = readPutBack();
     if (from === undefined) {
       if (chatJid in putBack) rememberPutBack(chatJid, undefined);
