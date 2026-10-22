@@ -89,9 +89,13 @@ describe('every refusal sentence that CLI can write', () => {
   });
 });
 
-/** An error template filled in the way the CLI fills it in. */
+/**
+ * An error template filled in the way the CLI fills it in. A part that opens
+ * the template is a count ("3 images exceed the API limit …").
+ */
 function filledIn(template: string): string {
   return template
+    .replace(/^\{(?:message|value)\}/, '3')
     .replaceAll(
       '{message}',
       '401 {"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}',
@@ -138,6 +142,19 @@ describe('every error message that CLI can write as a result', () => {
       'Not logged in to Notion from this container; the summary is below.',
     ]) {
       expect(isAgentAnswer(text), text).toBe(true);
+    }
+  });
+
+  it('is only the whole sentence: an answer may end by quoting it', () => {
+    for (const template of fixture.errors) {
+      for (const preamble of [
+        'Note:',
+        'Section 3 is uploaded. The figures failed:',
+        '그림 업로드 중 오류가 났습니다:\n-',
+      ]) {
+        const text = `${preamble} ${filledIn(template)}`;
+        expect(isAgentAnswer(text), text).toBe(true);
+      }
     }
   });
 });

@@ -124,7 +124,9 @@ export function isAgentAnswer(text: string | null | undefined): boolean {
  * The whole text a template stands for: {message} and {value} are free, and
  * may be empty (an Error with no message). The spaces beside a filled-in part
  * are matched as part of it, since the text is trimmed: "API Error: " with
- * nothing after it arrives as "API Error:".
+ * nothing after it arrives as "API Error:". A part that opens the template is
+ * one token (the CLI puts a count there), or an answer that ends by quoting
+ * the error would be taken for it.
  */
 function errorPattern(template: string): RegExp {
   const parts = template.split(/\{(?:message|value)\}/);
@@ -134,7 +136,11 @@ function errorPattern(template: string): RegExp {
     if (i < parts.length - 1) text = text.trimEnd();
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   });
-  return new RegExp(`^${fixed.join('[\\s\\S]*?')}$`);
+  const free = fixed.slice(1).map((text, i) => {
+    const part = i === 0 && fixed[0] === '' ? '\\S{0,20}\\s*' : '[\\s\\S]*?';
+    return part + text;
+  });
+  return new RegExp(`^${fixed[0]}${free.join('')}$`);
 }
 
 /**
