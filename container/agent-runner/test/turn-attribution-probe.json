@@ -1,5 +1,6 @@
 {
   "sdkVersion": "0.2.34",
+  "sourceHash": "f7a95fffbf9882078af7598d11e7b46ae5073adb1fbbf5a94a0bddc639934c8d",
   "outputs": [
     {
       "case": "start-up drain",
@@ -316,10 +317,104 @@
         ]
       },
       "subtype": "success"
+    },
+    {
+      "case": "turn failed after its acknowledgement",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": []
+      },
+      "subtype": "error_max_turns"
+    },
+    {
+      "case": "success after a failed turn",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERFAIL after: user PROBE-MAXTURNS, (assistant tool_use, user tool_result) x49, assistant tool_use, user tool_result+PROBE-AFTERFAIL",
+      "turn": {
+        "inputs": [
+          "r-after-fail"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "stream broke after its acknowledgement",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": []
+      },
+      "subtype": "error_during_execution"
+    },
+    {
+      "case": "follow-up after a broken stream",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERBROKEN after: user PROBE-BROKEN, assistant tool_use, user tool_result, assistant (no content), user PROBE-AFTERBROKEN",
+      "turn": {
+        "inputs": [
+          "r-after-broken"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command after a broken stream",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": [
+          "r-cost-after-broken"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "textless result with replay broken",
+      "status": "success",
+      "result": null,
+      "turn": null,
+      "attribution": "off",
+      "subtype": "success"
+    },
+    {
+      "case": "answer after attribution went off",
+      "status": "success",
+      "result": "ANSWER PROBE-OFFTEXT",
+      "turn": null,
+      "attribution": "off",
+      "subtype": "success"
+    },
+    {
+      "case": "session marker after attribution went off",
+      "status": "success",
+      "result": null,
+      "turn": null,
+      "attribution": "off",
+      "subtype": null
+    },
+    {
+      "case": "answer in a later query after attribution went off",
+      "status": "success",
+      "result": "ANSWER PROBE-OFFLATER",
+      "turn": null,
+      "attribution": "off",
+      "subtype": "success"
+    },
+    {
+      "case": "error after attribution went off",
+      "status": "error",
+      "result": null,
+      "turn": null,
+      "attribution": "off",
+      "subtype": null
     }
   ],
   "runnerNotes": [
-    "Input no result answered: [\"r-nothing\"] (never acknowledged)"
+    "Input no result answered: [\"r-nothing\"] (never acknowledged)",
+    "Input no result answered: [\"r-max-turns\"] (its turn failed)",
+    "Input no result answered: [\"r-broken\"] (its turn failed)",
+    "Turn attribution off for this container: a success result followed no replayed input, so replay is not working"
   ],
   "reusedUuid": {
     "events": [

@@ -171,8 +171,10 @@ export class GroupQueue {
    * None once it was told to close: the runner checks the close sentinel
    * before it drains input, so the message would wait for whatever container
    * the group starts next, behind a caller who counts it delivered.
+   * `ref` is the id the runner reports the input by in a result's `turn`
+   * (docs/SPEC.md, "Turn Attribution"); without one it uses the file name.
    */
-  sendMessage(groupJid: string, text: string): string | null {
+  sendMessage(groupJid: string, text: string, ref?: string): string | null {
     const state = this.getGroup(groupJid);
     if (
       !state.active ||
@@ -189,7 +191,10 @@ export class GroupQueue {
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
       const filepath = path.join(inputDir, filename);
       const tempPath = `${filepath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text }));
+      fs.writeFileSync(
+        tempPath,
+        JSON.stringify({ type: 'message', text, ...(ref ? { ref } : {}) }),
+      );
       fs.renameSync(tempPath, filepath);
       return filepath;
     } catch {

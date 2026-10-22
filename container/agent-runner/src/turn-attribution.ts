@@ -28,7 +28,11 @@ import path from 'path';
 
 /** The inputs one result answered. Written on every output made from a result. */
 export interface Turn {
-  /** Input ids: the turn's prompt, then what was merged into it, in order. */
+  /**
+   * Input ids: the turn's prompt, then what was merged into it, in order.
+   * None for a failed turn: it answered nothing, and no later turn answers
+   * what it took.
+   */
   inputs: string[];
   /**
    * The turn took something the host never sent: the runner's background-task
@@ -37,12 +41,23 @@ export interface Turn {
   internal?: true;
 }
 
+/**
+ * What every output says once the guard switched attribution off, from the
+ * output it tripped on: a textless result, the session marker and an error
+ * output carry no `turn` either way, so without it the host could not tell.
+ */
+export interface AttributionOff {
+  attribution: 'off';
+}
+
 /** A push no result was attributed to when its query ended. */
 export interface UnsettledPush {
   inputs: string[];
   nudge: boolean;
   /** The CLI took it into a turn, but that turn produced no result. */
   acked: boolean;
+  /** Its turn's result was a failure, which answers nothing. */
+  failed?: true;
 }
 
 /** The stdin prompt's id when the host gave none. */
@@ -90,12 +105,19 @@ function replayText(content: unknown): string {
     .join('');
 }
 
-/** Ids of the start-up push: the stdin prompt, then the IPC files drained into it. */
+/**
+ * Ids of the start-up push: the stdin prompt, by the `promptRef` of the input
+ * the host wrote to stdin, then the IPC files drained into it.
+ */
 export function startupInputIds(
-  promptRef: string | undefined,
+  input: { promptRef?: unknown },
   drained: string[],
 ): string[] {
-  return [promptRef || STDIN_INPUT_ID, ...drained];
+  const promptRef =
+    typeof input.promptRef === 'string' && input.promptRef !== ''
+      ? input.promptRef
+      : STDIN_INPUT_ID;
+  return [promptRef, ...drained];
 }
 
 /** An IPC input file's id: the `ref` it carries, else its file name. */
@@ -129,6 +151,13 @@ export class TurnAttribution {
   private foreignTeam = false;
   private foreignOther = false;
   private off = false;
+  /**
+   * Inputs the query's failed turns took. The CLI does not send them to the
+   * model again: each stays in the history once, where its turn left it,
+   * followed by the CLI's own "(no content)" message after a broken stream.
+   * So no later result answers them, and the end of the query reports them.
+   */
+  private failedInputs: string[] = [];
 
   constructor(
     private readonly log: (message: string) => void = () => {},
@@ -226,6 +255,7 @@ export class TurnAttribution {
       this.off = true;
       this.pushes.clear();
       this.own.clear();
+      this.failedInputs = [];
       this.log(
         'Turn attribution off for this container: a success result followed no replayed input, so replay is not working',
       );
@@ -244,7 +274,23 @@ export class TurnAttribution {
     // Replays no host input explains: a message the CLI queued itself. A
     // command's own replay is one, under the CLI's uuid, and it is explained.
     if (foreign && !hostInput) turn.internal = true;
+    // A failed turn (error_during_execution, error_max_turns) answered
+    // nothing, though it took its inputs. They stay unanswered: no later
+    // turn, a slash command that makes no API call least of all, answers
+    // them.
+    if (subtype !== 'success') {
+      this.failedInputs.push(...turn.inputs);
+      turn.inputs = [];
+    }
     return turn;
+  }
+
+  /**
+   * An output as the runner writes it: unchanged while attribution is on,
+   * and marked `attribution: 'off'` from the output the guard trips on.
+   */
+  stamp<T extends object>(output: T): T | (T & AttributionOff) {
+    return this.off ? { ...output, attribution: 'off' } : output;
   }
 
   /**
@@ -252,11 +298,20 @@ export class TurnAttribution {
    * the next query talks to a new CLI. Nothing once attribution is off.
    */
   endQuery(): UnsettledPush[] {
-    const unsettled = [...this.pushes].map(([uuid, push]) => ({
+    const unsettled: UnsettledPush[] = [...this.pushes].map(([uuid, push]) => ({
       inputs: push.inputs,
       nudge: push.nudge,
       acked: this.acked.includes(uuid),
     }));
+    if (this.failedInputs.length > 0) {
+      unsettled.push({
+        inputs: this.failedInputs,
+        nudge: false,
+        acked: true,
+        failed: true,
+      });
+    }
+    this.failedInputs = [];
     this.pushes.clear();
     this.own.clear();
     this.acked = [];

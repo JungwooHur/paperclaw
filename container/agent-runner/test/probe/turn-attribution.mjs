@@ -7,16 +7,23 @@
 // fake API, while a tool runs or during a turn's last API call. Every output
 // the runner writes is recorded under the case that produced it. The CLI's
 // home carries the settings.json every group is seeded with (agent teams on)
-// and one user skill, for the slash-command cases. One more case drives the
-// SDK directly, as the runner never reuses a uuid: what the CLI does with a
-// push under a uuid it has already seen. Last, it reads out of the CLI bundle
-// the prompt the CLI injects when its input closes while teammates are up,
-// which no case here makes it send.
+// and one user skill, for the slash-command cases. Two turns fail after the
+// CLI acknowledged their prompt, one on a scheduled run's maxTurns and one on
+// an API stream that breaks after a tool call, and the follow-up after each
+// answers with the history its request carried. The last container runs
+// the CLI through a `node` that drops --replay-user-messages, so replay is
+// broken there, with no switch in the runner. One more case drives the SDK
+// directly, as the runner never reuses a uuid: what the CLI does with a push
+// under a uuid it has already seen. Last, it reads out of the CLI bundle the
+// prompt the CLI injects when its input closes while teammates are up, which
+// no case here makes it send.
 import http from 'http';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+
+import { sourceHash } from './source-hash.mjs';
 
 const RUNNER = '/tmp/dist/index.js';
 const SDK_PACKAGE = '/app/node_modules/@anthropic-ai/claude-agent-sdk/package.json';
@@ -28,7 +35,7 @@ const MODEL = 'claude-sonnet-4-5-20250929';
 const OUTPUT_START = '---PAPERCLAW_OUTPUT_START---';
 const OUTPUT_END = '---PAPERCLAW_OUTPUT_END---';
 // The runner nudges after 60 s parked with a background task outstanding.
-const TIMEOUT_MS = 240_000;
+const TIMEOUT_MS = 330_000;
 
 const t0 = Date.now();
 const log = (...a) =>
@@ -83,6 +90,20 @@ function sse(res, blocks, stop) {
   res.end();
 }
 
+/** A stream that breaks: it starts a message and ends without finishing it. */
+function brokenSse(res) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'request-id': 'req_probe' });
+  res.write(`event: message_start\ndata: ${JSON.stringify({
+    type: 'message_start',
+    message: {
+      id: 'msg_broken', type: 'message', role: 'assistant', model: MODEL,
+      content: [], stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 1 },
+    },
+  })}\n\n`);
+  res.end();
+}
+
 function json(res, code, body) {
   res.writeHead(code, { 'content-type': 'application/json', 'request-id': 'req_probe' });
   res.end(JSON.stringify(body));
@@ -98,6 +119,49 @@ function lastToolName(msgs) {
   return null;
 }
 const tool = (name, input) => ({ type: 'tool_use', name, input });
+const MAX_TURNS_GLOB = 'probe-max-turns-*';
+const BROKEN_COMMAND = 'echo before the stream breaks';
+/** The input of the last tool call in the conversation. */
+function lastToolInput(msgs) {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const content = msgs[i].role === 'assistant' && Array.isArray(msgs[i].content) ? msgs[i].content : [];
+    const use = content.filter((x) => x.type === 'tool_use').pop();
+    if (use) return use.input;
+  }
+  return null;
+}
+/** A block or message text as the history below names it. */
+function partName(t) {
+  if (t.startsWith('<system-reminder>')) return 'reminder';
+  return (t.match(/PROBE-[A-Z]+/) || [t.slice(0, 40)])[0];
+}
+
+/**
+ * What a request carried, message by message: its role and each block, a
+ * text by its marker, else by its first words. A tool call and its result
+ * repeated back to back are counted, not listed.
+ */
+function historyOf(msgs) {
+  const items = msgs.map((m) => {
+    const parts = Array.isArray(m.content)
+      ? m.content.map((c) => (c.type === 'text' ? partName(c.text) : c.type))
+      : [partName(String(m.content))];
+    return `${m.role} ${parts.join('+')}`;
+  });
+  const out = [];
+  for (let i = 0; i < items.length;) {
+    let n = 1;
+    while (items[i + 2 * n + 1] !== undefined && items[i + 2 * n] === items[i] && items[i + 2 * n + 1] === items[i + 1]) n++;
+    if (n > 1) {
+      out.push(`(${items[i]}, ${items[i + 1]}) x${n}`);
+      i += 2 * n;
+    } else {
+      out.push(items[i]);
+      i++;
+    }
+  }
+  return out.join(', ');
+}
 const once = new Set();
 // While the reused-uuid case runs: every marker any request carried.
 let modelSaw = null;
@@ -135,6 +199,22 @@ function reply(b) {
       })],
       stop: 'tool_use',
     };
+  }
+  // A follow-up after a failed turn answers with the history its request
+  // carried: whether the CLI sent the failed turn's prompt again, or only
+  // kept it where it was. Before the tool loop below: the CLI may send the
+  // follow-up in the message with a tool result.
+  if (marker === 'PROBE-AFTERFAIL' || marker === 'PROBE-AFTERBROKEN') {
+    return { blocks: [text(`ANSWER ${marker} after: ${historyOf(msgs)}`)] };
+  }
+  // The tool call's next API call: the stream breaks there, and on the CLI's
+  // retry, so the turn fails after the CLI acknowledged its prompt.
+  if (afterTool && lastToolInput(msgs)?.command === BROKEN_COMMAND) {
+    return { broken: true };
+  }
+  // A tool call after every tool result: the turn runs into maxTurns.
+  if (afterTool && lastToolInput(msgs)?.pattern === MAX_TURNS_GLOB) {
+    return { blocks: [tool('Glob', { pattern: MAX_TURNS_GLOB })], stop: 'tool_use' };
   }
   if (afterTool) return { blocks: [text('ANSWER after-tool')] };
   switch (marker) {
@@ -176,6 +256,10 @@ function reply(b) {
       // No content at all: the CLI ends the turn in error before it yields a
       // message, so it never acknowledges the prompt it consumed.
       return { blocks: [] };
+    case 'PROBE-MAXTURNS':
+      return { blocks: [tool('Glob', { pattern: MAX_TURNS_GLOB })], stop: 'tool_use' };
+    case 'PROBE-BROKEN':
+      return { blocks: [tool('Bash', { command: BROKEN_COMMAND, description: 'probe tool' })], stop: 'tool_use' };
     case 'PROBE-BG':
       return {
         blocks: [tool('Task', {
@@ -201,6 +285,7 @@ const server = http.createServer((req, res) => {
     const r = reply(b);
     const stop = r.stop ?? 'end_turn';
     const send = () => {
+      if (r.broken) return brokenSse(res);
       if (b.stream) return sse(res, r.blocks, stop);
       json(res, 200, {
         id: 'msg_probe', type: 'message', role: 'assistant', model: b.model,
@@ -216,10 +301,57 @@ const server = http.createServer((req, res) => {
 // ---------- driver ----------
 const close = () => fs.writeFileSync(path.join(IPC_INPUT_DIR, '_close'), '');
 
+/** The running container's runner process. */
+let runnerPid = null;
+
+/** The CLI the runner's SDK spawned: the runner's child running cli.js. */
+function cliPid() {
+  for (const pid of fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+      const ppid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+      const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf-8');
+      // The CLI renames its process `claude`, over its arguments.
+      if (ppid === runnerPid && (stat.includes(' (claude) ') || cmdline.includes('cli.js'))) return Number(pid);
+    } catch {
+      // gone meanwhile
+    }
+  }
+  throw new Error('no CLI under the runner');
+}
+
+/** Signals the runner's CLI: SIGINT ends it with code 0, SIGTERM with 143. */
+const signalCli = (signal) => () => {
+  const pid = cliPid();
+  log('SIGNAL', signal, 'CLI', pid);
+  process.kill(pid, signal);
+};
+
+/**
+ * A directory with a `node` that drops --replay-user-messages and runs the
+ * real one. On PATH first, it is the node the SDK spawns the CLI with: the
+ * CLI then acknowledges nothing, as one whose replay broke.
+ */
+function nodeWithoutReplay() {
+  const dir = fs.mkdtempSync('/tmp/probe-noreplay-');
+  fs.writeFileSync(
+    path.join(dir, 'node'),
+    '#!/bin/sh\n' +
+      'for arg do\n' +
+      '  shift\n' +
+      '  [ "$arg" = --replay-user-messages ] || set -- "$@" "$arg"\n' +
+      'done\n' +
+      `exec ${process.execPath} "$@"\n`,
+    { mode: 0o755 },
+  );
+  return dir;
+}
+
 // Two containers, as in production: the first starts the group's session and
 // the second resumes it, as every later container does. `cases` labels the
 // outputs in the order the runner should write them; `after[n]` runs once the
-// n-th output is out.
+// n-th output is out. `notResults` numbers the outputs made from no SDK
+// result (the session marker, an error), which have no subtype.
 const CONTAINERS = [
   {
     prompt: 'PROBE-START the stdin prompt',
@@ -331,6 +463,61 @@ const CONTAINERS = [
       5: close,
     },
   },
+  // A scheduled run, which the runner caps at maxTurns: the CLI acknowledges
+  // the prompt, and the turn calls tools until it fails on that cap.
+  {
+    freshHome: true,
+    scheduled: true,
+    prompt: 'PROBE-MAXTURNS call tools until the turn cap',
+    promptRef: 'r-max-turns',
+    cases: ['turn failed after its acknowledgement', 'success after a failed turn'],
+    after: {
+      1: () => writeInput('0060-after.json', 'PROBE-AFTERFAIL a plain follow-up', 'r-after-fail'),
+      2: close,
+    },
+  },
+  // A message container's turn fails the same way: the CLI acknowledged its
+  // prompt, a tool ran, then the API stream broke, and broke again on the
+  // retry. A follow-up and a slash command that makes no API call come after.
+  {
+    freshHome: true,
+    prompt: 'PROBE-BROKEN call a tool, then the stream breaks',
+    promptRef: 'r-broken',
+    cases: [
+      'stream broke after its acknowledgement',
+      'follow-up after a broken stream',
+      'slash command after a broken stream',
+    ],
+    after: {
+      1: () => writeInput('0065-after.json', 'PROBE-AFTERBROKEN a plain follow-up', 'r-after-broken'),
+      2: () => writeInput('0066-cost.json', '/cost', 'r-cost-after-broken'),
+      3: close,
+    },
+  },
+  // Replay broken: the guard trips on the first result, a textless one. Then
+  // the CLI is ended cleanly, so the query ends and the runner writes its
+  // session marker, and in the next query killed, so the runner fails.
+  {
+    freshHome: true,
+    noReplay: true,
+    prompt: 'PROBE-EMPTY answer with no text',
+    promptRef: 'r-off-empty',
+    cases: [
+      'textless result with replay broken',
+      'answer after attribution went off',
+      'session marker after attribution went off',
+      'answer in a later query after attribution went off',
+      'error after attribution went off',
+    ],
+    notResults: [3, 5],
+    exitCode: 1,
+    after: {
+      1: () => writeInput('0070-text.json', 'PROBE-OFFTEXT a plain follow-up', 'r-off-text'),
+      2: signalCli('SIGINT'),
+      3: () => writeInput('0071-later.json', 'PROBE-OFFLATER starts the next query', 'r-off-later'),
+      4: signalCli('SIGTERM'),
+    },
+  },
 ];
 
 /** A CLI home with what src/container-runner.ts seeds every group with, agent teams included, and the probe's skill. */
@@ -367,18 +554,19 @@ function runContainer(spec, sessionId) {
     if (spec.leftover) writeInput(...spec.leftover);
     behindTeam = spec.behindTeam ?? null;
     const mine = [];
-    // The SDK result's subtype, by result number, read off the runner's log.
-    const subtypes = {};
+    // The SDK results' subtypes, in order, read off the runner's log.
+    const subtypes = [];
     let session = sessionId;
 
-    const runner = spawn('node', [RUNNER], {
-      env: spec.freshHome ? { ...cliEnv, HOME: seededHome() } : cliEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    const env = spec.freshHome ? { ...cliEnv, HOME: seededHome() } : { ...cliEnv };
+    if (spec.noReplay) env.PATH = `${nodeWithoutReplay()}:${env.PATH}`;
+    const runner = spawn(process.execPath, [RUNNER], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    runnerPid = runner.pid;
     runner.stdin.end(JSON.stringify({
       prompt: spec.prompt,
       promptRef: spec.promptRef,
       ...(spec.resume ? { sessionId } : {}),
+      ...(spec.scheduled ? { isScheduledTask: true } : {}),
       groupFolder: 'probe',
       chatJid: 'probe@g.us',
       isMain: true,
@@ -401,6 +589,7 @@ function runContainer(spec, sessionId) {
           status: output.status,
           result: output.result,
           turn: output.turn ?? null,
+          ...(output.attribution ? { attribution: output.attribution } : {}),
         });
         log('OUTPUT', JSON.stringify(mine[n - 1]));
         if (spec.after[n]) setTimeout(spec.after[n], 500);
@@ -414,8 +603,8 @@ function runContainer(spec, sessionId) {
         const line = err.slice(0, i);
         err = err.slice(i + 1);
         if (process.env.PROBE_VERBOSE) log(line);
-        const result = line.match(/Result #(\d+): subtype=(\S+)/);
-        if (result) subtypes[result[1]] = result[2];
+        const result = line.match(/Result #\d+: subtype=(\S+)/);
+        if (result) subtypes.push(result[1]);
         if (/Input no result answered|Turn attribution off/.test(line)) {
           notes.push(line.replace(/^\[agent-runner\] /, ''));
         }
@@ -423,11 +612,12 @@ function runContainer(spec, sessionId) {
     });
     runner.on('exit', (code) => {
       log('runner exit', code);
+      let next = 0;
       mine.forEach((o, i) => {
-        o.subtype = subtypes[i + 1] ?? null;
+        o.subtype = spec.notResults?.includes(i + 1) ? null : (subtypes[next++] ?? null);
       });
       outputs.push(...mine);
-      if (code === 0 && mine.length === spec.cases.length) resolve(session);
+      if (code === (spec.exitCode ?? 0) && mine.length === spec.cases.length) resolve(session);
       else reject(new Error(`runner exit ${code} after ${mine.length} of ${spec.cases.length} outputs`));
     });
   });
@@ -541,7 +731,9 @@ server.listen(PORT, '127.0.0.1', async () => {
   }
   clearTimeout(timer);
   const sdkVersion = JSON.parse(fs.readFileSync(SDK_PACKAGE, 'utf-8')).version;
-  const fixture = { sdkVersion, outputs, runnerNotes: notes, reusedUuid, cliShutdownPrompt: cliShutdownPrompt() };
+  // The runner source this compiled (mounted at /app/src) and this probe.
+  const hash = sourceHash({ src: '/app/src', probe: path.dirname(new URL(import.meta.url).pathname) });
+  const fixture = { sdkVersion, sourceHash: hash, outputs, runnerNotes: notes, reusedUuid, cliShutdownPrompt: cliShutdownPrompt() };
   process.stdout.write(JSON.stringify(fixture, null, 2) + '\n');
   server.close();
   process.exit(0);
