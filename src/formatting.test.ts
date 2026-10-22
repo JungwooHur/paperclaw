@@ -3,12 +3,10 @@ import { describe, it, expect } from 'vitest';
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from './config.js';
 import {
   escapeXml,
-  firstPrompt,
   formatMessages,
   formatOutbound,
   stripInternalTags,
   stripSaveOffer,
-  throughLastCommand,
 } from './router.js';
 import { NewMessage } from './types.js';
 
@@ -334,50 +332,5 @@ describe('formatMessages with a slash command', () => {
       makeMsg({ id: '2', content: '그건 무슨 뜻이야?' }),
     ]);
     expect(result).toContain('<messages>');
-  });
-});
-
-describe('firstPrompt', () => {
-  // formatMessages sends a batch whose newest message is a command as that
-  // command alone, so the messages before it have to go first, as a prompt
-  // of their own, or they would never reach the model.
-  const q = makeMsg({ id: 'q', content: 'what is section 2 about?' });
-  const a = makeMsg({ id: 'a', content: '/skill-a arg' });
-  const b = makeMsg({ id: 'b', content: `@${ASSISTANT_NAME} /skill-b` });
-
-  it('holds a newest command back behind the messages before it', () => {
-    expect(firstPrompt([q, a])).toEqual([q]);
-  });
-
-  it('holds back every command at the end, each for a prompt of its own', () => {
-    expect(firstPrompt([q, a, b])).toEqual([q]);
-    expect(firstPrompt([a, b])).toEqual([a]);
-    expect(firstPrompt([b])).toEqual([b]);
-  });
-
-  it('counts a command behind the trigger', () => {
-    expect(firstPrompt([q, b])).toEqual([q]);
-  });
-
-  it('keeps a batch that does not end in a command whole', () => {
-    expect(firstPrompt([q])).toEqual([q]);
-    expect(firstPrompt([a, q])).toEqual([a, q]);
-  });
-});
-
-describe('throughLastCommand', () => {
-  const q = makeMsg({ id: 'q', content: 'what is section 2 about?' });
-  const t = makeMsg({ id: 't', content: 'thanks' });
-  const a = makeMsg({ id: 'a', content: '/skill-a arg' });
-  const b = makeMsg({ id: 'b', content: `@${ASSISTANT_NAME} /skill-b` });
-
-  it('leaves out the messages after the newest command', () => {
-    expect(throughLastCommand([q, a, t])).toEqual([q, a]);
-    expect(throughLastCommand([a, q, b, q, t])).toEqual([a, q, b]);
-  });
-
-  it('keeps a batch that ends in a command, or has none, whole', () => {
-    expect(throughLastCommand([q, a])).toEqual([q, a]);
-    expect(throughLastCommand([q, t])).toEqual([q, t]);
   });
 });

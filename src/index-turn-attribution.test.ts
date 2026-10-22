@@ -300,7 +300,6 @@ const RUN_STATE_KEYS = [
   'turn_open_from',
   'turn_put_back',
   'usage_limit_refused_input',
-  'held_command',
 ];
 
 /** Messages stored while no process polls: start-up recovery finds them. */
@@ -1274,8 +1273,6 @@ describe('a router_state value of the wrong shape', () => {
     ['answered_ahead', `{"${CHAT}": [["a"]]}`],
     ['turn_open_from', 'null'],
     ['turn_open_from', `{"${CHAT}": 5}`],
-    ['held_command', '[]'],
-    ['held_command', `{"${CHAT}": null}`],
     ['usage_limit_refused_turn', 'null'],
     ['usage_limit_refused_turn', `{"${CHAT}": {"session": "session-old"}}`],
     ['turn_put_back', '"main"'],
@@ -1401,104 +1398,36 @@ describe('a restart while a container runs', () => {
 });
 
 describe('a batch whose newest message is a slash command', () => {
-  // The router sends such a batch as the command alone.
+  // The router sends such a batch as the command alone (src/router.ts), so
+  // the messages before it never reach the model. A known limit, as on main
+  // (docs/SPEC.md, "Turn Attribution", "What remains"): these pin it, so a
+  // change to it is a decision, not a side effect.
   const CMD = '/probe-skill run it';
 
-  describe('in a group that needs the trigger', () => {
-    const TEAM: RegisteredGroup = {
+  it('goes as the command alone, and the cursor passes the messages before it', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    expect(a.prompt).toBe(CMD);
+    await a.result('The skill ran.', { inputs: [a.startIds[0]] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('goes as the command alone after chatter in a group that needs the trigger', async () => {
+    const team: RegisteredGroup = {
       name: 'Team',
       folder: 'team',
       trigger: `@${ASSISTANT_NAME}`,
       added_at: '2026-10-01T00:00:00.000Z',
       requiresTrigger: true,
     };
-    beforeEach(() => {
-      _setRegisteredGroups({ [CHAT]: TEAM });
-      inputDir = groupInputDir(TEAM);
-    });
-    afterEach(() => {
-      inputDir = groupInputDir(MAIN_GROUP);
-    });
-
-    it('does not make a prompt of chatter before the command', async () => {
-      // Context, not a request: sent alone it would draw a reply.
-      await usersSay([
-        ['m1', 'lunch at noon?', NOW - 60_000],
-        ['m2', `@${ASSISTANT_NAME} ${CMD}`, NOW - 50_000],
-      ]);
-      const a = containers[0];
-      expect(a.prompt).toBe(CMD);
-      await a.result('The skill ran.', { inputs: [a.startIds[0]] });
-      await a.exit();
-      await nothingRunsAgain();
-    });
-
-    it('runs a triggered question before the command', async () => {
-      await usersSay([
-        ['m1', `@${ASSISTANT_NAME} ${M1}`, NOW - 60_000],
-        ['m2', `@${ASSISTANT_NAME} ${CMD}`, NOW - 50_000],
-      ]);
-      const a = containers[0];
-      expect(timesIn(a.prompt, M1)).toBe(1);
-      expect(a.prompt).not.toContain(CMD);
-      await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-      expect(waitingTexts()).toEqual([CMD]);
-      const [command] = a.drain();
-      await a.result('The skill ran.', { inputs: [command] });
-      await a.exit();
-      await nothingRunsAgain();
-    });
-
-    it('runs a command sent without the trigger after a triggered question', async () => {
-      // On its own it would not start the agent, but the batch it ended did.
-      await usersSay([
-        ['m1', `@${ASSISTANT_NAME} ${M1}`, NOW - 60_000],
-        ['m2', CMD, NOW - 50_000],
-      ]);
-      const a = containers[0];
-      expect(timesIn(a.prompt, M1)).toBe(1);
-      expect(a.prompt).not.toContain(CMD);
-      await userSays('m3', 'lunch at noon?', NOW - 45_000);
-      await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-      expect(waitingTexts()).toEqual([CMD]);
-      const [command] = a.drain();
-      await a.result('The skill ran.', { inputs: [command] });
-      // Chatter after the command is still context, not a request.
-      expect(waitingTexts()).toEqual([]);
-      await a.exit();
-      await nothingRunsAgain();
-    });
-
-    it('runs such a command after a restart stopped it in its file', async () => {
-      setRegisteredGroup(CHAT, TEAM);
-      await usersSay([
-        ['m1', `@${ASSISTANT_NAME} ${M1}`, NOW - 60_000],
-        ['m2', CMD, NOW - 50_000],
-      ]);
-      const a = containers[0];
-      await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-      expect(waitingTexts()).toEqual([CMD]); // never drained
-      const deadState = crashState();
-      await a.exit('error');
-      deadState();
-      _restoreStartupState();
-      _recoverPendingMessages();
-      await vi.advanceTimersByTimeAsync(0);
-
-      const b = containers[1];
-      expect(b.prompt).toBe(CMD);
-      await b.result('The skill ran.', { inputs: [b.startIds[0]] });
-      await b.exit();
-      await nothingRunsAgain();
-    });
-  });
-
-  it('goes as the command alone when it shares the second of the message before it', async () => {
-    // WhatsApp stamps whole seconds, and the cursor cannot stop between two
-    // messages that share a timestamp: the batch goes whole, as before.
+    _setRegisteredGroups({ [CHAT]: team });
     await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 60_000],
+      ['m1', `@${ASSISTANT_NAME} ${M1}`, NOW - 60_000],
+      ['m2', `@${ASSISTANT_NAME} ${CMD}`, NOW - 50_000],
     ]);
     const a = containers[0];
     expect(a.prompt).toBe(CMD);
@@ -1507,179 +1436,37 @@ describe('a batch whose newest message is a slash command', () => {
     await nothingRunsAgain();
   });
 
-  it('goes as the command alone at start-up too when it shares that second', async () => {
-    storedBeforeStart([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 60_000],
-    ]);
-    restart();
-    _recoverPendingMessages();
-    await vi.advanceTimersByTimeAsync(0);
-
-    const a = containers[0];
-    expect(a.prompt).toBe(CMD);
-    await a.result('The skill ran.', { inputs: [a.startIds[0]] });
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the messages before the second a command shares with the one before it', async () => {
-    await usersSay([
-      ['m0', M3, NOW - 70_000],
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 60_000],
-    ]);
-    const a = containers[0];
-    // The cursor can stop before that second, not inside it.
-    expect(timesIn(a.prompt, M3)).toBe(1);
-    expect(a.prompt).not.toContain(M1);
-    expect(a.prompt).not.toContain(CMD);
-    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('holds back a command the cut before a shared second leaves at the end', async () => {
-    const SECOND = '/probe-skill second';
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-      ['m3', M2, NOW - 40_000],
-      ['m4', SECOND, NOW - 40_000],
-    ]);
-    const a = containers[0];
-    expect(timesIn(a.prompt, M1)).toBe(1);
-    expect(a.prompt).not.toContain('/probe-skill');
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    // The question in the second command's second goes with it, as before.
-    expect(waitingTexts()).toEqual([SECOND]);
-    const [second] = a.drain();
-    await a.result('The second skill ran.', { inputs: [second] });
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs a message that waited behind a command before a later batch ending in a command that shares a second', async () => {
-    const SECOND = '/probe-skill second';
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    // Sent on its own while the question's turn runs: it waits.
-    await userSays('m3', M2, NOW - 40_000);
-    // Then a question and a command typed within one second.
-    await usersSay([
-      ['m4', M3, NOW - 30_000],
-      ['m5', SECOND, NOW - 30_000],
-    ]);
-    expect(waitingTexts()).toEqual([]);
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    const [later] = waitingTexts();
-    expect(timesIn(later, M2)).toBe(1);
-    expect(later).not.toContain(M3);
-    expect(later).not.toContain(SECOND);
-    const [p3] = a.drain();
-    await a.result('It covers the experiments.', { inputs: [p3] });
-    // The command goes alone, without the question in its second, as before.
-    expect(waitingTexts()).toEqual([SECOND]);
-    const [second] = a.drain();
-    await a.result('The second skill ran.', { inputs: [second] });
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('keeps a held command bare when a message stored after the poll shares its second', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    // Stored after that poll, in the command's second: the loop never sees
-    // it, and the cursor cannot stop between the two.
-    await userSays('m3', 'thanks', NOW - 50_000);
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs a refused command alone after the reset, ahead of a message sent in the window', async () => {
+  it('is piped into a running turn at once, where it can be merged as plain text', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    await userSays('m2', CMD, NOW - 40_000);
-    const [p2] = a.drain();
-    await a.result(LIMIT, { inputs: [p2] });
-    await a.exit();
-    await userSays('m3', 'did it run?', NOW - 20_000);
-
-    const b = await containerAfterReset();
-    expect(b.prompt).toBe(CMD);
-    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
-    const [later] = waitingTexts();
-    expect(timesIn(later, 'did it run?')).toBe(1);
-    expect(later).not.toContain(CMD);
-    const [p3] = b.drain();
-    await b.result('It did.', { inputs: [p3] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs a refused command that started its container alone after the reset', async () => {
-    await userSays('m1', CMD, NOW - 60_000);
-    const a = containers[0];
-    expect(a.prompt).toBe(CMD);
-    await a.result(LIMIT, { inputs: [a.startIds[0]] });
-    await a.exit();
-    await userSays('m2', 'did it run?', NOW - 20_000);
-
-    const b = await containerAfterReset();
-    expect(b.prompt).toBe(CMD);
-    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
-    const [later] = waitingTexts();
-    expect(timesIn(later, 'did it run?')).toBe(1);
-    const [p2] = b.drain();
-    await b.result('It did.', { inputs: [p2] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs a refused command an earlier container left in its file alone after the reset', async () => {
-    await userSays('m1', M1, NOW - 60_000);
-    const a = containers[0];
-    await a.result('It describes the method.', 'off');
     await userSays('m2', CMD, NOW - 50_000);
-    await a.exit();
     expect(waitingTexts()).toEqual([CMD]);
-    await userSays('m3', M2, NOW - 40_000);
-    const b = containers[1];
-    expect(b.startIds).toHaveLength(2);
-    await b.result(LIMIT, { inputs: b.startIds });
-    await b.exit();
-
-    const c = await containerAfterReset();
-    expect(c.prompt).toBe(CMD);
-    await c.result('The skill ran.', { inputs: [c.startIds[0]] });
-    const [later] = waitingTexts();
-    expect(timesIn(later, M2)).toBe(1);
-    const [p3] = c.drain();
-    await c.result('It covers the experiments.', { inputs: [p3] });
-    await c.exit();
+    const [command] = a.drain();
+    await a.result('It describes the method.', {
+      inputs: [a.startIds[0], command],
+    });
+    await a.exit();
     await nothingRunsAgain();
   });
 
-  it('runs a command put back alone ahead of a message put back after it', async () => {
+  it('goes back as the command alone when a put-back makes a question before it pending', async () => {
+    await userSays('m0', M3, NOW - 70_000);
+    const a = containers[0];
+    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
+    await userSays('m1', M1, NOW - 60_000);
+    await userSays('m2', CMD, NOW - 50_000);
+    expect(waitingTexts()).toHaveLength(2);
+    a.drain();
+    await a.exit('error'); // stopped before either turn ended
+
+    const b = await containerOnRetry();
+    expect(b.prompt).toBe(CMD);
+    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('goes back as plain text when a message after it goes back with it', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
     await a.result('It describes the method.', { inputs: [a.startIds[0]] });
@@ -1690,344 +1477,11 @@ describe('a batch whose newest message is a slash command', () => {
     await a.exit('error');
 
     const b = await containerOnRetry();
-    expect(b.prompt).toBe(CMD);
-    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
-    const [later] = waitingTexts();
-    expect(timesIn(later, 'did it run?')).toBe(1);
-    expect(later).not.toContain(CMD);
-    const [p3] = b.drain();
-    await b.result('It did.', { inputs: [p3] });
+    expect(b.prompt).toContain('<messages>');
+    expect(timesIn(b.prompt, CMD)).toBe(1);
+    expect(timesIn(b.prompt, 'did it run?')).toBe(1);
+    await b.result('It did not run yet.', { inputs: [b.startIds[0]] });
     await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the newer of two held commands that share a second', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', '/probe-skill first', NOW - 50_000],
-      ['m3', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    expect(a.prompt).not.toContain('/probe-skill');
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('keeps the command a prompt of its own when a message comes before the question is answered', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    await userSays('m3', M2, NOW - 40_000);
-    // Nothing goes past the command while it waits.
-    expect(waitingTexts()).toEqual([]);
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    const [later] = waitingTexts();
-    expect(timesIn(later, M2)).toBe(1);
-    expect(later).not.toContain(CMD);
-    const [p3] = a.drain();
-    await a.result('It covers the experiments.', { inputs: [p3] });
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('keeps the command a prompt of its own across a restart, with a message after it', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    await userSays('m3', M2, NOW - 40_000);
-    await restartWhileRunning(a);
-
-    const b = containers[1];
-    expect(timesIn(b.prompt, M1)).toBe(1);
-    expect(b.prompt).not.toContain(CMD);
-    expect(b.prompt).not.toContain(M2);
-    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = b.drain();
-    await b.result('The skill ran.', { inputs: [command] });
-    const [p3] = b.drain();
-    await b.result('It covers the experiments.', { inputs: [p3] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('waits for a question piped with it, not only for the turn running then', async () => {
-    await userSays('m0', M3, NOW - 70_000);
-    const a = containers[0];
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    expect(waitingTexts()).toHaveLength(1);
-    expect(waitingTexts()[0]).not.toContain(CMD);
-    const [p1] = a.drain();
-    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
-    // The question is still open: the command would be merged into its turn.
-    expect(waitingTexts()).toEqual([]);
-    await a.result('It describes the method.', { inputs: [p1] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the messages before it first, then the command as its own prompt', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    expect(timesIn(a.prompt, M1)).toBe(1);
-    expect(a.prompt).not.toContain(CMD);
-    // Piped now, it could be merged into the question's turn as plain text.
-    expect(waitingTexts()).toEqual([]);
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    await a.exit();
-    // Passed by the cursor, so the run's end forgets it.
-    expect(JSON.parse(getRouterState('held_command') || '{}')).toEqual({});
-    await nothingRunsAgain();
-  });
-
-  it('runs both a question and a command that a put-back made pending', async () => {
-    await userSays('m0', M3, NOW - 70_000);
-    const a = containers[0];
-    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
-    await userSays('m1', M1, NOW - 60_000);
-    // Alone in its batch, so piped as the command, as before.
-    await userSays('m2', CMD, NOW - 50_000);
-    expect(waitingTexts()).toHaveLength(2);
-    expect(waitingTexts()).toContain(CMD);
-    a.drain();
-    await a.exit('error'); // stopped before either turn ended
-
-    const b = await containerOnRetry();
-    expect(timesIn(b.prompt, M1)).toBe(1);
-    expect(b.prompt).not.toContain(CMD);
-    expect(b.prompt).not.toContain(M3);
-    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = b.drain();
-    await b.result('The skill ran.', { inputs: [command] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the command in the next container when this one is closing', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    // Told to close, as for a scheduled task waiting for the group.
-    queue.closeStdin(CHAT);
-    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
-    expect(waitingTexts()).toEqual([]);
-    await a.exit();
-    await vi.advanceTimersByTimeAsync(0);
-
-    const b = containers[1];
-    expect(b.prompt).toBe(CMD);
-    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs a refused question and its command once an answer closes the window before the exit', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    await a.result(LIMIT, { inputs: [a.startIds[0]] });
-    // A turn the CLI started itself gets through: the window closes while
-    // the refused container is still closing.
-    await a.result('Background work finished.', {
-      inputs: [],
-      internal: true,
-    });
-    await a.exit('error');
-    await vi.advanceTimersByTimeAsync(0);
-
-    const b = containers[1];
-    expect(b).toBeDefined();
-    expect(timesIn(b.prompt, M1)).toBe(1);
-    expect(b.prompt).not.toContain(CMD);
-    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = b.drain();
-    await b.result('The skill ran.', { inputs: [command] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the command after the turn ahead of it failed, without waiting for the idle close', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    // The question's turn fails after the CLI took it: it answers nothing,
-    // and no later turn of this container answers the question.
-    await a.result(null, { inputs: [] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    // Nothing waits behind the command any more.
-    await userSays('m3', M2, NOW - 40_000);
-    const [later] = waitingTexts();
-    expect(timesIn(later, M2)).toBe(1);
-    const [p3] = a.drain();
-    await a.result('It covers the experiments.', { inputs: [p3] });
-    await a.exit();
-
-    // Only the failed question goes back.
-    const b = await containerOnRetry();
-    expect(timesIn(b.prompt, M1)).toBe(1);
-    expect(b.prompt).not.toContain(CMD);
-    expect(b.prompt).not.toContain(M2);
-    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs a message that waited behind the command after the turn ahead of it failed', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    await userSays('m3', M2, NOW - 40_000);
-    expect(waitingTexts()).toEqual([]);
-    await a.result(null, { inputs: [] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    const [later] = waitingTexts();
-    expect(timesIn(later, M2)).toBe(1);
-    expect(later).not.toContain(CMD);
-    const [p3] = a.drain();
-    await a.result('It covers the experiments.', { inputs: [p3] });
-    await a.exit();
-
-    // The message marked the group for its next container, so that one
-    // need not wait for the retry.
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(containers).toHaveLength(2);
-    const b = containers[1];
-    expect(timesIn(b.prompt, M1)).toBe(1);
-    expect(b.prompt).not.toContain(M2);
-    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the command once the query ends with the prompt ahead of it unanswered', async () => {
-    await userSays('m0', M3, NOW - 70_000);
-    const a = containers[0];
-    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    expect(waitingTexts()).toHaveLength(1);
-    a.drain();
-    // The CLI took the question, and its query ended with no result after
-    // it: no turn runs until the next input.
-    await a.marker();
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = a.drain();
-    await a.result('The skill ran.', { inputs: [command] });
-    await a.exit();
-
-    const b = await containerOnRetry();
-    expect(timesIn(b.prompt, M1)).toBe(1);
-    expect(b.prompt).not.toContain(CMD);
-    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
-    await b.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the command after a failed start-up turn that took a file an earlier container left', async () => {
-    await userSays('m1', M1, NOW - 60_000);
-    const a = containers[0];
-    await a.result('It describes the method.', 'off');
-    await userSays('m2', M2, NOW - 55_000);
-    await a.exit();
-    expect(inputFiles()).toHaveLength(1);
-    await usersSay([
-      ['m3', M3, NOW - 50_000],
-      ['m4', CMD, NOW - 40_000],
-    ]);
-    const b = containers[1];
-    expect(b.startIds).toHaveLength(2);
-    expect(b.prompt).not.toContain(CMD);
-    // One push, the leftover with the start-up prompt, and its turn failed.
-    await b.result(null, { inputs: [] });
-    expect(waitingTexts()).toEqual([CMD]);
-    const [command] = b.drain();
-    await b.result('The skill ran.', { inputs: [command] });
-    await b.exit();
-
-    const c = await containerOnRetry();
-    expect(timesIn(c.prompt, M2)).toBe(1);
-    expect(timesIn(c.prompt, M3)).toBe(1);
-    expect(c.prompt).not.toContain(CMD);
-    await c.result('Both answered.', { inputs: [c.startIds[0]] });
-    await c.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the command after a turn of a runner that reports no turn, with a follow-up merged into it', async () => {
-    await userSays('m0', M3, NOW - 70_000);
-    const a = containers[0];
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    expect(waitingTexts()).toHaveLength(1);
-    a.drain(); // merged into the running turn
-    await userSays('m3', M2, NOW - 40_000);
-    expect(waitingTexts()).toEqual([]);
-    // One result for both, without `turn`: the question never settles.
-    await a.result('Appendix and section 2 answered together.');
-    expect(waitingTexts()).toEqual([CMD]);
-    a.drain();
-    await a.result('The skill ran.');
-    const [later] = waitingTexts();
-    expect(timesIn(later, M2)).toBe(1);
-    a.drain();
-    await a.result('It covers the experiments.');
-    await a.exit();
-    await nothingRunsAgain();
-  });
-
-  it('runs the command after a textless result from a runner that reports no turn', async () => {
-    await usersSay([
-      ['m1', M1, NOW - 60_000],
-      ['m2', CMD, NOW - 50_000],
-    ]);
-    const a = containers[0];
-    // Answered only through send_message: no text and no `turn`.
-    await a.result(null);
-    expect(waitingTexts()).toEqual([CMD]);
-    a.drain();
-    await a.result('The skill ran.');
-    await a.exit();
     await nothingRunsAgain();
   });
 });

@@ -33,36 +33,6 @@ function slashCommandIn(message: NewMessage): string | null {
 }
 
 /**
- * The messages the next prompt carries. formatMessages sends a batch whose
- * newest message is a command as that command alone, which would drop the
- * messages before it: they go first, as a prompt of their own, and each
- * command at the end waits for a prompt of its own after them. The caller
- * delivers the rest once the turn this prompt starts has ended, since a
- * command that reaches a running turn is merged into it as plain text.
- */
-export function firstPrompt(messages: NewMessage[]): NewMessage[] {
-  let n = messages.length;
-  while (n > 1 && slashCommandIn(messages[n - 1])) n--;
-  return messages.slice(0, n);
-}
-
-/** Whether formatMessages sends these messages as a bare command. */
-export function sentBare(messages: NewMessage[]): boolean {
-  const newest = messages[messages.length - 1];
-  return newest !== undefined && slashCommandIn(newest) !== null;
-}
-
-/**
- * The messages up to and including the newest command among them, or all of
- * them when none is one.
- */
-export function throughLastCommand(messages: NewMessage[]): NewMessage[] {
-  let n = messages.length;
-  while (n > 0 && !slashCommandIn(messages[n - 1])) n--;
-  return n > 0 ? messages.slice(0, n) : messages;
-}
-
-/**
  * Put before a message sent again after a usage limit refused the turn that
  * took it. The refused prompt stays in the session, and the request that
  * resumes it carries that copy in the same user message as this one
