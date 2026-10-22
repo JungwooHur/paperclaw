@@ -16,12 +16,21 @@
  * host and the previous runner in place together. `npm run dev` runs the
  * sources and keeps reading the checkout.
  *
+ * The host's tsc does not compile the runner; the image does, at every
+ * container start. So a runner that does not even parse (a merge conflict left
+ * in it, say) is refused here, and the build fails instead of every container
+ * of every unedited group. That check is syntax only: type-checking would need
+ * the runner's packages, which only the image has.
+ *
  * Run as `node dist/stage-runner.js` by the build script. It imports nothing
  * from this project, so it runs in a build with nothing else to load.
  */
 import fs from 'fs';
+import { createRequire } from 'module';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+type TypeScript = typeof import('typescript');
 
 /** The runner sources in the checkout at `projectRoot`. */
 export function runnerSourceDir(projectRoot: string): string {
@@ -51,13 +60,49 @@ export function runnerBundleDir(
 }
 
 /**
+ * Throws, naming each file and line, when a TypeScript file under `dir` does
+ * not parse. Parsing reads no imports, so it needs none of the runner's
+ * packages.
+ */
+export function checkRunnerSyntax(dir: string): void {
+  // Loaded here, not at the top: host modules import this file for its paths
+  // and must not load the compiler for them.
+  const ts: TypeScript = createRequire(import.meta.url)('typescript');
+  const files: string[] = [];
+  const walk = (sub: string): void => {
+    for (const entry of fs.readdirSync(sub, { withFileTypes: true })) {
+      const full = path.join(sub, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && /\.[cm]?tsx?$/.test(entry.name)) {
+        files.push(full);
+      }
+    }
+  };
+  walk(dir);
+  const program = ts.createProgram(files, {
+    noResolve: true,
+    noLib: true,
+    types: [],
+  });
+  const diagnostics = program.getSyntacticDiagnostics();
+  if (diagnostics.length === 0) return;
+  throw new Error(
+    `the agent runner does not parse:\n${ts.formatDiagnostics(diagnostics, {
+      getCanonicalFileName: (f) => f,
+      getCurrentDirectory: () => dir,
+      getNewLine: () => '\n',
+    })}`,
+  );
+}
+
+/**
  * Copies the runner sources of `projectRoot` to its staged runner, whole.
  *
  * The copy goes to a sibling and is swapped in by rename, so a host starting a
  * container meanwhile reads either the old copy or the new one, never half of
  * one, and a failed copy leaves the old one as it was. Throws when the sources
- * are missing or the copy fails, so the build fails and says why. Returns the
- * staged directory.
+ * are missing, do not parse, or cannot be copied, so the build fails and says
+ * why. Returns the staged directory.
  */
 export function stageRunner(projectRoot: string): string {
   const source = runnerSourceDir(projectRoot);
@@ -72,6 +117,7 @@ export function stageRunner(projectRoot: string): string {
   try {
     // As runner-seed.ts copies it on: a relative link stays relative.
     fs.cpSync(source, next, { recursive: true, verbatimSymlinks: true });
+    checkRunnerSyntax(next);
   } catch (err) {
     fs.rmSync(next, { recursive: true, force: true });
     throw err;
@@ -116,7 +162,12 @@ if (isDirectRun()) {
       `Staged the agent runner in ${path.relative(projectRoot, staged)}`,
     );
   } catch (err) {
-    console.error('Could not stage the agent runner:', err);
+    // On stdout, like tsc's own errors: under the unit that is
+    // logs/paperclaw.log, where the startup WARN about a stale runner points.
+    console.log(
+      'Could not stage the agent runner:',
+      err instanceof Error ? err.message : err,
+    );
     process.exitCode = 1;
   }
 }

@@ -38,7 +38,7 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'stage-runner-'));
   source = runnerSourceDir(root);
   staged = stagedRunnerDir(path.join(root, 'dist'));
-  write(source, { 'index.ts': 'v1 index\n', 'tools/ipc.ts': 'v1 ipc\n' });
+  write(source, { 'index.ts': '// v1 index\n', 'tools/ipc.ts': '// v1 ipc\n' });
 });
 
 afterEach(() => {
@@ -77,7 +77,7 @@ describe('stageRunner', () => {
   it('drops files from the staged copy that the sources no longer have', () => {
     stageRunner(root);
     fs.rmSync(path.join(source, 'tools', 'ipc.ts'));
-    write(source, { 'index.ts': 'v2 index\n' });
+    write(source, { 'index.ts': '// v2 index\n' });
 
     stageRunner(root);
 
@@ -88,7 +88,7 @@ describe('stageRunner', () => {
   it('keeps the previous staged copy whole when copying the new one fails', () => {
     stageRunner(root);
     const before = hashTree(staged);
-    write(source, { 'index.ts': 'v2 index\n' });
+    write(source, { 'index.ts': '// v2 index\n' });
     vi.spyOn(fs, 'cpSync').mockImplementationOnce((_src, dst) => {
       write(String(dst), { 'index.ts': 'half' });
       throw new Error('ENOSPC: no space left on device');
@@ -100,6 +100,34 @@ describe('stageRunner', () => {
     expect(fs.readdirSync(path.join(root, 'dist'))).toEqual([
       'agent-runner-src',
     ]);
+  });
+
+  it('stages nothing from a runner that does not parse, and names the file', () => {
+    stageRunner(root);
+    const before = hashTree(staged);
+    write(source, {
+      'tools/ipc.ts':
+        '<<<<<<< ours\nexport const a = 1;\n=======\nexport const a = 2;\n>>>>>>> theirs\n',
+    });
+
+    expect(() => stageRunner(root)).toThrow(/tools\/ipc\.ts/);
+
+    expect(hashTree(staged)).toBe(before);
+    expect(fs.readdirSync(path.join(root, 'dist'))).toEqual([
+      'agent-runner-src',
+    ]);
+  });
+
+  it('checks syntax only, since the host lacks the packages the runner imports', () => {
+    write(source, {
+      'index.ts':
+        "import { query } from 'a-package-only-the-image-has';\n" +
+        "export const n: number = query('not checked here');\n",
+    });
+
+    stageRunner(root);
+
+    expect(hashTree(staged)).toBe(hashTree(source));
   });
 
   it('fails without runner sources, so the build that ran it fails', () => {
@@ -193,7 +221,7 @@ describe('npm run build', () => {
   it('stages the runner when node is handed a symlinked path to the script', () => {
     const dir = project();
     expect(build(dir).status).toBe(0);
-    write(source, { 'index.ts': 'v2 index\n' });
+    write(source, { 'index.ts': '// v2 index\n' });
     const link = path.join(dir, 'via-link');
     fs.symlinkSync(dir, link);
 
@@ -207,11 +235,26 @@ describe('npm run build', () => {
     expect(hashTree(staged)).toBe(hashTree(source));
   }, 30_000);
 
+  // Under the unit, stdout is logs/paperclaw.log, where tsc's own errors go
+  // and where the startup WARN about a stale runner sends the reader.
+  it('fails on a runner that does not parse, and says why on stdout', () => {
+    const dir = project();
+    expect(build(dir).status).toBe(0);
+    const before = hashTree(staged);
+    write(source, { 'index.ts': '<<<<<<< ours\n// v2 index\n=======\n' });
+
+    const result = build(dir);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain('index.ts');
+    expect(hashTree(staged)).toBe(before);
+  }, 30_000);
+
   it('stages nothing new when tsc fails, so the runner stays as old as dist/', () => {
     const dir = project();
     expect(build(dir).status).toBe(0);
     const before = hashTree(staged);
-    write(source, { 'index.ts': 'v2 index\n', 'new-tool.ts': 'new\n' });
+    write(source, { 'index.ts': '// v2 index\n', 'new-tool.ts': '// new\n' });
     write(path.join(dir, 'src'), {
       'probe.ts': "export const n: number = 'not a number';\n",
     });
