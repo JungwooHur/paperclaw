@@ -1085,6 +1085,42 @@ describe('a container that exits with input no result answered', () => {
     await b.result('Both answered.', { inputs: b.startIds });
     await b.exit();
   });
+
+  it('leaves a restart nothing to put back once it gave a prompt up', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+    const b = await containerOnRetry();
+    await b.result(null, { inputs: [] }); // fails again: given up at exit
+    await b.exit();
+    await nothingRunsAgain();
+
+    restart();
+    _recoverPendingMessages();
+    await nothingRunsAgain();
+  });
+
+  it('keeps the ranges a put-back kept when the retry is refused', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+    const b = await containerOnRetry();
+    expect(b.prompt).not.toContain(M2);
+    await b.result(LIMIT, { inputs: [b.startIds[0]] });
+    await b.exit();
+
+    const c = await containerAfterReset();
+    expect(timesIn(c.prompt, M1)).toBe(1);
+    expect(c.prompt).not.toContain(M2);
+  });
 });
 
 describe('an input file an earlier container left', () => {
@@ -1296,6 +1332,22 @@ describe('a restart while a container runs', () => {
     expect(cursor()).toBe(m2.timestamp);
     await nothingRunsAgain();
   });
+
+  it('puts it back once: start-up forgets where it put back to', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    const deadState = crashState();
+    await a.exit('error');
+    deadState();
+    restart();
+
+    expect(cursor()).toBe(m1.timestamp);
+    // A second restart before any container runs puts back nothing more.
+    expect(openFrom()).toEqual({});
+  });
 });
 
 describe('a batch whose newest message is a slash command', () => {
@@ -1407,6 +1459,27 @@ describe('a batch whose newest message is a slash command', () => {
     expect(b.prompt).toBe(CMD);
     await b.result('The skill ran.', { inputs: [b.startIds[0]] });
     await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('waits for a question piped with it, not only for the turn running then', async () => {
+    await userSays('m0', M3, NOW - 70_000);
+    const a = containers[0];
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    expect(waitingTexts()).toHaveLength(1);
+    expect(waitingTexts()[0]).not.toContain(CMD);
+    const [p1] = a.drain();
+    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
+    // The question is still open: the command would be merged into its turn.
+    expect(waitingTexts()).toEqual([]);
+    await a.result('It describes the method.', { inputs: [p1] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.exit();
     await nothingRunsAgain();
   });
 });
