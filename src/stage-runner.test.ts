@@ -267,3 +267,35 @@ describe('npm run build', () => {
     expect(fs.existsSync(path.join(staged, 'new-tool.ts'))).toBe(false);
   }, 30_000);
 });
+
+describe('the /update skill', () => {
+  // Step 7b reads the status of the build the restart ran, and says where to
+  // read why it failed. Both ways it fails print there on stdout: tsc's errors,
+  // and this module's refusal. Under the unit that is the log StandardOutput
+  // names; the stderr log holds none of it.
+  it('reads why a build failed in the log the unit sends stdout to', () => {
+    const unit = fs.readFileSync(
+      path.join(repoRoot, 'systemd', 'paperclaw.service'),
+      'utf-8',
+    );
+    const logOf = (stream: string): string =>
+      path.basename(
+        new RegExp(`^${stream}=append:(\\S+)$`, 'm').exec(unit)![1],
+      );
+    const skill = fs.readFileSync(
+      path.join(repoRoot, '.claude', 'skills', 'update', 'SKILL.md'),
+      'utf-8',
+    );
+    // The block that reads the build's status, and the prose leading into it.
+    const check = skill.indexOf('-p ExecStartPre');
+    const open = skill.lastIndexOf('```', check);
+    const close = skill.indexOf('```', check);
+    const step = skill.slice(skill.lastIndexOf('```', open - 1) + 3, close);
+
+    const named = [...step.matchAll(/logs\/([\w.-]+\.log)/g)].map((m) => m[1]);
+
+    expect(logOf('StandardOutput')).not.toBe(logOf('StandardError'));
+    expect(named.length).toBeGreaterThan(0);
+    expect(new Set(named)).toEqual(new Set([logOf('StandardOutput')]));
+  });
+});

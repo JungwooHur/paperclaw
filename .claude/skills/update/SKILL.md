@@ -195,13 +195,17 @@ live until `/update` runs in that checkout.
 
 Then check the build the restart ran. `restart` returns once `ExecStartPre=` has
 finished, so its exit status is already there; a startup WARN in the log is not
-yet, since node writes it a moment later. The build's errors are in
-`logs/paperclaw.error.log`.
+yet, since node writes it a moment later. The build prints its errors on
+stdout, so they are in `logs/paperclaw.log`, before the startup lines.
 
 ```bash
 systemctl --user show paperclaw -p ExecStartPre | grep -o 'status=[0-9]*'   # as root: drop --user
-# status=0: the merge is running. Anything else: the build failed, and the bot
-# is running the previous dist/.
+# status=0: the merge is running. Anything else: the build failed, in one of two
+# ways, and its last lines in the log say which.
+# - "Could not stage the agent runner": tsc passed, so the bot is running the
+#   merged host beside the runner from before the merge.
+# - Anything else (tsc errors, say): nothing was written, and the bot is running
+#   the previous dist/, host and runner both.
 ```
 
 Linking leaves the node drop-in (`~/.config/systemd/user/paperclaw.service.d/node.conf`,
@@ -222,9 +226,10 @@ npm run build && npm test
 - Type errors from merged files — read the error, fix the file, retry
 - Missing dependencies — run `npm install` first, retry
 
-**If step 7b's build status was not 0**, the bot is still running the code from
-before the merge, and passing this step does not change that. Once the build
-passes, restart again and re-read the status until it is `status=0`:
+**If step 7b's build status was not 0**, the bot is not running all of the
+merge: either none of it, or the merged host with the runner from before (step
+7b says which). Passing this step does not change that. Once the build passes, restart again and re-read the
+status until it is `status=0`:
 
 ```bash
 systemctl --user restart paperclaw
