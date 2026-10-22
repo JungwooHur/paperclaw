@@ -301,8 +301,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (resumeAt) resumeAfterUsageLimit(resumeAt);
         return;
       }
-      // A request got through: an open window is over.
-      if (closeUsageLimitOnAnswer(raw)) usageLimitLifted();
+      // A request got through: an open window is over. The held messages it
+      // releases may go into this container, so they run only once this
+      // result has settled its own prompt: run first, a turn no prompt started
+      // (a task notification) would settle theirs, and a refusal of their turn
+      // would then put back nothing.
+      const closed = closeUsageLimitOnAnswer(raw);
       if (!runEnded) {
         // A result ends a turn, and turns take prompts in the order they were
         // given. A turn answered only through send_message counts too.
@@ -318,6 +322,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           rememberRefusedInput(chatJid, prompts);
         }
       }
+      if (closed) usageLimitLifted();
       // Single outbound path: formatOutbound strips <internal> blocks AND the
       // trailing "shall I save this to Notion?" offer. This used to inline only
       // the <internal> strip, so the offer-stripping rule silently did not apply

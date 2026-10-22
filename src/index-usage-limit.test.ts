@@ -559,6 +559,32 @@ describe('messages held for a container that is still running', () => {
     expect(runContainerAgent).toHaveBeenCalledTimes(1);
   });
 
+  it('stay pending when a turn no prompt started closes the window and theirs is refused', async () => {
+    let onOutput!: (output: ContainerOutput) => Promise<void>;
+    await containerRunning((output) => {
+      onOutput = output;
+      return answer(output, 'It describes the method.');
+    });
+    const m1Cursor = getRouterState('last_agent_timestamp');
+    // Idle. Another group is refused, and m2 is held for the window.
+    recordUsageLimit(LIMIT);
+    heldWhileOpen();
+    // A background task's notification starts a turn of its own, and its
+    // answer closes the window: m2 goes in.
+    await answer(onOutput, 'Paper 2 is uploaded.');
+    expect(pipedTexts()).toEqual([expect.stringContaining(m2Text)]);
+    // m2's turn is refused, so m2 is pending again, not settled by the
+    // answer that came before it.
+    await answer(
+      onOutput,
+      "You're out of extra usage · resets Oct 14, 10am (Asia/Seoul)",
+    );
+    expect(getRouterState('last_agent_timestamp')).toBe(m1Cursor);
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getRouterState('last_agent_timestamp')).toBe(m1Cursor);
+  });
+
   it('go into it at once when the window ends at its reset', async () => {
     const reset = NOW + 10 * 60_000; // 9:10pm in Seoul
     await containerRunning((onOutput) =>
