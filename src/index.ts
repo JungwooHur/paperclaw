@@ -127,20 +127,21 @@ function markAnswered(prompts: OpenPrompt[], inputs: string[]): string[] {
 }
 
 /**
- * Where a container's exit puts the cursor back to: the start of the oldest
- * prompt no result answered, whether the container took it or never drained
- * its file. Left on disk, that file would wait for the group's next container,
- * which starts only on the user's next message; the put-back deletes it, so
- * the retry delivers its messages once. Call only once the container has
- * exited, so that file can no longer go.
+ * Where a container's exit can put the cursor back to: the start of each
+ * prompt no result answered, oldest first, whether the container took it or
+ * never drained its file. Left on disk, that file would wait for the group's
+ * next container, which starts only on the user's next message; the put-back
+ * deletes it, so the retry delivers its messages once. Call only once the
+ * container has exited, so that file can no longer go.
  */
-function unansweredFrom(prompts: OpenPrompt[]): string | undefined {
+function unansweredStarts(prompts: OpenPrompt[]): string[] {
+  const starts: string[] = [];
   for (const prompt of prompts) {
     if (prompt.answered) continue;
     const range = prompt.ref ? refRange(prompt.ref) : null;
-    if (range) return range.from;
+    if (range) starts.push(range.from);
   }
-  return undefined;
+  return starts;
 }
 // Per group with a message container running: its open prompts, oldest first.
 const openPrompts: Record<string, OpenPrompt[]> = {};
@@ -153,9 +154,10 @@ const closingOnRefusal = new Set<string>();
 const REFUSED_INPUT_KEY = 'usage_limit_refused_input';
 // router_state key: per group, the cursor a container's exit last put back to
 // for a prompt no result answered, until an exit leaves nothing unanswered.
-// When the next exit would put back to the same cursor, the retry failed the
-// same way: that prompt is not put back a third time. Persisted, so a restart
-// in between does not buy it another run.
+// When the oldest prompt the next exit finds unanswered starts there, the
+// retry failed it the same way: that prompt is not put back a third time,
+// but a newer one is. Persisted, so a restart in between does not buy it
+// another run.
 const PUT_BACK_KEY = 'turn_put_back';
 
 /**
@@ -514,13 +516,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // an error or not, and the queue retries it. A duplicate beats a silent
     // loss. Whatever came after it goes back too, answered or not: that
     // reruns an answered follow-up behind an unanswered prompt (#114).
-    const from = unansweredFrom(prompts);
+    const starts = unansweredStarts(prompts);
     const putBack = readPutBack();
-    if (from === undefined) {
+    if (starts.length === 0) {
       if (chatJid in putBack) rememberPutBack(chatJid, undefined);
       return true;
     }
-    if (putBack[chatJid] !== from) {
+    if (starts[0] === putBack[chatJid]) {
+      // Put back once already, and its retry answered it neither: a prompt
+      // that fails every time would otherwise run on, and take every later
+      // message along. It is given up. A newer prompt never went back, so
+      // it still does; with none, the exit ends as it did before
+      // attribution, below.
+      logger.error(
+        { group: group.name, from: starts[0] },
+        'Input no result answered again after it was put back, not putting it back again',
+      );
+      starts.shift();
+    }
+    const from = starts[0];
+    if (from !== undefined) {
       lastAgentTimestamp[chatJid] = from;
       saveState();
       rememberPutBack(chatJid, from);
@@ -531,13 +546,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return false;
     }
-    // Put back once already, and its retry answered it neither: a prompt
-    // that fails every time would otherwise run on, and take every later
-    // message along. It ends as it did before attribution, below.
-    logger.error(
-      { group: group.name, from },
-      'Input no result answered again after it was put back, not putting it back again',
-    );
   }
 
   if (output === 'error' || hadError) {

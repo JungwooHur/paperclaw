@@ -547,6 +547,85 @@ describe('a container that exits with input no result answered', () => {
     await c.exit();
   });
 
+  /** m1's turn fails in its container and again in the retry. */
+  async function m1FailsTwice(): Promise<{
+    m1: NewMessage;
+    b: FakeContainer;
+  }> {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await a.exit();
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    await b.result(null, { inputs: [] });
+    return { m1, b };
+  }
+
+  it('gives up the prompt put back once, and puts back a newer one the retry took', async () => {
+    const { m1, b } = await m1FailsTwice();
+    await userSays('m2', M2, NOW - 30_000);
+    b.drain(); // taken; the container stops before its turn ends
+    await b.exit();
+
+    // m2 was never put back, so it is not given up with m1.
+    expect(cursor()).toBe(m1.timestamp);
+    const c = await containerOnRetry(2);
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('It covers the experiments.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    await nothingRunsAgain();
+  });
+
+  it('gives up the prompt put back once, and puts back a newer one the retry never drained', async () => {
+    const { m1, b } = await m1FailsTwice();
+    await userSays('m2', M2, NOW - 30_000); // never drained
+    await b.exit();
+
+    expect(cursor()).toBe(m1.timestamp);
+    // The file goes, so the retry delivers m2 once.
+    expect(inputFiles()).toEqual([]);
+    const c = await containerOnRetry(2);
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('It covers the experiments.', { inputs: c.startIds });
+    await c.exit();
+    await nothingRunsAgain();
+  });
+
+  it('gives up the prompt put back once after an error too, and puts back a newer one', async () => {
+    const { b } = await m1FailsTwice();
+    await userSays('m2', M2, NOW - 30_000);
+    b.drain();
+    await b.exit('error');
+
+    // Not a full rollback: m1 does not run a third time.
+    const c = await containerOnRetry(2);
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('It covers the experiments.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    await nothingRunsAgain();
+    expect(containers.filter((c) => c.prompt.includes(M1))).toHaveLength(2);
+  });
+
+  it('puts back a failed prompt with a newer one taken after it, when neither went back before', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await userSays('m2', M2, NOW - 30_000);
+    a.drain();
+    await a.exit();
+
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    await b.result('Both answered.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
   it('puts nothing back when an output was still being delivered', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
