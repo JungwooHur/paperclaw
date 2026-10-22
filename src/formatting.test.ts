@@ -8,6 +8,7 @@ import {
   formatOutbound,
   stripInternalTags,
   stripSaveOffer,
+  throughLastCommand,
 } from './router.js';
 import { NewMessage } from './types.js';
 
@@ -361,5 +362,22 @@ describe('firstPrompt', () => {
   it('keeps a batch that does not end in a command whole', () => {
     expect(firstPrompt([q])).toEqual([q]);
     expect(firstPrompt([a, q])).toEqual([a, q]);
+  });
+});
+
+describe('throughLastCommand', () => {
+  const q = makeMsg({ id: 'q', content: 'what is section 2 about?' });
+  const t = makeMsg({ id: 't', content: 'thanks' });
+  const a = makeMsg({ id: 'a', content: '/skill-a arg' });
+  const b = makeMsg({ id: 'b', content: `@${ASSISTANT_NAME} /skill-b` });
+
+  it('leaves out the messages after the newest command', () => {
+    expect(throughLastCommand([q, a, t])).toEqual([q, a]);
+    expect(throughLastCommand([a, q, b, q, t])).toEqual([a, q, b]);
+  });
+
+  it('keeps a batch that ends in a command, or has none, whole', () => {
+    expect(throughLastCommand([q, a])).toEqual([q, a]);
+    expect(throughLastCommand([q, t])).toEqual([q, t]);
   });
 });

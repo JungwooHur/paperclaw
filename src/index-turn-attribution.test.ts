@@ -1493,6 +1493,74 @@ describe('a batch whose newest message is a slash command', () => {
     await nothingRunsAgain();
   });
 
+  it('runs the messages before the second a command shares with the one before it', async () => {
+    await usersSay([
+      ['m0', M3, NOW - 70_000],
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 60_000],
+    ]);
+    const a = containers[0];
+    // The cursor can stop before that second, not inside it.
+    expect(timesIn(a.prompt, M3)).toBe(1);
+    expect(a.prompt).not.toContain(M1);
+    expect(a.prompt).not.toContain(CMD);
+    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs a message that waited behind a command before a later batch ending in a command that shares a second', async () => {
+    const SECOND = '/probe-skill second';
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    // Sent on its own while the question's turn runs: it waits.
+    await userSays('m3', M2, NOW - 40_000);
+    // Then a question and a command typed within one second.
+    await usersSay([
+      ['m4', M3, NOW - 30_000],
+      ['m5', SECOND, NOW - 30_000],
+    ]);
+    expect(waitingTexts()).toEqual([]);
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    const [later] = waitingTexts();
+    expect(timesIn(later, M2)).toBe(1);
+    expect(later).not.toContain(M3);
+    expect(later).not.toContain(SECOND);
+    const [p3] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p3] });
+    // The command goes alone, without the question in its second, as before.
+    expect(waitingTexts()).toEqual([SECOND]);
+    const [second] = a.drain();
+    await a.result('The second skill ran.', { inputs: [second] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('keeps a held command bare when a message stored after the poll shares its second', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    // Stored after that poll, in the command's second: the loop never sees
+    // it, and the cursor cannot stop between the two.
+    await userSays('m3', 'thanks', NOW - 50_000);
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
   it('runs the newer of two held commands that share a second', async () => {
     await usersSay([
       ['m1', M1, NOW - 60_000],

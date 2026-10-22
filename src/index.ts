@@ -46,6 +46,7 @@ import {
   firstPrompt,
   formatMessages,
   formatOutbound,
+  throughLastCommand,
 } from './router.js';
 import { SchedulerDependencies, startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
@@ -1153,14 +1154,17 @@ function pendingMessages(chatJid: string): Pending {
  * message they leave, which stays pending.
  *
  * Commands held back earlier (held_command) go first, one per prompt, and
- * nothing newer goes with them. Commands at the end of a batch are held back
- * for prompts of their own (firstPrompt), and remembered, only where the
- * cursor can stop between them and the messages before them, and only when
- * those messages start the agent. Otherwise the batch goes whole, as the
- * command alone, as before: when the last of those messages shares the
- * command's timestamp (WhatsApp stamps whole seconds), and in a group that
- * needs the trigger, when they are context, not a request, and sent alone
- * would draw a reply.
+ * nothing newer goes with them: not even a message stored after them in the
+ * newest one's second, which the cursor cannot leave pending once it passes
+ * that command, so it is dropped as it was before the hold. Commands at the
+ * end of a batch are held back for prompts of their own (firstPrompt), and
+ * remembered, behind the messages before them that the cursor can stop
+ * after, those before the first command's second (WhatsApp stamps whole
+ * seconds), and only when those messages start the agent. Otherwise the
+ * batch goes whole, as the command alone, as before: when every message
+ * before the command shares its second, and in a group that needs the
+ * trigger, when they are context, not a request, and sent alone would draw
+ * a reply.
  */
 function nextDelivery(
   chatJid: string,
@@ -1172,16 +1176,17 @@ function nextDelivery(
 } {
   const held = heldCommand(chatJid);
   const upToHeld = held
-    ? pending.messages.filter((m) => m.timestamp <= held)
+    ? throughLastCommand(pending.messages.filter((m) => m.timestamp <= held))
     : [];
   const batch = upToHeld.length > 0 ? upToHeld : pending.messages;
   const first = firstPrompt(batch);
   const command = batch[first.length];
+  let n = first.length;
+  while (command && n > 0 && first[n - 1].timestamp >= command.timestamp) n--;
+  const head = first.slice(0, n);
   const split =
-    command !== undefined &&
-    command.timestamp > first[first.length - 1].timestamp &&
-    startsAgent(chatJid, group, first);
-  const messages = split ? first : batch;
+    command !== undefined && n > 0 && startsAgent(chatJid, group, head);
+  const messages = split ? head : batch;
   // Before the cursor moves, so a crash cannot leave the commands pending
   // and forgotten.
   if (split) rememberHeldCommand(chatJid, batch[batch.length - 1].timestamp);

@@ -47,6 +47,16 @@ export function firstPrompt(messages: NewMessage[]): NewMessage[] {
 }
 
 /**
+ * The messages up to and including the newest command among them, or all of
+ * them when none is one.
+ */
+export function throughLastCommand(messages: NewMessage[]): NewMessage[] {
+  let n = messages.length;
+  while (n > 0 && !slashCommandIn(messages[n - 1])) n--;
+  return n > 0 ? messages.slice(0, n) : messages;
+}
+
+/**
  * Put before a message sent again after a usage limit refused the turn that
  * took it. The refused prompt stays in the session, and the request that
  * resumes it carries that copy in the same user message as this one
