@@ -20,6 +20,7 @@ interface ProbeOutput {
   status: string;
   result: string | null;
   turn: Turn | null;
+  attribution?: string;
   subtype: string | null;
 }
 
@@ -39,6 +40,15 @@ const runnerPackage = readJson<{ dependencies: Record<string, string> }>(
   '../package.json',
 );
 
+/** The container whose CLI ran without --replay-user-messages. */
+const REPLAY_BROKEN = [
+  'textless result with replay broken',
+  'answer after attribution went off',
+  'session marker after attribution went off',
+  'answer in a later query after attribution went off',
+  'error after attribution went off',
+];
+
 describe('the turn attribution probe', () => {
   it('ran the SDK the runner pins', () => {
     // On an SDK bump: rebuild the image, then scripts/probe-turn-attribution.sh
@@ -48,12 +58,16 @@ describe('the turn attribution probe', () => {
   });
 
   it('saw each result answer exactly the inputs its turn took', () => {
-    const seen = fixture.outputs.map((o) => ({
-      case: o.case,
-      subtype: o.subtype,
-      text: o.result !== null,
-      turn: o.turn,
-    }));
+    const seen = fixture.outputs
+      .filter((o) => !REPLAY_BROKEN.includes(o.case))
+      .map((o) => ({
+        case: o.case,
+        subtype: o.subtype,
+        text: o.result !== null,
+        turn: o.turn,
+        // Present only once attribution is off: on none of these.
+        ...('attribution' in o ? { attribution: o.attribution } : {}),
+      }));
     expect(seen).toEqual([
       // The stdin prompt and the file waiting at start-up are one push.
       {
@@ -257,6 +271,79 @@ describe('the turn attribution probe', () => {
         text: true,
         turn: { inputs: ['r-after-skill'] },
       },
+      // A scheduled run's turn hit the runner's maxTurns after the CLI had
+      // acknowledged its prompt. The failed result answers nothing...
+      {
+        case: 'turn failed after its acknowledgement',
+        subtype: 'error_max_turns',
+        text: false,
+        turn: { inputs: [] },
+      },
+      // ...and the next success of the same query answers that prompt first.
+      {
+        case: 'success after a failed turn',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-max-turns', 'r-after-fail'] },
+      },
+    ]);
+  });
+
+  it('saw every output say attribution is off from the one the guard tripped on', () => {
+    // The CLI ran through a `node` that drops --replay-user-messages, so it
+    // acknowledged nothing. The guard trips on the first result, a textless
+    // one that has no `turn` either way, so only the field tells it from the
+    // session marker of a container whose attribution is on. Every output
+    // after it says so too: the session marker (the CLI ended cleanly, so
+    // the query ended), the next query's result, and the error output (the
+    // CLI was then killed).
+    const seen = fixture.outputs
+      .filter((o) => REPLAY_BROKEN.includes(o.case))
+      .map((o) => ({
+        case: o.case,
+        status: o.status,
+        subtype: o.subtype,
+        text: o.result !== null,
+        turn: o.turn,
+        attribution: o.attribution,
+      }));
+    const off = { turn: null, attribution: 'off' };
+    expect(seen).toEqual([
+      {
+        case: 'textless result with replay broken',
+        status: 'success',
+        subtype: 'success',
+        text: false,
+        ...off,
+      },
+      {
+        case: 'answer after attribution went off',
+        status: 'success',
+        subtype: 'success',
+        text: true,
+        ...off,
+      },
+      {
+        case: 'session marker after attribution went off',
+        status: 'success',
+        subtype: null,
+        text: false,
+        ...off,
+      },
+      {
+        case: 'answer in a later query after attribution went off',
+        status: 'success',
+        subtype: 'success',
+        text: true,
+        ...off,
+      },
+      {
+        case: 'error after attribution went off',
+        status: 'error',
+        subtype: null,
+        text: false,
+        ...off,
+      },
     ]);
   });
 
@@ -288,12 +375,17 @@ describe('the turn attribution probe', () => {
       'Unknown skill: nonexistent-cmd',
     );
     expect(answer('skill behind a team message')).toBe('ANSWER skill body');
+    // The request the success after a failed turn made carried that turn's
+    // prompt, which is why that success answers it.
+    expect(answer('success after a failed turn')).toBe(
+      'ANSWER PROBE-AFTERFAIL saw PROBE-MAXTURNS',
+    );
   });
 
-  it('kept attribution on, and logged only the failed turn input as unanswered', () => {
-    // runnerNotes also holds any "Turn attribution off" line.
+  it('turned attribution off only where replay was broken, and logged only the unacknowledged input as unanswered', () => {
     expect(fixture.runnerNotes).toEqual([
       'Input no result answered: ["r-nothing"] (never acknowledged)',
+      'Turn attribution off for this container: a success result followed no replayed input, so replay is not working',
     ]);
   });
 
