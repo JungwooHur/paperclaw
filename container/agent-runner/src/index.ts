@@ -406,7 +406,7 @@ async function runQuery(
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
-  stream.push(prompt, attribution.push(promptIds));
+  stream.push(prompt, attribution.push(prompt, promptIds));
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
@@ -435,7 +435,7 @@ async function runQuery(
     const messages = drainIpcInput();
     for (const { id, text } of messages) {
       log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text, attribution.push([id]));
+      stream.push(text, attribution.push(text, [id]));
       parked = false; // real input starts its own turn; don't nudge on top of it
     }
 
@@ -451,7 +451,7 @@ async function runQuery(
       log(
         `Nudging agent (#${totalNudges}/${MAX_NUDGES}): ${pendingBgTasks} background task(s) pending while parked`,
       );
-      stream.push(BG_NUDGE_TEXT, attribution.push([], true));
+      stream.push(BG_NUDGE_TEXT, attribution.push(BG_NUDGE_TEXT, [], true));
       parked = false; // a new turn will start; re-arm only after its result
     }
 
@@ -535,7 +535,9 @@ async function runQuery(
     }
   })) {
     // An echoed push is an acknowledgement, not conversation: it is recorded
-    // and kept out of the counts, the log and the nudge state below.
+    // and kept out of the counts, the log and the nudge state below. So is a
+    // message the CLI replays under its own uuid (an expanded slash command,
+    // an agent-team message).
     if (message.type === 'user' && (message as { isReplay?: boolean }).isReplay) {
       attribution.ack((message as { uuid?: string }).uuid);
       continue;
@@ -572,6 +574,8 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      // One per turn: the turn takes the oldest push still queued.
+      attribution.turnStarted();
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -585,7 +589,7 @@ async function runQuery(
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       const turn = attribution.result(message.subtype);
-      log(`Result #${resultCount}: subtype=${message.subtype}${turn ? ` inputs=${JSON.stringify(turn.inputs)}${turn.nudge ? ' +nudge' : ''}` : ''}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      log(`Result #${resultCount}: subtype=${message.subtype}${turn ? ` inputs=${JSON.stringify(turn.inputs)}${turn.internal ? ' +internal' : ''}` : ''}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       writeOutput({
         status: 'success',
         result: textResult || null,

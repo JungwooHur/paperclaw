@@ -78,12 +78,14 @@ export interface ContainerInput {
 /**
  * The inputs an SDK result answered, as the runner saw the CLI take them: an
  * IPC file's `ref` (else its file name), the prompt's `promptRef` (else
- * "stdin"). `nudge` marks the runner's own background-task reminder. Read by
- * nothing yet; see docs/SPEC.md, "Turn Attribution".
+ * "stdin"). `internal` marks a turn that took something the host never sent:
+ * the runner's background-task reminder, or a message the CLI queued itself
+ * (an agent-team message). Read by nothing yet; see docs/SPEC.md, "Turn
+ * Attribution".
  */
 export interface ContainerTurn {
   inputs: string[];
-  nudge?: true;
+  internal?: true;
 }
 
 export interface ContainerOutput {
