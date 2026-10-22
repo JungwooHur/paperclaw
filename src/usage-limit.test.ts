@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { _initTestDatabase } from './db.js';
 import {
   classifyUsageLimit,
+  isAgentAnswer,
   recordUsageLimit,
   usageLimitHeldUntil,
 } from './usage-limit.js';
@@ -163,6 +164,40 @@ describe('classifyUsageLimit', () => {
       ),
     ).toBeNull();
     expect(resetOf('', now)).toBeNull();
+  });
+});
+
+describe('isAgentAnswer', () => {
+  it('takes text the agent wrote, internal or not, as an answer', () => {
+    expect(isAgentAnswer('Section 3 is translated and uploaded.')).toBe(true);
+    expect(isAgentAnswer('<internal>acked, dispatched</internal>')).toBe(true);
+    // Quoting an error is not being one.
+    expect(isAgentAnswer('The run failed with "API Error: 500".')).toBe(true);
+  });
+
+  it('does not take the refusal, an empty result or an API error as one', () => {
+    // The runner forwards is_error results as successes, so these arrive as
+    // result text. None of them shows the limit let a request through.
+    for (const text of [
+      WITH_DATE,
+      "You're out of extra usage · resets 11pm (Asia/Seoul)",
+      '',
+      '   ',
+      'API Error: 500 {"type":"error","error":{"type":"api_error"}}',
+      'API Error: Rate limit reached',
+      'API Error: Request was aborted.',
+      "There's an issue with the selected model (claude-x). It may not exist or you may not have access to it.",
+      'Prompt is too long',
+      'Credit balance is too low',
+      'Invalid API key · Fix external API key',
+      'OAuth token revoked · Please run /login',
+      'Not logged in · Please run /login',
+      'Repeated 529 Overloaded errors',
+      'Request timed out',
+    ]) {
+      expect(isAgentAnswer(text), text).toBe(false);
+    }
+    expect(isAgentAnswer(null)).toBe(false);
   });
 });
 

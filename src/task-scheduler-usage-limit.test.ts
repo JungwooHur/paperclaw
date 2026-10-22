@@ -18,15 +18,18 @@ const NOW = Date.parse('2026-10-13T12:00:00.000Z'); // 21:00 in Seoul
 const RESET = Date.parse('2026-10-14T01:00:00.000Z');
 const CHAT = 'main@g.us';
 
-function agentAnswers(text: string): void {
+/** The run's turns end with these results, in order. */
+function agentAnswers(...texts: string[]): void {
   vi.mocked(runContainerAgent).mockImplementation(
     async (_group, _input, _onProcess, onOutput) => {
-      const output: ContainerOutput = {
-        status: 'success',
-        result: text,
-        newSessionId: 'session-1',
-      };
-      await onOutput?.(output);
+      for (const text of texts) {
+        const output: ContainerOutput = {
+          status: 'success',
+          result: text,
+          newSessionId: 'session-1',
+        };
+        await onOutput?.(output);
+      }
       return { status: 'success', result: null, newSessionId: 'session-1' };
     },
   );
@@ -168,6 +171,50 @@ describe('a scheduled run that hits the usage limit', () => {
     );
     expect(queue.closeStdin).not.toHaveBeenCalled();
     expect(queue.notifyIdle).not.toHaveBeenCalled();
+  });
+
+  it('does not re-run a run that sent its result before a later turn was refused', async () => {
+    // A background-task nudge, say: the run answered, then its next turn hit
+    // the limit. Running it again after the reset would send the answer twice.
+    addDueTask('nightly', 'cron', '30 23 * * *');
+    agentAnswers('Batch done: 3 papers uploaded.', LIMIT);
+    const sendMessage = vi.fn(async () => {});
+
+    await runDueTasks(sendMessage);
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      CHAT,
+      'Batch done: 3 papers uploaded.',
+    );
+    const task = getTaskById('nightly');
+    expect(task?.status).toBe('active');
+    expect(deferredPastReset(task)).toBe(false);
+    expect(Date.parse(task!.next_run!)).toBeGreaterThan(NOW);
+    expect(task?.last_result).toMatch(/^Error: .*usage limit/i);
+  });
+
+  it('does not re-run a run answered on a turn after the refusal', async () => {
+    // Extra usage, say: the refusal came first and a later turn got through.
+    addDueTask('one-off', 'once', '2026-10-13T11:59:00.000Z');
+    agentAnswers(LIMIT, 'Batch done: 3 papers uploaded.');
+
+    await runDueTasks(vi.fn(async () => {}));
+
+    const task = getTaskById('one-off');
+    expect(task?.status).toBe('completed');
+    expect(task?.next_run).toBeNull();
+    expect(task?.last_result).toMatch(/^Error: .*usage limit/i);
+  });
+
+  it('defers a run whose only other result was an API error', async () => {
+    // The runner forwards an is_error result as a success, so its text is
+    // the error, and nothing ran.
+    addDueTask('nightly', 'cron', '30 23 * * *');
+    agentAnswers('API Error: 500 {"type":"error"}', LIMIT);
+
+    await runDueTasks(vi.fn(async () => {}));
+
+    expect(deferredPastReset(getTaskById('nightly'))).toBe(true);
   });
 
   it('returns to its own schedule once a run gets through', async () => {

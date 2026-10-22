@@ -425,7 +425,7 @@ PaperClaw has a built-in scheduler that runs tasks as full agents in their group
 3. **Optional Messaging**: Tasks can send messages to their group using the `send_message` tool, or complete silently
 4. **Main Channel Privileges**: The main channel can schedule tasks for any group and view all tasks
 5. **One Run per Due Time**: A task's `next_run` advances only when its run finishes, so every 60-second scheduler poll during a long run finds it due again. The queue skips a task that is already running or queued. A queued task is re-read when its turn comes, and does not run if it was paused or cancelled while it waited.
-6. **Usage Limits**: A run refused by the usage limit sends nothing to the group. Its `next_run` moves to five minutes after the reset for that run only, and a `once` task stays `active` so that it runs then.
+6. **Usage Limits**: A run refused by the usage limit sends nothing to the group. If no turn of it ended with an answer, its `next_run` moves to five minutes after the reset for that run only, and a `once` task stays `active` so that it runs then. A run that answered on one turn and was refused on another, in either order, is not run again, since that would send the answer twice: its run is logged as an error naming the limit, `next_run` follows the schedule, and a `once` task completes. An answer is result text that is neither the refusal nor one of the CLI's error messages (`API Error: …` and the like), which the runner forwards as successes. Output sent only through `send_message` is not seen, so a run that sent its work that way and was then refused still runs again in full.
 
 ### Schedule Types
 
