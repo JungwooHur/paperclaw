@@ -202,10 +202,12 @@ const REFUSED_INPUT_KEY = 'usage_limit_refused_input';
 // but a newer one is. Persisted, so a restart in between does not buy it
 // another run.
 const PUT_BACK_KEY = 'turn_put_back';
-// router_state key: per group, the ranges past its cursor that a turn already
-// answered, `[[from, to], ...]` oldest first. A put-back or a refusal moves
-// the cursor back to the oldest unanswered prompt; the answered prompts after
-// it are kept here, so the retry runs only what is unanswered. Dropped once a
+// router_state key: per group, the ranges a turn already answered after the
+// group's oldest unanswered prompt, `[[from, to], ...]` oldest first. A
+// put-back or a refusal moves the cursor back to that prompt, so the ranges
+// are past it, and the retry runs only what is unanswered. While a container
+// runs they are written as its prompts settle, behind the cursor its pipes
+// moved on: inert there until a restart puts the cursor back. Dropped once a
 // run ends, without a refusal, with the cursor past them.
 const ANSWERED_AHEAD_KEY = 'answered_ahead';
 // router_state key: per group with a message container running, the start of

@@ -117,9 +117,13 @@ grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
 # after its first cursor, up to its second. JSON per chat, except the first.
 #   `last_timestamp`             the newest message the message loop has seen
 #   `last_agent_timestamp`       the message cursor: what is after it is pending
-#   `answered_ahead`             ranges past the cursor a turn already answered,
-#                                left out of what is pending; dropped once a run
-#                                ends with the cursor past them
+#   `answered_ahead`             ranges a turn already answered after the oldest
+#                                unanswered prompt. Past the cursor after a
+#                                put-back or a refusal: left out of what is
+#                                pending. Behind it while a container runs
+#                                (its pipes moved the cursor on): inert until a
+#                                restart puts the cursor back. Dropped once a
+#                                run ends with the cursor past them
 #   `turn_open_from`             while a message container runs, the start of
 #                                its oldest prompt no turn answered: a restart
 #                                puts the cursor back there. Cleared at exit
