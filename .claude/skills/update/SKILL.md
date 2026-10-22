@@ -130,9 +130,10 @@ Parse the JSON output. It contains: `migrationsRun` (count), `results` (array of
 ## 7a. Rebuild the agent image
 
 If `filesChanged` (step 3) or a conflict you resolved includes `container/Dockerfile`
-or `container/agent-runner/package.json` / `package-lock.json`, rebuild the image
-now, before 7b restarts the bot. The restart's build stages the new runner, and
-a runner needing a package the old image lacks fails every container at start.
+or anything under `container/agent-runner/` outside `src/` (`package*.json`,
+`tsconfig.json`), rebuild the image now, before 7b restarts the bot. The image
+bakes those in, the restart's build stages the new runner, and a runner needing
+what the old image lacks fails every container at start.
 Prune first (CLAUDE.md, "Container Build Cache"): `--no-cache` alone keeps stale
 COPY steps.
 
