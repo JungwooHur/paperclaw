@@ -1,3 +1,7 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { _initTestDatabase } from './db.js';
@@ -477,5 +481,25 @@ describe('closeUsageLimitOnAnswer', () => {
     );
     expect(hit?.resetsAt.toISOString()).toBe('2026-10-13T16:00:00.000Z');
     expect(hit?.notice).toContain('1:00');
+  });
+});
+
+describe('the debug checklist', () => {
+  it('says what every usage-limit key in router_state holds', () => {
+    // Its query lists every key that starts with usage_limit, and they hold
+    // different things: a key it does not explain reads as one it does.
+    const srcDir = fileURLToPath(new URL('.', import.meta.url));
+    const keys = new Set<string>();
+    for (const file of fs.readdirSync(srcDir)) {
+      if (!file.endsWith('.ts') || file.endsWith('.test.ts')) continue;
+      const code = fs.readFileSync(path.join(srcDir, file), 'utf-8');
+      for (const m of code.matchAll(/'(usage_limit[a-z_]*)'/g)) keys.add(m[1]);
+    }
+    const checklist = fs.readFileSync(
+      fileURLToPath(new URL('../docs/DEBUG_CHECKLIST.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(keys.size).toBeGreaterThan(0);
+    for (const key of keys) expect(checklist, key).toContain(`\`${key}\``);
   });
 });

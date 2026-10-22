@@ -91,7 +91,15 @@ grep -E 'Piped messages|sendMessage' logs/paperclaw.log | tail -10
 # Check the queue state — any active containers?
 grep -E 'Starting container|Container active|concurrency limit' logs/paperclaw.log | tail -10
 
-# Is a Claude usage-limit window holding work? (values are the reset, in UTC)
+# Is a Claude usage-limit window holding work? Times are UTC. A window is open
+# only while `usage_limited_until` is set: that is its reset, empty once closed.
+#   `usage_limit_announced`      the last reset the user was told about
+#   `usage_limit_closed`         JSON {at, resetsAt}: when an answer last closed a
+#                                window, and that window's reset (see docs/SPEC.md
+#                                "Usage Limits"); cleared by the next refusal
+#   `usage_limit_refused_input`  JSON per chat: input files a refusal put back;
+#                                deleted, and the entry dropped, when that
+#                                container exits or at the next startup
 sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key LIKE 'usage_limit%';"
 grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
 
