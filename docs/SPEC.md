@@ -309,9 +309,25 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 3. Claude continues the conversation with full context
 4. Session transcripts are stored as JSONL files in `data/sessions/{group}/.claude/`
 
-### Per-Group Copies Are Seeded Once
+### Per-Group Copies: Settings and Runner
 
-`data/sessions/{group}/.claude/settings.json` and `data/sessions/{group}/agent-runner-src/` are created the first time a group's container starts, and are never refreshed. A change to the settings defaults in `src/container-runner.ts`, or to `container/agent-runner/src/`, therefore reaches new groups only. To apply one to an existing group, delete that group's copy and it is recreated on the next run; edits the agent made to its copy are lost. A setting that must reach every group is passed with `-e` on the container command instead, as the model pin is.
+Each group gets two copies under `data/sessions/{group}/` the first time its container starts, and they are kept differently.
+
+**`.claude/settings.json` is seeded once** and never refreshed. A change to the settings defaults in `src/container-runner.ts` therefore reaches new groups only. To apply one to an existing group, delete that group's `settings.json` and it is recreated on the next run. A setting that must reach every group is passed with `-e` on the container command instead, as the model pin is.
+
+**`agent-runner-src/` follows the bundled runner unless the group edited it.** The container compiles this copy, mounted writable at `/app/src`, not `container/agent-runner/src/`, so an agent can change its own runner without touching other groups. Beside the copy, outside the mount, `agent-runner-src.seed.json` records a content hash of what the copy was seeded from. The hash covers the sorted relative paths and their contents, so mtimes and readdir order do not change it. At every container start, `src/runner-seed.ts` compares the copy with the bundle and the marker:
+
+| The copy | What happens |
+|----------|--------------|
+| is missing | the bundle is copied in and the marker written |
+| equals the bundle | kept; a missing or stale marker is rewritten (this adopts a copy seeded before markers existed) |
+| equals the marker, and the bundle changed | replaced by the bundle, marker updated, logged at info with the group and both short hashes |
+| differs from the marker | kept, since it was edited in place. A WARN names the group whenever the bundle has changed since seeding |
+| differs from the bundle and has no marker | kept with a WARN, like an edited copy, because an old seed cannot be told from an edit |
+
+A runner change therefore reaches every group with an unedited copy at that group's next container start. A replacement is copied into a sibling directory and swapped in by rename, so a failure never leaves a half-copied tree. A failure to hash, copy or swap is logged as an error, and the container starts with the copy as it is.
+
+**To take the bundled runner after an edit**, delete `data/sessions/{group}/agent-runner-src/`. The next start seeds it again, and the edits are lost. The WARN says the same.
 
 ---
 

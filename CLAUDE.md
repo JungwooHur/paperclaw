@@ -124,10 +124,11 @@ and it went out to WhatsApp as one. Two real cases:
 **Any other `is_error` result is still sent as the reply.** When the bot
 answers with an error sentence, this is the path it took.
 
-The model pin is a container `-e`, not a `settings.json` entry, because
-per-group `settings.json` and `agent-runner-src/` are seeded once and never
-refreshed. A change to either default reaches new groups only (docs/SPEC.md,
-"Per-Group Copies Are Seeded Once").
+The model pin is a container `-e`, not a `settings.json` entry, because a
+group's `settings.json` is seeded once and never refreshed: a change to its
+defaults reaches new groups only. It is not in the runner either, since a group
+whose runner copy was edited keeps that copy, while `-e` reaches every group
+(docs/SPEC.md, "Per-Group Copies: Settings and Runner").
 
 ## systemd unit staleness (paper healer)
 
@@ -266,11 +267,11 @@ Two fixes:
   - The queue carries `backlog_remaining`, so the final summary can say how many
     papers continue in later sessions.
 
-**Why chunking and not a higher cap.** Each group's runner copy is seeded once
-(docs/SPEC.md, "Per-Group Copies Are Seeded Once"), so a new `maxTurns` never
-reaches the existing main group. The 5 h no-output timeout also bounds a session,
-because a scheduled run emits nothing until its one turn ends. A higher cap would
-only turn a clean stop into a hard kill. `tests/test_sweep_batch_queue.py` covers
+**Why chunking and not a higher cap.** The 5 h no-output timeout bounds a
+session whatever `maxTurns` says, because a scheduled run emits nothing until its
+one turn ends. A higher cap would only turn a clean stop into a hard kill. A new
+cap would also reach the main group only while its runner copy is unedited
+(docs/SPEC.md, "Per-Group Copies: Settings and Runner"). `tests/test_sweep_batch_queue.py` covers
 the chunking, and `src/task-scheduler.test.ts` covers the close. **When a batch looks
 stalled, read `papers_backlog.json` and the `papers-batch-resume-*` tasks as well as
 the queue — the queue only ever holds one session's share.**
