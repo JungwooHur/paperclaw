@@ -109,25 +109,53 @@ function writeMarker(markerPath: string, hash: string): void {
 }
 
 /**
+ * Removes a sibling an install left behind, logging instead of throwing.
+ *
+ * It only ever holds a bundle or an unedited copy, since an edited copy is
+ * never swapped out, so nothing is lost by removing it. When it cannot be
+ * removed (a directory the container made read-only, say), the owner is told
+ * and the install goes on without it: a leftover must never block a refresh.
+ */
+function removeLeftover(dir: string, group: string): boolean {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch (err) {
+    logger.warn(
+      { group, path: dir, err },
+      'Could not remove a leftover agent-runner copy. Nothing uses it, so ' +
+        'remove it by hand; refreshes go on without it.',
+    );
+    return false;
+  }
+}
+
+/** `base` emptied, or a fresh name beside it when `base` cannot be emptied. */
+function freeSibling(base: string, group: string): string {
+  return removeLeftover(base, group) ? base : `${base}-${Date.now()}`;
+}
+
+/**
  * Puts a fresh copy of the bundle at `copyDir`, never leaving a half tree there.
  *
  * The bundle is copied into a sibling first and swapped in by rename, so a
  * failure while copying leaves the current copy untouched, and a failed swap
  * puts it back. Fixed sibling names are safe because only one container per
- * group runs at a time (`group-queue.ts`). A sibling left by a crash is removed
- * first; it only ever holds a bundle or an unedited copy, since an edited copy
- * is never swapped out.
+ * group runs at a time (`group-queue.ts`); a sibling left by a crash is removed
+ * first.
  *
  * Returns the hash of the tree it installed, taken from the copy and not from
  * the bundle: the bundle can change while it is copied (a `git pull` writing the
  * runner files), and the marker has to describe what is actually in place, or
  * an unedited copy reads as edited from then on.
  */
-function installBundle(bundleDir: string, copyDir: string): string {
-  const next = `${copyDir}.next`;
-  const prev = `${copyDir}.prev`;
-  fs.rmSync(next, { recursive: true, force: true });
-  fs.rmSync(prev, { recursive: true, force: true });
+function installBundle(
+  bundleDir: string,
+  copyDir: string,
+  group: string,
+): string {
+  const next = freeSibling(`${copyDir}.next`, group);
+  const prev = freeSibling(`${copyDir}.prev`, group);
   let installed: string;
   try {
     // verbatimSymlinks: by default a relative link is rewritten to an
@@ -136,7 +164,7 @@ function installBundle(bundleDir: string, copyDir: string): string {
     fs.cpSync(bundleDir, next, { recursive: true, verbatimSymlinks: true });
     installed = hashTree(next);
   } catch (err) {
-    fs.rmSync(next, { recursive: true, force: true });
+    removeLeftover(next, group);
     throw err;
   }
   const hadCopy = fs.existsSync(copyDir);
@@ -145,14 +173,10 @@ function installBundle(bundleDir: string, copyDir: string): string {
     fs.renameSync(next, copyDir);
   } catch (err) {
     if (hadCopy) fs.renameSync(prev, copyDir);
-    fs.rmSync(next, { recursive: true, force: true });
+    removeLeftover(next, group);
     throw err;
   }
-  try {
-    fs.rmSync(prev, { recursive: true, force: true });
-  } catch {
-    // The new copy is in place; the next install removes the leftover.
-  }
+  removeLeftover(prev, group);
   return installed;
 }
 
@@ -166,7 +190,7 @@ function refresh(
   const bundleHash = hashTree(bundleDir);
 
   if (!fs.existsSync(copyDir)) {
-    const installed = installBundle(bundleDir, copyDir);
+    const installed = installBundle(bundleDir, copyDir, group);
     writeMarker(markerPath, installed);
     logger.info(
       { group, hash: short(installed) },
@@ -192,7 +216,7 @@ function refresh(
   }
 
   if (copyHash === seededHash) {
-    const installed = installBundle(bundleDir, copyDir);
+    const installed = installBundle(bundleDir, copyDir, group);
     writeMarker(markerPath, installed);
     logger.info(
       { group, from: short(copyHash), to: short(installed) },

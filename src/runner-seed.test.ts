@@ -198,6 +198,41 @@ describe('refreshRunnerCopy', () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
+  // Root ignores directory modes, so the leftover could always be removed.
+  it.skipIf(process.getuid?.() === 0)(
+    'logs a replaced copy it cannot remove, and refreshes past it later',
+    () => {
+      write(bundle, { 'lib/a.ts': 'a\n' });
+      refreshRunnerCopy(bundle, copy, GROUP);
+      // Modes are not hashed, so this copy is still unedited and is swapped
+      // out, but nothing under lib/ can be deleted any more.
+      fs.chmodSync(path.join(copy, 'lib'), 0o555);
+      try {
+        write(bundle, { 'index.ts': 'v2 index\n' });
+        vi.clearAllMocks();
+
+        expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('refreshed');
+        expect(read(copy)).toEqual(read(bundle));
+        const leftover = `${copy}.prev`;
+        expect(fs.existsSync(leftover)).toBe(true);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ group: GROUP, path: leftover }),
+          expect.any(String),
+        );
+
+        write(bundle, { 'index.ts': 'v3 index\n' });
+        expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('refreshed');
+        expect(read(copy)).toEqual(read(bundle));
+        expect(logger.error).not.toHaveBeenCalled();
+      } finally {
+        for (const name of fs.readdirSync(path.dirname(copy))) {
+          const lib = path.join(path.dirname(copy), name, 'lib');
+          if (fs.existsSync(lib)) fs.chmodSync(lib, 0o755);
+        }
+      }
+    },
+  );
+
   it('drops files from a replaced copy that the bundle no longer has', () => {
     write(bundle, { 'old-tool.ts': 'gone soon\n' });
     refreshRunnerCopy(bundle, copy, GROUP);

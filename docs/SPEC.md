@@ -325,7 +325,7 @@ Each group gets two copies under `data/sessions/{group}/` the first time its con
 | differs from the marker | kept, since it was edited in place. A WARN names the group whenever the bundle has changed since seeding |
 | differs from the bundle and has no marker | kept with a WARN, like an edited copy, because an old seed cannot be told from an edit |
 
-A runner change therefore reaches every group with an unedited copy at that group's next container start. A replacement is copied into a sibling directory and swapped in by rename, so a failure never leaves a half-copied tree. A failure to hash, copy or swap is logged as an error, and the container starts with the copy as it is.
+A runner change therefore reaches every group with an unedited copy at that group's next container start. A replacement is copied into a sibling directory and swapped in by rename, so a failure never leaves a half-copied tree. A replaced copy that cannot be removed afterwards (a directory made read-only inside the container, say) is left beside the copy with a WARN naming its path, for the owner to remove by hand; it never blocks a later refresh. A failure to hash, copy or swap is logged as an error, and the container starts with the copy as it is.
 
 **To take the bundled runner after an edit**, delete `data/sessions/{group}/agent-runner-src/`. The next start seeds it again, and the edits are lost. The WARN says the same.
 
