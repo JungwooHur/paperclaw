@@ -71,6 +71,21 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  /** The prompt's input id, echoed back in `turn.inputs`. Not sent yet. */
+  promptRef?: string;
+}
+
+/**
+ * The inputs an SDK result answered, as the runner saw the CLI take them: an
+ * IPC file's `ref` (else its file name), the prompt's `promptRef` (else
+ * "stdin"). `internal` marks a turn that took something the host never sent:
+ * the runner's background-task reminder, or a message the CLI queued itself
+ * (an agent-team message). Read by nothing yet; see docs/SPEC.md, "Turn
+ * Attribution".
+ */
+export interface ContainerTurn {
+  inputs: string[];
+  internal?: true;
 }
 
 export interface ContainerOutput {
@@ -78,6 +93,8 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /** Only on an output made from an SDK result, and only from a new runner. */
+  turn?: ContainerTurn;
 }
 
 interface VolumeMount {

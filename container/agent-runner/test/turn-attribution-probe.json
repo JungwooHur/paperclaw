@@ -1,0 +1,341 @@
+{
+  "sdkVersion": "0.2.34",
+  "outputs": [
+    {
+      "case": "start-up drain",
+      "status": "success",
+      "result": "ANSWER PROBE-LEFTOVER",
+      "turn": {
+        "inputs": [
+          "r-start",
+          "r-leftover"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "plain",
+      "status": "success",
+      "result": "ANSWER PROBE-PLAIN",
+      "turn": {
+        "inputs": [
+          "0001-plain.json"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "start-up drain, resumed session",
+      "status": "success",
+      "result": "ANSWER PROBE-LEFTOVER",
+      "turn": {
+        "inputs": [
+          "r-resume",
+          "r-leftover-2"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "merged follow-up",
+      "status": "success",
+      "result": "ANSWER after-tool",
+      "turn": {
+        "inputs": [
+          "r-tool",
+          "r-merged"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "turn running when a follow-up came",
+      "status": "success",
+      "result": "ANSWER PROBE-SLOW",
+      "turn": {
+        "inputs": [
+          "r-slow"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "follow-up as its own turn",
+      "status": "success",
+      "result": "ANSWER PROBE-OWN",
+      "turn": {
+        "inputs": [
+          "r-own"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "textless",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": [
+          "r-empty"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "error before any message",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": []
+      },
+      "subtype": "error_during_execution"
+    },
+    {
+      "case": "background dispatch",
+      "status": "success",
+      "result": "ANSWER after-tool",
+      "turn": {
+        "inputs": [
+          "r-bg"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "nudge-only",
+      "status": "success",
+      "result": "ANSWER none",
+      "turn": {
+        "inputs": [],
+        "internal": true
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command: skill",
+      "status": "success",
+      "result": "ANSWER skill body",
+      "turn": {
+        "inputs": [
+          "r-skill"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command: local",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": [
+          "r-cost"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command: unknown",
+      "status": "success",
+      "result": "Unknown skill: nonexistent-cmd",
+      "turn": {
+        "inputs": [
+          "r-unknown"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "turn running when a slash command came",
+      "status": "success",
+      "result": "ANSWER PROBE-CMDSLOW",
+      "turn": {
+        "inputs": [
+          "r-cmdslow"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command as its own turn",
+      "status": "success",
+      "result": "Unknown skill: nonexistent-cmd",
+      "turn": {
+        "inputs": [
+          "r-late-command"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "follow-up after the slash commands",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERSLASH",
+      "turn": {
+        "inputs": [
+          "r-after-slash"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "team created",
+      "status": "success",
+      "result": "ANSWER after-tool",
+      "turn": {
+        "inputs": [
+          "r-team"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "agent-team message",
+      "status": "success",
+      "result": "ANSWER team message",
+      "turn": {
+        "inputs": [],
+        "internal": true
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "follow-up after the team message",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERTEAM",
+      "turn": {
+        "inputs": [
+          "r-after-team"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "team created, before an unknown command",
+      "status": "success",
+      "result": "ANSWER after-tool",
+      "turn": {
+        "inputs": [
+          "r-team-2"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "turn running when a team message and an unknown command came",
+      "status": "success",
+      "result": "ANSWER PROBE-TEAMSLOW",
+      "turn": {
+        "inputs": [
+          "r-team-slow-2"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "team message ahead of an unknown command",
+      "status": "success",
+      "result": "ANSWER team message",
+      "turn": {
+        "inputs": [],
+        "internal": true
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "unknown command behind a team message",
+      "status": "success",
+      "result": "Unknown skill: nonexistent-cmd",
+      "turn": {
+        "inputs": [
+          "r-unknown-behind-team"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "follow-up after the unknown command",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERBEHIND",
+      "turn": {
+        "inputs": [
+          "r-after-unknown"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "team created, before a skill",
+      "status": "success",
+      "result": "ANSWER after-tool",
+      "turn": {
+        "inputs": [
+          "r-team-3"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "turn running when a team message and a skill came",
+      "status": "success",
+      "result": "ANSWER PROBE-TEAMSLOW",
+      "turn": {
+        "inputs": [
+          "r-team-slow-3"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "team message ahead of a skill",
+      "status": "success",
+      "result": "ANSWER team message",
+      "turn": {
+        "inputs": [],
+        "internal": true
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "skill behind a team message",
+      "status": "success",
+      "result": "ANSWER skill body",
+      "turn": {
+        "inputs": [
+          "r-skill-behind-team"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "follow-up after the skill",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERBEHIND",
+      "turn": {
+        "inputs": [
+          "r-after-skill"
+        ]
+      },
+      "subtype": "success"
+    }
+  ],
+  "runnerNotes": [
+    "Input no result answered: [\"r-nothing\"] (never acknowledged)"
+  ],
+  "reusedUuid": {
+    "events": [
+      "push PROBE-FIRST as u1",
+      "ack PROBE-FIRST as u1",
+      "result ANSWER PROBE-FIRST",
+      "push PROBE-REUSED as u1",
+      "ack PROBE-REUSED as u1",
+      "push PROBE-FRESH as u2",
+      "ack PROBE-FRESH as u2",
+      "result ANSWER PROBE-FRESH"
+    ],
+    "modelSaw": [
+      "PROBE-FIRST",
+      "PROBE-FRESH"
+    ]
+  },
+  "cliShutdownPrompt": "<system-reminder>\nYou are running in non-interactive mode and cannot return a response to the user until your team is shut down.\n\nYou MUST shut down your team before preparing your final response:\n1. Use requestShutdown to ask each team member to shut down gracefully\n2. Wait for shutdown approvals\n3. Use the cleanup operation to clean up the team\n4. Only then provide your final response to the user\n\nThe user cannot receive your response until the team is completely shut down.\n</system-reminder>\n\nShut down your team and prepare your final response for the user."
+}

@@ -20,7 +20,11 @@ export function escapeXml(s: string): string {
 //
 // The first token must be a bare command name. `/home/jw is my home` opens with
 // a slash and is a path, not a command, so the token may not itself contain one.
-const SLASH_COMMAND = /^\/[a-z][a-z0-9_-]*(\s|$)/i;
+//
+// The agent runner keeps a copy in its turn-attribution.ts, because the CLI
+// never acknowledges a bare command under the uuid it was pushed with.
+// container/agent-runner/test/turn-attribution.test.ts fails when they differ.
+export const SLASH_COMMAND = /^\/[a-z][a-z0-9_-]*(\s|$)/i;
 
 /** The command a message carries, with any trigger prefix removed, or null. */
 function slashCommandIn(message: NewMessage): string | null {
