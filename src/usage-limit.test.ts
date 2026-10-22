@@ -179,7 +179,8 @@ describe('isAgentAnswer', () => {
 
   it('does not take the refusal, an empty result or an API error as one', () => {
     // The runner forwards is_error results as successes, so these arrive as
-    // result text. None of them shows the limit let a request through.
+    // result text. None of them shows the limit let a request through. Every
+    // other error the CLI can write is in usage-limit-cli.test.ts.
     for (const text of [
       WITH_DATE,
       "You're out of extra usage · resets 11pm (Asia/Seoul)",
@@ -187,15 +188,7 @@ describe('isAgentAnswer', () => {
       '   ',
       'API Error: 500 {"type":"error","error":{"type":"api_error"}}',
       'API Error: Rate limit reached',
-      'API Error: Request was aborted.',
-      "There's an issue with the selected model (claude-x). It may not exist or you may not have access to it.",
-      'Prompt is too long',
-      'Credit balance is too low',
-      'Invalid API key · Fix external API key',
-      'OAuth token revoked · Please run /login',
-      'Not logged in · Please run /login',
-      'Repeated 529 Overloaded errors',
-      'Request timed out',
+      '  Request timed out\n',
     ]) {
       expect(isAgentAnswer(text), text).toBe(false);
     }

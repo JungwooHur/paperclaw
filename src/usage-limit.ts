@@ -12,6 +12,7 @@
  */
 import { OUTPUT_LANGUAGE, TIMEZONE } from './config.js';
 import { getRouterState, setRouterState } from './db.js';
+import cliSentences from './usage-limit-cli-sentences.json' with { type: 'json' };
 
 export interface UsageLimit {
   resetsAt: Date;
@@ -32,11 +33,16 @@ export interface UsageLimitHit {
 // its warnings ("You've used 90% of…") leave the request running and are not.
 const LIMIT_PATTERN =
   /^\s*(?:you['’]ve hit your (?:(?:session|weekly|opus|sonnet|usage)\s+)?limit|you['’]re out of extra usage)\b/i;
-// The heads of the error messages the CLI writes as a turn's result in place
-// of an answer. The runner forwards those results as successes (it does not
-// pass is_error on), so only the text tells them apart.
-const ERROR_RESULT_PATTERN =
-  /^\s*(?:API Error\b|There['’]s an issue with the selected model|Claude Opus is not available|Opus is experiencing high load|Prompt is too long|Credit balance is too low|Not logged in\b|Invalid API key\b|OAuth token revoked\b|Repeated 529 Overloaded errors|Request timed out|Your account does not have access to Claude Code)/;
+// The error messages the CLI writes as a turn's result in place of an
+// answer. The runner forwards those results as successes (it does not pass
+// is_error on), so only the text tells them apart. Each is a whole sentence
+// the CLI's own code makes, read out of the bundle the container pins by
+// scripts/extract-usage-limit-sentences.ts, with the parts it fills in left
+// free: an answer that only starts with an error's words is an answer.
+const CLI_ERRORS = cliSentences.errors.map(errorPattern);
+// Except this head, which the CLI always follows with a status or a reason,
+// and composes in more places than any list of sentences would keep up with.
+const API_ERROR_PREFIX = 'API Error: ';
 // "resets Oct 14, 10am (Asia/Seoul)", "resets Jan 2, 2027, 1am (Asia/Seoul)",
 // "resets 10am (Asia/Seoul)", "resets 10:30pm". The CLI adds the date only
 // when the reset is more than a day ahead, and the year only when it differs.
@@ -89,8 +95,21 @@ export function isUsageLimit(text: string): boolean {
  * a request got through and its work ran.
  */
 export function isAgentAnswer(text: string | null | undefined): boolean {
-  if (!text?.trim()) return false;
-  return !isUsageLimit(text) && !ERROR_RESULT_PATTERN.test(text);
+  const result = text?.trim();
+  if (!result) return false;
+  return (
+    !isUsageLimit(result) &&
+    !result.startsWith(API_ERROR_PREFIX) &&
+    !CLI_ERRORS.some((pattern) => pattern.test(result))
+  );
+}
+
+/** The whole text a template stands for: {message} and {value} are free. */
+function errorPattern(template: string): RegExp {
+  const fixed = template
+    .split(/\{(?:message|value)\}/)
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp(`^${fixed.join('[\\s\\S]+?')}$`);
 }
 
 /**

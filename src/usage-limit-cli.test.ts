@@ -1,19 +1,23 @@
 /**
- * Ties the usage-limit classifier to the CLI that actually writes the refusal.
+ * Ties the usage-limit classifier to the CLI that actually writes the refusal
+ * and the error messages it returns in place of an answer.
  *
- * The sentences come from the CLI bundled with the agent SDK the container
- * pins, read out of its code by scripts/extract-usage-limit-sentences.ts. The
- * pin is exact and must match the version the sentences were read from, so an
- * SDK bump fails here until they are read again from the new bundle — and a
- * reworded refusal then fails the classifier check instead of going out to
- * WhatsApp as a reply.
+ * Both come from the CLI bundled with the agent SDK the container pins, read
+ * out of its code by scripts/extract-usage-limit-sentences.ts. The pin is
+ * exact and must match the version they were read from, so an SDK bump fails
+ * here until they are read again from the new bundle — and a reworded refusal
+ * then fails the classifier check instead of going out to WhatsApp as a reply.
  */
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 import { describe, expect, it } from 'vitest';
 
-import { classifyUsageLimit, isUsageLimit } from './usage-limit.js';
+import {
+  classifyUsageLimit,
+  isAgentAnswer,
+  isUsageLimit,
+} from './usage-limit.js';
 
 const SDK = '@anthropic-ai/claude-agent-sdk';
 const HOUR = 60 * 60 * 1000;
@@ -22,6 +26,8 @@ interface Sentences {
   sdkVersion: string;
   zone: string;
   sentences: { text: string; now: string; resetsAt: string | null }[];
+  /** Templates: {message} and {value} are the parts the CLI fills in. */
+  errors: string[];
 }
 
 function readJson<T>(relative: string): T {
@@ -79,6 +85,53 @@ describe('every refusal sentence that CLI can write', () => {
         expect(limit?.stated, text).toBe(true);
         expect(limit?.resetsAt.toISOString(), text).toBe(resetsAt);
       }
+    }
+  });
+});
+
+/** An error template filled in the way the CLI fills it in. */
+function filledIn(template: string): string {
+  return template
+    .replaceAll(
+      '{message}',
+      '401 {"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}',
+    )
+    .replaceAll('{value}', '6.2 MB');
+}
+
+describe('every error message that CLI can write as a result', () => {
+  it('is read out of it whole, with the parts it fills in marked', () => {
+    expect(fixture.errors.length).toBeGreaterThan(0);
+    expect(fixture.errors.some((t) => /\{(?:message|value)\}/.test(t))).toBe(
+      true,
+    );
+    expect(fixture.errors.some((t) => !/\{(?:message|value)\}/.test(t))).toBe(
+      true,
+    );
+  });
+
+  it('is not taken for an answer', () => {
+    for (const template of fixture.errors) {
+      const text = filledIn(template);
+      expect(isAgentAnswer(text), text).toBe(false);
+    }
+  });
+
+  it('is only the whole sentence: an answer may start with its words', () => {
+    // Every text after "API Error: " is the CLI's, and so is whatever follows
+    // a template's last filled-in part. Any other sentence ends where the
+    // CLI ends it, so more text after it is the agent's.
+    for (const template of fixture.errors) {
+      if (template.startsWith('API Error: ')) continue;
+      if (/\{(?:message|value)\}$/.test(template)) continue;
+      const text = `${filledIn(template)} I used the PDF instead: section 3 is uploaded.`;
+      expect(isAgentAnswer(text), text).toBe(true);
+    }
+    for (const text of [
+      'Request timed out on arXiv twice, so I used the PDF instead. Summary: the method trains in two stages.',
+      'Not logged in to Notion from this container; the summary is below.',
+    ]) {
+      expect(isAgentAnswer(text), text).toBe(true);
     }
   });
 });
