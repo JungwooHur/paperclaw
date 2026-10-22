@@ -537,9 +537,10 @@ async function runQuery(
     // An echoed push is an acknowledgement, not conversation: it is recorded
     // and kept out of the counts, the log and the nudge state below. So is a
     // message the CLI replays under its own uuid (an expanded slash command,
-    // an agent-team message).
+    // an agent-team message), told apart by its text.
     if (message.type === 'user' && (message as { isReplay?: boolean }).isReplay) {
-      attribution.ack((message as { uuid?: string }).uuid);
+      const replay = message as { uuid?: string; message?: { content?: unknown } };
+      attribution.ack(replay.uuid, replay.message?.content);
       continue;
     }
 

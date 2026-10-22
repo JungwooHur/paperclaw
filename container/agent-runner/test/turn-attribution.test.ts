@@ -20,6 +20,7 @@ import {
   TurnAttribution,
   ipcInputId,
   isSlashCommand,
+  isTeamPrompt,
   startupInputIds,
 } from '../src/turn-attribution.js';
 
@@ -27,6 +28,27 @@ const UUID_SHAPE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** A replay under a uuid the runner never pushed: the CLI made the message. */
 const FOREIGN = '00000000-0000-4000-8000-000000000000';
+const FOREIGN_2 = '00000000-0000-4000-8000-000000000001';
+
+// What the CLI replays, under its own uuid, for a turn it starts itself in an
+// agent team (cli.js print mode): a team member's message to the lead...
+const TEAMMATE_MESSAGE =
+  '<teammate-message teammate_id="mate" color="blue">\n' +
+  '{"type":"idle_notification","from":"mate","idleReason":"available"}\n' +
+  '</teammate-message>';
+// ...and the prompt it injects when its input closes while teammates are up.
+const SHUTDOWN_PROMPT =
+  '<system-reminder>\nYou are running in non-interactive mode and cannot ' +
+  'return a response to the user until your team is shut down.\n\nYou MUST ' +
+  'shut down your team before preparing your final response:\n</system-reminder>' +
+  '\n\nShut down your team and prepare your final response for the user.';
+// What it replays for a slash command's turn: a skill expanded...
+const SKILL_REPLAY =
+  '<command-message>probe-skill</command-message>\n' +
+  '<command-name>/probe-skill</command-name>\n<command-args>x</command-args>';
+// ...and a local command's output.
+const LOCAL_REPLAY =
+  '<local-command-stdout>Total cost: $0.0000</local-command-stdout>';
 
 describe('a push', () => {
   it('goes out under a fresh uuid every time', () => {
@@ -186,13 +208,130 @@ describe('a turn the CLI started itself', () => {
   });
 });
 
+describe('a team turn the CLI runs ahead of a queued slash command', () => {
+  // A team member's message reached the lead during a host turn and was
+  // queued; the command landed behind it. The CLI runs the team message
+  // first, and that turn start is booked against the command, the oldest push.
+  function queueBehindTeamMessage(
+    command: string,
+    log: (message: string) => void = () => {},
+  ): TurnAttribution {
+    const attribution = new TurnAttribution(log);
+    const slow = attribution.push('slow', ['r-slow']);
+    attribution.turnStarted();
+    attribution.ack(slow);
+    attribution.push(command, ['r-cmd']);
+    expect(attribution.result('success')).toEqual({ inputs: ['r-slow'] });
+    return attribution;
+  }
+
+  it('leaves an unknown command to its own turn, and attribution on', () => {
+    const log = vi.fn();
+    const attribution = queueBehindTeamMessage('/nonexistent-cmd x', log);
+    attribution.turnStarted();
+    attribution.ack(FOREIGN, TEAMMATE_MESSAGE);
+    expect(attribution.result('success')).toEqual({
+      inputs: [],
+      internal: true,
+    });
+    // The command's own turn replays nothing.
+    attribution.turnStarted();
+    expect(attribution.result('success')).toEqual({ inputs: ['r-cmd'] });
+    const after = attribution.push('after', ['r-after']);
+    attribution.turnStarted();
+    attribution.ack(after);
+    expect(attribution.result('success')).toEqual({ inputs: ['r-after'] });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('leaves a skill to its own turn, which is the host input it is', () => {
+    const log = vi.fn();
+    const attribution = queueBehindTeamMessage('/probe-skill x', log);
+    attribution.turnStarted();
+    attribution.ack(FOREIGN, TEAMMATE_MESSAGE);
+    expect(attribution.result('success')).toEqual({
+      inputs: [],
+      internal: true,
+    });
+    attribution.turnStarted();
+    attribution.ack(FOREIGN_2, SKILL_REPLAY);
+    expect(attribution.result('success')).toEqual({ inputs: ['r-cmd'] });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('does the same for the shutdown prompt the CLI injects', () => {
+    const attribution = queueBehindTeamMessage('/cost');
+    attribution.turnStarted();
+    attribution.ack(FOREIGN, [{ type: 'text', text: SHUTDOWN_PROMPT }]);
+    expect(attribution.result('success')).toEqual({
+      inputs: [],
+      internal: true,
+    });
+    attribution.turnStarted();
+    attribution.ack(FOREIGN_2, LOCAL_REPLAY);
+    expect(attribution.result('success')).toEqual({ inputs: ['r-cmd'] });
+  });
+
+  it('leaves the command queued when the team turn fails', () => {
+    const log = vi.fn();
+    const attribution = queueBehindTeamMessage('/nonexistent-cmd x', log);
+    attribution.turnStarted();
+    attribution.ack(FOREIGN, TEAMMATE_MESSAGE);
+    expect(attribution.result('error_during_execution')).toEqual({
+      inputs: [],
+      internal: true,
+    });
+    attribution.turnStarted();
+    expect(attribution.result('success')).toEqual({ inputs: ['r-cmd'] });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('keeps the command on a turn that also replayed the command', () => {
+    // A team message merged into the skill's own turn does not make that
+    // turn the CLI's: the skill's expansion shows the command ran.
+    const attribution = queueBehindTeamMessage('/probe-skill x');
+    attribution.turnStarted();
+    attribution.ack(FOREIGN, SKILL_REPLAY);
+    attribution.ack(FOREIGN_2, TEAMMATE_MESSAGE);
+    expect(attribution.result('success')).toEqual({ inputs: ['r-cmd'] });
+  });
+});
+
+describe('a team prompt', () => {
+  it('is a team member message or the injected shutdown prompt', () => {
+    expect(isTeamPrompt(TEAMMATE_MESSAGE)).toBe(true);
+    // Several queued messages are joined into one prompt.
+    expect(isTeamPrompt(`${TEAMMATE_MESSAGE}\n\n${TEAMMATE_MESSAGE}`)).toBe(
+      true,
+    );
+    expect(isTeamPrompt(SHUTDOWN_PROMPT)).toBe(true);
+  });
+
+  it('is not what a command, the host or the runner sends', () => {
+    expect(isTeamPrompt(SKILL_REPLAY)).toBe(false);
+    expect(isTeamPrompt(LOCAL_REPLAY)).toBe(false);
+    expect(
+      isTeamPrompt(
+        '<local-command-stderr>Error: no such thing</local-command-stderr>',
+      ),
+    ).toBe(false);
+    expect(isTeamPrompt('<messages>\n<message>hi</message>\n</messages>')).toBe(
+      false,
+    );
+    expect(isTeamPrompt(' <teammate-message teammate_id="x">')).toBe(false);
+    // A skill whose body quotes the shutdown prompt is still a skill.
+    expect(isTeamPrompt(`${SKILL_REPLAY}\n${SHUTDOWN_PROMPT}`)).toBe(false);
+    expect(isTeamPrompt('')).toBe(false);
+  });
+});
+
 describe('a slash command', () => {
   it('is answered by the turn it started, under no acknowledgement of its own', () => {
     // A skill: the CLI replays the expanded skill under its own uuid.
     const skill = new TurnAttribution();
     skill.push('/probe-skill x', ['r0']);
     skill.turnStarted();
-    skill.ack(FOREIGN);
+    skill.ack(FOREIGN, SKILL_REPLAY);
     expect(skill.result('success')).toEqual({ inputs: ['r0'] });
 
     // A local command: its output is replayed under the CLI's uuid, and the
@@ -200,7 +339,7 @@ describe('a slash command', () => {
     const local = new TurnAttribution();
     local.push('/cost', ['r0']);
     local.turnStarted();
-    local.ack(FOREIGN);
+    local.ack(FOREIGN, LOCAL_REPLAY);
     expect(local.result('success')).toEqual({ inputs: ['r0'] });
   });
 
