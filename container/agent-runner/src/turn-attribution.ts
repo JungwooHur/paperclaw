@@ -29,9 +29,9 @@ import path from 'path';
 /** The inputs one result answered. Written on every output made from a result. */
 export interface Turn {
   /**
-   * Input ids: the turn's prompt, then what was merged into it, in order,
-   * after the inputs of failed turns the CLI sent to the model again in it.
-   * None for a failed turn: it answered nothing.
+   * Input ids: the turn's prompt, then what was merged into it, in order.
+   * None for a failed turn: it answered nothing, and no later turn answers
+   * what it took.
    */
   inputs: string[];
   /**
@@ -56,7 +56,7 @@ export interface UnsettledPush {
   nudge: boolean;
   /** The CLI took it into a turn, but that turn produced no result. */
   acked: boolean;
-  /** Its turn's result was a failure, and no result came after it. */
+  /** Its turn's result was a failure, which answers nothing. */
   failed?: true;
 }
 
@@ -152,9 +152,10 @@ export class TurnAttribution {
   private foreignOther = false;
   private off = false;
   /**
-   * Inputs of the query's failed turns since its last success. The CLI sends
-   * them to the model again inside the next turn's request, so the next
-   * success answers them.
+   * Inputs the query's failed turns took. The CLI does not send them to the
+   * model again: each stays in the history once, where its turn left it,
+   * followed by the CLI's own "(no content)" message after a broken stream.
+   * So no later result answers them, and the end of the query reports them.
    */
   private failedInputs: string[] = [];
 
@@ -273,14 +274,13 @@ export class TurnAttribution {
     // Replays no host input explains: a message the CLI queued itself. A
     // command's own replay is one, under the CLI's uuid, and it is explained.
     if (foreign && !hostInput) turn.internal = true;
-    // A failed turn (error_during_execution) answered nothing, though it
-    // took its inputs: they go with the next success of this query.
+    // A failed turn (error_during_execution, error_max_turns) answered
+    // nothing, though it took its inputs. They stay unanswered: no later
+    // turn, a slash command that makes no API call least of all, answers
+    // them.
     if (subtype !== 'success') {
       this.failedInputs.push(...turn.inputs);
       turn.inputs = [];
-    } else if (this.failedInputs.length > 0) {
-      turn.inputs.unshift(...this.failedInputs);
-      this.failedInputs = [];
     }
     return turn;
   }

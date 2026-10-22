@@ -1,6 +1,6 @@
 {
   "sdkVersion": "0.2.34",
-  "sourceHash": "773e1e89164cbf99fc82ba5fdf5ef7adab6d69f66ed3c5b376deb9cafdec8ee4",
+  "sourceHash": "f7a95fffbf9882078af7598d11e7b46ae5073adb1fbbf5a94a0bddc639934c8d",
   "outputs": [
     {
       "case": "start-up drain",
@@ -330,11 +330,41 @@
     {
       "case": "success after a failed turn",
       "status": "success",
-      "result": "ANSWER PROBE-AFTERFAIL saw PROBE-MAXTURNS",
+      "result": "ANSWER PROBE-AFTERFAIL after: user PROBE-MAXTURNS, (assistant tool_use, user tool_result) x49, assistant tool_use, user tool_result+PROBE-AFTERFAIL",
       "turn": {
         "inputs": [
-          "r-max-turns",
           "r-after-fail"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "stream broke after its acknowledgement",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": []
+      },
+      "subtype": "error_during_execution"
+    },
+    {
+      "case": "follow-up after a broken stream",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERBROKEN after: user PROBE-BROKEN, assistant tool_use, user tool_result, assistant (no content), user PROBE-AFTERBROKEN",
+      "turn": {
+        "inputs": [
+          "r-after-broken"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command after a broken stream",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": [
+          "r-cost-after-broken"
         ]
       },
       "subtype": "success"
@@ -382,6 +412,8 @@
   ],
   "runnerNotes": [
     "Input no result answered: [\"r-nothing\"] (never acknowledged)",
+    "Input no result answered: [\"r-max-turns\"] (its turn failed)",
+    "Input no result answered: [\"r-broken\"] (its turn failed)",
     "Turn attribution off for this container: a success result followed no replayed input, so replay is not working"
   ],
   "reusedUuid": {

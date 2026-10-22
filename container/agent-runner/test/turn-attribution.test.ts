@@ -153,10 +153,11 @@ describe('a result', () => {
     expect(attribution.result('success')).toEqual({ inputs: ['b'] });
   });
 
-  it('answers nothing when its turn fails after taking its input', () => {
-    // The CLI acknowledged the prompt, then failed the turn (an API error
-    // after a tool call). The CLI sends that input to the model again inside
-    // the next turn's request, so the next result answers it.
+  it('answers nothing when its turn fails after taking its input, and no later result answers it', () => {
+    // The CLI acknowledged the prompt, then failed the turn (a stream that
+    // broke after a tool call). It does not send that input again: it stays
+    // in the history once, closed by the CLI's own "(no content)" message,
+    // so a later turn answers only what it took.
     const attribution = new TurnAttribution();
     const a = attribution.push('a', ['a']);
     attribution.turnStarted();
@@ -167,14 +168,26 @@ describe('a result', () => {
     const b = attribution.push('b', ['b']);
     attribution.turnStarted();
     attribution.ack(b);
-    expect(attribution.result('success')).toEqual({ inputs: ['a', 'b'] });
-    const c = attribution.push('c', ['c']);
-    attribution.turnStarted();
-    attribution.ack(c);
-    expect(attribution.result('success')).toEqual({ inputs: ['c'] });
+    expect(attribution.result('success')).toEqual({ inputs: ['b'] });
+    expect(attribution.endQuery()).toEqual([
+      { inputs: ['a'], nudge: false, acked: true, failed: true },
+    ]);
   });
 
-  it('leaves the inputs of failed turns in a row to the next success', () => {
+  it('credits no failed input to a slash command that makes no model call', () => {
+    // A local command's turn after a failed one: it answers itself only.
+    const attribution = new TurnAttribution();
+    const a = attribution.push('a', ['a']);
+    attribution.turnStarted();
+    attribution.ack(a);
+    attribution.result('error_max_turns');
+    attribution.push('/cost', ['r-cost']);
+    attribution.turnStarted();
+    attribution.ack(FOREIGN, LOCAL_REPLAY);
+    expect(attribution.result('success')).toEqual({ inputs: ['r-cost'] });
+  });
+
+  it('reports the inputs of failed turns in a row when the query ends', () => {
     const attribution = new TurnAttribution();
     for (const id of ['a', 'b']) {
       const uuid = attribution.push(id, [id]);
@@ -187,9 +200,10 @@ describe('a result', () => {
     const c = attribution.push('c', ['c']);
     attribution.turnStarted();
     attribution.ack(c);
-    expect(attribution.result('success')).toEqual({
-      inputs: ['a', 'b', 'c'],
-    });
+    expect(attribution.result('success')).toEqual({ inputs: ['c'] });
+    expect(attribution.endQuery()).toEqual([
+      { inputs: ['a', 'b'], nudge: false, acked: true, failed: true },
+    ]);
   });
 });
 
@@ -438,7 +452,7 @@ describe('a slash command', () => {
     expect(attribution.result('success')).toEqual({ inputs: ['y'] });
   });
 
-  it('is answered by the next result when its turn fails', () => {
+  it('is left unanswered when its turn fails', () => {
     const attribution = new TurnAttribution();
     attribution.push('/probe-skill x', ['r0']);
     attribution.turnStarted();
@@ -448,7 +462,10 @@ describe('a slash command', () => {
     const b = attribution.push('b', ['b']);
     attribution.turnStarted();
     attribution.ack(b);
-    expect(attribution.result('success')).toEqual({ inputs: ['r0', 'b'] });
+    expect(attribution.result('success')).toEqual({ inputs: ['b'] });
+    expect(attribution.endQuery()).toEqual([
+      { inputs: ['r0'], nudge: false, acked: true, failed: true },
+    ]);
   });
 
   it('has the shape the router sends bare', () => {
@@ -571,7 +588,7 @@ describe('the end of a query', () => {
     ]);
   });
 
-  it('reports the inputs of a failed turn no later result answered', () => {
+  it('reports the inputs of a failed turn, as its turn left them unanswered', () => {
     const attribution = new TurnAttribution();
     const a = attribution.push('a', ['a']);
     attribution.turnStarted();

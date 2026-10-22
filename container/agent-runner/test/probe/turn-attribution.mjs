@@ -7,7 +7,10 @@
 // fake API, while a tool runs or during a turn's last API call. Every output
 // the runner writes is recorded under the case that produced it. The CLI's
 // home carries the settings.json every group is seeded with (agent teams on)
-// and one user skill, for the slash-command cases. The last container runs
+// and one user skill, for the slash-command cases. Two turns fail after the
+// CLI acknowledged their prompt, one on a scheduled run's maxTurns and one on
+// an API stream that breaks after a tool call, and the follow-up after each
+// answers with the history its request carried. The last container runs
 // the CLI through a `node` that drops --replay-user-messages, so replay is
 // broken there, with no switch in the runner. One more case drives the SDK
 // directly, as the runner never reuses a uuid: what the CLI does with a push
@@ -87,6 +90,20 @@ function sse(res, blocks, stop) {
   res.end();
 }
 
+/** A stream that breaks: it starts a message and ends without finishing it. */
+function brokenSse(res) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'request-id': 'req_probe' });
+  res.write(`event: message_start\ndata: ${JSON.stringify({
+    type: 'message_start',
+    message: {
+      id: 'msg_broken', type: 'message', role: 'assistant', model: MODEL,
+      content: [], stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 1 },
+    },
+  })}\n\n`);
+  res.end();
+}
+
 function json(res, code, body) {
   res.writeHead(code, { 'content-type': 'application/json', 'request-id': 'req_probe' });
   res.end(JSON.stringify(body));
@@ -103,6 +120,7 @@ function lastToolName(msgs) {
 }
 const tool = (name, input) => ({ type: 'tool_use', name, input });
 const MAX_TURNS_GLOB = 'probe-max-turns-*';
+const BROKEN_COMMAND = 'echo before the stream breaks';
 /** The input of the last tool call in the conversation. */
 function lastToolInput(msgs) {
   for (let i = msgs.length - 1; i >= 0; i--) {
@@ -111,6 +129,38 @@ function lastToolInput(msgs) {
     if (use) return use.input;
   }
   return null;
+}
+/** A block or message text as the history below names it. */
+function partName(t) {
+  if (t.startsWith('<system-reminder>')) return 'reminder';
+  return (t.match(/PROBE-[A-Z]+/) || [t.slice(0, 40)])[0];
+}
+
+/**
+ * What a request carried, message by message: its role and each block, a
+ * text by its marker, else by its first words. A tool call and its result
+ * repeated back to back are counted, not listed.
+ */
+function historyOf(msgs) {
+  const items = msgs.map((m) => {
+    const parts = Array.isArray(m.content)
+      ? m.content.map((c) => (c.type === 'text' ? partName(c.text) : c.type))
+      : [partName(String(m.content))];
+    return `${m.role} ${parts.join('+')}`;
+  });
+  const out = [];
+  for (let i = 0; i < items.length;) {
+    let n = 1;
+    while (items[i + 2 * n + 1] !== undefined && items[i + 2 * n] === items[i] && items[i + 2 * n + 1] === items[i + 1]) n++;
+    if (n > 1) {
+      out.push(`(${items[i]}, ${items[i + 1]}) x${n}`);
+      i += 2 * n;
+    } else {
+      out.push(items[i]);
+      i++;
+    }
+  }
+  return out.join(', ');
 }
 const once = new Set();
 // While the reused-uuid case runs: every marker any request carried.
@@ -150,11 +200,17 @@ function reply(b) {
       stop: 'tool_use',
     };
   }
-  // Says whether the failed turn's prompt reached the model again. Before the
-  // tool loop below: the CLI may send it in the message with a tool result.
-  if (marker === 'PROBE-AFTERFAIL') {
-    const saw = JSON.stringify(msgs).includes('PROBE-MAXTURNS');
-    return { blocks: [text(`ANSWER PROBE-AFTERFAIL${saw ? ' saw PROBE-MAXTURNS' : ''}`)] };
+  // A follow-up after a failed turn answers with the history its request
+  // carried: whether the CLI sent the failed turn's prompt again, or only
+  // kept it where it was. Before the tool loop below: the CLI may send the
+  // follow-up in the message with a tool result.
+  if (marker === 'PROBE-AFTERFAIL' || marker === 'PROBE-AFTERBROKEN') {
+    return { blocks: [text(`ANSWER ${marker} after: ${historyOf(msgs)}`)] };
+  }
+  // The tool call's next API call: the stream breaks there, and on the CLI's
+  // retry, so the turn fails after the CLI acknowledged its prompt.
+  if (afterTool && lastToolInput(msgs)?.command === BROKEN_COMMAND) {
+    return { broken: true };
   }
   // A tool call after every tool result: the turn runs into maxTurns.
   if (afterTool && lastToolInput(msgs)?.pattern === MAX_TURNS_GLOB) {
@@ -202,6 +258,8 @@ function reply(b) {
       return { blocks: [] };
     case 'PROBE-MAXTURNS':
       return { blocks: [tool('Glob', { pattern: MAX_TURNS_GLOB })], stop: 'tool_use' };
+    case 'PROBE-BROKEN':
+      return { blocks: [tool('Bash', { command: BROKEN_COMMAND, description: 'probe tool' })], stop: 'tool_use' };
     case 'PROBE-BG':
       return {
         blocks: [tool('Task', {
@@ -227,6 +285,7 @@ const server = http.createServer((req, res) => {
     const r = reply(b);
     const stop = r.stop ?? 'end_turn';
     const send = () => {
+      if (r.broken) return brokenSse(res);
       if (b.stream) return sse(res, r.blocks, stop);
       json(res, 200, {
         id: 'msg_probe', type: 'message', role: 'assistant', model: b.model,
@@ -415,6 +474,24 @@ const CONTAINERS = [
     after: {
       1: () => writeInput('0060-after.json', 'PROBE-AFTERFAIL a plain follow-up', 'r-after-fail'),
       2: close,
+    },
+  },
+  // A message container's turn fails the same way: the CLI acknowledged its
+  // prompt, a tool ran, then the API stream broke, and broke again on the
+  // retry. A follow-up and a slash command that makes no API call come after.
+  {
+    freshHome: true,
+    prompt: 'PROBE-BROKEN call a tool, then the stream breaks',
+    promptRef: 'r-broken',
+    cases: [
+      'stream broke after its acknowledgement',
+      'follow-up after a broken stream',
+      'slash command after a broken stream',
+    ],
+    after: {
+      1: () => writeInput('0065-after.json', 'PROBE-AFTERBROKEN a plain follow-up', 'r-after-broken'),
+      2: () => writeInput('0066-cost.json', '/cost', 'r-cost-after-broken'),
+      3: close,
     },
   },
   // Replay broken: the guard trips on the first result, a textless one. Then

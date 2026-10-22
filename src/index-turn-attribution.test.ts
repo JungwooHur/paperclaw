@@ -64,7 +64,8 @@ const { ipcInputId, startupInputIds, TurnAttribution } = (await import(
   TurnAttribution: new () => {
     push(text: string, inputs: string[]): string;
     turnStarted(): void;
-    result(subtype: string): unknown;
+    ack(uuid: string): void;
+    result(subtype: string): ContainerTurn | undefined;
     stamp(output: ContainerOutput): ContainerOutput;
   };
 };
@@ -476,6 +477,34 @@ describe('a container that exits with input no result answered', () => {
     expect(timesIn(b.prompt, M2)).toBe(1);
     await b.result('Both answered.', { inputs: [b.startIds[0]] });
     await b.exit();
+  });
+
+  it('has the prompt of a turn that failed after the runner took it delivered again', async () => {
+    // The turns as the runner's own record reports them: the CLI took m1,
+    // then its stream broke, and m2's turn answers m2 alone, since the CLI
+    // kept m1 in the history but did not send it again.
+    const runner = new TurnAttribution();
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    const u1 = runner.push(a.prompt, a.startIds);
+    runner.turnStarted();
+    runner.ack(u1);
+    await a.result(null, runner.result('error_during_execution'));
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    const u2 = runner.push(M2, [p2]);
+    runner.turnStarted();
+    runner.ack(u2);
+    await a.result('It covers the experiments.', runner.result('success'));
+    await a.exit();
+
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    // Behind m1, until #114 slice 3.
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    await b.result('Both answered.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
   });
 
   it('puts it back once, not again when its retry answers it neither', async () => {

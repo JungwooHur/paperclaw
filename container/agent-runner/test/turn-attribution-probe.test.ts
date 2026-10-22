@@ -293,14 +293,57 @@ describe('the turn attribution probe', () => {
         text: false,
         turn: { inputs: [] },
       },
-      // ...and the next success of the same query answers that prompt first.
+      // ...and neither does the next success: it answers its own input only
+      // (the CLI did not send the failed prompt again, below).
       {
         case: 'success after a failed turn',
         subtype: 'success',
         text: true,
-        turn: { inputs: ['r-max-turns', 'r-after-fail'] },
+        turn: { inputs: ['r-after-fail'] },
+      },
+      // The same in a message container, on a stream that broke after a
+      // tool call: the turn's prompt is left unanswered...
+      {
+        case: 'stream broke after its acknowledgement',
+        subtype: 'error_during_execution',
+        text: false,
+        turn: { inputs: [] },
+      },
+      {
+        case: 'follow-up after a broken stream',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-after-broken'] },
+      },
+      // ...even by a command that made no API call, which answers itself.
+      {
+        case: 'slash command after a broken stream',
+        subtype: 'success',
+        text: false,
+        turn: { inputs: ['r-cost-after-broken'] },
       },
     ]);
+  });
+
+  it('saw the CLI keep the prompt of a failed turn where it was, not send it again', () => {
+    // Each follow-up answers with the history its request carried. The
+    // failed turn's prompt is in it once, where that turn left it: the CLI
+    // did not send it to the model again, so no later turn answers it. After
+    // maxTurns the follow-up shares a message with the last tool's result;
+    // after the broken stream the CLI closed the turn with a message of its
+    // own.
+    const answer = (name: string) =>
+      fixture.outputs.find((o) => o.case === name)?.result;
+    expect(answer('success after a failed turn')).toBe(
+      'ANSWER PROBE-AFTERFAIL after: user PROBE-MAXTURNS, ' +
+        '(assistant tool_use, user tool_result) x49, assistant tool_use, ' +
+        'user tool_result+PROBE-AFTERFAIL',
+    );
+    expect(answer('follow-up after a broken stream')).toBe(
+      'ANSWER PROBE-AFTERBROKEN after: user PROBE-BROKEN, ' +
+        'assistant tool_use, user tool_result, assistant (no content), ' +
+        'user PROBE-AFTERBROKEN',
+    );
   });
 
   it('saw every output say attribution is off from the one the guard tripped on', () => {
@@ -389,16 +432,13 @@ describe('the turn attribution probe', () => {
       'Unknown skill: nonexistent-cmd',
     );
     expect(answer('skill behind a team message')).toBe('ANSWER skill body');
-    // The request the success after a failed turn made carried that turn's
-    // prompt, which is why that success answers it.
-    expect(answer('success after a failed turn')).toBe(
-      'ANSWER PROBE-AFTERFAIL saw PROBE-MAXTURNS',
-    );
   });
 
-  it('turned attribution off only where replay was broken, and logged only the unacknowledged input as unanswered', () => {
+  it('turned attribution off only where replay was broken, and logged the unacknowledged and failed inputs as unanswered', () => {
     expect(fixture.runnerNotes).toEqual([
       'Input no result answered: ["r-nothing"] (never acknowledged)',
+      'Input no result answered: ["r-max-turns"] (its turn failed)',
+      'Input no result answered: ["r-broken"] (its turn failed)',
       'Turn attribution off for this container: a success result followed no replayed input, so replay is not working',
     ]);
   });
