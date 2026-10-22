@@ -26,6 +26,7 @@ vi.mock('./qa-followup.js', () => ({
   worthFilingCheck: () => false,
 }));
 
+import { IDLE_TIMEOUT } from './config.js';
 import {
   ContainerOutput,
   ContainerTurn,
@@ -624,6 +625,28 @@ describe('a container that exits with input no result answered', () => {
     await b.result('Both answered.', { inputs: [b.startIds[0]] });
     await b.exit();
     await nothingRunsAgain();
+  });
+
+  it('closes once idle after a failed turn, so its input goes back without waiting for the hard timeout', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    const closed = () => fs.existsSync(path.join(inputDir, '_close'));
+    // The session marker is no result: it does not start the idle wait.
+    await a.marker();
+    await vi.advanceTimersByTimeAsync(IDLE_TIMEOUT);
+    expect(closed()).toBe(false);
+    // The turn failed: a textless result that answers nothing.
+    await a.result(null, { inputs: [] });
+    await vi.advanceTimersByTimeAsync(IDLE_TIMEOUT - 1);
+    expect(closed()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(closed()).toBe(true);
+    await a.exit();
+
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
   });
 
   it('puts nothing back when an output was still being delivered', async () => {

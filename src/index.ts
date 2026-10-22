@@ -442,9 +442,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         outputSentToUser = true;
         fileAnsweredQa(chatJid, text);
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      if (!runEnded) resetIdleTimer();
     }
+    // A turn ended: the container is idle until its next input. Not on the
+    // session marker (result: null, no `turn`), which follows the results.
+    // A textless result with `turn` counts: a turn that failed, or one
+    // answered only through send_message. Without it, a container whose
+    // last turn failed would close only on its hard timeout, and its exit
+    // would put the input back only then.
+    if (!runEnded && (raw !== null || result.turn)) resetIdleTimer();
 
     if (!runEnded) {
       if (result.status === 'success') {
