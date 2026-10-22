@@ -1179,11 +1179,11 @@ function pendingMessages(chatJid: string): Pending {
  * end of a batch are held back for prompts of their own (firstPrompt), and
  * remembered, behind the messages before them that the cursor can stop
  * after, those before the first command's second (WhatsApp stamps whole
- * seconds), and only when those messages start the agent. Otherwise the
- * batch goes whole, as the command alone, as before: when every message
- * before the command shares its second, and in a group that needs the
- * trigger, when they are context, not a request, and sent alone would draw
- * a reply.
+ * seconds), and only when those messages start the agent; when they end in
+ * a command of their own, it is held back the same way. Otherwise the batch
+ * goes whole, as the command alone, as before: when every message before
+ * the command shares its second, and in a group that needs the trigger,
+ * when they are context, not a request, and sent alone would draw a reply.
  */
 function nextDelivery(
   chatJid: string,
@@ -1197,18 +1197,25 @@ function nextDelivery(
   const upToHeld = held
     ? throughLastCommand(pending.messages.filter((m) => m.timestamp <= held))
     : [];
-  const batch = upToHeld.length > 0 ? upToHeld : pending.messages;
-  const first = firstPrompt(batch);
-  const command = batch[first.length];
-  let n = first.length;
-  while (command && n > 0 && first[n - 1].timestamp >= command.timestamp) n--;
-  const head = first.slice(0, n);
-  const split =
-    command !== undefined && n > 0 && startsAgent(chatJid, group, head);
-  const messages = split ? head : batch;
-  // Before the cursor moves, so a crash cannot leave the commands pending
-  // and forgotten.
-  if (split) rememberHeldCommand(chatJid, batch[batch.length - 1].timestamp);
+  let messages = upToHeld.length > 0 ? upToHeld : pending.messages;
+  // Cut before a command's second, what is kept can end in a command of its
+  // own, which is held back in turn.
+  for (;;) {
+    const first = firstPrompt(messages);
+    const command = messages[first.length];
+    if (!command) break;
+    let n = first.length;
+    while (n > 0 && first[n - 1].timestamp >= command.timestamp) n--;
+    const head = first.slice(0, n);
+    if (n === 0 || !startsAgent(chatJid, group, head)) break;
+    // Before the cursor moves, so a crash cannot leave the commands pending
+    // and forgotten. Never lowered: a put-back may have held a newer one.
+    const newest = messages[messages.length - 1].timestamp;
+    if (newest > (readHeldCommands()[chatJid] ?? '')) {
+      rememberHeldCommand(chatJid, newest);
+    }
+    messages = head;
+  }
   const next = pending.messages[messages.length];
   let end = messages[messages.length - 1].timestamp;
   for (const m of pending.all) {

@@ -1542,6 +1542,29 @@ describe('a batch whose newest message is a slash command', () => {
     await nothingRunsAgain();
   });
 
+  it('holds back a command the cut before a shared second leaves at the end', async () => {
+    const SECOND = '/probe-skill second';
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+      ['m3', M2, NOW - 40_000],
+      ['m4', SECOND, NOW - 40_000],
+    ]);
+    const a = containers[0];
+    expect(timesIn(a.prompt, M1)).toBe(1);
+    expect(a.prompt).not.toContain('/probe-skill');
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    // The question in the second command's second goes with it, as before.
+    expect(waitingTexts()).toEqual([SECOND]);
+    const [second] = a.drain();
+    await a.result('The second skill ran.', { inputs: [second] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
   it('runs a message that waited behind a command before a later batch ending in a command that shares a second', async () => {
     const SECOND = '/probe-skill second';
     await usersSay([
