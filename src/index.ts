@@ -41,7 +41,12 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  firstPrompt,
+  formatMessages,
+  formatOutbound,
+} from './router.js';
 import { SchedulerDependencies, startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logHeartbeat } from './liveness-log.js';
@@ -340,10 +345,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const prompt = formatMessages(missedMessages);
+  // A command at the end of the batch waits for a prompt of its own.
+  const delivery = nextDelivery(pending);
+  const prompt = formatMessages(delivery.messages);
 
   const previousCursor = lastAgentTimestamp[chatJid] || '';
-  const end = deliveryEnd(pending);
+  const end = delivery.end;
   // Files an earlier container left: this one drains them into its first
   // prompt, so they are its oldest prompts, and the cursor can go back to
   // where they start.
@@ -363,7 +370,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, messageCount: delivery.messages.length },
     'Processing messages',
   );
 
@@ -517,6 +524,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!runEnded) {
       if (result.status === 'success') {
         queue.notifyIdle(chatJid);
+        // Every prompt settled: a command held back behind them goes now.
+        // After notifyIdle, so a task waiting on this container has closed
+        // it, and the command waits for the next one (queueHeldBack).
+        if (prompts.length === 0 && (raw !== null || result.turn)) {
+          deliverHeldBack(chatJid, channel, group);
+        }
       }
       if (result.status === 'error') {
         hadError = true;
@@ -650,6 +663,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   rememberOpenFrom(chatJid, undefined);
   // Behind the cursor wherever the exit left it, so no rollback reaches them.
   pruneAnsweredAhead(chatJid);
+  if (done) queueHeldBack(chatJid, group);
   return done;
 }
 
@@ -924,16 +938,41 @@ function deliverMessages(
   channel: Channel,
   pending: Pending,
 ): void {
+  const delivery = nextDelivery(pending);
   if (
-    !pipeToActiveContainer(
-      chatJid,
-      channel,
-      pending.messages,
-      deliveryEnd(pending),
-    )
+    !pipeToActiveContainer(chatJid, channel, delivery.messages, delivery.end)
   ) {
     queue.enqueueMessageCheck(chatJid);
   }
+}
+
+/**
+ * Pipes into the group's running container what is still pending once every
+ * prompt it was given is settled: a command held back behind the messages
+ * before it (firstPrompt), which now starts a turn of its own.
+ */
+function deliverHeldBack(
+  chatJid: string,
+  channel: Channel,
+  group: RegisteredGroup,
+): void {
+  const pending = pendingMessages(chatJid);
+  if (pending.messages.length === 0) return;
+  if (!startsAgent(group, pending.messages)) return;
+  const delivery = nextDelivery(pending);
+  pipeToActiveContainer(chatJid, channel, delivery.messages, delivery.end);
+}
+
+/**
+ * After a run that did not put its input back: what is still pending (a
+ * command its container closed before taking) starts the group's next
+ * container, instead of waiting for the user's next message.
+ */
+function queueHeldBack(chatJid: string, group: RegisteredGroup): void {
+  if (usageLimitHeldUntil()) return;
+  const pending = pendingMessages(chatJid);
+  if (pending.messages.length === 0) return;
+  if (startsAgent(group, pending.messages)) queue.enqueueMessageCheck(chatJid);
 }
 
 /**
@@ -1022,11 +1061,21 @@ function pendingMessages(chatJid: string): Pending {
 }
 
 /**
- * Where delivering the pending messages moves the cursor: past the newest
- * message, answered or not, so an answered range among them is behind it.
+ * The pending messages the next prompt carries (firstPrompt), and where
+ * delivering them moves the cursor: past the newest message they reach,
+ * answered or not, so an answered range among them is behind it. Not past a
+ * command held back for a prompt of its own, which stays pending.
  */
-function deliveryEnd(pending: Pending): string {
-  return pending.all[pending.all.length - 1].timestamp;
+function nextDelivery(pending: Pending): {
+  messages: NewMessage[];
+  end: string;
+} {
+  const messages = firstPrompt(pending.messages);
+  const held = pending.messages[messages.length];
+  const reached = held
+    ? pending.all.filter((m) => m.timestamp < held.timestamp)
+    : pending.all;
+  return { messages, end: reached[reached.length - 1].timestamp };
 }
 
 function readAnsweredAhead(): Record<string, Range[]> {

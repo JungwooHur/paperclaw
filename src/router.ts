@@ -32,6 +32,20 @@ function slashCommandIn(message: NewMessage): string | null {
   return SLASH_COMMAND.test(text) ? text : null;
 }
 
+/**
+ * The messages the next prompt carries. formatMessages sends a batch whose
+ * newest message is a command as that command alone, which would drop the
+ * messages before it: they go first, as a prompt of their own, and each
+ * command at the end waits for a prompt of its own after them. The caller
+ * delivers the rest once the turn this prompt starts has ended, since a
+ * command that reaches a running turn is merged into it as plain text.
+ */
+export function firstPrompt(messages: NewMessage[]): NewMessage[] {
+  let n = messages.length;
+  while (n > 1 && slashCommandIn(messages[n - 1])) n--;
+  return messages.slice(0, n);
+}
+
 export function formatMessages(messages: NewMessage[]): string {
   // Only the newest message counts. An older command followed by ordinary chat
   // is a conversation that has moved on, and re-invoking the skill there would

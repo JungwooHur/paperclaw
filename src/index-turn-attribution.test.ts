@@ -246,6 +246,32 @@ async function userSays(
   return message;
 }
 
+/** Messages that arrive between two polls: the message loop sees them as one batch. */
+async function usersSay(
+  messages: [id: string, content: string, at: number][],
+): Promise<void> {
+  for (const [id, content, at] of messages) {
+    storeMessage({
+      id,
+      chat_jid: CHAT,
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content,
+      timestamp: new Date(at).toISOString(),
+    });
+  }
+  _pollNewMessages();
+  await vi.advanceTimersByTimeAsync(0);
+}
+
+/** The texts of the input files waiting for the container, oldest first. */
+function waitingTexts(): string[] {
+  return inputFiles().map(
+    (file) =>
+      JSON.parse(fs.readFileSync(path.join(inputDir, file), 'utf-8')).text,
+  );
+}
+
 /** The message cursor as saved, which is what a restart would resume from. */
 function cursor(): string | undefined {
   return JSON.parse(getRouterState('last_agent_timestamp') || '{}')[CHAT];
@@ -1142,8 +1168,9 @@ describe('a restart while a container runs', () => {
     const a = containers[0];
     await a.result('It describes the method.', { inputs: [a.startIds[0]] });
     await userSays('m2', M2, NOW - 40_000);
+    a.drain();
     await userSays('m3', M3, NOW - 30_000);
-    const [, p3] = a.drain();
+    const [p3] = a.drain();
     // m2's turn failed, and m3's own turn answered it.
     await a.result(null, { inputs: [] });
     await a.result('It covers the appendix.', { inputs: [p3] });
@@ -1188,6 +1215,73 @@ describe('a restart while a container runs', () => {
 
     // As before attribution: the cursor stays where it was saved.
     expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+});
+
+describe('a batch whose newest message is a slash command', () => {
+  // The router sends such a batch as the command alone.
+  const CMD = '/probe-skill run it';
+
+  it('runs the messages before it first, then the command as its own prompt', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    expect(timesIn(a.prompt, M1)).toBe(1);
+    expect(a.prompt).not.toContain(CMD);
+    // Piped now, it could be merged into the question's turn as plain text.
+    expect(waitingTexts()).toEqual([]);
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs both a question and a command that a put-back made pending', async () => {
+    await userSays('m0', M3, NOW - 70_000);
+    const a = containers[0];
+    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
+    await userSays('m1', M1, NOW - 60_000);
+    // Alone in its batch, so piped as the command, as before.
+    await userSays('m2', CMD, NOW - 50_000);
+    expect(waitingTexts()).toHaveLength(2);
+    expect(waitingTexts()).toContain(CMD);
+    a.drain();
+    await a.exit('error'); // stopped before either turn ended
+
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(CMD);
+    expect(b.prompt).not.toContain(M3);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = b.drain();
+    await b.result('The skill ran.', { inputs: [command] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs the command in the next container when this one is closing', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    // Told to close, as for a scheduled task waiting for the group.
+    queue.closeStdin(CHAT);
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    expect(waitingTexts()).toEqual([]);
+    await a.exit();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const b = containers[1];
+    expect(b.prompt).toBe(CMD);
+    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
+    await b.exit();
     await nothingRunsAgain();
   });
 });
