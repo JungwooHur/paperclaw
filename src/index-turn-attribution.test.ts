@@ -50,17 +50,30 @@ import { Channel, NewMessage, RegisteredGroup } from './types.js';
 
 /**
  * The runner's own input-id readers, so the fake below reports each input by
- * the id the runner would read off what the host wrote: a field renamed on
- * either side fails here. Loaded by a path tsc does not follow, since the
- * runner is outside this package's rootDir.
+ * the id the runner would read off what the host wrote, and the runner's own
+ * stamp for an output once its guard switched attribution off: a field
+ * renamed on either side fails here. Loaded by a path tsc does not follow,
+ * since the runner is outside this package's rootDir.
  */
 const RUNNER_IDS = '../container/agent-runner/src/turn-attribution.js';
-const { ipcInputId, startupInputIds } = (await import(
+const { ipcInputId, startupInputIds, TurnAttribution } = (await import(
   /* @vite-ignore */ RUNNER_IDS
 )) as {
   ipcInputId(file: string, data: { ref?: unknown }): string;
   startupInputIds(input: { promptRef?: unknown }, drained: string[]): string[];
+  TurnAttribution: new () => {
+    push(text: string, inputs: string[]): string;
+    turnStarted(): void;
+    result(subtype: string): unknown;
+    stamp(output: ContainerOutput): ContainerOutput;
+  };
 };
+
+/** The runner's record once its guard tripped: a success with no replay. */
+const attributionOff = new TurnAttribution();
+attributionOff.push('prompt', ['prompt']);
+attributionOff.turnStarted();
+attributionOff.result('success');
 
 const LIMIT = "You've hit your limit · resets Oct 14, 10am (Asia/Seoul)";
 const NOW = Date.parse('2026-10-13T12:00:00.000Z'); // 21:00 in Seoul
@@ -102,10 +115,13 @@ interface FakeContainer {
   prompt: string;
   /** Takes the files piped since, as the runner's poll does; their ids. */
   drain(): string[];
-  /** A result, from a runner that reports `turn` or (none given) one that does not. */
-  result(text: string | null, turn?: ContainerTurn): Promise<void>;
+  /**
+   * A result, from a runner that reports `turn`, one that does not (none
+   * given), or one whose guard switched attribution off ('off').
+   */
+  result(text: string | null, turn?: ContainerTurn | 'off'): Promise<void>;
   /** The session-update marker the runner writes when a query ends. */
-  marker(): Promise<void>;
+  marker(off?: 'off'): Promise<void>;
   exit(status?: 'success' | 'error'): Promise<void>;
   exited: boolean;
 }
@@ -159,19 +175,23 @@ function runnerStarts(): void {
         ),
         prompt: [input.prompt, ...drained.map((d) => d.text)].join('\n'),
         drain: () => drainFiles().map((d) => d.id),
-        result: (text, turn) =>
-          emit({
+        result: (text, turn) => {
+          const output: ContainerOutput = {
             status: 'success',
             result: text,
             newSessionId: 'session-new',
-            ...(turn ? { turn } : {}),
-          }),
-        marker: () =>
-          emit({
+            ...(turn && turn !== 'off' ? { turn } : {}),
+          };
+          return emit(turn === 'off' ? attributionOff.stamp(output) : output);
+        },
+        marker: (off) => {
+          const output: ContainerOutput = {
             status: 'success',
             result: null,
             newSessionId: 'session-new',
-          }),
+          };
+          return emit(off ? attributionOff.stamp(output) : output);
+        },
         exited: false,
         exit: async (status = 'success') => {
           container.exited = true;
@@ -617,6 +637,60 @@ describe('a container whose results carry no turn', () => {
     // Not exact to the end, so the exit puts nothing back, as before.
     expect(cursor()).toBe(m3.timestamp);
     await nothingRunsAgain();
+  });
+
+  it('once the runner says attribution is off on a textless result, puts nothing back', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    // Answered through send_message alone, as is m2 below.
+    await a.result(null, { inputs: [a.startIds[0]] });
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    // Replay broke: the guard trips on this textless result. Without the
+    // runner saying so, it would look like the session marker.
+    await a.result(null, 'off');
+    await a.marker('off');
+    await a.exit();
+
+    // m2 was answered: the exit does what it did before attribution.
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('once the runner says attribution is off, an error exit after a reply puts nothing back', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    await a.result(null, 'off');
+    await a.exit('error');
+
+    // A reply went out, so no rollback, as before attribution.
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('once the runner says attribution is off, settles the rest the old way', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    // Textless: the old rule settles nothing on it.
+    await a.result(null, 'off');
+    await userSays('m3', M3, NOW - 20_000);
+    a.drain();
+    // The oldest open prompt (m2) takes it, whichever it answered.
+    await a.result('It covers the experiments.', 'off');
+    await a.result(LIMIT, 'off');
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    expect(b.prompt).not.toContain(M1);
+    await b.exit();
   });
 
   it('once the runner turned attribution off, a refusal puts back what the fallback left', async () => {

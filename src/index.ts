@@ -348,11 +348,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let outputsRunning = 0;
   // Whether this container's results say which inputs they answered (`turn`,
   // docs/SPEC.md "Turn Attribution"): unknown until its first result. Off for
-  // good once a result with text comes without one: a runner that predates
-  // it, or one whose guard found replay broken. A textless output without one
-  // says nothing either way: it is the session marker, or a textless result
-  // that cannot be told from it. (Cast, or the checks after the run would
-  // read it as never reassigned.)
+  // good on the first output that says so (`attribution: 'off'`, from the one
+  // the runner's guard tripped on), or once a result with text comes without
+  // `turn`: a runner that predates attribution, or this field. Any other
+  // textless output without `turn` is the session marker and says nothing
+  // either way. (Cast, or the checks after the run would read it as never
+  // reassigned.)
   let attribution = 'unknown' as 'unknown' | 'on' | 'off';
 
   const onOutput = async (result: ContainerOutput): Promise<void> => {
@@ -364,7 +365,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         : JSON.stringify(result.result)
       : null;
     if (!runEnded && attribution !== 'off') {
-      if (result.turn) attribution = 'on';
+      if (result.attribution === 'off') attribution = 'off';
+      else if (result.turn) attribution = 'on';
       else if (raw !== null) attribution = 'off';
     }
     const turn = attribution === 'on' ? result.turn : undefined;

@@ -99,6 +99,11 @@ export interface ContainerOutput {
   error?: string;
   /** Only on an output made from an SDK result, and only from a new runner. */
   turn?: ContainerTurn;
+  /**
+   * On every output from the one where the runner's guard found replay
+   * broken and switched attribution off, a textless one included.
+   */
+  attribution?: 'off';
 }
 
 interface VolumeMount {
