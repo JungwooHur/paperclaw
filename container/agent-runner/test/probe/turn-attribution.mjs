@@ -9,7 +9,9 @@
 // home carries the settings.json every group is seeded with (agent teams on)
 // and one user skill, for the slash-command cases. One more case drives the
 // SDK directly, as the runner never reuses a uuid: what the CLI does with a
-// push under a uuid it has already seen.
+// push under a uuid it has already seen. Last, it reads out of the CLI bundle
+// the prompt the CLI injects when its input closes while teammates are up,
+// which no case here makes it send.
 import http from 'http';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
@@ -19,6 +21,7 @@ import path from 'path';
 const RUNNER = '/tmp/dist/index.js';
 const SDK_PACKAGE = '/app/node_modules/@anthropic-ai/claude-agent-sdk/package.json';
 const SDK_MODULE = '/app/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs';
+const SDK_CLI = '/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js';
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const PORT = 8787;
 const MODEL = 'claude-sonnet-4-5-20250929';
@@ -98,6 +101,8 @@ const tool = (name, input) => ({ type: 'tool_use', name, input });
 const once = new Set();
 // While the reused-uuid case runs: every marker any request carried.
 let modelSaw = null;
+// The running container's command that must land behind a team message.
+let behindTeam = null;
 
 function reply(b) {
   const msgs = b.messages || [];
@@ -114,8 +119,7 @@ function reply(b) {
       : { blocks: [tool('Bash', { command: 'sleep 2', description: 'subagent sleep' })], stop: 'tool_use' };
   }
   // Only an expanded skill carries its body: proof the CLI ran the command.
-  if (!once.has('skill') && JSON.stringify(msgs).includes('PROBE-SKILLBODY')) {
-    once.add('skill');
+  if (!afterTool && lastText.includes('PROBE-SKILLBODY')) {
     return { blocks: [text('ANSWER skill body')] };
   }
   // The lead's turn for a member going idle.
@@ -155,6 +159,15 @@ function reply(b) {
         setTimeout(() => writeInput('0023-late.json', '/nonexistent-cmd PROBE-LATE', 'r-late-command'), 1000);
       }
       return { blocks: [text('ANSWER PROBE-CMDSLOW')], delayMs: 3000 };
+    case 'PROBE-TEAMSLOW':
+      // The member's message, due 2 s after the team was made, is queued
+      // during this slow last API call, and the command lands behind it.
+      if (behindTeam && !once.has(behindTeam[2])) {
+        once.add(behindTeam[2]);
+        const command = behindTeam;
+        setTimeout(() => writeInput(...command), 4000);
+      }
+      return { blocks: [text('ANSWER PROBE-TEAMSLOW')], delayMs: 8000 };
     case 'PROBE-TEAM':
       return { blocks: [tool('TeamCreate', { team_name: 'probe-team', description: 'probe' })], stop: 'tool_use' };
     case 'PROBE-EMPTY':
@@ -267,7 +280,8 @@ const CONTAINERS = [
     },
   },
   {
-    // Last: the team it makes stays in the CLI's home.
+    // The team it makes stays in the CLI's home, so this is the last
+    // container there.
     resume: true,
     prompt: 'PROBE-TEAM make a team',
     promptRef: 'r-team',
@@ -277,19 +291,63 @@ const CONTAINERS = [
       3: close,
     },
   },
+  // A member's message reaches the lead while a host turn runs, and a bare
+  // command lands behind it: the CLI runs the team message first, then the
+  // command. Each in a home of its own, for a team of its own.
+  {
+    freshHome: true,
+    prompt: 'PROBE-TEAM make a team',
+    promptRef: 'r-team-2',
+    behindTeam: ['0041-unknown.json', '/nonexistent-cmd PROBE-BEHINDTEAM', 'r-unknown-behind-team'],
+    cases: [
+      'team created, before an unknown command',
+      'turn running when a team message and an unknown command came',
+      'team message ahead of an unknown command',
+      'unknown command behind a team message',
+      'follow-up after the unknown command',
+    ],
+    after: {
+      1: () => writeInput('0040-slow.json', 'PROBE-TEAMSLOW a slow last API call', 'r-team-slow-2'),
+      // 2, 3: the team message, then the command, run as turns of their own.
+      4: () => writeInput('0042-after.json', 'PROBE-AFTERBEHIND a plain follow-up', 'r-after-unknown'),
+      5: close,
+    },
+  },
+  {
+    freshHome: true,
+    prompt: 'PROBE-TEAM make a team',
+    promptRef: 'r-team-3',
+    behindTeam: ['0051-skill.json', '/probe-skill PROBE-SKILLARG', 'r-skill-behind-team'],
+    cases: [
+      'team created, before a skill',
+      'turn running when a team message and a skill came',
+      'team message ahead of a skill',
+      'skill behind a team message',
+      'follow-up after the skill',
+    ],
+    after: {
+      1: () => writeInput('0050-slow.json', 'PROBE-TEAMSLOW a slow last API call', 'r-team-slow-3'),
+      4: () => writeInput('0052-after.json', 'PROBE-AFTERBEHIND a plain follow-up', 'r-after-skill'),
+      5: close,
+    },
+  },
 ];
 
-const home = fs.mkdtempSync('/tmp/probe-home-');
-// What src/container-runner.ts seeds every group with, agent teams included.
-fs.mkdirSync(path.join(home, '.claude/skills/probe-skill'), { recursive: true });
-fs.writeFileSync(
-  path.join(home, '.claude/settings.json'),
-  JSON.stringify({ env: { CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1' } }),
-);
-fs.writeFileSync(
-  path.join(home, '.claude/skills/probe-skill/SKILL.md'),
-  '---\nname: probe-skill\ndescription: A probe skill\ndisable-model-invocation: true\n---\nReply with PROBE-SKILLBODY and nothing else.\n',
-);
+/** A CLI home with what src/container-runner.ts seeds every group with, agent teams included, and the probe's skill. */
+function seededHome() {
+  const home = fs.mkdtempSync('/tmp/probe-home-');
+  fs.mkdirSync(path.join(home, '.claude/skills/probe-skill'), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, '.claude/settings.json'),
+    JSON.stringify({ env: { CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1' } }),
+  );
+  fs.writeFileSync(
+    path.join(home, '.claude/skills/probe-skill/SKILL.md'),
+    '---\nname: probe-skill\ndescription: A probe skill\ndisable-model-invocation: true\n---\nReply with PROBE-SKILLBODY and nothing else.\n',
+  );
+  return home;
+}
+const home = seededHome();
 const outputs = [];
 const notes = [];
 const cliEnv = {
@@ -307,13 +365,14 @@ function runContainer(spec, sessionId) {
   return new Promise((resolve, reject) => {
     for (const f of fs.readdirSync(IPC_INPUT_DIR)) fs.rmSync(path.join(IPC_INPUT_DIR, f), { force: true });
     if (spec.leftover) writeInput(...spec.leftover);
+    behindTeam = spec.behindTeam ?? null;
     const mine = [];
     // The SDK result's subtype, by result number, read off the runner's log.
     const subtypes = {};
     let session = sessionId;
 
     const runner = spawn('node', [RUNNER], {
-      env: cliEnv,
+      env: spec.freshHome ? { ...cliEnv, HOME: seededHome() } : cliEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     runner.stdin.end(JSON.stringify({
@@ -452,6 +511,19 @@ async function reusedUuidCase() {
   return { events, modelSaw: saw };
 }
 
+/**
+ * The prompt the CLI injects when its input closes while teammates are up,
+ * read at its injection site in the bundle: the constant passed there.
+ */
+function cliShutdownPrompt() {
+  const bundle = fs.readFileSync(SDK_CLI, 'utf-8');
+  const site = bundle.match(/injecting shutdown prompt"\),[\w$]+\(\{mode:"prompt",value:([\w$]+)/);
+  if (!site) return null;
+  const name = site[1].replace(/\$/g, '\\$');
+  const literal = bundle.match(new RegExp(`(?:^|[^\\w$])${name}=\`([^\`]*)\``));
+  return literal?.[1] ?? null;
+}
+
 server.listen(PORT, '127.0.0.1', async () => {
   let reusedUuid;
   const timer = setTimeout(() => {
@@ -469,7 +541,8 @@ server.listen(PORT, '127.0.0.1', async () => {
   }
   clearTimeout(timer);
   const sdkVersion = JSON.parse(fs.readFileSync(SDK_PACKAGE, 'utf-8')).version;
-  process.stdout.write(JSON.stringify({ sdkVersion, outputs, runnerNotes: notes, reusedUuid }, null, 2) + '\n');
+  const fixture = { sdkVersion, outputs, runnerNotes: notes, reusedUuid, cliShutdownPrompt: cliShutdownPrompt() };
+  process.stdout.write(JSON.stringify(fixture, null, 2) + '\n');
   server.close();
   process.exit(0);
 });

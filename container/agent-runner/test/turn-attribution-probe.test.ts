@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 
 import { describe, expect, it } from 'vitest';
 
-import type { Turn } from '../src/turn-attribution.js';
+import { isTeamPrompt, type Turn } from '../src/turn-attribution.js';
 
 interface ProbeOutput {
   case: string;
@@ -33,6 +33,7 @@ const fixture = readJson<{
   outputs: ProbeOutput[];
   runnerNotes: string[];
   reusedUuid?: { events: string[]; modelSaw: string[] };
+  cliShutdownPrompt?: string | null;
 }>('./turn-attribution-probe.json');
 const runnerPackage = readJson<{ dependencies: Record<string, string> }>(
   '../package.json',
@@ -189,6 +190,73 @@ describe('the turn attribution probe', () => {
         text: true,
         turn: { inputs: ['r-after-team'] },
       },
+      // A member's message reached the lead during a host turn, and a bare
+      // command landed behind it. The CLI runs the team message first, and
+      // that turn start is counted as the command's, the oldest push; the
+      // turn replayed only the team message, so the command waits for the
+      // next turn, which answers it.
+      {
+        case: 'team created, before an unknown command',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-team-2'] },
+      },
+      {
+        case: 'turn running when a team message and an unknown command came',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-team-slow-2'] },
+      },
+      {
+        case: 'team message ahead of an unknown command',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: [], internal: true },
+      },
+      // It replays nothing, and is not taken for broken replay.
+      {
+        case: 'unknown command behind a team message',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-unknown-behind-team'] },
+      },
+      {
+        case: 'follow-up after the unknown command',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-after-unknown'] },
+      },
+      {
+        case: 'team created, before a skill',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-team-3'] },
+      },
+      {
+        case: 'turn running when a team message and a skill came',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-team-slow-3'] },
+      },
+      {
+        case: 'team message ahead of a skill',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: [], internal: true },
+      },
+      // The host sent it, so it is not internal.
+      {
+        case: 'skill behind a team message',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-skill-behind-team'] },
+      },
+      {
+        case: 'follow-up after the skill',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-after-skill'] },
+      },
     ]);
   });
 
@@ -207,6 +275,19 @@ describe('the turn attribution probe', () => {
       'Unknown skill: nonexistent-cmd',
     );
     expect(answer('agent-team message')).toBe('ANSWER team message');
+    // The member's message did come first, and each command after it.
+    for (const command of ['an unknown command', 'a skill']) {
+      expect(
+        answer(`turn running when a team message and ${command} came`),
+      ).toBe('ANSWER PROBE-TEAMSLOW');
+      expect(answer(`team message ahead of ${command}`)).toBe(
+        'ANSWER team message',
+      );
+    }
+    expect(answer('unknown command behind a team message')).toBe(
+      'Unknown skill: nonexistent-cmd',
+    );
+    expect(answer('skill behind a team message')).toBe('ANSWER skill body');
   });
 
   it('kept attribution on, and logged only the failed turn input as unanswered', () => {
@@ -214,6 +295,15 @@ describe('the turn attribution probe', () => {
     expect(fixture.runnerNotes).toEqual([
       'Input no result answered: ["r-nothing"] (never acknowledged)',
     ]);
+  });
+
+  it('read the shutdown prompt the CLI injects as a team prompt', () => {
+    // No case here makes the CLI send it, so the probe reads it out of the
+    // bundle, as the constant passed at its injection site. A
+    // reworded one fails here: unrecognised, a shutdown turn run ahead of a
+    // queued command would be taken for that command's turn.
+    expect(fixture.cliShutdownPrompt).toEqual(expect.any(String));
+    expect(isTeamPrompt(fixture.cliShutdownPrompt!)).toBe(true);
   });
 
   it('saw the CLI acknowledge a reused uuid without running it', () => {

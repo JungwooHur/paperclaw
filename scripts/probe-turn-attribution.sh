@@ -5,10 +5,11 @@
 # entrypoint does, then runs it with no network against a fake Messages API
 # (container/agent-runner/test/probe/turn-attribution.mjs) and writes the
 # `turn` of every output it produced to the fixture below, then drives the SDK
-# directly to record what the CLI does with a reused uuid.
+# directly to record what the CLI does with a reused uuid, and reads the
+# prompt the CLI injects to shut an agent team down out of its bundle.
 # container/agent-runner/test/turn-attribution-probe.test.ts checks the fixture
 # came from the pinned SDK and holds what the protocol promises, so rerun this
-# after an SDK bump, once the image is rebuilt. Takes about 2 minutes: one case
+# after an SDK bump, once the image is rebuilt. Takes about 3 minutes: one case
 # waits out the runner's 60 s background-task nudge.
 #
 #   scripts/probe-turn-attribution.sh            # writes the fixture
