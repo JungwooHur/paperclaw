@@ -523,62 +523,68 @@ async function startMessageLoop(): Promise<void> {
 
   while (true) {
     try {
-      const jids = Object.keys(registeredGroups);
-      const { messages, newTimestamp } = getNewMessages(
-        jids,
-        lastTimestamp,
-        ASSISTANT_NAME,
-      );
-
-      if (messages.length > 0) {
-        logger.info({ count: messages.length }, 'New messages');
-
-        // Advance the "seen" cursor for all messages immediately
-        lastTimestamp = newTimestamp;
-        saveState();
-
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
-        for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
-          if (existing) {
-            existing.push(msg);
-          } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
-          }
-        }
-
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
-
-          const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-            continue;
-          }
-
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (!startsAgent(group, groupMessages)) continue;
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-
-          deliverMessages(chatJid, channel, messagesToSend);
-        }
-      }
+      pollNewMessages();
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+  }
+}
+
+/** One pass of the message loop: hands new messages to their groups. */
+function pollNewMessages(): void {
+  const jids = Object.keys(registeredGroups);
+  const { messages, newTimestamp } = getNewMessages(
+    jids,
+    lastTimestamp,
+    ASSISTANT_NAME,
+  );
+
+  if (messages.length > 0) {
+    logger.info({ count: messages.length }, 'New messages');
+
+    // Advance the "seen" cursor for all messages immediately
+    lastTimestamp = newTimestamp;
+    saveState();
+
+    // Deduplicate by group
+    const messagesByGroup = new Map<string, NewMessage[]>();
+    for (const msg of messages) {
+      const existing = messagesByGroup.get(msg.chat_jid);
+      if (existing) {
+        existing.push(msg);
+      } else {
+        messagesByGroup.set(msg.chat_jid, [msg]);
+      }
+    }
+
+    for (const [chatJid, groupMessages] of messagesByGroup) {
+      const group = registeredGroups[chatJid];
+      if (!group) continue;
+
+      const channel = findChannel(channels, chatJid);
+      if (!channel) {
+        logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+        continue;
+      }
+
+      // Non-trigger messages accumulate in DB and get pulled as
+      // context when a trigger eventually arrives.
+      if (!startsAgent(group, groupMessages)) continue;
+
+      // Pull all messages since lastAgentTimestamp so non-trigger
+      // context that accumulated between triggers is included.
+      const allPending = getMessagesSince(
+        chatJid,
+        lastAgentTimestamp[chatJid] || '',
+        ASSISTANT_NAME,
+      );
+      // None: the cursor is already past these. Recovery piped them, or a
+      // container took them at start-up, before this poll saw them.
+      if (allPending.length === 0) continue;
+
+      deliverMessages(chatJid, channel, allPending);
+    }
   }
 }
 
@@ -797,6 +803,7 @@ function schedulerDependencies(): SchedulerDependencies {
 export {
   loadState as _loadState,
   pipeToActiveContainer as _pipeToActiveContainer,
+  pollNewMessages as _pollNewMessages,
   processGroupMessages as _processGroupMessages,
   recoverPendingMessages as _recoverPendingMessages,
   restoreStartupState as _restoreStartupState,

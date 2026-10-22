@@ -46,6 +46,7 @@ import { GroupQueue } from './group-queue.js';
 import {
   _loadState,
   _pipeToActiveContainer,
+  _pollNewMessages,
   _processGroupMessages,
   _recoverPendingMessages,
   _restoreStartupState,
@@ -498,12 +499,13 @@ describe('messages held for a container that is still running', () => {
 
   /**
    * Starts m1 through the queue in a container that runs `turn` and then
-   * stays up, idle, until the test ends it.
+   * stays up, idle, until the test ends it. `start` hands m1 to the queue.
    */
   async function containerRunning(
     turn: (
       onOutput: (output: ContainerOutput) => Promise<void>,
     ) => Promise<void>,
+    start: () => void = () => queue.enqueueMessageCheck(CHAT),
   ): Promise<void> {
     vi.mocked(runContainerAgent).mockImplementationOnce(
       async (_group, _input, onProcess, onOutput) => {
@@ -516,7 +518,7 @@ describe('messages held for a container that is still running', () => {
       },
     );
     userSays('m1', 'what is section 2 about?', NOW - 60_000);
-    queue.enqueueMessageCheck(CHAT);
+    start();
     await vi.advanceTimersByTimeAsync(0);
   }
 
@@ -609,6 +611,30 @@ describe('messages held for a container that is still running', () => {
     expect(runContainerAgent).toHaveBeenCalledTimes(2);
     expect(promptOfRun(1)).toContain(m2Text);
     expect(sentTexts()).toContain('It covers the experiments.');
+  });
+
+  it('are not piped again by the next poll of the message loop', async () => {
+    // The window ends between two polls: recovery pipes what the loop has
+    // not seen yet, and moves the cursor past it before the loop sees it.
+    const reset = NOW + 10 * 60_000; // 9:10pm in Seoul
+    await containerRunning(
+      (onOutput) => answer(onOutput, 'It describes the method.'),
+      _pollNewMessages,
+    );
+    recordUsageLimit("You've hit your limit · resets 9:10pm (Asia/Seoul)");
+    _recoverPendingMessages();
+    userSays('m2', m2Text, Date.now());
+    _pollNewMessages();
+    await vi.advanceTimersByTimeAsync(reset + 2 * 60_000 - 700 - Date.now());
+    const m3 = userSays('m3', 'and the appendix?', Date.now());
+    await vi.advanceTimersByTimeAsync(700);
+    expect(pipedTexts()).toEqual([
+      expect.stringMatching(/and section 3\?[\s\S]*and the appendix\?/),
+    ]);
+    expect(getRouterState('last_agent_timestamp')).toContain(m3.timestamp);
+
+    _pollNewMessages();
+    expect(pipedTexts()).toHaveLength(1);
   });
 
   it('go into it at once when the window ends at its reset', async () => {
