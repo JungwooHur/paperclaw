@@ -512,6 +512,48 @@ describe('a success result with no replay at all', () => {
     attribution.push('/probe-skill x', ['c']);
     expect(attribution.result('success')).toBeUndefined();
   });
+
+  it('says so on the output it trips on and on every one after it, and on none before', () => {
+    const attribution = new TurnAttribution();
+    const a = attribution.push('a', ['a']);
+    attribution.turnStarted();
+    attribution.ack(a);
+    const answered = attribution.result('success');
+    expect(
+      attribution.stamp({ status: 'success', result: 'x', turn: answered }),
+    ).toEqual({ status: 'success', result: 'x', turn: { inputs: ['a'] } });
+    expect(attribution.stamp({ status: 'success', result: null })).toEqual({
+      status: 'success',
+      result: null,
+    });
+
+    // A textless result: without the stamp, the host could not tell it from
+    // the session marker of a container whose attribution is on.
+    attribution.push('b', ['b']);
+    attribution.turnStarted();
+    expect(attribution.result('success')).toBeUndefined();
+    expect(attribution.stamp({ status: 'success', result: null })).toEqual({
+      status: 'success',
+      result: null,
+      attribution: 'off',
+    });
+    // The session marker, an error output, and the results of a later query.
+    expect(attribution.stamp({ status: 'error', result: null })).toEqual({
+      status: 'error',
+      result: null,
+      attribution: 'off',
+    });
+    attribution.endQuery();
+    const c = attribution.push('c', ['c']);
+    attribution.turnStarted();
+    attribution.ack(c);
+    expect(attribution.result('success')).toBeUndefined();
+    expect(attribution.stamp({ status: 'success', result: 'y' })).toEqual({
+      status: 'success',
+      result: 'y',
+      attribution: 'off',
+    });
+  });
 });
 
 describe('the end of a query', () => {

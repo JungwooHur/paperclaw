@@ -41,6 +41,15 @@ export interface Turn {
   internal?: true;
 }
 
+/**
+ * What every output says once the guard switched attribution off, from the
+ * output it tripped on: a textless result, the session marker and an error
+ * output carry no `turn` either way, so without it the host could not tell.
+ */
+export interface AttributionOff {
+  attribution: 'off';
+}
+
 /** A push no result was attributed to when its query ended. */
 export interface UnsettledPush {
   inputs: string[];
@@ -274,6 +283,14 @@ export class TurnAttribution {
       this.failedInputs = [];
     }
     return turn;
+  }
+
+  /**
+   * An output as the runner writes it: unchanged while attribution is on,
+   * and marked `attribution: 'off'` from the output the guard trips on.
+   */
+  stamp<T extends object>(output: T): T | (T & AttributionOff) {
+    return this.off ? { ...output, attribution: 'off' } : output;
   }
 
   /**

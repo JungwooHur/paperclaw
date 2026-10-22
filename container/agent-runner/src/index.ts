@@ -14,6 +14,9 @@
  *   Each output made from an SDK result carries `turn`: the ids of the inputs
  *   that result answered (see turn-attribution.ts). An input's id is its
  *   `ref` (stdin: `promptRef`), else its file name (stdin: "stdin").
+ *   Once the guard in turn-attribution.ts switches attribution off, every
+ *   output from the one it tripped on carries `attribution: "off"` instead,
+ *   the session marker and error outputs included.
  *   Final marker after loop ends signals completion.
  */
 
@@ -23,7 +26,13 @@ import path from 'path';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
-import { ipcInputId, startupInputIds, type Turn, TurnAttribution } from './turn-attribution.js';
+import {
+  type AttributionOff,
+  ipcInputId,
+  startupInputIds,
+  type Turn,
+  TurnAttribution,
+} from './turn-attribution.js';
 
 interface ContainerInput {
   prompt: string;
@@ -45,6 +54,8 @@ interface ContainerOutput {
   error?: string;
   /** Only on outputs made from an SDK result. */
   turn?: Turn;
+  /** On every output once the guard switched attribution off. */
+  attribution?: AttributionOff['attribution'];
 }
 
 interface SessionEntry {
@@ -148,13 +159,17 @@ const OUTPUT_END_MARKER = '---PAPERCLAW_OUTPUT_END---';
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
-  console.log(JSON.stringify(output));
+  console.log(JSON.stringify(attribution.stamp(output)));
   console.log(OUTPUT_END_MARKER);
 }
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
+
+// Which inputs each result answered, for the whole container: every output
+// says whether it is still on (writeOutput).
+const attribution = new TurnAttribution(log);
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
   const projectDir = path.dirname(transcriptPath);
@@ -398,7 +413,6 @@ function waitForIpcMessage(): Promise<{ text: string; ids: string[] } | null> {
 async function runQuery(
   prompt: string,
   promptIds: string[],
-  attribution: TurnAttribution,
   sessionId: string | undefined,
   mcpServerPath: string,
   containerInput: ContainerInput,
@@ -672,7 +686,6 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.map(m => m.text).join('\n');
   }
   let promptIds = startupInputIds(containerInput, pending.map(m => m.id));
-  const attribution = new TurnAttribution(log);
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
@@ -680,7 +693,7 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, promptIds, attribution, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = await runQuery(prompt, promptIds, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
