@@ -123,12 +123,94 @@ describe('the turn attribution probe', () => {
         case: 'nudge-only',
         subtype: 'success',
         text: true,
-        turn: { inputs: [], nudge: true },
+        turn: { inputs: [], internal: true },
+      },
+      // A slash command that starts a turn is never acknowledged under its
+      // own uuid: a skill is replayed expanded and a local command's output
+      // replayed, each under the CLI's uuid, and an unknown command replays
+      // nothing. The turn that took it answers it all the same.
+      {
+        case: 'slash command: skill',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-skill'] },
+      },
+      {
+        case: 'slash command: local',
+        subtype: 'success',
+        text: false,
+        turn: { inputs: ['r-cost'] },
+      },
+      {
+        case: 'slash command: unknown',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-unknown'] },
+      },
+      // Sent during a turn's last API call: the CLI runs the command after
+      // that turn, so the running turn does not claim it...
+      {
+        case: 'turn running when a slash command came',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-cmdslow'] },
+      },
+      // ...its own turn does.
+      {
+        case: 'slash command as its own turn',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-late-command'] },
+      },
+      // None of them switched attribution off.
+      {
+        case: 'follow-up after the slash commands',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-after-slash'] },
+      },
+      {
+        case: 'team created',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-team'] },
+      },
+      // A team member's message starts a lead turn the CLI queued itself,
+      // replayed under its own uuid: no input, and marked internal.
+      {
+        case: 'agent-team message',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: [], internal: true },
+      },
+      {
+        case: 'follow-up after the team message',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-after-team'] },
       },
     ]);
   });
 
-  it('logged only the input the failed turn took as unanswered', () => {
+  it('saw the CLI run the bare commands as commands and the team turn itself', () => {
+    // The fake API answers these turns by what reached the model, so a CLI
+    // that took a command as plain text, or folded the team member's message
+    // into another turn, fails here.
+    const answer = (name: string) =>
+      fixture.outputs.find((o) => o.case === name)?.result;
+    // Only an expanded skill carries the skill's body.
+    expect(answer('slash command: skill')).toBe('ANSWER skill body');
+    expect(answer('slash command: unknown')).toBe(
+      'Unknown skill: nonexistent-cmd',
+    );
+    expect(answer('slash command as its own turn')).toBe(
+      'Unknown skill: nonexistent-cmd',
+    );
+    expect(answer('agent-team message')).toBe('ANSWER team message');
+  });
+
+  it('kept attribution on, and logged only the failed turn input as unanswered', () => {
+    // runnerNotes also holds any "Turn attribution off" line.
     expect(fixture.runnerNotes).toEqual([
       'Input no result answered: ["r-nothing"] (never acknowledged)',
     ]);

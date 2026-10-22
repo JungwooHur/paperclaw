@@ -107,7 +107,105 @@
       "result": "ANSWER none",
       "turn": {
         "inputs": [],
-        "nudge": true
+        "internal": true
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command: skill",
+      "status": "success",
+      "result": "ANSWER skill body",
+      "turn": {
+        "inputs": [
+          "r-skill"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command: local",
+      "status": "success",
+      "result": null,
+      "turn": {
+        "inputs": [
+          "r-cost"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command: unknown",
+      "status": "success",
+      "result": "Unknown skill: nonexistent-cmd",
+      "turn": {
+        "inputs": [
+          "r-unknown"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "turn running when a slash command came",
+      "status": "success",
+      "result": "ANSWER PROBE-CMDSLOW",
+      "turn": {
+        "inputs": [
+          "r-cmdslow"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "slash command as its own turn",
+      "status": "success",
+      "result": "Unknown skill: nonexistent-cmd",
+      "turn": {
+        "inputs": [
+          "r-late-command"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "follow-up after the slash commands",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERSLASH",
+      "turn": {
+        "inputs": [
+          "r-after-slash"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "team created",
+      "status": "success",
+      "result": "ANSWER after-tool",
+      "turn": {
+        "inputs": [
+          "r-team"
+        ]
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "agent-team message",
+      "status": "success",
+      "result": "ANSWER team message",
+      "turn": {
+        "inputs": [],
+        "internal": true
+      },
+      "subtype": "success"
+    },
+    {
+      "case": "follow-up after the team message",
+      "status": "success",
+      "result": "ANSWER PROBE-AFTERTEAM",
+      "turn": {
+        "inputs": [
+          "r-after-team"
+        ]
       },
       "subtype": "success"
     }

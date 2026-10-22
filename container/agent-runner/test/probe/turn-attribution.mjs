@@ -5,9 +5,11 @@
 // /tmp/dist gets its prompt on stdin and its follow-ups as IPC files, each
 // written at the moment its case needs: after an output, or, timed off the
 // fake API, while a tool runs or during a turn's last API call. Every output
-// the runner writes is recorded under the case that produced it. One more
-// case drives the SDK directly, as the runner never reuses a uuid: what the
-// CLI does with a push under a uuid it has already seen.
+// the runner writes is recorded under the case that produced it. The CLI's
+// home carries the settings.json every group is seeded with (agent teams on)
+// and one user skill, for the slash-command cases. One more case drives the
+// SDK directly, as the runner never reuses a uuid: what the CLI does with a
+// push under a uuid it has already seen.
 import http from 'http';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
@@ -23,7 +25,7 @@ const MODEL = 'claude-sonnet-4-5-20250929';
 const OUTPUT_START = '---PAPERCLAW_OUTPUT_START---';
 const OUTPUT_END = '---PAPERCLAW_OUTPUT_END---';
 // The runner nudges after 60 s parked with a background task outstanding.
-const TIMEOUT_MS = 200_000;
+const TIMEOUT_MS = 240_000;
 
 const t0 = Date.now();
 const log = (...a) =>
@@ -84,6 +86,14 @@ function json(res, code, body) {
 }
 
 const text = (t) => ({ type: 'text', text: t });
+function lastToolName(msgs) {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const content = msgs[i].role === 'assistant' && Array.isArray(msgs[i].content) ? msgs[i].content : [];
+    const use = content.filter((x) => x.type === 'tool_use').pop();
+    if (use) return use.name;
+  }
+  return null;
+}
 const tool = (name, input) => ({ type: 'tool_use', name, input });
 const once = new Set();
 // While the reused-uuid case runs: every marker any request carried.
@@ -103,6 +113,25 @@ function reply(b) {
       ? { blocks: [text('SUB-DONE')] }
       : { blocks: [tool('Bash', { command: 'sleep 2', description: 'subagent sleep' })], stop: 'tool_use' };
   }
+  // Only an expanded skill carries its body: proof the CLI ran the command.
+  if (!once.has('skill') && JSON.stringify(msgs).includes('PROBE-SKILLBODY')) {
+    once.add('skill');
+    return { blocks: [text('ANSWER skill body')] };
+  }
+  // The lead's turn for a member going idle.
+  if (lastText.includes('idle_notification')) return { blocks: [text('ANSWER team message')] };
+  // An agent-team member: answers once, then goes idle, which messages the lead.
+  // Slow, so the lead's turn is over when the member's message arrives.
+  if (textOf(msgs[0]?.content).includes('TEAMMATE-WORK')) return { blocks: [text('TM-DONE')], delayMs: 2000 };
+  if (afterTool && lastToolName(msgs) === 'TeamCreate') {
+    return {
+      blocks: [tool('Task', {
+        description: 'teammate', prompt: 'TEAMMATE-WORK say done',
+        subagent_type: 'general-purpose', name: 'mate', team_name: 'probe-team',
+      })],
+      stop: 'tool_use',
+    };
+  }
   if (afterTool) return { blocks: [text('ANSWER after-tool')] };
   switch (marker) {
     case 'PROBE-TOOL':
@@ -119,6 +148,15 @@ function reply(b) {
         setTimeout(() => writeInput('0005-own.json', 'PROBE-OWN sent during the last API call', 'r-own'), 1000);
       }
       return { blocks: [text('ANSWER PROBE-SLOW')], delayMs: 3000 };
+    case 'PROBE-CMDSLOW':
+      // A bare slash command lands during the turn's last API call.
+      if (!once.has('late-command')) {
+        once.add('late-command');
+        setTimeout(() => writeInput('0023-late.json', '/nonexistent-cmd PROBE-LATE', 'r-late-command'), 1000);
+      }
+      return { blocks: [text('ANSWER PROBE-CMDSLOW')], delayMs: 3000 };
+    case 'PROBE-TEAM':
+      return { blocks: [tool('TeamCreate', { team_name: 'probe-team', description: 'probe' })], stop: 'tool_use' };
     case 'PROBE-EMPTY':
       return { blocks: [text('')] };
     case 'PROBE-NOTHING':
@@ -206,9 +244,52 @@ const CONTAINERS = [
       8: close,
     },
   },
+  {
+    // The router sends the newest message bare when it is a slash command.
+    resume: true,
+    prompt: '/probe-skill PROBE-SKILLARG',
+    promptRef: 'r-skill',
+    cases: [
+      'slash command: skill',
+      'slash command: local',
+      'slash command: unknown',
+      'turn running when a slash command came',
+      'slash command as its own turn',
+      'follow-up after the slash commands',
+    ],
+    after: {
+      1: () => writeInput('0020-cost.json', '/cost', 'r-cost'),
+      2: () => writeInput('0021-unknown.json', '/nonexistent-cmd PROBE-UNKNOWN', 'r-unknown'),
+      3: () => writeInput('0022-cmdslow.json', 'PROBE-CMDSLOW a slow last API call', 'r-cmdslow'),
+      // 4: the command written during that call runs as the next turn.
+      5: () => writeInput('0024-after.json', 'PROBE-AFTERSLASH a plain follow-up', 'r-after-slash'),
+      6: close,
+    },
+  },
+  {
+    // Last: the team it makes stays in the CLI's home.
+    resume: true,
+    prompt: 'PROBE-TEAM make a team',
+    promptRef: 'r-team',
+    cases: ['team created', 'agent-team message', 'follow-up after the team message'],
+    after: {
+      2: () => writeInput('0030-after.json', 'PROBE-AFTERTEAM a plain follow-up', 'r-after-team'),
+      3: close,
+    },
+  },
 ];
 
 const home = fs.mkdtempSync('/tmp/probe-home-');
+// What src/container-runner.ts seeds every group with, agent teams included.
+fs.mkdirSync(path.join(home, '.claude/skills/probe-skill'), { recursive: true });
+fs.writeFileSync(
+  path.join(home, '.claude/settings.json'),
+  JSON.stringify({ env: { CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1' } }),
+);
+fs.writeFileSync(
+  path.join(home, '.claude/skills/probe-skill/SKILL.md'),
+  '---\nname: probe-skill\ndescription: A probe skill\ndisable-model-invocation: true\n---\nReply with PROBE-SKILLBODY and nothing else.\n',
+);
 const outputs = [];
 const notes = [];
 const cliEnv = {
@@ -225,7 +306,7 @@ const cliEnv = {
 function runContainer(spec, sessionId) {
   return new Promise((resolve, reject) => {
     for (const f of fs.readdirSync(IPC_INPUT_DIR)) fs.rmSync(path.join(IPC_INPUT_DIR, f), { force: true });
-    writeInput(...spec.leftover);
+    if (spec.leftover) writeInput(...spec.leftover);
     const mine = [];
     // The SDK result's subtype, by result number, read off the runner's log.
     const subtypes = {};
@@ -346,7 +427,8 @@ async function reusedUuidCase() {
     prompt: stream,
     options: {
       cwd: fs.mkdtempSync('/tmp/probe-reused-'),
-      env: { ...cliEnv, ANTHROPIC_API_KEY: 'offline-probe-key' },
+      // A home of its own: the team the runner's cases made stays out of it.
+      env: { ...cliEnv, HOME: fs.mkdtempSync('/tmp/probe-reused-home-'), ANTHROPIC_API_KEY: 'offline-probe-key' },
       extraArgs: { 'replay-user-messages': null },
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,

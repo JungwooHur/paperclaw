@@ -8,7 +8,7 @@
 # directly to record what the CLI does with a reused uuid.
 # container/agent-runner/test/turn-attribution-probe.test.ts checks the fixture
 # came from the pinned SDK and holds what the protocol promises, so rerun this
-# after an SDK bump, once the image is rebuilt. Takes about 100 s: one case
+# after an SDK bump, once the image is rebuilt. Takes about 2 minutes: one case
 # waits out the runner's 60 s background-task nudge.
 #
 #   scripts/probe-turn-attribution.sh            # writes the fixture
