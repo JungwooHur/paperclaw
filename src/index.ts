@@ -39,7 +39,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { SchedulerDependencies, startSchedulerLoop } from './task-scheduler.js';
@@ -81,6 +81,11 @@ interface OpenPrompt {
   ref?: string;
   /** A result's `turn` named it, but an older prompt is still open. */
   answered?: boolean;
+  /**
+   * A file an earlier container left, which this one drained into its
+   * first prompt (leftoverPrompts).
+   */
+  leftover?: boolean;
 }
 
 /**
@@ -113,8 +118,8 @@ function shiftAnswered(prompts: OpenPrompt[]): string | undefined {
 
 /**
  * Marks the prompts a result's turn names answered. Returns the ids it names
- * that are no open prompt of this container: a file an earlier container
- * left, drained into this one's first prompt, answers no prompt here.
+ * that are no open prompt of this container: a file left with no range to
+ * register it by answers no prompt here.
  */
 function markAnswered(prompts: OpenPrompt[], inputs: string[]): string[] {
   const unknown: string[] = [];
@@ -358,12 +363,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
   let usageLimited = false;
+  // Files an earlier container left: this one drains them into its first
+  // prompt, so they are its oldest prompts, and the cursor can go back to
+  // where they start.
+  const leftovers = leftoverPrompts(group);
+  const startCursor = leftovers.length
+    ? refRange(leftovers[0].ref!)!.from
+    : previousCursor;
   // The cursor at the end of the last prompt a turn finished on: a usage limit
   // after it puts back only the messages that came later. Not the cursor at
   // the time, which a follow-up piped in mid-answer has already moved on.
-  let answeredCursor = previousCursor;
+  let answeredCursor = startCursor;
   const promptRef = inputRef(previousCursor, lastAgentTimestamp[chatJid]);
   const prompts: OpenPrompt[] = [
+    ...leftovers,
     { cursor: lastAgentTimestamp[chatJid], ref: promptRef },
   ];
   openPrompts[chatJid] = prompts;
@@ -446,7 +459,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // order they were given, so it settles the oldest open prompt. A
         // turn answered only through send_message counts too. Wrong when a
         // follow-up was merged into a turn, or a turn took no prompt (#114).
-        prompts[0].answered = true;
+        // Leftover files went in one push with the stdin prompt, so they
+        // settle with it.
+        let i = 0;
+        while (i < prompts.length - 1 && prompts[i].leftover) {
+          prompts[i++].answered = true;
+        }
+        prompts[i].answered = true;
       }
       const settled = shiftAnswered(prompts);
       if (settled !== undefined) answeredCursor = settled;
@@ -591,11 +610,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         );
         return true;
       }
-      // Roll back cursor so retries can re-process these messages. That makes
-      // every piped one pending again, so the files the container never drained
-      // go: the retry would get them twice. Saved first, so a crash in between
-      // cannot leave a message neither pending nor in a file.
-      putCursorBack(chatJid, previousCursor, prompts);
+      // Roll back cursor so retries can re-process these messages, the
+      // files an earlier container left that this one drained at start-up
+      // included. That makes every piped one pending again, so the files the
+      // container never drained go: the retry would get them twice. Saved
+      // first, so a crash in between cannot leave a message neither pending
+      // nor in a file.
+      putCursorBack(chatJid, startCursor, prompts);
       discardRefusedInput(chatJid, prompts);
       logger.warn(
         { group: group.name },
@@ -610,6 +631,44 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Behind the cursor wherever the exit left it, so no rollback reaches them.
   pruneAnsweredAhead(chatJid);
   return done;
+}
+
+/**
+ * The input files waiting in the group's input dir, which its next container
+ * drains into its first prompt, as prompts of that container: oldest first,
+ * each by the range its ref names. A file the runner would skip (not a
+ * message), or one with no range to put back to (written by an older
+ * process), is none.
+ */
+function leftoverPrompts(group: RegisteredGroup): OpenPrompt[] {
+  const inputDir = path.join(resolveGroupIpcPath(group.folder), 'input');
+  let files: string[];
+  try {
+    files = fs.readdirSync(inputDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  const prompts: (OpenPrompt & { from: string })[] = [];
+  for (const name of files) {
+    const file = path.join(inputDir, name);
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      const range = typeof data.ref === 'string' ? refRange(data.ref) : null;
+      if (data.type !== 'message' || !data.text || !range) continue;
+      prompts.push({
+        cursor: range.to,
+        file,
+        ref: data.ref,
+        leftover: true,
+        from: range.from,
+      });
+    } catch {
+      // Gone meanwhile, or unreadable: the runner skips it too.
+    }
+  }
+  return prompts
+    .sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0))
+    .map(({ from: _from, ...prompt }) => prompt);
 }
 
 /**

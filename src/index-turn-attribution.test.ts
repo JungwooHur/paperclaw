@@ -930,6 +930,96 @@ describe('a container that exits with input no result answered', () => {
 });
 
 describe('an input file an earlier container left', () => {
+  /**
+   * m1's container falls back to the old rule, so its exit leaves m2's file,
+   * never drained, for the next container; m3 starts that one, which drains
+   * the file into its first prompt.
+   */
+  async function drainedLeftover(): Promise<{
+    b: FakeContainer;
+    m2: NewMessage;
+    m3: NewMessage;
+  }> {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', 'off');
+    const m2 = await userSays('m2', M2, NOW - 50_000);
+    await a.exit();
+    expect(inputFiles()).toHaveLength(1);
+    const m3 = await userSays('m3', M3, NOW - 40_000);
+    const b = containers[1];
+    expect(b.startIds).toHaveLength(2);
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    return { b, m2, m3 };
+  }
+
+  it('has it delivered again when the turn that took it is refused', async () => {
+    const { b, m3 } = await drainedLeftover();
+    await b.result(LIMIT, { inputs: b.startIds });
+    await b.exit();
+
+    const c = await containerAfterReset();
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(timesIn(c.prompt, M3)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('Both answered.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    expect(cursor()).toBe(m3.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('has it delivered again when no result answers it', async () => {
+    const { b } = await drainedLeftover();
+    // The CLI failed the start-up turn before it acknowledged anything.
+    await b.result(null, { inputs: [] });
+    await b.exit();
+
+    const c = await containerOnRetry();
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(timesIn(c.prompt, M3)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('Both answered.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    await nothingRunsAgain();
+  });
+
+  it('has it delivered again when the container dies before any result', async () => {
+    const { b } = await drainedLeftover();
+    await b.exit('error');
+
+    const c = await containerOnRetry();
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(timesIn(c.prompt, M3)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('Both answered.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    await nothingRunsAgain();
+  });
+
+  it('is settled with the start-up prompt it was drained into', async () => {
+    const { b, m3 } = await drainedLeftover();
+    await b.result('Both answered.', { inputs: b.startIds });
+    await b.exit();
+    expect(cursor()).toBe(m3.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('is settled with the start-up prompt by a runner that reports no turn', async () => {
+    const { b } = await drainedLeftover();
+    await b.result('Both answered.');
+    await userSays('m4', M4, NOW - 30_000);
+    b.drain();
+    await b.result(LIMIT);
+    await b.exit();
+
+    // The old rule: the answer settled the start-up push, leftover and all.
+    const c = await containerAfterReset();
+    expect(timesIn(c.prompt, M4)).toBe(1);
+    expect(c.prompt).not.toContain(M3);
+    expect(c.prompt).not.toContain(M2);
+    await c.exit();
+  });
+
   it('settles nothing else when the next container names it', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
