@@ -1449,6 +1449,37 @@ describe('a batch whose newest message is a slash command', () => {
     await nothingRunsAgain();
   });
 
+  it('holds nothing newer back after a failed turn that took two prompts', async () => {
+    await userSays('m1', M1, NOW - 90_000);
+    const a = containers[0];
+    await userSays('m2', M2, NOW - 80_000);
+    a.drain(); // merged into m1's turn
+    await a.result(null, { inputs: [] }); // which fails past its ack
+    await usersSay([
+      ['m3', M3, NOW - 60_000],
+      ['m4', CMD, NOW - 50_000],
+    ]);
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await userSays('m5', M4, NOW - 40_000);
+    const [later] = waitingTexts();
+    expect(timesIn(later, M4)).toBe(1);
+    const [p5] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.result('It surveys related work.', { inputs: [p5] });
+    await a.exit();
+
+    // Only the failed turn's two prompts run again.
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(CMD);
+    expect(b.prompt).not.toContain(M4);
+    await b.result('Sections 2 and 3, then.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
   it('goes back as the command alone when a put-back makes a question before it pending', async () => {
     await userSays('m0', M3, NOW - 70_000);
     const a = containers[0];
