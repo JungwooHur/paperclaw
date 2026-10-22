@@ -42,7 +42,9 @@ const LIMIT_PATTERN =
 const CLI_ERRORS = cliSentences.errors.map(errorPattern);
 // Except this head, which the CLI always follows with a status or a reason,
 // and composes in more places than any list of sentences would keep up with.
-const API_ERROR_PREFIX = 'API Error: ';
+// Without its space: the result is trimmed, and an Error with no message
+// leaves "API Error: " with nothing after it.
+const API_ERROR_PREFIX = 'API Error:';
 // "resets Oct 14, 10am (Asia/Seoul)", "resets Jan 2, 2027, 1am (Asia/Seoul)",
 // "resets 10am (Asia/Seoul)", "resets 10:30pm". The CLI adds the date only
 // when the reset is more than a day ahead, and the year only when it differs.
@@ -118,12 +120,21 @@ export function isAgentAnswer(text: string | null | undefined): boolean {
   );
 }
 
-/** The whole text a template stands for: {message} and {value} are free. */
+/**
+ * The whole text a template stands for: {message} and {value} are free, and
+ * may be empty (an Error with no message). The spaces beside a filled-in part
+ * are matched as part of it, since the text is trimmed: "API Error: " with
+ * nothing after it arrives as "API Error:".
+ */
 function errorPattern(template: string): RegExp {
-  const fixed = template
-    .split(/\{(?:message|value)\}/)
-    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  return new RegExp(`^${fixed.join('[\\s\\S]+?')}$`);
+  const parts = template.split(/\{(?:message|value)\}/);
+  const fixed = parts.map((part, i) => {
+    let text = part;
+    if (i > 0) text = text.trimStart();
+    if (i < parts.length - 1) text = text.trimEnd();
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  });
+  return new RegExp(`^${fixed.join('[\\s\\S]*?')}$`);
 }
 
 /**

@@ -99,6 +99,11 @@ function filledIn(template: string): string {
     .replaceAll('{value}', '6.2 MB');
 }
 
+/** The same template with nothing to fill in: an Error with no message. */
+function filledInEmpty(template: string): string {
+  return template.replaceAll('{message}', '').replaceAll('{value}', '');
+}
+
 describe('every error message that CLI can write as a result', () => {
   it('is read out of it whole, with the parts it fills in marked', () => {
     expect(fixture.errors.length).toBeGreaterThan(0);
@@ -112,8 +117,9 @@ describe('every error message that CLI can write as a result', () => {
 
   it('is not taken for an answer', () => {
     for (const template of fixture.errors) {
-      const text = filledIn(template);
-      expect(isAgentAnswer(text), text).toBe(false);
+      for (const text of [filledIn(template), filledInEmpty(template)]) {
+        expect(isAgentAnswer(text), text).toBe(false);
+      }
     }
   });
 

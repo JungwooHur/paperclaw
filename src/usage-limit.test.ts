@@ -188,6 +188,7 @@ describe('isAgentAnswer', () => {
       '   ',
       'API Error: 500 {"type":"error","error":{"type":"api_error"}}',
       'API Error: Rate limit reached',
+      'API Error: ',
       '  Request timed out\n',
     ]) {
       expect(isAgentAnswer(text), text).toBe(false);
