@@ -26,7 +26,7 @@ vi.mock('./qa-followup.js', () => ({
   worthFilingCheck: () => false,
 }));
 
-import { IDLE_TIMEOUT } from './config.js';
+import { ASSISTANT_NAME, IDLE_TIMEOUT } from './config.js';
 import {
   ContainerOutput,
   ContainerTurn,
@@ -113,7 +113,11 @@ const channel: Channel = {
   },
 };
 const { queue } = _schedulerDependencies();
-const inputDir = path.join(dataDir, 'ipc', MAIN_GROUP.folder, 'input');
+/** The input dir of the group under test. */
+function groupInputDir(group: RegisteredGroup): string {
+  return path.join(dataDir, 'ipc', group.folder, 'input');
+}
+let inputDir = groupInputDir(MAIN_GROUP);
 
 /**
  * A message container as the runner behaves: it drains the input files at
@@ -1297,6 +1301,52 @@ describe('a restart while a container runs', () => {
 describe('a batch whose newest message is a slash command', () => {
   // The router sends such a batch as the command alone.
   const CMD = '/probe-skill run it';
+
+  describe('in a group that needs the trigger', () => {
+    const TEAM: RegisteredGroup = {
+      name: 'Team',
+      folder: 'team',
+      trigger: `@${ASSISTANT_NAME}`,
+      added_at: '2026-10-01T00:00:00.000Z',
+      requiresTrigger: true,
+    };
+    beforeEach(() => {
+      _setRegisteredGroups({ [CHAT]: TEAM });
+      inputDir = groupInputDir(TEAM);
+    });
+    afterEach(() => {
+      inputDir = groupInputDir(MAIN_GROUP);
+    });
+
+    it('does not make a prompt of chatter before the command', async () => {
+      // Context, not a request: sent alone it would draw a reply.
+      await usersSay([
+        ['m1', 'lunch at noon?', NOW - 60_000],
+        ['m2', `@${ASSISTANT_NAME} ${CMD}`, NOW - 50_000],
+      ]);
+      const a = containers[0];
+      expect(a.prompt).toBe(CMD);
+      await a.result('The skill ran.', { inputs: [a.startIds[0]] });
+      await a.exit();
+      await nothingRunsAgain();
+    });
+
+    it('runs a triggered question before the command', async () => {
+      await usersSay([
+        ['m1', `@${ASSISTANT_NAME} ${M1}`, NOW - 60_000],
+        ['m2', `@${ASSISTANT_NAME} ${CMD}`, NOW - 50_000],
+      ]);
+      const a = containers[0];
+      expect(timesIn(a.prompt, M1)).toBe(1);
+      expect(a.prompt).not.toContain(CMD);
+      await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+      expect(waitingTexts()).toEqual([CMD]);
+      const [command] = a.drain();
+      await a.result('The skill ran.', { inputs: [command] });
+      await a.exit();
+      await nothingRunsAgain();
+    });
+  });
 
   it('runs the messages before it first, then the command as its own prompt', async () => {
     await usersSay([

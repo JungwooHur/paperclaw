@@ -352,7 +352,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   // A command at the end of the batch waits for a prompt of its own.
-  const delivery = nextDelivery(pending);
+  const delivery = nextDelivery(pending, group);
   const prompt = formatMessages(delivery.messages, resentIn(chatJid));
 
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -925,7 +925,7 @@ function pollNewMessages(): void {
       // container took them at start-up, before this poll saw them.
       if (pending.messages.length === 0) continue;
 
-      deliverMessages(chatJid, channel, pending);
+      deliverMessages(chatJid, channel, group, pending);
     }
   }
 }
@@ -951,9 +951,10 @@ function startsAgent(group: RegisteredGroup, messages: NewMessage[]): boolean {
 function deliverMessages(
   chatJid: string,
   channel: Channel,
+  group: RegisteredGroup,
   pending: Pending,
 ): void {
-  const delivery = nextDelivery(pending);
+  const delivery = nextDelivery(pending, group);
   if (
     !pipeToActiveContainer(chatJid, channel, delivery.messages, delivery.end)
   ) {
@@ -974,7 +975,7 @@ function deliverHeldBack(
   const pending = pendingMessages(chatJid);
   if (pending.messages.length === 0) return;
   if (!startsAgent(group, pending.messages)) return;
-  const delivery = nextDelivery(pending);
+  const delivery = nextDelivery(pending, group);
   pipeToActiveContainer(chatJid, channel, delivery.messages, delivery.end);
 }
 
@@ -1083,13 +1084,20 @@ function pendingMessages(chatJid: string): Pending {
  * The pending messages the next prompt carries (firstPrompt), and where
  * delivering them moves the cursor: past the newest message they reach,
  * answered or not, so an answered range among them is behind it. Not past a
- * command held back for a prompt of its own, which stays pending.
+ * command held back for a prompt of its own, which stays pending. In a group
+ * that needs the trigger, messages before a command that would not start the
+ * agent are context, not a request: sent alone they would draw a reply, so
+ * the batch goes whole, as the command alone, as before.
  */
-function nextDelivery(pending: Pending): {
+function nextDelivery(
+  pending: Pending,
+  group: RegisteredGroup,
+): {
   messages: NewMessage[];
   end: string;
 } {
-  const messages = firstPrompt(pending.messages);
+  const first = firstPrompt(pending.messages);
+  const messages = startsAgent(group, first) ? first : pending.messages;
   const held = pending.messages[messages.length];
   const reached = held
     ? pending.all.filter((m) => m.timestamp < held.timestamp)
@@ -1350,7 +1358,7 @@ function recoverPendingMessages(): void {
       );
       const channel = findChannel(channels, chatJid);
       if (channel && startsAgent(group, pending.messages)) {
-        deliverMessages(chatJid, channel, pending);
+        deliverMessages(chatJid, channel, group, pending);
       } else {
         queue.enqueueMessageCheck(chatJid);
       }
