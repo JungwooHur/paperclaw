@@ -1265,6 +1265,36 @@ describe('an input file an earlier container left', () => {
   });
 });
 
+describe('a router_state value of the wrong shape', () => {
+  // Only a hand edit or a format this process does not know writes one. It
+  // reads as missing, instead of throwing at every start-up.
+  it.each([
+    ['answered_ahead', 'null'],
+    ['answered_ahead', `{"${CHAT}": {}}`],
+    ['answered_ahead', `{"${CHAT}": [["a"]]}`],
+    ['turn_open_from', 'null'],
+    ['turn_open_from', `{"${CHAT}": 5}`],
+    ['held_command', '[]'],
+    ['held_command', `{"${CHAT}": null}`],
+    ['usage_limit_refused_turn', 'null'],
+    ['usage_limit_refused_turn', `{"${CHAT}": {"session": "session-old"}}`],
+    ['turn_put_back', '"main"'],
+    ['usage_limit_refused_input', `{"${CHAT}": [null]}`],
+  ])('starts with %s = %s as if it were missing', async (key, value) => {
+    storedBeforeStart([['m1', M1, NOW - 60_000]]);
+    setRouterState(key, value);
+    restart();
+    _recoverPendingMessages();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const a = containers[0];
+    expect(timesIn(a.prompt, M1)).toBe(1);
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+});
+
 describe('a restart while a container runs', () => {
   it('delivers again a follow-up the container took and no turn answered', async () => {
     const m1 = await userSays('m1', M1, NOW - 60_000);

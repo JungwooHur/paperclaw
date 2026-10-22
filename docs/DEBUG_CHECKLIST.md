@@ -115,6 +115,7 @@ grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
 # Which messages are pending, and why (docs/SPEC.md "Turn Attribution").
 # Timestamps are message cursors, and a range [from, to] holds the messages
 # after its first cursor, up to its second. JSON per chat, except the first.
+# A value of another shape (a hand edit) reads as missing, logged once.
 #   `last_timestamp`             the newest message the message loop has seen
 #   `last_agent_timestamp`       the message cursor: what is after it is pending
 #   `answered_ahead`             ranges a turn already answered after the oldest
@@ -135,7 +136,7 @@ grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
 #                                it, nothing newer is delivered first. Dropped
 #                                once a run ends with the cursor past it
 sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key IN ('last_timestamp', 'last_agent_timestamp', 'answered_ahead', 'turn_open_from', 'turn_put_back', 'held_command');"
-grep -E 'putting it back|Restart stopped a container|not putting it back again' logs/paperclaw.log | tail -5
+grep -E 'putting it back|Restart stopped a container|not putting it back again|router_state value of the wrong shape' logs/paperclaw.log | tail -5
 
 # Check lastAgentTimestamp vs latest message timestamp
 sqlite3 store/messages.db "SELECT chat_jid, MAX(timestamp) as latest FROM messages GROUP BY chat_jid ORDER BY latest DESC LIMIT 5;"

@@ -1218,12 +1218,86 @@ function nextDelivery(
   return { messages, end };
 }
 
-function readHeldCommands(): Record<string, string> {
+// router_state keys already warned about this process, once each.
+const malformedStateKeys = new Set<string>();
+
+/**
+ * A per-group router_state record, without the entries `valid` rejects. A
+ * value that is no JSON object, or an entry of another shape (a hand edit,
+ * or a format this process does not know), reads as missing instead of
+ * throwing at start-up or in delivery.
+ */
+function readGroupRecord<T>(
+  key: string,
+  valid: (value: unknown) => value is T,
+): Record<string, T> {
+  let parsed: unknown;
   try {
-    return JSON.parse(getRouterState(HELD_COMMAND_KEY) || '{}');
+    parsed = JSON.parse(getRouterState(key) || '{}');
   } catch {
-    return {};
+    parsed = undefined;
   }
+  const record: Record<string, T> = {};
+  const isRecord =
+    typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed);
+  let malformed = !isRecord;
+  for (const [chatJid, value] of isRecord
+    ? Object.entries(parsed as object)
+    : []) {
+    if (valid(value)) record[chatJid] = value;
+    else malformed = true;
+  }
+  if (malformed && !malformedStateKeys.has(key)) {
+    malformedStateKeys.add(key);
+    logger.warn(
+      { key },
+      'router_state value of the wrong shape, read without it',
+    );
+  }
+  return record;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+function isRanges(value: unknown): value is Range[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (range) =>
+        Array.isArray(range) && range.length === 2 && range.every(isString),
+    )
+  );
+}
+
+function isRefusedTurn(
+  value: unknown,
+): value is { session: string; ranges: Range[] } {
+  const turn = value as { session?: unknown; ranges?: unknown } | null;
+  return (
+    typeof turn === 'object' &&
+    turn !== null &&
+    isString(turn.session) &&
+    isRanges(turn.ranges)
+  );
+}
+
+function isPrompts(value: unknown): value is OpenPrompt[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (prompt: { cursor?: unknown; file?: unknown } | null) =>
+        typeof prompt === 'object' &&
+        prompt !== null &&
+        isString(prompt.cursor) &&
+        (prompt.file === undefined || isString(prompt.file)),
+    )
+  );
+}
+
+function readHeldCommands(): Record<string, string> {
+  return readGroupRecord(HELD_COMMAND_KEY, isString);
 }
 
 /**
@@ -1266,11 +1340,7 @@ function pruneHeldCommand(chatJid: string): void {
 }
 
 function readAnsweredAhead(): Record<string, Range[]> {
-  try {
-    return JSON.parse(getRouterState(ANSWERED_AHEAD_KEY) || '{}');
-  } catch {
-    return {};
-  }
+  return readGroupRecord(ANSWERED_AHEAD_KEY, isRanges);
 }
 
 /** Persists a group's answered ranges past its cursor (none: forget it). */
@@ -1314,11 +1384,7 @@ function putCursorBack(
 }
 
 function readOpenFrom(): Record<string, string> {
-  try {
-    return JSON.parse(getRouterState(OPEN_FROM_KEY) || '{}');
-  } catch {
-    return {};
-  }
+  return readGroupRecord(OPEN_FROM_KEY, isString);
 }
 
 /** Persists where a restart puts the group's cursor back to (undefined: none). */
@@ -1354,11 +1420,7 @@ function readRefusedTurns(): Record<
   string,
   { session: string; ranges: Range[] }
 > {
-  try {
-    return JSON.parse(getRouterState(REFUSED_TURN_KEY) || '{}');
-  } catch {
-    return {};
-  }
+  return readGroupRecord(REFUSED_TURN_KEY, isRefusedTurn);
 }
 
 /**
@@ -1423,11 +1485,7 @@ function pruneAnsweredAhead(chatJid: string): void {
 }
 
 function readPutBack(): Record<string, string> {
-  try {
-    return JSON.parse(getRouterState(PUT_BACK_KEY) || '{}');
-  } catch {
-    return {};
-  }
+  return readGroupRecord(PUT_BACK_KEY, isString);
 }
 
 /** Persists where a group's exit put back to (undefined: forget the group). */
@@ -1448,11 +1506,7 @@ function rememberRefusedInput(chatJid: string, prompts: OpenPrompt[]): void {
 }
 
 function readRefusedInput(): Record<string, OpenPrompt[]> {
-  try {
-    return JSON.parse(getRouterState(REFUSED_INPUT_KEY) || '{}');
-  } catch {
-    return {};
-  }
+  return readGroupRecord(REFUSED_INPUT_KEY, isPrompts);
 }
 
 /**
