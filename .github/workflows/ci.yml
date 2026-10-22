@@ -21,6 +21,12 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+      # An unedited group copy follows the runner at the next restart, and the
+      # container compiles it under `set -e`: a type error stops every container.
+      - name: Typecheck agent runner
+        working-directory: container/agent-runner
+        run: npm ci --no-audit --no-fund && npx tsc --noEmit
+
       - name: Tests
         run: npx vitest run
 

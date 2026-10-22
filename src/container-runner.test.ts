@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
+import path from 'path';
 import { PassThrough } from 'stream';
 
 // Sentinel markers must match container-runner.ts
@@ -55,6 +56,13 @@ vi.mock('./mount-security.js', () => ({
   validateAdditionalMounts: vi.fn(() => []),
 }));
 
+// The runner copy has its own suite (runner-seed.test.ts); here only the calls.
+vi.mock('./runner-seed.js', () => ({
+  adoptRunnerCopies: vi.fn(() => []),
+  hostRunnerBundle: vi.fn(() => '/pinned/agent-runner-src'),
+  refreshRunnerCopy: vi.fn(() => 'current'),
+}));
+
 // Create a controllable fake ChildProcess
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {
@@ -97,7 +105,17 @@ import {
   runContainerAgent,
   ContainerOutput,
 } from './container-runner.js';
+import {
+  adoptRunnerCopies,
+  hostRunnerBundle,
+  refreshRunnerCopy,
+} from './runner-seed.js';
 import type { RegisteredGroup } from './types.js';
+
+// Taken now, before any test clears the mocks: importing the module is when
+// the host starts.
+const runnerBundleCallsAtStart = [...vi.mocked(hostRunnerBundle).mock.calls];
+const adoptCallsAtStart = [...vi.mocked(adoptRunnerCopies).mock.calls];
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
@@ -346,5 +364,87 @@ describe('container-runner agent model', () => {
     // container's entrypoint as an argument instead of setting it.
     const image = args.indexOf('paperclaw-agent:latest');
     expect(args.lastIndexOf('-e')).toBeLessThan(image);
+  });
+});
+
+describe('container-runner agent-runner copy', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+    vi.mocked(refreshRunnerCopy).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('brings the group copy up to date before mounting it as the runner source', async () => {
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+
+    const copy =
+      '/tmp/paperclaw-test-data/sessions/test-group/agent-runner-src';
+    expect(refreshRunnerCopy).toHaveBeenCalledWith(
+      '/pinned/agent-runner-src',
+      copy,
+      'test-group',
+    );
+    const args = vi.mocked(spawn).mock.calls[0][1] as string[];
+    expect(args).toContain(`${copy}:/app/src`);
+    // Before the container is spawned, so this start compiles the result.
+    expect(
+      vi.mocked(refreshRunnerCopy).mock.invocationCallOrder[0],
+    ).toBeLessThan(vi.mocked(spawn).mock.invocationCallOrder[0]);
+  });
+
+  // A build while the host runs restages the runner; read at each start, it
+  // reached groups before the restart that runs the host built with it.
+  it('settles the runner once, when the host starts, not at each container start', async () => {
+    expect(runnerBundleCallsAtStart).toEqual([
+      [
+        expect.stringMatching(/container-runner\.ts$/),
+        `${process.cwd()}/container/agent-runner/src`,
+        '/tmp/paperclaw-test-data/runner-bundle',
+      ],
+    ]);
+    // Copies made before markers existed are adopted now, not at each group's
+    // next container start, which may come after the next runner change.
+    expect(adoptCallsAtStart).toEqual([
+      ['/pinned/agent-runner-src', '/tmp/paperclaw-test-data/sessions'],
+    ]);
+    vi.mocked(hostRunnerBundle).mockClear();
+
+    for (let i = 0; i < 2; i++) {
+      fakeProc = createFakeProcess();
+      const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+      fakeProc.emit('close', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      await resultPromise;
+    }
+
+    expect(hostRunnerBundle).not.toHaveBeenCalled();
+    expect(refreshRunnerCopy).toHaveBeenCalledTimes(2);
+  });
+
+  // The SPEC tree is where a reader looks up which runner groups get. Naming
+  // only the build's staged copy sends them to compare a group's copy with one
+  // a build may have replaced since the host started.
+  it('pins the runner where the SPEC directory tree says, under data/', async () => {
+    const pin = runnerBundleCallsAtStart[0][2];
+    const name = path.relative('/tmp/paperclaw-test-data', pin);
+    const { readFileSync } = await vi.importActual<typeof import('fs')>('fs');
+    const spec = new URL('../docs/SPEC.md', import.meta.url);
+    const lines = readFileSync(spec, 'utf-8').split('\n');
+    const start = lines.findIndex((l) => l.startsWith('├── data/'));
+    const end = lines.findIndex((l, i) => i > start && /^[├└]── /.test(l));
+
+    const data = lines.slice(start + 1, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(name).not.toMatch(/^\.\.|\//);
+    expect(data.some((l) => l.includes(`── ${name}/`))).toBe(true);
   });
 });

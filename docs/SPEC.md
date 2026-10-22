@@ -126,6 +126,7 @@ paperclaw/
 │       └── agent-browser.md       # Browser automation skill
 │
 ├── dist/                          # Compiled JavaScript (gitignored)
+│   └── agent-runner-src/          # The runner staged by the same build; a host pins it to data/runner-bundle/ when it starts
 │
 ├── .claude/
 │   └── skills/
@@ -155,6 +156,7 @@ paperclaw/
 │
 ├── data/                          # Application state (gitignored)
 │   ├── sessions/                  # Per-group session data (.claude/ dirs with JSONL transcripts)
+│   ├── runner-bundle/             # The runner this host hands to groups, pinned when it started
 │   ├── env/env                    # Copy of .env for container mounting
 │   └── ipc/                       # Container IPC (messages/, tasks/)
 │
@@ -309,9 +311,29 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 3. Claude continues the conversation with full context
 4. Session transcripts are stored as JSONL files in `data/sessions/{group}/.claude/`
 
-### Per-Group Copies Are Seeded Once
+### Per-Group Copies: Settings and Runner
 
-`data/sessions/{group}/.claude/settings.json` and `data/sessions/{group}/agent-runner-src/` are created the first time a group's container starts, and are never refreshed. A change to the settings defaults in `src/container-runner.ts`, or to `container/agent-runner/src/`, therefore reaches new groups only. To apply one to an existing group, delete that group's copy and it is recreated on the next run; edits the agent made to its copy are lost. A setting that must reach every group is passed with `-e` on the container command instead, as the model pin is.
+Each group gets two copies under `data/sessions/{group}/` the first time its container starts, and they are kept differently.
+
+**`.claude/settings.json` is seeded once** and never refreshed. A change to the settings defaults in `src/container-runner.ts` therefore reaches new groups only. To apply one to an existing group, delete that group's `settings.json` and it is recreated on the next run. A setting that must reach every group is passed with `-e` on the container command instead, as the model pin is.
+
+**`agent-runner-src/` follows the bundled runner unless the group edited it.** The container compiles this copy, mounted writable at `/app/src`, not `container/agent-runner/src/`, so an agent can change its own runner without touching other groups. The bundle is the runner the host's own build staged: `npm run build` copies `container/agent-runner/src/` to `dist/agent-runner-src/` (`src/stage-runner.ts`), and a host running from `dist/` refreshes groups from that copy as it was when the host started (below). `npm run dev` runs the sources and refreshes from the checkout. Beside the copy, outside the mount, `agent-runner-src.seed.json` records a content hash of the copy as it was installed, taken from the copy and not the bundle, so a bundle that changes during the copy cannot make an unedited copy look edited. The hash covers the sorted relative paths and their contents, so mtimes and readdir order do not change it. At every container start, `src/runner-seed.ts` compares the copy with the bundle and the marker:
+
+| The copy | What happens |
+|----------|--------------|
+| is missing or empty | the bundle is copied in and the marker written. An empty directory is what the container runtime leaves after mounting a copy that did not exist |
+| equals the bundle | kept; a missing or stale marker is rewritten (this adopts a copy seeded before markers existed). The host also adopts every unmarked copy equal to the bundle when it starts, so a copy is not left unmarked until its group's next container start, which may come after the next runner change |
+| equals the marker, and the bundle changed | replaced by the bundle, marker updated, logged at info with the group and both short hashes |
+| differs from the marker | kept, since it was edited in place. A WARN names the group whenever the bundle has changed since seeding |
+| differs from the bundle and has no marker | kept with a WARN, like an edited copy, because an old seed cannot be told from an edit |
+
+The replaced copy is removed after the swap, so there is no older copy to fall back to. A replacement is copied into a sibling directory and swapped in by rename, so a failure never leaves a half-copied tree. A replaced copy that cannot be removed afterwards (a directory made read-only inside the container, say) is left beside the copy with a WARN naming its path, for the owner to remove by hand; it never blocks a later refresh. A failure to hash, copy or swap is logged as an error, and the container starts with the copy as it is.
+
+A runner change therefore takes effect like a host change: with the restart. The build the restart runs (`ExecStartPre=`) stages it, and a host running from `dist/` copies the staged runner to `data/runner-bundle/` when it starts and refreshes groups only from that copy, at each unedited group's next container start. A `git pull`, or a build while the host runs (setup, `/update`, a recipe that builds before it rebuilds the image), reaches no group before the next restart. The copy is compared with the staged runner after it is taken and taken again if a build swapped it meanwhile, so it never holds half of two versions. When nothing is staged, or no whole copy can be taken, it is removed: each container start then logs a WARN and keeps the group's copy as it is, never falling back to the checkout or to an earlier host's copy.
+
+The build stages the runner only after tsc succeeded, and a failed tsc writes nothing (`noEmitOnError`), so a failed tsc leaves the previous host and the previous runner in place together. Staging refuses a runner that does not parse (an unresolved merge conflict, say) and fails the build. That comes after tsc wrote the new host, so the new host then runs beside the previous runner. Either way, at startup a staged copy older than `container/agent-runner/src/` is named in a WARN, as a `dist/` older than `src/` is, and the cause is at the start of `logs/paperclaw.log`, where tsc and the staging step both print. The check is syntax only, because type-checking needs the runner's packages, which only the image has. The image compiles the runner at every container start, under `set -e`, so a runner that parses but does not compile is still staged, and after the restart every container of those groups exits at start. **Rebuild the image with `./container/build.sh` before the restart when a change touches `container/Dockerfile` or anything under `container/agent-runner/` outside `src/`** (`package.json` for a new package, `tsconfig.json`): the image bakes those in, and a runner that needs them fails the same way until it is rebuilt. `/update` does this.
+
+**To take the bundled runner after an edit**, delete `data/sessions/{group}/agent-runner-src/`. The next start seeds it again, and the edits are lost. The WARN says the same.
 
 ---
 
