@@ -203,6 +203,14 @@ async function containerAfterReset(): Promise<FakeContainer> {
   return containers[before];
 }
 
+/** The queue's retry of a run that put messages back. */
+async function containerOnRetry(): Promise<FakeContainer> {
+  const before = containers.length;
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(containers).toHaveLength(before + 1);
+  return containers[before];
+}
+
 /** No container starts for a while: nothing was put back to run again. */
 async function nothingRunsAgain(): Promise<void> {
   const before = containers.length;
@@ -336,6 +344,95 @@ describe('a result that names the inputs it answered', () => {
     expect(timesIn(b.prompt, M3)).toBe(1);
     expect(b.prompt).not.toContain(M2);
     expect(b.prompt).not.toContain(M1);
+    await b.exit();
+  });
+});
+
+describe('a container that exits with input no result answered', () => {
+  it('has it delivered again, once', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain(); // taken, but no result ever answers it
+    await a.exit();
+
+    expect(cursor()).toBe(m1.timestamp);
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('has it delivered again after an error, past an answer that went out', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    await a.exit('error');
+
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: [b.startIds[0]] });
+    await b.exit();
+  });
+
+  it('runs an answered follow-up again behind an unanswered prompt (until #114 slice 3)', async () => {
+    // A duplicate, never a loss: the cursor goes back to the oldest prompt
+    // no result answered, and everything after it is pending again.
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    // The CLI failed the turn before it acknowledged anything.
+    await a.result(null, { inputs: [] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    await b.result('Both answered.', { inputs: [b.startIds[0]] });
+    await b.exit();
+  });
+
+  it('leaves a follow-up it never drained to the next container', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    const m2 = await userSays('m2', M2, NOW - 40_000); // never drained
+    await a.exit();
+
+    expect(cursor()).toBe(m2.timestamp);
+    expect(inputFiles()).toHaveLength(1);
+    await nothingRunsAgain();
+
+    await userSays('m3', M3, NOW - 20_000);
+    const b = containers[1];
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    await b.result('Both answered.', { inputs: b.startIds });
+    await b.exit();
+  });
+
+  it('drops the file of a follow-up the put-back made pending', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain(); // taken, never answered
+    await userSays('m3', M3, NOW - 20_000); // never drained
+    await a.exit();
+
+    expect(inputFiles()).toEqual([]);
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    await b.result('Both answered.', { inputs: b.startIds });
     await b.exit();
   });
 });

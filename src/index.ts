@@ -125,6 +125,23 @@ function markAnswered(prompts: OpenPrompt[], inputs: string[]): string[] {
   }
   return unknown;
 }
+
+/**
+ * Where a container's exit puts the cursor back to: the start of the oldest
+ * prompt it took that no result answered. Not one whose file is still on
+ * disk: the container never took it, and the group's next container drains
+ * it, so putting it back would deliver it twice. Call only once the container
+ * has exited, so that file can no longer go.
+ */
+function unansweredFrom(prompts: OpenPrompt[]): string | undefined {
+  for (const prompt of prompts) {
+    if (prompt.answered) continue;
+    if (prompt.file && fs.existsSync(prompt.file)) continue;
+    const range = prompt.ref ? refRange(prompt.ref) : null;
+    if (range) return range.from;
+  }
+  return undefined;
+}
 // Per group with a message container running: its open prompts, oldest first.
 const openPrompts: Record<string, OpenPrompt[]> = {};
 // Groups whose message container is closing on a usage-limit refusal, until it
@@ -457,6 +474,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       'Usage limit reached, messages held until the reset',
     );
     return true;
+  }
+
+  if (attribution === 'on') {
+    // Every result said what it answered, so the exit knows what was not:
+    // a prompt the container took and no result answered goes back, on an
+    // error or not, and the queue retries it. A duplicate beats a silent
+    // loss. Whatever came after it goes back too, answered or not: that
+    // reruns an answered follow-up behind an unanswered prompt (#114).
+    const from = unansweredFrom(prompts);
+    if (from === undefined) return true;
+    lastAgentTimestamp[chatJid] = from;
+    saveState();
+    discardRefusedInput(chatJid, prompts);
+    logger.warn(
+      { group: group.name, error: output === 'error' || hadError },
+      'Container exited with input no result answered, putting it back for retry',
+    );
+    return false;
   }
 
   if (output === 'error' || hadError) {
