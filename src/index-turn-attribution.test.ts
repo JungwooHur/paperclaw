@@ -341,6 +341,26 @@ describe('a result that names the inputs it answered', () => {
     await b.exit();
   });
 
+  it('reads the turn of a textless first result, before any text came', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    // Answered through send_message alone: the container's first result.
+    await a.result(null, { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await userSays('m3', M3, NOW - 20_000);
+    const [p3] = a.drain();
+    await a.result(LIMIT, { inputs: [p3] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    expect(b.prompt).not.toContain(M1);
+    await b.exit();
+  });
+
   it('puts back only what no turn answered when a refusal follows a merged follow-up', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
