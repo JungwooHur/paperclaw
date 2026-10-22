@@ -25,6 +25,7 @@ import { ContainerOutput, runContainerAgent } from './container-runner.js';
 import { cleanupOrphans } from './container-runtime.js';
 import {
   _initTestDatabase,
+  createTask,
   getAllSessions,
   getRouterState,
   setSession,
@@ -38,9 +39,14 @@ import {
   _processGroupMessages,
   _recoverPendingMessages,
   _restoreStartupState,
+  _schedulerDependencies,
   _setChannels,
   _setRegisteredGroups,
 } from './index.js';
+import {
+  _resetSchedulerLoopForTests,
+  startSchedulerLoop,
+} from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { recordUsageLimit, usageLimitHeldUntil } from './usage-limit.js';
 
@@ -438,6 +444,65 @@ describe('an answer inside an open window', () => {
     await answeredInsideWindow('API Error: 500 {"type":"error"}');
     expect(usageLimitHeldUntil()).not.toBeNull();
     expect(enqueueMessageCheck).not.toHaveBeenCalled();
+  });
+});
+
+describe('the scheduler, started as main() starts it', () => {
+  afterEach(() => {
+    _resetSchedulerLoopForTests();
+  });
+
+  /**
+   * Starts the scheduler with main()'s dependencies and runs one task due
+   * now, whose container calls `run` with a way to end a turn on a result.
+   */
+  async function runScheduledTask(
+    run: (turn: (result: string) => Promise<void>) => Promise<void>,
+  ): Promise<void> {
+    createTask({
+      id: 'nightly',
+      group_folder: 'main',
+      chat_jid: CHAT,
+      prompt: 'nightly batch',
+      schedule_type: 'cron',
+      schedule_value: '30 23 * * *',
+      context_mode: 'isolated',
+      next_run: new Date(NOW - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-10-01T00:00:00.000Z',
+    });
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        await run(async (result) => {
+          await onOutput?.({
+            status: 'success',
+            result,
+            newSessionId: 'session-task',
+          });
+        });
+        return {
+          status: 'success',
+          result: null,
+          newSessionId: 'session-task',
+        };
+      },
+    );
+    _resetSchedulerLoopForTests();
+    startSchedulerLoop(_schedulerDependencies());
+    await vi.advanceTimersByTimeAsync(10);
+  }
+
+  it('runs the held messages at once when a scheduled answer closes the window', async () => {
+    await runScheduledTask(async (turn) => {
+      // A message is refused while the run is under way, and held...
+      recordUsageLimit(LIMIT);
+      userSays('m1', 'translate the new paper', NOW - 30_000);
+      // ...and then the run's own request gets through.
+      await turn('Batch done: 3 papers uploaded.');
+    });
+
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
   });
 });
 

@@ -42,7 +42,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import { SchedulerDependencies, startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logHeartbeat } from './liveness-log.js';
 import { logger } from './logger.js';
@@ -738,6 +738,27 @@ function restoreStartupState(): void {
   discardRefusedInputAfterRestart();
 }
 
+/** What the scheduler is started with: this process's queue and channels. */
+function schedulerDependencies(): SchedulerDependencies {
+  return {
+    registeredGroups: () => registeredGroups,
+    getSessions: () => sessions,
+    queue,
+    onProcess: (groupJid, proc, containerName, groupFolder) =>
+      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    sendMessage: async (jid, rawText) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) {
+        logger.warn({ jid }, 'No channel owns JID, cannot send message');
+        return;
+      }
+      const text = formatOutbound(rawText);
+      if (text) await channel.sendMessage(jid, text);
+    },
+    onUsageLimitLifted: usageLimitLifted,
+  };
+}
+
 /** @internal - exported for testing */
 export {
   loadState as _loadState,
@@ -745,6 +766,7 @@ export {
   processGroupMessages as _processGroupMessages,
   recoverPendingMessages as _recoverPendingMessages,
   restoreStartupState as _restoreStartupState,
+  schedulerDependencies as _schedulerDependencies,
 };
 
 async function main(): Promise<void> {
@@ -786,23 +808,7 @@ async function main(): Promise<void> {
   await whatsapp.connect();
 
   // Start subsystems (independently of connection handler)
-  startSchedulerLoop({
-    registeredGroups: () => registeredGroups,
-    getSessions: () => sessions,
-    queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) =>
-      queue.registerProcess(groupJid, proc, containerName, groupFolder),
-    sendMessage: async (jid, rawText) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send message');
-        return;
-      }
-      const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
-    },
-    onUsageLimitLifted: usageLimitLifted,
-  });
+  startSchedulerLoop(schedulerDependencies());
   startIpcWatcher({
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
