@@ -151,6 +151,12 @@ const closingOnRefusal = new Set<string>();
 // refusal put back, so a restart before the container exits can still drop
 // the files it left. Cleared once the files are dealt with.
 const REFUSED_INPUT_KEY = 'usage_limit_refused_input';
+// router_state key: per group, the cursor a container's exit last put back to
+// for a prompt no result answered, until an exit leaves nothing unanswered.
+// When the next exit would put back to the same cursor, the retry failed the
+// same way: that prompt is not put back a third time. Persisted, so a restart
+// in between does not buy it another run.
+const PUT_BACK_KEY = 'turn_put_back';
 
 /**
  * Files a paper Q&A right after the answer goes out, so it does not wait for the
@@ -483,15 +489,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // loss. Whatever came after it goes back too, answered or not: that
     // reruns an answered follow-up behind an unanswered prompt (#114).
     const from = unansweredFrom(prompts);
-    if (from === undefined) return true;
-    lastAgentTimestamp[chatJid] = from;
-    saveState();
-    discardRefusedInput(chatJid, prompts);
-    logger.warn(
-      { group: group.name, error: output === 'error' || hadError },
-      'Container exited with input no result answered, putting it back for retry',
+    const putBack = readPutBack();
+    if (from === undefined) {
+      if (chatJid in putBack) rememberPutBack(chatJid, undefined);
+      return true;
+    }
+    if (putBack[chatJid] !== from) {
+      lastAgentTimestamp[chatJid] = from;
+      saveState();
+      rememberPutBack(chatJid, from);
+      discardRefusedInput(chatJid, prompts);
+      logger.warn(
+        { group: group.name, error: output === 'error' || hadError },
+        'Container exited with input no result answered, putting it back for retry',
+      );
+      return false;
+    }
+    // Put back once already, and its retry answered it neither: a prompt
+    // that fails every time would otherwise run on, and take every later
+    // message along. It ends as it did before attribution, below.
+    logger.error(
+      { group: group.name, from },
+      'Input no result answered again after it was put back, not putting it back again',
     );
-    return false;
   }
 
   if (output === 'error' || hadError) {
@@ -814,6 +834,22 @@ function discardRefusedInput(chatJid: string, prompts: OpenPrompt[]): void {
       logger.warn({ chatJid, err }, 'Could not discard refused input file');
     }
   }
+}
+
+function readPutBack(): Record<string, string> {
+  try {
+    return JSON.parse(getRouterState(PUT_BACK_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+/** Persists where a group's exit put back to (undefined: forget the group). */
+function rememberPutBack(chatJid: string, from: string | undefined): void {
+  const all = readPutBack();
+  if (from === undefined) delete all[chatJid];
+  else all[chatJid] = from;
+  setRouterState(PUT_BACK_KEY, JSON.stringify(all));
 }
 
 /** Persists the piped prompts a refusal put back (none: forget the group). */
