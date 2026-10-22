@@ -186,6 +186,18 @@ describe('refreshRunnerCopy', () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
+  it('copies a relative symlink in the bundle as it is', () => {
+    write(bundle, { 'lib/a.ts': 'a\n' });
+    fs.symlinkSync('lib/a.ts', path.join(bundle, 'alias.ts'));
+
+    expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('seeded');
+
+    // Relative still, so it resolves inside the container's mount too.
+    expect(fs.readlinkSync(path.join(copy, 'alias.ts'))).toBe('lib/a.ts');
+    expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('current');
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it('drops files from a replaced copy that the bundle no longer has', () => {
     write(bundle, { 'old-tool.ts': 'gone soon\n' });
     refreshRunnerCopy(bundle, copy, GROUP);

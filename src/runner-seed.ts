@@ -130,7 +130,10 @@ function installBundle(bundleDir: string, copyDir: string): string {
   fs.rmSync(prev, { recursive: true, force: true });
   let installed: string;
   try {
-    fs.cpSync(bundleDir, next, { recursive: true });
+    // verbatimSymlinks: by default a relative link is rewritten to an
+    // absolute host path, which does not exist inside the container and
+    // hashes unlike the bundle's link.
+    fs.cpSync(bundleDir, next, { recursive: true, verbatimSymlinks: true });
     installed = hashTree(next);
   } catch (err) {
     fs.rmSync(next, { recursive: true, force: true });
