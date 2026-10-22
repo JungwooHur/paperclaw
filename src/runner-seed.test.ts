@@ -11,6 +11,7 @@ vi.mock('./logger.js', () => ({
 
 import { logger } from './logger.js';
 import {
+  adoptRunnerCopies,
   hashTree,
   hostRunnerBundle,
   pinRunnerBundle,
@@ -447,6 +448,50 @@ describe('refreshRunnerCopy', () => {
  * builds before it rebuilds the image), and groups must not take that runner
  * before the restart that also runs the host built with it.
  */
+describe('adoptRunnerCopies', () => {
+  it('adopts an unmarked copy equal to the bundle when the host starts, before any container does', () => {
+    // A copy seeded before markers existed. If the first runner change arrived
+    // before this group's next container start, the copy would differ from the
+    // bundle with no marker, and would be kept as an edit for good.
+    fs.cpSync(bundle, copy, { recursive: true });
+    const sessions = path.dirname(path.dirname(copy));
+
+    expect(adoptRunnerCopies(bundle, sessions)).toEqual([GROUP]);
+    expect(markerHash()).toBe(hashTree(bundle));
+
+    write(bundle, { 'index.ts': 'v2 index\n' });
+    expect(refreshRunnerCopy(bundle, copy, GROUP)).toBe('refreshed');
+    expect(read(copy)).toEqual(read(bundle));
+  });
+
+  it('leaves an unmarked copy that differs, and a copy that has a marker, as they are', () => {
+    const sessions = path.dirname(path.dirname(copy));
+    write(copy, { 'index.ts': 'some older or edited index\n' });
+    const edited = read(copy);
+    const marked = path.join(sessions, 'marked', 'agent-runner-src');
+    write(marked, { 'index.ts': 'v0 index\n' });
+    fs.writeFileSync(
+      seedMarkerPath(marked),
+      JSON.stringify({ hash: hashTree(marked) }),
+    );
+    const markedMarker = fs.readFileSync(seedMarkerPath(marked), 'utf-8');
+
+    expect(adoptRunnerCopies(bundle, sessions)).toEqual([]);
+
+    expect(read(copy)).toEqual(edited);
+    expect(markerHash()).toBeUndefined();
+    expect(fs.readFileSync(seedMarkerPath(marked), 'utf-8')).toBe(markedMarker);
+  });
+
+  it('adopts nothing, and does not throw, without sessions or a bundle', () => {
+    expect(adoptRunnerCopies(bundle, path.join(root, 'none'))).toEqual([]);
+    fs.cpSync(bundle, copy, { recursive: true });
+    const sessions = path.dirname(path.dirname(copy));
+    expect(adoptRunnerCopies(path.join(root, 'none'), sessions)).toEqual([]);
+    expect(markerHash()).toBeUndefined();
+  });
+});
+
 describe('pinRunnerBundle', () => {
   let staged: string;
   let pin: string;

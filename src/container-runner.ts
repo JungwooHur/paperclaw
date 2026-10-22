@@ -33,7 +33,11 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
-import { hostRunnerBundle, refreshRunnerCopy } from './runner-seed.js';
+import {
+  adoptRunnerCopies,
+  hostRunnerBundle,
+  refreshRunnerCopy,
+} from './runner-seed.js';
 import { RegisteredGroup } from './types.js';
 
 // What unedited runner copies follow, settled when the host starts, so a build
@@ -43,6 +47,7 @@ const runnerBundle = hostRunnerBundle(
   path.join(process.cwd(), 'container', 'agent-runner', 'src'),
   path.join(DATA_DIR, 'runner-bundle'),
 );
+adoptRunnerCopies(runnerBundle, path.join(DATA_DIR, 'sessions'));
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---PAPERCLAW_OUTPUT_START---';

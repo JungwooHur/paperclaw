@@ -322,7 +322,7 @@ Each group gets two copies under `data/sessions/{group}/` the first time its con
 | The copy | What happens |
 |----------|--------------|
 | is missing or empty | the bundle is copied in and the marker written. An empty directory is what the container runtime leaves after mounting a copy that did not exist |
-| equals the bundle | kept; a missing or stale marker is rewritten (this adopts a copy seeded before markers existed) |
+| equals the bundle | kept; a missing or stale marker is rewritten (this adopts a copy seeded before markers existed). The host also adopts every unmarked copy equal to the bundle when it starts, so a copy is not left unmarked until its group's next container start, which may come after the next runner change |
 | equals the marker, and the bundle changed | replaced by the bundle, marker updated, logged at info with the group and both short hashes |
 | differs from the marker | kept, since it was edited in place. A WARN names the group whenever the bundle has changed since seeding |
 | differs from the bundle and has no marker | kept with a WARN, like an edited copy, because an old seed cannot be told from an edit |

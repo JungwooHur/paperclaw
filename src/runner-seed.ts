@@ -338,6 +338,54 @@ export function hostRunnerBundle(
 }
 
 /**
+ * Records, when the host starts, every unmarked group copy that equals the
+ * bundle as seeded from it. Returns the groups adopted.
+ *
+ * A copy made before markers existed is otherwise adopted only at that group's
+ * next container start. If the first runner change were built and restarted
+ * before then, the copy would differ from the bundle with no marker, and be
+ * kept as an edit for good. Only writes markers; never throws.
+ */
+export function adoptRunnerCopies(
+  bundleDir: string,
+  sessionsDir: string,
+): string[] {
+  const adopted: string[] = [];
+  try {
+    if (!fs.existsSync(bundleDir) || !fs.existsSync(sessionsDir)) {
+      return adopted;
+    }
+    const bundleHash = hashTree(bundleDir);
+    for (const group of fs.readdirSync(sessionsDir)) {
+      const copyDir = path.join(sessionsDir, group, 'agent-runner-src');
+      try {
+        if (!fs.existsSync(copyDir)) continue;
+        const markerPath = seedMarkerPath(copyDir);
+        if (readSeededHash(markerPath) !== null) continue;
+        if (hashTree(copyDir) !== bundleHash) continue;
+        writeMarker(markerPath, bundleHash);
+        adopted.push(group);
+        logger.info(
+          { group, hash: short(bundleHash) },
+          'Agent-runner copy matches the bundled runner; recorded it as seeded',
+        );
+      } catch (err) {
+        logger.error(
+          { group, copyDir, err },
+          'Could not check the agent-runner copy against the bundled runner',
+        );
+      }
+    }
+  } catch (err) {
+    logger.error(
+      { sessionsDir, err },
+      'Could not look for agent-runner copies to adopt',
+    );
+  }
+  return adopted;
+}
+
+/**
  * Seeds or refreshes a group's runner copy before its container starts.
  *
  * Never throws: a failure to hash, copy or swap is logged and the container

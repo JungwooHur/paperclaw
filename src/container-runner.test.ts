@@ -58,6 +58,7 @@ vi.mock('./mount-security.js', () => ({
 
 // The runner copy has its own suite (runner-seed.test.ts); here only the calls.
 vi.mock('./runner-seed.js', () => ({
+  adoptRunnerCopies: vi.fn(() => []),
   hostRunnerBundle: vi.fn(() => '/pinned/agent-runner-src'),
   refreshRunnerCopy: vi.fn(() => 'current'),
 }));
@@ -104,12 +105,17 @@ import {
   runContainerAgent,
   ContainerOutput,
 } from './container-runner.js';
-import { hostRunnerBundle, refreshRunnerCopy } from './runner-seed.js';
+import {
+  adoptRunnerCopies,
+  hostRunnerBundle,
+  refreshRunnerCopy,
+} from './runner-seed.js';
 import type { RegisteredGroup } from './types.js';
 
 // Taken now, before any test clears the mocks: importing the module is when
 // the host starts.
 const runnerBundleCallsAtStart = [...vi.mocked(hostRunnerBundle).mock.calls];
+const adoptCallsAtStart = [...vi.mocked(adoptRunnerCopies).mock.calls];
 
 const testGroup: RegisteredGroup = {
   name: 'Test Group',
@@ -403,6 +409,11 @@ describe('container-runner agent-runner copy', () => {
         `${process.cwd()}/container/agent-runner/src`,
         '/tmp/paperclaw-test-data/runner-bundle',
       ],
+    ]);
+    // Copies made before markers existed are adopted now, not at each group's
+    // next container start, which may come after the next runner change.
+    expect(adoptCallsAtStart).toEqual([
+      ['/pinned/agent-runner-src', '/tmp/paperclaw-test-data/sessions'],
     ]);
     vi.mocked(hostRunnerBundle).mockClear();
 
