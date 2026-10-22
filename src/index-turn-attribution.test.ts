@@ -130,6 +130,14 @@ function drainFiles(): { id: string; text: string }[] {
   });
 }
 
+/** How long container-runner waits for output callbacks after an exit. */
+const SETTLE_BOUND = 120_000;
+
+/**
+ * Starts containers as container-runner runs them: their outputs' callbacks
+ * in order, one at a time, and an exit that waits for them, but at most
+ * SETTLE_BOUND.
+ */
 function runnerStarts(): void {
   vi.mocked(runContainerAgent).mockImplementation(
     async (_group, input, onProcess, onOutput) => {
@@ -139,7 +147,11 @@ function runnerStarts(): void {
       const done = new Promise<ContainerOutput>((resolve) => {
         finish = resolve;
       });
-      const emit = (output: ContainerOutput) => onOutput!(output);
+      let chain = Promise.resolve();
+      const emit = (output: ContainerOutput): Promise<void> => {
+        chain = chain.then(() => onOutput!(output));
+        return chain;
+      };
       const container: FakeContainer = {
         startIds: startupInputIds(
           input,
@@ -163,11 +175,15 @@ function runnerStarts(): void {
         exited: false,
         exit: async (status = 'success') => {
           container.exited = true;
-          finish(
+          const output: ContainerOutput =
             status === 'success'
               ? { status, result: null, newSessionId: 'session-new' }
-              : { status, result: null, error: 'exited with code 137' },
-          );
+              : { status, result: null, error: 'exited with code 137' };
+          const bound = setTimeout(() => finish(output), SETTLE_BOUND);
+          void chain.then(() => {
+            clearTimeout(bound);
+            finish(output);
+          });
           await vi.advanceTimersByTimeAsync(0);
         },
       };
@@ -475,6 +491,32 @@ describe('a container that exits with input no result answered', () => {
     expect(c.prompt).not.toContain(M1);
     await c.result('It covers the experiments.', { inputs: [c.startIds[0]] });
     await c.exit();
+  });
+
+  it('puts nothing back when an output was still being delivered', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 50_000);
+    const [p2] = a.drain();
+    // The send of m2's answer hangs past the runner's wait, and m3's answer
+    // waits behind it.
+    let release!: () => void;
+    sendMessage.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+    void a.result('It covers the experiments.', { inputs: [p2] });
+    await userSays('m3', M3, NOW - 40_000);
+    const [p3] = a.drain();
+    void a.result('It covers the appendix.', { inputs: [p3] });
+    await a.exit();
+    await vi.advanceTimersByTimeAsync(SETTLE_BOUND);
+    release();
+
+    // m3 was answered, only late: running it again would answer it twice.
+    await nothingRunsAgain();
+    const sent = sendMessage.mock.calls.map((c) => c[1]);
+    expect(sent.filter((t) => t === 'It covers the appendix.')).toHaveLength(1);
   });
 
   it('leaves a follow-up it never drained to the next container', async () => {

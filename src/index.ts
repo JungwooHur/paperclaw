@@ -343,6 +343,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // stdin, idle timer and pipes belong to its next container: a late callback
   // delivers what it carries and writes none of them.
   let runEnded = false;
+  // Output callbacks running now. One still running when the run returns has
+  // outlived that wait, and the outputs queued behind it are not read yet.
+  let outputsRunning = 0;
   // Whether this container's results say which inputs they answered (`turn`,
   // docs/SPEC.md "Turn Attribution"): unknown until its first result. Off for
   // good once a result with text comes without one: a runner that predates
@@ -456,8 +459,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // instead of holding the task up for another turn.
     if (closed) usageLimitLifted();
   };
-  const output = await runAgent(group, prompt, chatJid, promptRef, onOutput);
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    promptRef,
+    async (result) => {
+      outputsRunning++;
+      try {
+        await onOutput(result);
+      } finally {
+        outputsRunning--;
+      }
+    },
+  );
   runEnded = true;
+  // Results the run returned without: what they answered is unknown.
+  const outputsLate = outputsRunning > 0;
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -482,7 +500,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  if (attribution === 'on') {
+  if (attribution === 'on' && outputsLate) {
+    // An answer still on its way would be sent twice if its prompt went back.
+    logger.warn(
+      { group: group.name },
+      'Container exited with output still being delivered, putting nothing back',
+    );
+  } else if (attribution === 'on') {
     // Every result said what it answered, so the exit knows what was not:
     // a prompt the container took and no result answered goes back, on an
     // error or not, and the queue retries it. A duplicate beats a silent
