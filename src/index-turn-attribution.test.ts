@@ -1913,6 +1913,32 @@ describe('a batch whose newest message is a slash command', () => {
     await nothingRunsAgain();
   });
 
+  it('runs the command once the query ends with the prompt ahead of it unanswered', async () => {
+    await userSays('m0', M3, NOW - 70_000);
+    const a = containers[0];
+    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    expect(waitingTexts()).toHaveLength(1);
+    a.drain();
+    // The CLI took the question, and its query ended with no result after
+    // it: no turn runs until the next input.
+    await a.marker();
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.exit();
+
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(CMD);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
   it('runs the command after a failed start-up turn that took a file an earlier container left', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];

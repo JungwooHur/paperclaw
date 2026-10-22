@@ -588,17 +588,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!runEnded) {
       if (result.status === 'success') {
         queue.notifyIdle(chatJid);
-        // A turn ended with no prompt left for a later one: a command held
-        // back behind them goes now. Without `turn`, a follow-up merged into
-        // a turn, or a turn answered only through send_message, never
-        // settles, so there any output lets it go once a turn ends, as
-        // before the hold. After notifyIdle, so a task waiting on this
-        // container has closed it, and the command waits for the next one
-        // (queueHeldBack).
+        // A turn ended with no prompt left for a later one, or the query
+        // ended (the session marker, after which no turn runs until the
+        // next input): a command held back behind them goes now. Without
+        // `turn`, a follow-up merged into a turn, or a turn answered only
+        // through send_message, never settles, so there any output lets it
+        // go once a turn ends, as before the hold. After notifyIdle, so a
+        // task waiting on this container has closed it, and the command
+        // waits for the next one (queueHeldBack).
         if (
-          attribution === 'on'
-            ? (raw !== null || result.turn) && !prompts.some(awaitsTurn)
-            : true
+          attribution !== 'on' ||
+          (raw === null && !result.turn) ||
+          !prompts.some(awaitsTurn)
         ) {
           deliverHeldBack(chatJid, channel, group);
         }
