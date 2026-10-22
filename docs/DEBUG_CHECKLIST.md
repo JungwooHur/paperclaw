@@ -91,10 +91,12 @@ grep -E 'Piped messages|sendMessage' logs/paperclaw.log | tail -10
 # Check the queue state — any active containers?
 grep -E 'Starting container|Container active|concurrency limit' logs/paperclaw.log | tail -10
 
-# Is a Claude usage-limit window holding work? Times are UTC. A window is open
-# while `usage_limited_until` holds a reset that is not yet two minutes past,
-# when held messages resume. An answer that closes a window empties it; a
-# window that runs out at its reset leaves that past reset in place.
+# Is a Claude usage-limit window holding work? Times are UTC.
+#   `usage_limited_until`        the window's reset: open while it holds a reset
+#                                not yet two minutes past, when held messages
+#                                resume. An answer that closes a window empties
+#                                it; a window that runs out at its reset leaves
+#                                that past reset in place
 #   `usage_limit_announced`      the last reset the user was told about
 #   `usage_limit_closed`         JSON {at, resetsAt}: when an answer last closed a
 #                                window, and that window's reset (see docs/SPEC.md
@@ -109,6 +111,22 @@ grep -E 'Starting container|Container active|concurrency limit' logs/paperclaw.l
 #                                Dropped once a run ends with the cursor past them
 sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key LIKE 'usage_limit%';"
 grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
+
+# Which messages are pending, and why (docs/SPEC.md "Turn Attribution").
+# Timestamps are message cursors, and a range [from, to] holds the messages
+# after its first cursor, up to its second. JSON per chat, except the first.
+#   `last_timestamp`             the newest message the message loop has seen
+#   `last_agent_timestamp`       the message cursor: what is after it is pending
+#   `answered_ahead`             ranges past the cursor a turn already answered,
+#                                left out of what is pending; dropped once a run
+#                                ends with the cursor past them
+#   `turn_open_from`             while a message container runs, the start of
+#                                its oldest prompt no turn answered: a restart
+#                                puts the cursor back there. Cleared at exit
+#   `turn_put_back`              the cursor an exit last put back to: a prompt
+#                                that starts there and fails again is given up
+sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key IN ('last_timestamp', 'last_agent_timestamp', 'answered_ahead', 'turn_open_from', 'turn_put_back');"
+grep -E 'putting it back|Restart stopped a container|not putting it back again' logs/paperclaw.log | tail -5
 
 # Check lastAgentTimestamp vs latest message timestamp
 sqlite3 store/messages.db "SELECT chat_jid, MAX(timestamp) as latest FROM messages GROUP BY chat_jid ORDER BY latest DESC LIMIT 5;"
