@@ -1561,6 +1561,93 @@ describe('a batch whose newest message is a slash command', () => {
     await nothingRunsAgain();
   });
 
+  it('runs a refused command alone after the reset, ahead of a message sent in the window', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', CMD, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [p2] });
+    await a.exit();
+    await userSays('m3', 'did it run?', NOW - 20_000);
+
+    const b = await containerAfterReset();
+    expect(b.prompt).toBe(CMD);
+    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
+    const [later] = waitingTexts();
+    expect(timesIn(later, 'did it run?')).toBe(1);
+    expect(later).not.toContain(CMD);
+    const [p3] = b.drain();
+    await b.result('It did.', { inputs: [p3] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs a refused command that started its container alone after the reset', async () => {
+    await userSays('m1', CMD, NOW - 60_000);
+    const a = containers[0];
+    expect(a.prompt).toBe(CMD);
+    await a.result(LIMIT, { inputs: [a.startIds[0]] });
+    await a.exit();
+    await userSays('m2', 'did it run?', NOW - 20_000);
+
+    const b = await containerAfterReset();
+    expect(b.prompt).toBe(CMD);
+    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
+    const [later] = waitingTexts();
+    expect(timesIn(later, 'did it run?')).toBe(1);
+    const [p2] = b.drain();
+    await b.result('It did.', { inputs: [p2] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs a refused command an earlier container left in its file alone after the reset', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', 'off');
+    await userSays('m2', CMD, NOW - 50_000);
+    await a.exit();
+    expect(waitingTexts()).toEqual([CMD]);
+    await userSays('m3', M2, NOW - 40_000);
+    const b = containers[1];
+    expect(b.startIds).toHaveLength(2);
+    await b.result(LIMIT, { inputs: b.startIds });
+    await b.exit();
+
+    const c = await containerAfterReset();
+    expect(c.prompt).toBe(CMD);
+    await c.result('The skill ran.', { inputs: [c.startIds[0]] });
+    const [later] = waitingTexts();
+    expect(timesIn(later, M2)).toBe(1);
+    const [p3] = c.drain();
+    await c.result('It covers the experiments.', { inputs: [p3] });
+    await c.exit();
+    await nothingRunsAgain();
+  });
+
+  it('runs a command put back alone ahead of a message put back after it', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', CMD, NOW - 40_000);
+    a.drain(); // taken, and its turn never ends
+    await userSays('m3', 'did it run?', NOW - 20_000);
+    a.drain();
+    await a.exit('error');
+
+    const b = await containerOnRetry();
+    expect(b.prompt).toBe(CMD);
+    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
+    const [later] = waitingTexts();
+    expect(timesIn(later, 'did it run?')).toBe(1);
+    expect(later).not.toContain(CMD);
+    const [p3] = b.drain();
+    await b.result('It did.', { inputs: [p3] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
   it('runs the newer of two held commands that share a second', async () => {
     await usersSay([
       ['m1', M1, NOW - 60_000],

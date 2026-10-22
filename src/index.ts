@@ -46,6 +46,8 @@ import {
   firstPrompt,
   formatMessages,
   formatOutbound,
+  sentBare,
+  SLASH_COMMAND,
   throughLastCommand,
 } from './router.js';
 import { SchedulerDependencies, startSchedulerLoop } from './task-scheduler.js';
@@ -87,6 +89,8 @@ interface OpenPrompt {
   ref?: string;
   /** A result's `turn` named it, but an older prompt is still open. */
   answered?: boolean;
+  /** Sent as a bare command: its newest message is one (formatMessages). */
+  command?: boolean;
   /**
    * The turn that took it failed (`inputs: []`): no later turn of this
    * container answers it, though its exit still puts it back.
@@ -242,11 +246,12 @@ const ANSWERED_AHEAD_KEY = 'answered_ahead';
 const OPEN_FROM_KEY = 'turn_open_from';
 // router_state key: per group, the newest of the commands a delivery held
 // back for prompts of their own, behind the messages before them in the same
-// batch (nextDelivery). While the cursor is behind it, those commands go
-// before anything newer, one per prompt, and start the agent without the
-// trigger, as the batch they ended did. Persisted, so a put-back or a restart
-// that makes the batch pending again does not turn them into plain text.
-// Dropped once a run ends with the cursor past it.
+// batch (nextDelivery), or that went bare and a put-back made pending again
+// (putCursorBack). While the cursor is behind it, those commands go before
+// anything newer, one per prompt, and start the agent without the trigger, as
+// the batch they ended did. Persisted, so a put-back or a restart that makes
+// the batch pending again does not turn them into plain text. Dropped once a
+// run ends with the cursor past it.
 const HELD_COMMAND_KEY = 'held_command';
 // router_state key: per group, the session a usage-limit refusal left its
 // refused prompts in, and the ranges of the messages those took. The session
@@ -401,7 +406,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     ? refRange(leftovers[0].ref!)!.from
     : previousCursor;
   const promptRef = inputRef(previousCursor, end);
-  const prompts: OpenPrompt[] = [...leftovers, { cursor: end, ref: promptRef }];
+  const prompts: OpenPrompt[] = [
+    ...leftovers,
+    {
+      cursor: end,
+      ref: promptRef,
+      ...(sentBare(delivery.messages) ? { command: true } : {}),
+    },
+  ];
   // Unknown until this container's first result, whatever the last one said.
   attributionOff.delete(chatJid);
   // Where a restart puts the cursor back to, saved before the cursor moves.
@@ -756,6 +768,7 @@ function leftoverPrompts(group: RegisteredGroup): OpenPrompt[] {
         file,
         ref: data.ref,
         leftover: true,
+        ...(SLASH_COMMAND.test(data.text) ? { command: true } : {}),
         from: range.from,
       });
     } catch {
@@ -1087,7 +1100,12 @@ function pipeToActiveContainer(
   );
   const prompts = openPrompts[chatJid];
   if (prompts) {
-    prompts.push({ cursor: end, file, ref });
+    prompts.push({
+      cursor: end,
+      file,
+      ref,
+      ...(sentBare(messages) ? { command: true } : {}),
+    });
     trackOpenPrompts(chatJid, prompts);
   }
   lastAgentTimestamp[chatJid] = end;
@@ -1266,8 +1284,10 @@ function rememberAnsweredAhead(chatJid: string, ranges: Range[]): void {
 /**
  * Moves the group's cursor back to `from`, the start of its oldest prompt no
  * turn answered, and keeps the answered prompts past it as answered, beside
- * the ranges kept before. Those go first: a crash in between leaves ranges
- * behind the cursor, which nothing reads, never answered messages pending.
+ * the ranges kept before. A command sent bare that goes back is held, so it
+ * keeps a prompt of its own ahead of anything newer (held_command). Those go
+ * first: a crash in between leaves ranges behind the cursor, which nothing
+ * reads, never answered messages pending.
  */
 function putCursorBack(
   chatJid: string,
@@ -1281,6 +1301,14 @@ function putCursorBack(
       ([, to]) => to > from,
     ),
   );
+  let held = readHeldCommands()[chatJid] ?? '';
+  for (const prompt of prompts) {
+    const range = prompt.command && prompt.ref ? refRange(prompt.ref) : null;
+    if (range && !prompt.answered && range.from >= from && range.to > held) {
+      held = range.to;
+    }
+  }
+  if (held > from) rememberHeldCommand(chatJid, held);
   lastAgentTimestamp[chatJid] = from;
   saveState();
 }

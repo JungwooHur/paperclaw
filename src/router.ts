@@ -46,6 +46,12 @@ export function firstPrompt(messages: NewMessage[]): NewMessage[] {
   return messages.slice(0, n);
 }
 
+/** Whether formatMessages sends these messages as a bare command. */
+export function sentBare(messages: NewMessage[]): boolean {
+  const newest = messages[messages.length - 1];
+  return newest !== undefined && slashCommandIn(newest) !== null;
+}
+
 /**
  * The messages up to and including the newest command among them, or all of
  * them when none is one.

@@ -130,10 +130,10 @@ grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
 #   `turn_put_back`              the cursor an exit last put back to: a prompt
 #                                that starts there and fails again is given up
 #   `held_command`               the newest command held back for a prompt of
-#                                its own after the messages before it; while
-#                                the cursor is behind it, nothing newer is
-#                                delivered first. Dropped once a run ends with
-#                                the cursor past it
+#                                its own after the messages before it, or sent
+#                                bare and put back; while the cursor is behind
+#                                it, nothing newer is delivered first. Dropped
+#                                once a run ends with the cursor past it
 sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key IN ('last_timestamp', 'last_agent_timestamp', 'answered_ahead', 'turn_open_from', 'turn_put_back', 'held_command');"
 grep -E 'putting it back|Restart stopped a container|not putting it back again' logs/paperclaw.log | tail -5
 
