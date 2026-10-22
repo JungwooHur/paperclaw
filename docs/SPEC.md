@@ -126,7 +126,7 @@ paperclaw/
 │       └── agent-browser.md       # Browser automation skill
 │
 ├── dist/                          # Compiled JavaScript (gitignored)
-│   └── agent-runner-src/          # The runner staged by the same build (groups refresh from it)
+│   └── agent-runner-src/          # The runner staged by the same build; a host pins it to data/runner-bundle/ when it starts
 │
 ├── .claude/
 │   └── skills/
@@ -156,6 +156,7 @@ paperclaw/
 │
 ├── data/                          # Application state (gitignored)
 │   ├── sessions/                  # Per-group session data (.claude/ dirs with JSONL transcripts)
+│   ├── runner-bundle/             # The runner this host hands to groups, pinned when it started
 │   ├── env/env                    # Copy of .env for container mounting
 │   └── ipc/                       # Container IPC (messages/, tasks/)
 │

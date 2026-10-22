@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
+import path from 'path';
 import { PassThrough } from 'stream';
 
 // Sentinel markers must match container-runner.ts
@@ -415,5 +416,24 @@ describe('container-runner agent-runner copy', () => {
 
     expect(hostRunnerBundle).not.toHaveBeenCalled();
     expect(refreshRunnerCopy).toHaveBeenCalledTimes(2);
+  });
+
+  // The SPEC tree is where a reader looks up which runner groups get. Naming
+  // only the build's staged copy sends them to compare a group's copy with one
+  // a build may have replaced since the host started.
+  it('pins the runner where the SPEC directory tree says, under data/', async () => {
+    const pin = runnerBundleCallsAtStart[0][2];
+    const name = path.relative('/tmp/paperclaw-test-data', pin);
+    const { readFileSync } = await vi.importActual<typeof import('fs')>('fs');
+    const spec = new URL('../docs/SPEC.md', import.meta.url);
+    const lines = readFileSync(spec, 'utf-8').split('\n');
+    const start = lines.findIndex((l) => l.startsWith('├── data/'));
+    const end = lines.findIndex((l, i) => i > start && /^[├└]── /.test(l));
+
+    const data = lines.slice(start + 1, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(name).not.toMatch(/^\.\.|\//);
+    expect(data.some((l) => l.includes(`── ${name}/`))).toBe(true);
   });
 });
