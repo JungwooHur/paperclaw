@@ -5,7 +5,9 @@
 // /tmp/dist gets its prompt on stdin and its follow-ups as IPC files, each
 // written at the moment its case needs: after an output, or, timed off the
 // fake API, while a tool runs or during a turn's last API call. Every output
-// the runner writes is recorded under the case that produced it.
+// the runner writes is recorded under the case that produced it. One more
+// case drives the SDK directly, as the runner never reuses a uuid: what the
+// CLI does with a push under a uuid it has already seen.
 import http from 'http';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
@@ -14,6 +16,7 @@ import path from 'path';
 
 const RUNNER = '/tmp/dist/index.js';
 const SDK_PACKAGE = '/app/node_modules/@anthropic-ai/claude-agent-sdk/package.json';
+const SDK_MODULE = '/app/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs';
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const PORT = 8787;
 const MODEL = 'claude-sonnet-4-5-20250929';
@@ -83,6 +86,8 @@ function json(res, code, body) {
 const text = (t) => ({ type: 'text', text: t });
 const tool = (name, input) => ({ type: 'tool_use', name, input });
 const once = new Set();
+// While the reused-uuid case runs: every marker any request carried.
+let modelSaw = null;
 
 function reply(b) {
   const msgs = b.messages || [];
@@ -141,6 +146,7 @@ const server = http.createServer((req, res) => {
     if (req.url.includes('count_tokens')) return json(res, 200, { input_tokens: 100 });
     let b;
     try { b = JSON.parse(body); } catch { return json(res, 400, {}); }
+    if (modelSaw) for (const m of body.match(/PROBE-[A-Z]+/g) ?? []) modelSaw.add(m);
     const r = reply(b);
     const stop = r.stop ?? 'end_turn';
     const send = () => {
@@ -205,6 +211,15 @@ const CONTAINERS = [
 const home = fs.mkdtempSync('/tmp/probe-home-');
 const outputs = [];
 const notes = [];
+const cliEnv = {
+  ...process.env,
+  HOME: home,
+  ANTHROPIC_BASE_URL: `http://127.0.0.1:${PORT}`,
+  ANTHROPIC_MODEL: MODEL,
+  DISABLE_TELEMETRY: '1',
+  DISABLE_AUTOUPDATER: '1',
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+};
 
 /** Runs one container's runner to its exit; resolves with the session it used. */
 function runContainer(spec, sessionId) {
@@ -217,15 +232,7 @@ function runContainer(spec, sessionId) {
     let session = sessionId;
 
     const runner = spawn('node', [RUNNER], {
-      env: {
-        ...process.env,
-        HOME: home,
-        ANTHROPIC_BASE_URL: `http://127.0.0.1:${PORT}`,
-        ANTHROPIC_MODEL: MODEL,
-        DISABLE_TELEMETRY: '1',
-        DISABLE_AUTOUPDATER: '1',
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      },
+      env: cliEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     runner.stdin.end(JSON.stringify({
@@ -286,7 +293,85 @@ function runContainer(spec, sessionId) {
   });
 }
 
+/** The runner's MessageStream: user messages pushed into a live query. */
+class PushStream {
+  queue = [];
+  wake = null;
+  done = false;
+  push(content, uuid) {
+    this.queue.push({
+      type: 'user', message: { role: 'user', content }, parent_tool_use_id: null, session_id: '', uuid,
+    });
+    this.wake?.();
+  }
+  end() {
+    this.done = true;
+    this.wake?.();
+  }
+  async *[Symbol.asyncIterator]() {
+    while (true) {
+      while (this.queue.length > 0) yield this.queue.shift();
+      if (this.done) return;
+      await new Promise((r) => (this.wake = r));
+    }
+  }
+}
+
+/**
+ * One push, a second under the same uuid once the first is answered, then a
+ * fresh one, all with the runner's replay flag. Records the pushes, the
+ * acknowledgements and the results in order, uuids named u1, u2, and which
+ * markers ever reached the fake API.
+ */
+async function reusedUuidCase() {
+  const { query } = await import(SDK_MODULE);
+  const stream = new PushStream();
+  const events = [];
+  const names = new Map();
+  const name = (uuid) => names.get(uuid) ?? 'an unknown uuid';
+  const markerOf = (t) => (t.match(/PROBE-[A-Z]+/) || ['none'])[0];
+  const record = (event) => {
+    events.push(event);
+    log('REUSED', event);
+  };
+  const push = (content, uuid) => {
+    if (!names.has(uuid)) names.set(uuid, `u${names.size + 1}`);
+    record(`push ${markerOf(content)} as ${name(uuid)}`);
+    stream.push(content, uuid);
+  };
+  modelSaw = new Set();
+  const first = randomUUID();
+  push('PROBE-FIRST the first push', first);
+  for await (const m of query({
+    prompt: stream,
+    options: {
+      cwd: fs.mkdtempSync('/tmp/probe-reused-'),
+      env: { ...cliEnv, ANTHROPIC_API_KEY: 'offline-probe-key' },
+      extraArgs: { 'replay-user-messages': null },
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
+    },
+  })) {
+    if (m.type === 'user' && m.isReplay) {
+      record(`ack ${markerOf(textOf(m.message?.content))} as ${name(m.uuid)}`);
+    }
+    if (m.type !== 'result') continue;
+    record(`result ${m.subtype === 'success' ? m.result : m.subtype}`);
+    if (m.result === 'ANSWER PROBE-FIRST') {
+      push('PROBE-REUSED pushed under the uuid the CLI has seen', first);
+      // Ample time for a turn the fake API answers at once to show up.
+      setTimeout(() => push('PROBE-FRESH pushed under a fresh uuid', randomUUID()), 3000);
+    } else if (m.result === 'ANSWER PROBE-FRESH') {
+      stream.end();
+    }
+  }
+  const saw = [...modelSaw].sort();
+  modelSaw = null;
+  return { events, modelSaw: saw };
+}
+
 server.listen(PORT, '127.0.0.1', async () => {
+  let reusedUuid;
   const timer = setTimeout(() => {
     log('TIMEOUT; outputs so far:', JSON.stringify(outputs));
     process.exit(2);
@@ -295,13 +380,14 @@ server.listen(PORT, '127.0.0.1', async () => {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
     let session;
     for (const spec of CONTAINERS) session = await runContainer(spec, session);
+    reusedUuid = await reusedUuidCase();
   } catch (err) {
     log('FAILED:', err.message, '; outputs so far:', JSON.stringify(outputs));
     process.exit(1);
   }
   clearTimeout(timer);
   const sdkVersion = JSON.parse(fs.readFileSync(SDK_PACKAGE, 'utf-8')).version;
-  process.stdout.write(JSON.stringify({ sdkVersion, outputs, runnerNotes: notes }, null, 2) + '\n');
+  process.stdout.write(JSON.stringify({ sdkVersion, outputs, runnerNotes: notes, reusedUuid }, null, 2) + '\n');
   server.close();
   process.exit(0);
 });

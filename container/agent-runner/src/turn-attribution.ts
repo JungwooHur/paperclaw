@@ -66,8 +66,10 @@ export class TurnAttribution {
   ) {}
 
   /**
-   * Records a push and returns the uuid it must be sent with. Always a fresh
-   * one: the CLI skips a uuid it has already seen, without a reply.
+   * Records a push and returns the uuid it must be sent with, a fresh one
+   * every time, a retry included. The CLI acknowledges a uuid it has already
+   * seen without running it, so a reused one would be a false
+   * acknowledgement: the next result would claim an input the model never saw.
    */
   push(inputs: string[], nudge = false): UUID {
     const uuid = this.newUuid();

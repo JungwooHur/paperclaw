@@ -32,6 +32,7 @@ const fixture = readJson<{
   sdkVersion: string;
   outputs: ProbeOutput[];
   runnerNotes: string[];
+  reusedUuid?: { events: string[]; modelSaw: string[] };
 }>('./turn-attribution-probe.json');
 const runnerPackage = readJson<{ dependencies: Record<string, string> }>(
   '../package.json',
@@ -131,5 +132,26 @@ describe('the turn attribution probe', () => {
     expect(fixture.runnerNotes).toEqual([
       'Input no result answered: ["r-nothing"] (never acknowledged)',
     ]);
+  });
+
+  it('saw the CLI acknowledge a reused uuid without running it', () => {
+    // Why every push needs a fresh uuid. Driven through the SDK directly, as
+    // the runner never reuses one: a uuid the CLI has already seen comes back
+    // at once as an acknowledgement carrying the new text, but the CLI
+    // neither runs it nor sends it to the model. The next result would claim
+    // an input nobody answered, so a reused uuid is a false acknowledgement.
+    expect(fixture.reusedUuid).toEqual({
+      events: [
+        'push PROBE-FIRST as u1',
+        'ack PROBE-FIRST as u1',
+        'result ANSWER PROBE-FIRST',
+        'push PROBE-REUSED as u1',
+        'ack PROBE-REUSED as u1',
+        'push PROBE-FRESH as u2',
+        'ack PROBE-FRESH as u2',
+        'result ANSWER PROBE-FRESH',
+      ],
+      modelSaw: ['PROBE-FIRST', 'PROBE-FRESH'],
+    });
   });
 });

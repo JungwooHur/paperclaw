@@ -114,5 +114,21 @@
   ],
   "runnerNotes": [
     "Input no result answered: [\"r-nothing\"] (never acknowledged)"
-  ]
+  ],
+  "reusedUuid": {
+    "events": [
+      "push PROBE-FIRST as u1",
+      "ack PROBE-FIRST as u1",
+      "result ANSWER PROBE-FIRST",
+      "push PROBE-REUSED as u1",
+      "ack PROBE-REUSED as u1",
+      "push PROBE-FRESH as u2",
+      "ack PROBE-FRESH as u2",
+      "result ANSWER PROBE-FRESH"
+    ],
+    "modelSaw": [
+      "PROBE-FIRST",
+      "PROBE-FRESH"
+    ]
+  }
 }
