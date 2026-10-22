@@ -30,6 +30,7 @@ vi.mock('./qa-followup.js', () => ({
   worthFilingCheck: () => false,
 }));
 
+import { ASSISTANT_NAME } from './config.js';
 import { ContainerOutput, runContainerAgent } from './container-runner.js';
 import { cleanupOrphans } from './container-runtime.js';
 import {
@@ -626,6 +627,114 @@ describe('messages held for a container that is still running', () => {
     exitContainer();
     await vi.advanceTimersByTimeAsync(0);
     expect(runContainerAgent).toHaveBeenCalledTimes(1);
+  });
+
+  // Recovery pipes by the message loop's rule: in a group that needs the
+  // trigger, chatter waits as context until a message with the trigger comes.
+  describe('in a group that needs the trigger', () => {
+    const TEAM = 'team@g.us';
+    const TEAM_GROUP: RegisteredGroup = {
+      name: 'Team',
+      folder: 'team',
+      trigger: `@${ASSISTANT_NAME}`,
+      added_at: '2026-10-01T00:00:00.000Z',
+    };
+
+    function teamSays(id: string, content: string, at: number): NewMessage {
+      const message: NewMessage = {
+        id,
+        chat_jid: TEAM,
+        sender: 'user@s.whatsapp.net',
+        sender_name: 'User',
+        content,
+        timestamp: new Date(at).toISOString(),
+      };
+      storeMessage(message);
+      return message;
+    }
+
+    function teamPiped(): string[] {
+      const dir = path.join(dataDir, 'ipc', TEAM_GROUP.folder, 'input');
+      if (!fs.existsSync(dir)) return [];
+      return fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith('.json'))
+        .map(
+          (f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')).text,
+        );
+    }
+
+    function teamCursor(): string | undefined {
+      return JSON.parse(getRouterState('last_agent_timestamp') || '{}')[TEAM];
+    }
+
+    /** The team's container answered a triggered message and idles. */
+    async function teamContainerRunning(): Promise<
+      (output: ContainerOutput) => Promise<void>
+    > {
+      vi.spyOn(channel, 'ownsJid').mockImplementation((jid) => jid === TEAM);
+      _setRegisteredGroups({ [TEAM]: TEAM_GROUP });
+      storeChatMetadata(
+        TEAM,
+        new Date(NOW).toISOString(),
+        'Team',
+        'test',
+        true,
+      );
+      let onOutput!: (output: ContainerOutput) => Promise<void>;
+      vi.mocked(runContainerAgent).mockImplementationOnce(
+        async (_group, _input, onProcess, output) => {
+          onProcess({} as never, 'paperclaw-team-1');
+          onOutput = output!;
+          await answer(output!, 'It describes the method.');
+          await new Promise<void>((resolve) => {
+            exitContainer = resolve;
+          });
+          return {
+            status: 'success',
+            result: null,
+            newSessionId: 'session-new',
+          };
+        },
+      );
+      teamSays(
+        't1',
+        `@${ASSISTANT_NAME} what is section 2 about?`,
+        NOW - 60_000,
+      );
+      queue.enqueueMessageCheck(TEAM);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runContainerAgent).toHaveBeenCalledTimes(1);
+      return onOutput;
+    }
+
+    it('keep chatter without the trigger out of it when the window closes', async () => {
+      const onOutput = await teamContainerRunning();
+      const cursor = teamCursor();
+      recordUsageLimit(LIMIT);
+      teamSays('t2', 'thanks, that helps', NOW - 30_000);
+      // A turn of its own answers, which closes the window.
+      await answer(onOutput, 'Paper 2 is uploaded.');
+      expect(usageLimitHeldUntil()).toBeNull();
+      expect(teamPiped()).toEqual([]);
+      expect(teamCursor()).toBe(cursor);
+    });
+
+    it('go into it with that chatter once one has the trigger', async () => {
+      const onOutput = await teamContainerRunning();
+      recordUsageLimit(LIMIT);
+      teamSays('t2', 'thanks, that helps', NOW - 30_000);
+      const t3 = teamSays(
+        't3',
+        `@${ASSISTANT_NAME} and section 3?`,
+        NOW - 20_000,
+      );
+      await answer(onOutput, 'Paper 2 is uploaded.');
+      expect(teamPiped()).toEqual([
+        expect.stringMatching(/thanks, that helps[\s\S]*and section 3\?/),
+      ]);
+      expect(teamCursor()).toBe(t3.timestamp);
+    });
   });
 });
 
