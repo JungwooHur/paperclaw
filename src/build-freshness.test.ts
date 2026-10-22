@@ -114,6 +114,50 @@ describe('warnIfRunningStaleBuild (the check main() runs at startup)', () => {
     });
   });
 
+  it('names a runner source newer than the copy the build staged', () => {
+    write(path.join(src, 'index.ts'), 1000);
+    write(path.join(dist, 'index.js'), 2000);
+    const runner = path.join(root, 'container', 'agent-runner', 'src');
+    write(path.join(runner, 'index.ts'), 3000);
+    write(path.join(runner, 'ipc-mcp-stdio.ts'), 1000);
+    write(path.join(dist, 'agent-runner-src', 'index.ts'), 2000);
+    write(path.join(dist, 'agent-runner-src', 'ipc-mcp-stdio.ts'), 2000);
+
+    warnIfRunningStaleBuild(pathToFileURL(path.join(dist, 'index.js')).href);
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    const [fields, message] = vi.mocked(logger.warn).mock
+      .calls[0] as unknown as [{ stale: string[]; count: number }, string];
+    expect(fields).toMatchObject({ stale: ['index.ts'], count: 1 });
+    expect(message).toContain('dist/agent-runner-src/');
+  });
+
+  it('names a runner source the build never staged', () => {
+    write(path.join(src, 'index.ts'), 1000);
+    write(path.join(dist, 'index.js'), 2000);
+    const runner = path.join(root, 'container', 'agent-runner', 'src');
+    write(path.join(runner, 'index.ts'), 1000);
+
+    warnIfRunningStaleBuild(pathToFileURL(path.join(dist, 'index.js')).href);
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(logger.warn).mock.calls[0][0]).toMatchObject({
+      stale: ['index.ts'],
+    });
+  });
+
+  it('stays quiet when the staged runner is as new as its sources', () => {
+    write(path.join(src, 'index.ts'), 1000);
+    write(path.join(dist, 'index.js'), 2000);
+    const runner = path.join(root, 'container', 'agent-runner', 'src');
+    write(path.join(runner, 'index.ts'), 1000);
+    write(path.join(dist, 'agent-runner-src', 'index.ts'), 2000);
+
+    warnIfRunningStaleBuild(pathToFileURL(path.join(dist, 'index.js')).href);
+
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it('checks nothing when the module runs from src/ (npm run dev)', () => {
     write(path.join(src, 'index.ts'), 3000);
     write(path.join(dist, 'index.js'), 2000);
