@@ -91,6 +91,8 @@ const M3 = 'and the appendix?';
 const M4 = 'and the related work?';
 
 const sendMessage = vi.fn(async (_jid: string, _text: string) => {});
+/** While set, clearing the typing indicator after a run waits for it. */
+let typingHold: Promise<void> | null = null;
 const channel: Channel = {
   name: 'test',
   connect: async () => {},
@@ -98,7 +100,9 @@ const channel: Channel = {
   isConnected: () => true,
   ownsJid: (jid) => jid === CHAT,
   disconnect: async () => {},
-  setTyping: async () => {},
+  setTyping: async (_jid, on) => {
+    if (!on && typingHold) await typingHold;
+  },
 };
 const { queue } = _schedulerDependencies();
 const inputDir = path.join(dataDir, 'ipc', MAIN_GROUP.folder, 'input');
@@ -276,6 +280,7 @@ beforeEach(() => {
   vi.setSystemTime(NOW);
   fs.rmSync(dataDir, { recursive: true, force: true });
   containers = [];
+  typingHold = null;
   _initTestDatabase();
   setSession('main', 'session-old');
   _loadState();
@@ -555,6 +560,49 @@ describe('a container that exits with input no result answered', () => {
     expect(timesIn(b.prompt, M2)).toBe(1);
     expect(timesIn(b.prompt, M3)).toBe(1);
     await b.result('Both answered.', { inputs: b.startIds });
+    await b.exit();
+  });
+
+  it('puts back a follow-up it never drained when it exits on an error', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    // Answered through send_message: no reply text goes out.
+    await a.result('<internal>Sent the answer.</internal>', {
+      inputs: [a.startIds[0]],
+    });
+    await userSays('m2', M2, NOW - 40_000); // never drained
+    await a.exit('error');
+
+    // No container is coming to drain the file: the retry gets m2 instead.
+    expect(inputFiles()).toEqual([]);
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: b.startIds });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('puts back a follow-up piped while it winds down after an error', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('<internal>Sent the answer.</internal>', {
+      inputs: [a.startIds[0]],
+    });
+    let release!: () => void;
+    typingHold = new Promise<void>((resolve) => (release = resolve));
+    await a.exit('error');
+    // The queue still counts the container active, so m2 is piped.
+    await userSays('m2', M2, NOW - 40_000);
+    expect(inputFiles()).toHaveLength(1);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(inputFiles()).toEqual([]);
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: b.startIds });
     await b.exit();
   });
 

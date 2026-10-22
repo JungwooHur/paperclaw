@@ -128,15 +128,20 @@ function markAnswered(prompts: OpenPrompt[], inputs: string[]): string[] {
 
 /**
  * Where a container's exit puts the cursor back to: the start of the oldest
- * prompt it took that no result answered. Not one whose file is still on
- * disk: the container never took it, and the group's next container drains
- * it, so putting it back would deliver it twice. Call only once the container
- * has exited, so that file can no longer go.
+ * prompt it took that no result answered. After a clean exit, not one whose
+ * file is still on disk: the container never took it, and the group's next
+ * container drains it, so putting it back would deliver it twice. After an
+ * error it counts (`undrained`): no retry would start for it, and the put-back
+ * deletes its file. Call only once the container has exited, so that file can
+ * no longer go.
  */
-function unansweredFrom(prompts: OpenPrompt[]): string | undefined {
+function unansweredFrom(
+  prompts: OpenPrompt[],
+  undrained: boolean,
+): string | undefined {
   for (const prompt of prompts) {
     if (prompt.answered) continue;
-    if (prompt.file && fs.existsSync(prompt.file)) continue;
+    if (!undrained && prompt.file && fs.existsSync(prompt.file)) continue;
     const range = prompt.ref ? refRange(prompt.ref) : null;
     if (range) return range.from;
   }
@@ -514,7 +519,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // error or not, and the queue retries it. A duplicate beats a silent
     // loss. Whatever came after it goes back too, answered or not: that
     // reruns an answered follow-up behind an unanswered prompt (#114).
-    const from = unansweredFrom(prompts);
+    const from = unansweredFrom(prompts, output === 'error' || hadError);
     const putBack = readPutBack();
     if (from === undefined) {
       if (chatJid in putBack) rememberPutBack(chatJid, undefined);
