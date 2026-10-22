@@ -92,7 +92,9 @@ grep -E 'Piped messages|sendMessage' logs/paperclaw.log | tail -10
 grep -E 'Starting container|Container active|concurrency limit' logs/paperclaw.log | tail -10
 
 # Is a Claude usage-limit window holding work? Times are UTC. A window is open
-# only while `usage_limited_until` is set: that is its reset, empty once closed.
+# while `usage_limited_until` holds a reset that is not yet two minutes past,
+# when held messages resume. An answer that closes a window empties it; a
+# window that runs out at its reset leaves that past reset in place.
 #   `usage_limit_announced`      the last reset the user was told about
 #   `usage_limit_closed`         JSON {at, resetsAt}: when an answer last closed a
 #                                window, and that window's reset (see docs/SPEC.md
