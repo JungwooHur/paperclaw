@@ -585,6 +585,31 @@ describe('messages held for a container that is still running', () => {
     expect(getRouterState('last_agent_timestamp')).toBe(m1Cursor);
   });
 
+  it('stay pending when the answer that closes the window also closes it for a task', async () => {
+    const task = vi.fn(async () => {});
+    let m2!: NewMessage;
+    await containerRunning(async (onOutput) => {
+      recordUsageLimit(LIMIT);
+      m2 = heldWhileOpen();
+      // A scheduled run comes due meanwhile and waits for this container.
+      queue.enqueueTask(CHAT, 'nightly', task);
+      await answer(onOutput, 'It describes the method.');
+    });
+    // The container now closes for the task without reading new input, so
+    // m2 is not left in a file it never reads, behind a cursor past it.
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(pipedTexts()).toEqual([]);
+    expect(getRouterState('last_agent_timestamp')).not.toContain(m2.timestamp);
+
+    agentReplies('It covers the experiments.');
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(task).toHaveBeenCalledTimes(1);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+    expect(promptOfRun(1)).toContain(m2Text);
+    expect(sentTexts()).toContain('It covers the experiments.');
+  });
+
   it('go into it at once when the window ends at its reset', async () => {
     const reset = NOW + 10 * 60_000; // 9:10pm in Seoul
     await containerRunning((onOutput) =>

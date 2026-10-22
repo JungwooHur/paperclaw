@@ -269,6 +269,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
+    let closed = false;
     if (result.result) {
       const raw =
         typeof result.result === 'string'
@@ -302,11 +303,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         return;
       }
       // A request got through: an open window is over. The held messages it
-      // releases may go into this container, so they run only once this
-      // result has settled its own prompt: run first, a turn no prompt started
-      // (a task notification) would settle theirs, and a refusal of their turn
-      // would then put back nothing.
-      const closed = closeUsageLimitOnAnswer(raw);
+      // releases run at the end, below.
+      closed = closeUsageLimitOnAnswer(raw);
       if (!runEnded) {
         // A result ends a turn, and turns take prompts in the order they were
         // given. A turn answered only through send_message counts too.
@@ -322,7 +320,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           rememberRefusedInput(chatJid, prompts);
         }
       }
-      if (closed) usageLimitLifted();
       // Single outbound path: formatOutbound strips <internal> blocks AND the
       // trailing "shall I save this to Notion?" offer. This used to inline only
       // the <internal> strip, so the offer-stripping rule silently did not apply
@@ -337,14 +334,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (!runEnded) resetIdleTimer();
     }
 
-    if (runEnded) return;
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
+    if (!runEnded) {
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
+      if (result.status === 'error') {
+        hadError = true;
+      }
     }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
+    // Held messages may go into this container, so they run only once this
+    // result is done with it. Before it settles its own prompt, a turn no
+    // prompt started (a task notification) would settle theirs, and a refusal
+    // of their turn would put back nothing. Before notifyIdle, which closes
+    // the container for a task waiting on it, they would be piped into a
+    // container that never reads them.
+    if (closed) usageLimitLifted();
   });
   runEnded = true;
 
