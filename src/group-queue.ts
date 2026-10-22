@@ -149,9 +149,14 @@ export class GroupQueue {
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
+   * Not while it has input it has not read: a pipe can land after the result
+   * this acknowledges, and the runner checks the close sentinel before it
+   * drains, so a close now would leave that input to the group's next
+   * container. The turn that input starts ends in a result of its own.
    */
   notifyIdle(groupJid: string): void {
     const state = this.getGroup(groupJid);
+    if (this.hasUnreadInput(state)) return;
     state.idleWaiting = true;
     if (state.pendingTasks.length > 0) {
       this.closeStdin(groupJid);
@@ -189,6 +194,17 @@ export class GroupQueue {
       return filepath;
     } catch {
       return null;
+    }
+  }
+
+  /** Whether follow-ups wait in the group's input dir for its container. */
+  private hasUnreadInput(state: GroupState): boolean {
+    if (!state.groupFolder) return false;
+    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    try {
+      return fs.readdirSync(inputDir).some((f) => f.endsWith('.json'));
+    } catch {
+      return false;
     }
   }
 

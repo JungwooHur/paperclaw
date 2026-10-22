@@ -613,6 +613,102 @@ describe('messages held for a container that is still running', () => {
     expect(sentTexts()).toContain('It covers the experiments.');
   });
 
+  it('are read by it before it closes for a task, when another group lets them in during its send', async () => {
+    const OTHER = 'other@g.us';
+    vi.spyOn(channel, 'ownsJid').mockImplementation(
+      (jid) => jid === CHAT || jid === OTHER,
+    );
+    _setRegisteredGroups({
+      [CHAT]: MAIN_GROUP,
+      [OTHER]: {
+        ...MAIN_GROUP,
+        name: 'Other',
+        folder: 'other',
+        requiresTrigger: false,
+      },
+    });
+    storeChatMetadata(OTHER, new Date(NOW).toISOString(), 'Other', 'test');
+    // Sends take a moment, as a WhatsApp send does, until released.
+    const sends: Record<string, () => void> = {};
+    const send = vi.spyOn(channel, 'sendMessage').mockImplementation(
+      (jid) =>
+        new Promise<void>((resolve) => {
+          sends[jid] = resolve;
+        }),
+    );
+    const emit: Record<string, (output: ContainerOutput) => Promise<void>> = {};
+    const exits: (() => void)[] = [];
+    exitContainer = () => exits.forEach((exit) => exit());
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (group, _input, onProcess, onOutput) => {
+        onProcess({} as never, `paperclaw-${group.folder}-1`);
+        emit[group.folder] = onOutput!;
+        await new Promise<void>((resolve) => exits.push(resolve));
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    storeMessage({
+      id: 'o1',
+      chat_jid: OTHER,
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'any news?',
+      timestamp: new Date(NOW - 50_000).toISOString(),
+    });
+    queue.enqueueMessageCheck(CHAT);
+    queue.enqueueMessageCheck(OTHER);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // A third group is refused: m2 is held, and a scheduled run for main
+    // comes due while main is still busy with m1.
+    recordUsageLimit(LIMIT);
+    const m2 = heldWhileOpen();
+    const task = vi.fn(async () => {});
+    queue.enqueueTask(CHAT, 'nightly', task);
+
+    // The other group's answer closes the window; its send is in flight.
+    const otherDone = emit.other({
+      status: 'success',
+      result: 'Nothing new yet.',
+      newSessionId: 'session-new',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    // Main answers m1, and its send is in flight too.
+    const mainDone = emit.main({
+      status: 'success',
+      result: 'It describes the method.',
+      newSessionId: 'session-new',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    // The other send completes: recovery pipes m2 into main.
+    sends[OTHER]();
+    await otherDone;
+    expect(pipedTexts()).toEqual([expect.stringContaining(m2Text)]);
+    // Main's send completes. It has not read m2, so it is not idle yet.
+    sends[CHAT]();
+    await mainDone;
+    const input = path.join(dataDir, 'ipc', MAIN_GROUP.folder, 'input');
+    expect(fs.existsSync(path.join(input, '_close'))).toBe(false);
+
+    // It reads m2 and answers it; then it closes for the task.
+    for (const file of fs.readdirSync(input)) {
+      fs.unlinkSync(path.join(input, file));
+    }
+    send.mockImplementation(async () => {});
+    await emit.main({
+      status: 'success',
+      result: 'It covers the experiments.',
+      newSessionId: 'session-new',
+    });
+    expect(fs.existsSync(path.join(input, '_close'))).toBe(true);
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(task).toHaveBeenCalledTimes(1);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+    expect(getRouterState('last_agent_timestamp')).toContain(m2.timestamp);
+  });
+
   it('are not piped again by the next poll of the message loop', async () => {
     // The window ends between two polls: recovery pipes what the loop has
     // not seen yet, and moves the cursor past it before the loop sees it.

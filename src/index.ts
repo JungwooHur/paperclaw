@@ -346,9 +346,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Held messages may go into this container, so they run only once this
     // result is done with it. Before it settles its own prompt, a turn no
     // prompt started (a task notification) would settle theirs, and a refusal
-    // of their turn would put back nothing. Before notifyIdle, which closes
-    // the container for a task waiting on it, they would be piped into a
-    // container that never reads them.
+    // of their turn would put back nothing. After notifyIdle, a task waiting
+    // on this container has closed it, and they wait for the next one
+    // instead of holding the task up for another turn.
     if (closed) usageLimitLifted();
   });
   runEnded = true;
