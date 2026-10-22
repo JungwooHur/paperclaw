@@ -55,6 +55,11 @@ vi.mock('./mount-security.js', () => ({
   validateAdditionalMounts: vi.fn(() => []),
 }));
 
+// The runner copy has its own suite (runner-seed.test.ts); here only the call.
+vi.mock('./runner-seed.js', () => ({
+  refreshRunnerCopy: vi.fn(() => 'current'),
+}));
+
 // Create a controllable fake ChildProcess
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {
@@ -97,6 +102,7 @@ import {
   runContainerAgent,
   ContainerOutput,
 } from './container-runner.js';
+import { refreshRunnerCopy } from './runner-seed.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -346,5 +352,39 @@ describe('container-runner agent model', () => {
     // container's entrypoint as an argument instead of setting it.
     const image = args.indexOf('paperclaw-agent:latest');
     expect(args.lastIndexOf('-e')).toBeLessThan(image);
+  });
+});
+
+describe('container-runner agent-runner copy', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+    vi.mocked(refreshRunnerCopy).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('brings the group copy up to date before mounting it as the runner source', async () => {
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+
+    const copy =
+      '/tmp/paperclaw-test-data/sessions/test-group/agent-runner-src';
+    expect(refreshRunnerCopy).toHaveBeenCalledWith(
+      `${process.cwd()}/container/agent-runner/src`,
+      copy,
+      'test-group',
+    );
+    const args = vi.mocked(spawn).mock.calls[0][1] as string[];
+    expect(args).toContain(`${copy}:/app/src`);
+    // Before the container is spawned, so this start compiles the result.
+    expect(
+      vi.mocked(refreshRunnerCopy).mock.invocationCallOrder[0],
+    ).toBeLessThan(vi.mocked(spawn).mock.invocationCallOrder[0]);
   });
 });
