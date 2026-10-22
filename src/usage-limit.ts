@@ -79,11 +79,18 @@ const JUST_PASSED_MS = 2 * MINUTE_MS;
 const MESSAGE_RESUME_MARGIN_MS = 2 * MINUTE_MS;
 /** ...and a deferred scheduled task runs a little after them. */
 const TASK_RESUME_MARGIN_MS = 5 * MINUTE_MS;
+/**
+ * A refusal this soon after an answer closed the window is the retry a close
+ * on a stray answer costs: it reopens that window. One later opens a new
+ * window, to a user who has seen the bot answer again since.
+ */
+const CLOSE_GRACE_MS = 10 * MINUTE_MS;
 
-// router_state keys: the open window's reset, and the reset of the window the
-// user has already been told about.
+// router_state keys: the open window's reset, the reset of the window the user
+// has already been told about, and when an answer last closed a window.
 const LIMITED_UNTIL_KEY = 'usage_limited_until';
 const ANNOUNCED_KEY = 'usage_limit_announced';
+const CLOSED_KEY = 'usage_limit_closed_at';
 
 export function isUsageLimit(text: string): boolean {
   return LIMIT_PATTERN.test(text);
@@ -166,9 +173,13 @@ export function recordUsageLimit(
   // without a word they wait on a time that has passed. A smaller move is the
   // guessed hold starting again from a later refusal, and a reset earlier
   // than the announced one only means the work resumes sooner than they were
-  // told.
+  // told. So does a refusal well after an answer closed the window, whatever
+  // its reset: the window is open again, so the close is over.
   const announced = readTime(ANNOUNCED_KEY);
+  const closed = readTime(CLOSED_KEY);
+  if (closed !== null) setRouterState(CLOSED_KEY, '');
   if (
+    (closed === null || now.getTime() - closed <= CLOSE_GRACE_MS) &&
     announced !== null &&
     now.getTime() < announced + MESSAGE_RESUME_MARGIN_MS &&
     resetsAt.getTime() <= announced + UNKNOWN_RESET_HOLD_MS
@@ -201,8 +212,9 @@ export function usageLimitResetsAt(now: Date = new Date()): Date | null {
  * Closes the open window on an answer: a request got through, so the limit no
  * longer holds (extra usage, or quota back before the stated reset). Returns
  * whether it closed one, so the caller can run the held work now. The
- * announced reset stays: if the close was wrong, the next refusal reopens the
- * same window without telling the user again.
+ * announced reset stays, and the close is recorded: if it was wrong, the
+ * refusal of the retry, which comes within CLOSE_GRACE_MS, reopens the same
+ * window without telling the user again.
  */
 export function closeUsageLimitOnAnswer(
   text: string | null | undefined,
@@ -210,6 +222,7 @@ export function closeUsageLimitOnAnswer(
 ): boolean {
   if (!isAgentAnswer(text) || usageLimitResetsAt(now) === null) return false;
   setRouterState(LIMITED_UNTIL_KEY, '');
+  setRouterState(CLOSED_KEY, now.toISOString());
   return true;
 }
 

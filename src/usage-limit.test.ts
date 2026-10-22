@@ -424,4 +424,30 @@ describe('closeUsageLimitOnAnswer', () => {
     expect(again?.notice).toBeNull();
     expect(usageLimitHeldUntil(later)).not.toBeNull();
   });
+
+  it('stays silent within ten minutes of the close, and for the rest of that window', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const retry = new Date(later.getTime() + 9 * 60_000);
+    expect(recordUsageLimit(WITH_DATE, retry, SEOUL, 'en')?.notice).toBeNull();
+    // The window is open again, so a later refusal is still this window's.
+    const after = new Date(retry.getTime() + HOUR);
+    expect(recordUsageLimit(WITH_DATE, after, SEOUL, 'en')?.notice).toBeNull();
+  });
+
+  it('announces a window that opens well after an answer closed the last one', () => {
+    // The user saw the bot answer again; without a word, a new window would
+    // look like it had stopped. Its reset is still before the announced one.
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en'); // 10am tomorrow
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const reopened = new Date(later.getTime() + 11 * 60_000);
+    const hit = recordUsageLimit(
+      "You're out of extra usage · resets 1am (Asia/Seoul)",
+      reopened,
+      SEOUL,
+      'en',
+    );
+    expect(hit?.resetsAt.toISOString()).toBe('2026-10-13T16:00:00.000Z');
+    expect(hit?.notice).toContain('1:00');
+  });
 });
