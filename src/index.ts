@@ -42,12 +42,13 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import { SchedulerDependencies, startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logHeartbeat } from './liveness-log.js';
 import { logger } from './logger.js';
 import { qaFollowupCommand, worthFilingCheck } from './qa-followup.js';
 import {
+  closeUsageLimitOnAnswer,
   isUsageLimit,
   recordUsageLimit,
   usageLimitHeldUntil,
@@ -197,8 +198,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
   const missedMessages = getMessagesSince(
     chatJid,
@@ -207,14 +206,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
 
   if (missedMessages.length === 0) return true;
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const hasTrigger = missedMessages.some((m) =>
-      TRIGGER_PATTERN.test(m.content.trim()),
-    );
-    if (!hasTrigger) return true;
-  }
+  if (!startsAgent(group, missedMessages)) return true;
 
   // A usage-limit window is open: leave the messages pending rather than start
   // a container the limit would refuse. They run when the window closes.
@@ -277,6 +269,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
+    let closed = false;
     if (result.result) {
       const raw =
         typeof result.result === 'string'
@@ -309,6 +302,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (resumeAt) resumeAfterUsageLimit(resumeAt);
         return;
       }
+      // A request got through: an open window is over. The held messages it
+      // releases run at the end, below.
+      closed = closeUsageLimitOnAnswer(raw);
       if (!runEnded) {
         // A result ends a turn, and turns take prompts in the order they were
         // given. A turn answered only through send_message counts too.
@@ -338,14 +334,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (!runEnded) resetIdleTimer();
     }
 
-    if (runEnded) return;
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
+    if (!runEnded) {
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
+      if (result.status === 'error') {
+        hadError = true;
+      }
     }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
+    // Held messages may go into this container, so they run only once this
+    // result is done with it. Before it settles its own prompt, a turn no
+    // prompt started (a task notification) would settle theirs, and a refusal
+    // of their turn would put back nothing. After notifyIdle, a task waiting
+    // on this container has closed it, and they wait for the next one
+    // instead of holding the task up for another turn.
+    if (closed) usageLimitLifted();
   });
   runEnded = true;
 
@@ -519,74 +523,96 @@ async function startMessageLoop(): Promise<void> {
 
   while (true) {
     try {
-      const jids = Object.keys(registeredGroups);
-      const { messages, newTimestamp } = getNewMessages(
-        jids,
-        lastTimestamp,
-        ASSISTANT_NAME,
-      );
-
-      if (messages.length > 0) {
-        logger.info({ count: messages.length }, 'New messages');
-
-        // Advance the "seen" cursor for all messages immediately
-        lastTimestamp = newTimestamp;
-        saveState();
-
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
-        for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
-          if (existing) {
-            existing.push(msg);
-          } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
-          }
-        }
-
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
-
-          const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-            continue;
-          }
-
-          const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const hasTrigger = groupMessages.some((m) =>
-              TRIGGER_PATTERN.test(m.content.trim()),
-            );
-            if (!hasTrigger) continue;
-          }
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-
-          if (!pipeToActiveContainer(chatJid, channel, messagesToSend)) {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
-        }
-      }
+      pollNewMessages();
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+  }
+}
+
+/** One pass of the message loop: hands new messages to their groups. */
+function pollNewMessages(): void {
+  const jids = Object.keys(registeredGroups);
+  const { messages, newTimestamp } = getNewMessages(
+    jids,
+    lastTimestamp,
+    ASSISTANT_NAME,
+  );
+
+  if (messages.length > 0) {
+    logger.info({ count: messages.length }, 'New messages');
+
+    // Advance the "seen" cursor for all messages immediately
+    lastTimestamp = newTimestamp;
+    saveState();
+
+    // Deduplicate by group
+    const messagesByGroup = new Map<string, NewMessage[]>();
+    for (const msg of messages) {
+      const existing = messagesByGroup.get(msg.chat_jid);
+      if (existing) {
+        existing.push(msg);
+      } else {
+        messagesByGroup.set(msg.chat_jid, [msg]);
+      }
+    }
+
+    for (const [chatJid, groupMessages] of messagesByGroup) {
+      const group = registeredGroups[chatJid];
+      if (!group) continue;
+
+      const channel = findChannel(channels, chatJid);
+      if (!channel) {
+        logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+        continue;
+      }
+
+      // Non-trigger messages accumulate in DB and get pulled as
+      // context when a trigger eventually arrives.
+      if (!startsAgent(group, groupMessages)) continue;
+
+      // Pull all messages since lastAgentTimestamp so non-trigger
+      // context that accumulated between triggers is included.
+      const allPending = getMessagesSince(
+        chatJid,
+        lastAgentTimestamp[chatJid] || '',
+        ASSISTANT_NAME,
+      );
+      // None: the cursor is already past these. Recovery piped them, or a
+      // container took them at start-up, before this poll saw them.
+      if (allPending.length === 0) continue;
+
+      deliverMessages(chatJid, channel, allPending);
+    }
+  }
+}
+
+/**
+ * Whether these messages start the agent: any message in the main group, or
+ * in a group that needs no trigger; elsewhere only one with the trigger.
+ */
+function startsAgent(group: RegisteredGroup, messages: NewMessage[]): boolean {
+  if (group.folder === MAIN_GROUP_FOLDER || group.requiresTrigger === false) {
+    return true;
+  }
+  return messages.some((m) => TRIGGER_PATTERN.test(m.content.trim()));
+}
+
+/**
+ * Hands a group's pending messages to its running container, or queues a
+ * check that starts one when no container takes them. A check for a group
+ * whose container is running only marks it, and that container takes the
+ * messages only once it closes, on idle after half an hour: so the message
+ * loop and recovery both deliver this way.
+ */
+function deliverMessages(
+  chatJid: string,
+  channel: Channel,
+  messages: NewMessage[],
+): void {
+  if (!pipeToActiveContainer(chatJid, channel, messages)) {
+    queue.enqueueMessageCheck(chatJid);
   }
 }
 
@@ -682,10 +708,38 @@ function resumeAfterUsageLimit(heldUntil: Date): void {
 }
 
 /**
+ * An answer closed the usage-limit window: run the held messages now, not at
+ * the reset the window had. If the limit still holds, the first of them is
+ * refused and reopens the window without a second notice. Only a container
+ * already running when it reopens can answer into it, so this cannot repeat
+ * on its own.
+ */
+function usageLimitLifted(): void {
+  if (usageLimitRecoveryTimer) {
+    clearTimeout(usageLimitRecoveryTimer);
+    usageLimitRecoveryTimer = null;
+  }
+  logger.info('Usage limit window closed by an answer, resuming held work');
+  recoverPendingMessages();
+}
+
+/**
+ * A scheduled run changed the usage-limit window. Held messages follow it: a
+ * refusal can state an earlier reset than the one recovery is armed for, and
+ * an answer that closed the window runs them now.
+ */
+function usageLimitChanged(): void {
+  if (usageLimitHeldUntil()) recoverPendingMessages();
+  else usageLimitLifted();
+}
+
+/**
  * Startup recovery: check for unprocessed messages in registered groups.
  * Handles crash between advancing lastTimestamp and processing messages.
  * While a usage-limit window is open it only arms itself for the window's end,
- * which is also how held messages get picked up after the reset.
+ * which is also how held messages get picked up after the reset. Messages a
+ * window held while the group's container kept running go into that
+ * container, as the message loop would have put them.
  */
 function recoverPendingMessages(): void {
   const heldUntil = usageLimitHeldUntil();
@@ -702,7 +756,12 @@ function recoverPendingMessages(): void {
         { group: group.name, pendingCount: pending.length },
         'Recovery: found unprocessed messages',
       );
-      queue.enqueueMessageCheck(chatJid);
+      const channel = findChannel(channels, chatJid);
+      if (channel && startsAgent(group, pending)) {
+        deliverMessages(chatJid, channel, pending);
+      } else {
+        queue.enqueueMessageCheck(chatJid);
+      }
     }
   }
 }
@@ -719,13 +778,36 @@ function restoreStartupState(): void {
   discardRefusedInputAfterRestart();
 }
 
+/** What the scheduler is started with: this process's queue and channels. */
+function schedulerDependencies(): SchedulerDependencies {
+  return {
+    registeredGroups: () => registeredGroups,
+    getSessions: () => sessions,
+    queue,
+    onProcess: (groupJid, proc, containerName, groupFolder) =>
+      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    sendMessage: async (jid, rawText) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) {
+        logger.warn({ jid }, 'No channel owns JID, cannot send message');
+        return;
+      }
+      const text = formatOutbound(rawText);
+      if (text) await channel.sendMessage(jid, text);
+    },
+    onUsageLimitChanged: usageLimitChanged,
+  };
+}
+
 /** @internal - exported for testing */
 export {
   loadState as _loadState,
   pipeToActiveContainer as _pipeToActiveContainer,
+  pollNewMessages as _pollNewMessages,
   processGroupMessages as _processGroupMessages,
   recoverPendingMessages as _recoverPendingMessages,
   restoreStartupState as _restoreStartupState,
+  schedulerDependencies as _schedulerDependencies,
 };
 
 async function main(): Promise<void> {
@@ -767,22 +849,7 @@ async function main(): Promise<void> {
   await whatsapp.connect();
 
   // Start subsystems (independently of connection handler)
-  startSchedulerLoop({
-    registeredGroups: () => registeredGroups,
-    getSessions: () => sessions,
-    queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) =>
-      queue.registerProcess(groupJid, proc, containerName, groupFolder),
-    sendMessage: async (jid, rawText) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send message');
-        return;
-      }
-      const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
-    },
-  });
+  startSchedulerLoop(schedulerDependencies());
   startIpcWatcher({
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);

@@ -4,6 +4,15 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The group queue writes follow-ups and the close sentinel under DATA_DIR;
+// keep them out of the checkout's data/.
+const { dataDir } = vi.hoisted(() => ({
+  dataDir: `${process.env.TMPDIR || '/tmp'}/usage-limit-data-${process.pid}`,
+}));
+vi.mock('./config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./config.js')>()),
+  DATA_DIR: dataDir,
+}));
 vi.mock('./container-runner.js', () => ({
   runContainerAgent: vi.fn(),
   writeTasksSnapshot: vi.fn(),
@@ -21,10 +30,12 @@ vi.mock('./qa-followup.js', () => ({
   worthFilingCheck: () => false,
 }));
 
+import { ASSISTANT_NAME } from './config.js';
 import { ContainerOutput, runContainerAgent } from './container-runner.js';
 import { cleanupOrphans } from './container-runtime.js';
 import {
   _initTestDatabase,
+  createTask,
   getAllSessions,
   getRouterState,
   setSession,
@@ -35,14 +46,24 @@ import { GroupQueue } from './group-queue.js';
 import {
   _loadState,
   _pipeToActiveContainer,
+  _pollNewMessages,
   _processGroupMessages,
   _recoverPendingMessages,
   _restoreStartupState,
+  _schedulerDependencies,
   _setChannels,
   _setRegisteredGroups,
 } from './index.js';
+import {
+  _resetSchedulerLoopForTests,
+  startSchedulerLoop,
+} from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
-import { recordUsageLimit, usageLimitHeldUntil } from './usage-limit.js';
+import {
+  recordUsageLimit,
+  usageLimitHeldUntil,
+  usageLimitResetsAt,
+} from './usage-limit.js';
 
 const LIMIT = "You've hit your limit · resets Oct 14, 10am (Asia/Seoul)";
 const NOW = Date.parse('2026-10-13T12:00:00.000Z'); // 21:00 in Seoul
@@ -121,11 +142,15 @@ let inputDir: string;
 // builds it: the host's prompt plus every input file it drains at start-up.
 let bootPrompts: string[];
 
-/** Pipes write real input files, the way GroupQueue.sendMessage does. */
-function pipesWriteFiles(): void {
+/**
+ * Pipes write real input files, the way GroupQueue.sendMessage does while the
+ * group's container runs. Restore the spy once it no longer does.
+ */
+function pipesWriteFiles() {
   let written = 0;
-  vi.spyOn(GroupQueue.prototype, 'sendMessage').mockImplementation(
-    (_jid, text) => {
+  return vi
+    .spyOn(GroupQueue.prototype, 'sendMessage')
+    .mockImplementation((_jid, text) => {
       written++;
       const file = path.join(
         inputDir,
@@ -133,8 +158,7 @@ function pipesWriteFiles(): void {
       );
       fs.writeFileSync(file, JSON.stringify({ type: 'message', text }));
       return file;
-    },
-  );
+    });
 }
 
 function inputFiles(): string[] {
@@ -182,6 +206,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   fs.rmSync(inputDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
 describe('a message answered with the usage limit', () => {
@@ -281,7 +306,7 @@ describe('a message answered with the usage limit', () => {
 
   it('keeps a follow-up piped in during the answer pending when the limit refuses it', async () => {
     userSays('m1', 'what is section 2 about?', NOW - 60_000);
-    pipesWriteFiles();
+    const pipes = pipesWriteFiles();
     vi.mocked(runContainerAgent).mockImplementationOnce(
       async (_group, _input, _onProcess, onOutput) => {
         // The follow-up arrives while the first answer is being written, and
@@ -304,6 +329,8 @@ describe('a message answered with the usage limit', () => {
     );
     await _processGroupMessages(CHAT);
     expect(sentTexts()).toContain('It describes the method.');
+    // The container is gone, so recovery finds none to pipe into.
+    pipes.mockRestore();
 
     await vi.advanceTimersByTimeAsync(RESET + 5 * 60_000 - Date.now());
     expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
@@ -383,6 +410,529 @@ describe('startup recovery', () => {
     _loadState();
     _setRegisteredGroups({ [CHAT]: MAIN_GROUP });
     _recoverPendingMessages();
+    expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
+  });
+});
+
+describe('an answer inside an open window', () => {
+  /**
+   * Runs m1 in a container that answers with `result` after the window opened
+   * under it (a scheduled run refused meanwhile), with m2 held, not piped.
+   */
+  async function answeredInsideWindow(result: string): Promise<void> {
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        expect(recordUsageLimit(LIMIT)?.notice).toBeTruthy();
+        const m2 = userSays('m2', 'and section 3?', NOW - 30_000);
+        expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(false);
+        await onOutput?.({
+          status: 'success',
+          result,
+          newSessionId: 'session-new',
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    await _processGroupMessages(CHAT);
+  }
+
+  it('closes the window and runs the held messages now, not at the reset', async () => {
+    await answeredInsideWindow('It describes the method.');
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
+
+    agentReplies('It covers the experiments.');
+    await _processGroupMessages(CHAT);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+    expect(promptOfRun(1)).toContain('and section 3?');
+    expect(sentTexts()).toContain('It covers the experiments.');
+  });
+
+  it('costs one refused retry when the limit still holds, and no second notice', async () => {
+    await answeredInsideWindow('It describes the method.');
+    agentReplies(LIMIT);
+    await _processGroupMessages(CHAT);
+    expect(sentTexts()).toEqual(['It describes the method.']);
+    expect(usageLimitHeldUntil()).not.toBeNull();
+
+    // Held again: nothing starts until the reset.
+    await _processGroupMessages(CHAT);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the window open on an API error', async () => {
+    await answeredInsideWindow('API Error: 500 {"type":"error"}');
+    expect(usageLimitHeldUntil()).not.toBeNull();
+    expect(enqueueMessageCheck).not.toHaveBeenCalled();
+  });
+});
+
+// Through the module's own queue, as main() runs it: a check for a group whose
+// container is still running only marks it pending, and that container takes
+// it only when it closes, half an hour after its last answer if it idles.
+describe('messages held for a container that is still running', () => {
+  const { queue } = _schedulerDependencies();
+  const m2Text = 'and section 3?';
+  let exitContainer: () => void;
+
+  beforeEach(() => {
+    enqueueMessageCheck.mockRestore();
+    queue.setProcessMessagesFn(_processGroupMessages);
+  });
+
+  afterEach(async () => {
+    exitContainer?.();
+    await vi.advanceTimersByTimeAsync(0);
+    queue.setProcessMessagesFn(async () => true);
+  });
+
+  /** What the queue has piped into the group's running container. */
+  function pipedTexts(): string[] {
+    const dir = path.join(dataDir, 'ipc', MAIN_GROUP.folder, 'input');
+    if (!fs.existsSync(dir)) return [];
+    return fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')).text);
+  }
+
+  /**
+   * Starts m1 through the queue in a container that runs `turn` and then
+   * stays up, idle, until the test ends it. `start` hands m1 to the queue.
+   */
+  async function containerRunning(
+    turn: (
+      onOutput: (output: ContainerOutput) => Promise<void>,
+    ) => Promise<void>,
+    start: () => void = () => queue.enqueueMessageCheck(CHAT),
+  ): Promise<void> {
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, onProcess, onOutput) => {
+        onProcess({} as never, 'paperclaw-main-1');
+        await turn(onOutput!);
+        await new Promise<void>((resolve) => {
+          exitContainer = resolve;
+        });
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    start();
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  /** m2 arrives while the window is open, and the message loop queues it. */
+  function heldWhileOpen(): NewMessage {
+    const m2 = userSays('m2', m2Text, Date.now());
+    expect(_pipeToActiveContainer(CHAT, channel, [m2])).toBe(false);
+    queue.enqueueMessageCheck(CHAT);
+    return m2;
+  }
+
+  async function answer(
+    onOutput: (output: ContainerOutput) => Promise<void>,
+    result: string,
+  ): Promise<void> {
+    await onOutput({ status: 'success', result, newSessionId: 'session-new' });
+    await onOutput({
+      status: 'success',
+      result: null,
+      newSessionId: 'session-new',
+    });
+  }
+
+  it('go into it at once when its own answer closes the window', async () => {
+    let m2!: NewMessage;
+    await containerRunning(async (onOutput) => {
+      // Another group is refused while m1 is in flight: the window opens.
+      recordUsageLimit(LIMIT);
+      m2 = heldWhileOpen();
+      await answer(onOutput, 'It describes the method.');
+    });
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(pipedTexts()).toEqual([expect.stringContaining(m2Text)]);
+    // The cursor moves past it, as a pipe from the message loop moves it.
+    expect(getRouterState('last_agent_timestamp')).toContain(m2.timestamp);
+
+    // The check the loop queued finds nothing left once the container exits:
+    // m2 is not run again.
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runContainerAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('stay pending when a turn no prompt started closes the window and theirs is refused', async () => {
+    let onOutput!: (output: ContainerOutput) => Promise<void>;
+    await containerRunning((output) => {
+      onOutput = output;
+      return answer(output, 'It describes the method.');
+    });
+    const m1Cursor = getRouterState('last_agent_timestamp');
+    // Idle. Another group is refused, and m2 is held for the window.
+    recordUsageLimit(LIMIT);
+    heldWhileOpen();
+    // A background task's notification starts a turn of its own, and its
+    // answer closes the window: m2 goes in.
+    await answer(onOutput, 'Paper 2 is uploaded.');
+    expect(pipedTexts()).toEqual([expect.stringContaining(m2Text)]);
+    // m2's turn is refused, so m2 is pending again, not settled by the
+    // answer that came before it.
+    await answer(
+      onOutput,
+      "You're out of extra usage · resets Oct 14, 10am (Asia/Seoul)",
+    );
+    expect(getRouterState('last_agent_timestamp')).toBe(m1Cursor);
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getRouterState('last_agent_timestamp')).toBe(m1Cursor);
+  });
+
+  it('stay pending when the answer that closes the window also closes it for a task', async () => {
+    const task = vi.fn(async () => {});
+    let m2!: NewMessage;
+    await containerRunning(async (onOutput) => {
+      recordUsageLimit(LIMIT);
+      m2 = heldWhileOpen();
+      // A scheduled run comes due meanwhile and waits for this container.
+      queue.enqueueTask(CHAT, 'nightly', task);
+      await answer(onOutput, 'It describes the method.');
+    });
+    // The container now closes for the task without reading new input, so
+    // m2 is not left in a file it never reads, behind a cursor past it.
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(pipedTexts()).toEqual([]);
+    expect(getRouterState('last_agent_timestamp')).not.toContain(m2.timestamp);
+
+    agentReplies('It covers the experiments.');
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(task).toHaveBeenCalledTimes(1);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+    expect(promptOfRun(1)).toContain(m2Text);
+    expect(sentTexts()).toContain('It covers the experiments.');
+  });
+
+  it('are read by it before it closes for a task, when another group lets them in during its send', async () => {
+    const OTHER = 'other@g.us';
+    vi.spyOn(channel, 'ownsJid').mockImplementation(
+      (jid) => jid === CHAT || jid === OTHER,
+    );
+    _setRegisteredGroups({
+      [CHAT]: MAIN_GROUP,
+      [OTHER]: {
+        ...MAIN_GROUP,
+        name: 'Other',
+        folder: 'other',
+        requiresTrigger: false,
+      },
+    });
+    storeChatMetadata(OTHER, new Date(NOW).toISOString(), 'Other', 'test');
+    // Sends take a moment, as a WhatsApp send does, until released.
+    const sends: Record<string, () => void> = {};
+    const send = vi.spyOn(channel, 'sendMessage').mockImplementation(
+      (jid) =>
+        new Promise<void>((resolve) => {
+          sends[jid] = resolve;
+        }),
+    );
+    const emit: Record<string, (output: ContainerOutput) => Promise<void>> = {};
+    const exits: (() => void)[] = [];
+    exitContainer = () => exits.forEach((exit) => exit());
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (group, _input, onProcess, onOutput) => {
+        onProcess({} as never, `paperclaw-${group.folder}-1`);
+        emit[group.folder] = onOutput!;
+        await new Promise<void>((resolve) => exits.push(resolve));
+        return { status: 'success', result: null, newSessionId: 'session-new' };
+      },
+    );
+    userSays('m1', 'what is section 2 about?', NOW - 60_000);
+    storeMessage({
+      id: 'o1',
+      chat_jid: OTHER,
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'any news?',
+      timestamp: new Date(NOW - 50_000).toISOString(),
+    });
+    queue.enqueueMessageCheck(CHAT);
+    queue.enqueueMessageCheck(OTHER);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // A third group is refused: m2 is held, and a scheduled run for main
+    // comes due while main is still busy with m1.
+    recordUsageLimit(LIMIT);
+    const m2 = heldWhileOpen();
+    const task = vi.fn(async () => {});
+    queue.enqueueTask(CHAT, 'nightly', task);
+
+    // The other group's answer closes the window; its send is in flight.
+    const otherDone = emit.other({
+      status: 'success',
+      result: 'Nothing new yet.',
+      newSessionId: 'session-new',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    // Main answers m1, and its send is in flight too.
+    const mainDone = emit.main({
+      status: 'success',
+      result: 'It describes the method.',
+      newSessionId: 'session-new',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    // The other send completes: recovery pipes m2 into main.
+    sends[OTHER]();
+    await otherDone;
+    expect(pipedTexts()).toEqual([expect.stringContaining(m2Text)]);
+    // Main's send completes. It has not read m2, so it is not idle yet.
+    sends[CHAT]();
+    await mainDone;
+    const input = path.join(dataDir, 'ipc', MAIN_GROUP.folder, 'input');
+    expect(fs.existsSync(path.join(input, '_close'))).toBe(false);
+
+    // It reads m2 and answers it; then it closes for the task.
+    for (const file of fs.readdirSync(input)) {
+      fs.unlinkSync(path.join(input, file));
+    }
+    send.mockImplementation(async () => {});
+    await emit.main({
+      status: 'success',
+      result: 'It covers the experiments.',
+      newSessionId: 'session-new',
+    });
+    expect(fs.existsSync(path.join(input, '_close'))).toBe(true);
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(task).toHaveBeenCalledTimes(1);
+    expect(runContainerAgent).toHaveBeenCalledTimes(2);
+    expect(getRouterState('last_agent_timestamp')).toContain(m2.timestamp);
+  });
+
+  it('are not piped again by the next poll of the message loop', async () => {
+    // The window ends between two polls: recovery pipes what the loop has
+    // not seen yet, and moves the cursor past it before the loop sees it.
+    const reset = NOW + 10 * 60_000; // 9:10pm in Seoul
+    await containerRunning(
+      (onOutput) => answer(onOutput, 'It describes the method.'),
+      _pollNewMessages,
+    );
+    recordUsageLimit("You've hit your limit · resets 9:10pm (Asia/Seoul)");
+    _recoverPendingMessages();
+    userSays('m2', m2Text, Date.now());
+    _pollNewMessages();
+    await vi.advanceTimersByTimeAsync(reset + 2 * 60_000 - 700 - Date.now());
+    const m3 = userSays('m3', 'and the appendix?', Date.now());
+    await vi.advanceTimersByTimeAsync(700);
+    expect(pipedTexts()).toEqual([
+      expect.stringMatching(/and section 3\?[\s\S]*and the appendix\?/),
+    ]);
+    expect(getRouterState('last_agent_timestamp')).toContain(m3.timestamp);
+
+    _pollNewMessages();
+    expect(pipedTexts()).toHaveLength(1);
+  });
+
+  it('go into it at once when the window ends at its reset', async () => {
+    const reset = NOW + 10 * 60_000; // 9:10pm in Seoul
+    await containerRunning((onOutput) =>
+      answer(onOutput, 'It describes the method.'),
+    );
+    // Then another group is refused, and its run arms recovery for the reset.
+    recordUsageLimit("You've hit your limit · resets 9:10pm (Asia/Seoul)");
+    _recoverPendingMessages();
+    heldWhileOpen();
+    expect(pipedTexts()).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(reset + 3 * 60_000 - Date.now());
+    expect(pipedTexts()).toEqual([expect.stringContaining(m2Text)]);
+    exitContainer();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runContainerAgent).toHaveBeenCalledTimes(1);
+  });
+
+  // Recovery pipes by the message loop's rule: in a group that needs the
+  // trigger, chatter waits as context until a message with the trigger comes.
+  describe('in a group that needs the trigger', () => {
+    const TEAM = 'team@g.us';
+    const TEAM_GROUP: RegisteredGroup = {
+      name: 'Team',
+      folder: 'team',
+      trigger: `@${ASSISTANT_NAME}`,
+      added_at: '2026-10-01T00:00:00.000Z',
+    };
+
+    function teamSays(id: string, content: string, at: number): NewMessage {
+      const message: NewMessage = {
+        id,
+        chat_jid: TEAM,
+        sender: 'user@s.whatsapp.net',
+        sender_name: 'User',
+        content,
+        timestamp: new Date(at).toISOString(),
+      };
+      storeMessage(message);
+      return message;
+    }
+
+    function teamPiped(): string[] {
+      const dir = path.join(dataDir, 'ipc', TEAM_GROUP.folder, 'input');
+      if (!fs.existsSync(dir)) return [];
+      return fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith('.json'))
+        .map(
+          (f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')).text,
+        );
+    }
+
+    function teamCursor(): string | undefined {
+      return JSON.parse(getRouterState('last_agent_timestamp') || '{}')[TEAM];
+    }
+
+    /** The team's container answered a triggered message and idles. */
+    async function teamContainerRunning(): Promise<
+      (output: ContainerOutput) => Promise<void>
+    > {
+      vi.spyOn(channel, 'ownsJid').mockImplementation((jid) => jid === TEAM);
+      _setRegisteredGroups({ [TEAM]: TEAM_GROUP });
+      storeChatMetadata(
+        TEAM,
+        new Date(NOW).toISOString(),
+        'Team',
+        'test',
+        true,
+      );
+      let onOutput!: (output: ContainerOutput) => Promise<void>;
+      vi.mocked(runContainerAgent).mockImplementationOnce(
+        async (_group, _input, onProcess, output) => {
+          onProcess({} as never, 'paperclaw-team-1');
+          onOutput = output!;
+          await answer(output!, 'It describes the method.');
+          await new Promise<void>((resolve) => {
+            exitContainer = resolve;
+          });
+          return {
+            status: 'success',
+            result: null,
+            newSessionId: 'session-new',
+          };
+        },
+      );
+      teamSays(
+        't1',
+        `@${ASSISTANT_NAME} what is section 2 about?`,
+        NOW - 60_000,
+      );
+      queue.enqueueMessageCheck(TEAM);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runContainerAgent).toHaveBeenCalledTimes(1);
+      return onOutput;
+    }
+
+    it('keep chatter without the trigger out of it when the window closes', async () => {
+      const onOutput = await teamContainerRunning();
+      const cursor = teamCursor();
+      recordUsageLimit(LIMIT);
+      teamSays('t2', 'thanks, that helps', NOW - 30_000);
+      // A turn of its own answers, which closes the window.
+      await answer(onOutput, 'Paper 2 is uploaded.');
+      expect(usageLimitHeldUntil()).toBeNull();
+      expect(teamPiped()).toEqual([]);
+      expect(teamCursor()).toBe(cursor);
+    });
+
+    it('go into it with that chatter once one has the trigger', async () => {
+      const onOutput = await teamContainerRunning();
+      recordUsageLimit(LIMIT);
+      teamSays('t2', 'thanks, that helps', NOW - 30_000);
+      const t3 = teamSays(
+        't3',
+        `@${ASSISTANT_NAME} and section 3?`,
+        NOW - 20_000,
+      );
+      await answer(onOutput, 'Paper 2 is uploaded.');
+      expect(teamPiped()).toEqual([
+        expect.stringMatching(/thanks, that helps[\s\S]*and section 3\?/),
+      ]);
+      expect(teamCursor()).toBe(t3.timestamp);
+    });
+  });
+});
+
+describe('the scheduler, started as main() starts it', () => {
+  afterEach(() => {
+    _resetSchedulerLoopForTests();
+  });
+
+  /**
+   * Starts the scheduler with main()'s dependencies and runs one task due
+   * now, whose container calls `run` with a way to end a turn on a result.
+   */
+  async function runScheduledTask(
+    run: (turn: (result: string) => Promise<void>) => Promise<void>,
+  ): Promise<void> {
+    createTask({
+      id: 'nightly',
+      group_folder: 'main',
+      chat_jid: CHAT,
+      prompt: 'nightly batch',
+      schedule_type: 'cron',
+      schedule_value: '30 23 * * *',
+      context_mode: 'isolated',
+      next_run: new Date(NOW - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-10-01T00:00:00.000Z',
+    });
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_group, _input, _onProcess, onOutput) => {
+        await run(async (result) => {
+          await onOutput?.({
+            status: 'success',
+            result,
+            newSessionId: 'session-task',
+          });
+        });
+        return {
+          status: 'success',
+          result: null,
+          newSessionId: 'session-task',
+        };
+      },
+    );
+    _resetSchedulerLoopForTests();
+    startSchedulerLoop(_schedulerDependencies());
+    await vi.advanceTimersByTimeAsync(10);
+  }
+
+  it('runs the held messages at once when a scheduled answer closes the window', async () => {
+    await runScheduledTask(async (turn) => {
+      // A message is refused while the run is under way, and held...
+      recordUsageLimit(LIMIT);
+      userSays('m1', 'translate the new paper', NOW - 30_000);
+      // ...and then the run's own request gets through.
+      await turn('Batch done: 3 papers uploaded.');
+    });
+
+    expect(usageLimitHeldUntil()).toBeNull();
+    expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
+  });
+
+  it('runs the held messages at an earlier reset a scheduled refusal states', async () => {
+    const sessionReset = Date.parse('2026-10-13T14:00:00.000Z'); // 11pm Seoul
+    await runScheduledTask(async (turn) => {
+      // A message is refused while the run is under way: held, with recovery
+      // armed for the window's end, 10am tomorrow.
+      userSays('m1', 'translate the new paper', NOW - 30_000);
+      recordUsageLimit(LIMIT);
+      _recoverPendingMessages();
+      // The run is refused too, by a limit that resets sooner.
+      await turn("You've hit your session limit · resets 11pm (Asia/Seoul)");
+    });
+    expect(usageLimitResetsAt()?.getTime()).toBe(sessionReset);
+    expect(enqueueMessageCheck).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(sessionReset + 3 * 60_000 - Date.now());
     expect(enqueueMessageCheck).toHaveBeenCalledWith(CHAT);
   });
 });

@@ -1,10 +1,17 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { _initTestDatabase } from './db.js';
 import {
   classifyUsageLimit,
+  closeUsageLimitOnAnswer,
+  isAgentAnswer,
   recordUsageLimit,
   usageLimitHeldUntil,
+  usageLimitResetsAt,
 } from './usage-limit.js';
 
 // What the bundled CLI actually sends back when the account is out of quota.
@@ -166,6 +173,34 @@ describe('classifyUsageLimit', () => {
   });
 });
 
+describe('isAgentAnswer', () => {
+  it('takes text the agent wrote, internal or not, as an answer', () => {
+    expect(isAgentAnswer('Section 3 is translated and uploaded.')).toBe(true);
+    expect(isAgentAnswer('<internal>acked, dispatched</internal>')).toBe(true);
+    // Quoting an error is not being one.
+    expect(isAgentAnswer('The run failed with "API Error: 500".')).toBe(true);
+  });
+
+  it('does not take the refusal, an empty result or an API error as one', () => {
+    // The runner forwards is_error results as successes, so these arrive as
+    // result text. None of them shows the limit let a request through. Every
+    // other error the CLI can write is in usage-limit-cli.test.ts.
+    for (const text of [
+      WITH_DATE,
+      "You're out of extra usage · resets 11pm (Asia/Seoul)",
+      '',
+      '   ',
+      'API Error: 500 {"type":"error","error":{"type":"api_error"}}',
+      'API Error: Rate limit reached',
+      'API Error: ',
+      '  Request timed out\n',
+    ]) {
+      expect(isAgentAnswer(text), text).toBe(false);
+    }
+    expect(isAgentAnswer(null)).toBe(false);
+  });
+});
+
 describe('recordUsageLimit', () => {
   beforeEach(() => {
     _initTestDatabase();
@@ -279,6 +314,63 @@ describe('recordUsageLimit', () => {
     ).not.toBeNull();
   });
 
+  it('does not let a guessed reset shorten an open window', () => {
+    // The window runs to 10am tomorrow. A later refusal that states no reset
+    // knows less than that, and an hour's guess would resume work hours early.
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    const later = new Date(now.getTime() + 10 * 60_000);
+    const guessed = recordUsageLimit(
+      "You've hit your limit",
+      later,
+      SEOUL,
+      'en',
+    );
+    expect(guessed?.resetsAt.getTime()).toBe(reset);
+    expect(guessed?.notice).toBeNull();
+    expect(usageLimitResetsAt(later)?.getTime()).toBe(reset);
+
+    // Nor does a stated reset already in the past, which is a guess as well.
+    const past = "You've hit your limit · resets Oct 13, 8pm (Asia/Seoul)";
+    expect(recordUsageLimit(past, later, SEOUL, 'en')?.resetsAt.getTime()).toBe(
+      reset,
+    );
+    expect(usageLimitResetsAt(later)?.getTime()).toBe(reset);
+  });
+
+  it('lets a guessed reset extend an open window that ends sooner', () => {
+    const text = "You've hit your limit";
+    recordUsageLimit(text, now, SEOUL, 'en');
+    const later = new Date(now.getTime() + 40 * 60_000);
+    recordUsageLimit(text, later, SEOUL, 'en');
+    expect(usageLimitResetsAt(later)?.getTime()).toBe(later.getTime() + HOUR);
+  });
+
+  it('takes a stated reset as the window, earlier or later, and says nothing on an earlier one', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en'); // 10am tomorrow
+    const later = new Date(now.getTime() + 60_000);
+    const earlier = recordUsageLimit(
+      "You've hit your session limit · resets 11pm (Asia/Seoul)",
+      later,
+      SEOUL,
+      'en',
+    );
+    const elevenPm = Date.parse('2026-10-13T14:00:00.000Z');
+    expect(earlier?.resetsAt.getTime()).toBe(elevenPm);
+    expect(earlier?.notice).toBeNull();
+    expect(usageLimitResetsAt(later)?.getTime()).toBe(elevenPm);
+
+    const weekly = recordUsageLimit(
+      "You've hit your weekly limit · resets Oct 16, 11pm (Asia/Seoul)",
+      later,
+      SEOUL,
+      'en',
+    );
+    expect(usageLimitResetsAt(later)?.toISOString()).toBe(
+      '2026-10-16T14:00:00.000Z',
+    );
+    expect(weekly?.notice).toContain('Oct 16');
+  });
+
   it('writes the notice in Korean for ko, with the reset in the configured zone', () => {
     // 10am in New York is 11pm in Seoul.
     const hit = recordUsageLimit(
@@ -297,5 +389,137 @@ describe('recordUsageLimit', () => {
     expect(hit?.notice).not.toMatch(/[가-힣]/);
     expect(hit?.notice).toMatch(/10:00\sAM/);
     expect(hit?.notice).not.toContain("You've hit your limit");
+  });
+});
+
+describe('closeUsageLimitOnAnswer', () => {
+  beforeEach(() => {
+    _initTestDatabase();
+  });
+
+  const now = new Date('2026-10-13T12:00:00.000Z'); // 21:00 in Seoul
+  const later = new Date(now.getTime() + 10 * 60_000);
+
+  it('closes an open window when a request gets through', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    expect(closeUsageLimitOnAnswer('Section 3 is uploaded.', later)).toBe(true);
+    expect(usageLimitHeldUntil(later)).toBeNull();
+    expect(usageLimitResetsAt(later)).toBeNull();
+  });
+
+  it('leaves the window open on a refusal or an API error', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    expect(closeUsageLimitOnAnswer(WITH_DATE, later)).toBe(false);
+    expect(
+      closeUsageLimitOnAnswer('API Error: Rate limit reached', later),
+    ).toBe(false);
+    expect(closeUsageLimitOnAnswer(null, later)).toBe(false);
+    expect(usageLimitHeldUntil(later)).not.toBeNull();
+  });
+
+  it('reports nothing closed when no window is open', () => {
+    expect(closeUsageLimitOnAnswer('Section 3 is uploaded.', now)).toBe(false);
+  });
+
+  it('does not announce the window again when the next request is refused', () => {
+    // A close on a stray answer costs one refused retry, and only that.
+    expect(recordUsageLimit(WITH_DATE, now, SEOUL, 'en')?.notice).toBeTruthy();
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const again = recordUsageLimit(WITH_DATE, later, SEOUL, 'en');
+    expect(again?.notice).toBeNull();
+    expect(usageLimitHeldUntil(later)).not.toBeNull();
+  });
+
+  it('stays silent within ten minutes of the close, and for the rest of that window', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const retry = new Date(later.getTime() + 9 * 60_000);
+    expect(recordUsageLimit(WITH_DATE, retry, SEOUL, 'en')?.notice).toBeNull();
+    // The window is open again, so a later refusal is still this window's.
+    const after = new Date(retry.getTime() + HOUR);
+    expect(recordUsageLimit(WITH_DATE, after, SEOUL, 'en')?.notice).toBeNull();
+  });
+
+  it('reopens the closed window, not a fresh hour, on a retry that states no reset', () => {
+    // Otherwise the held work would be retried, and silently refused, every
+    // hour until the reset the user was told.
+    const reset = Date.parse('2026-10-14T01:00:00.000Z');
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en'); // 10am tomorrow
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const retry = new Date(later.getTime() + 5 * 60_000);
+    const hit = recordUsageLimit("You've hit your limit", retry, SEOUL, 'en');
+    expect(hit?.notice).toBeNull();
+    expect(hit?.resetsAt.getTime()).toBe(reset);
+    expect(usageLimitResetsAt(retry)?.getTime()).toBe(reset);
+  });
+
+  it('guesses an hour for a window that opens well after the close', () => {
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en');
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const reopened = new Date(later.getTime() + 11 * 60_000);
+    const hit = recordUsageLimit(
+      "You've hit your limit",
+      reopened,
+      SEOUL,
+      'en',
+    );
+    expect(hit?.resetsAt.getTime()).toBe(reopened.getTime() + HOUR);
+    expect(hit?.notice).toBeTruthy();
+  });
+
+  it('announces a window that opens well after an answer closed the last one', () => {
+    // The user saw the bot answer again; without a word, a new window would
+    // look like it had stopped. Its reset is still before the announced one.
+    recordUsageLimit(WITH_DATE, now, SEOUL, 'en'); // 10am tomorrow
+    closeUsageLimitOnAnswer('Section 3 is uploaded.', later);
+    const reopened = new Date(later.getTime() + 11 * 60_000);
+    const hit = recordUsageLimit(
+      "You're out of extra usage · resets 1am (Asia/Seoul)",
+      reopened,
+      SEOUL,
+      'en',
+    );
+    expect(hit?.resetsAt.toISOString()).toBe('2026-10-13T16:00:00.000Z');
+    expect(hit?.notice).toContain('1:00');
+  });
+});
+
+describe('the debug checklist', () => {
+  // Its query lists every key that starts with usage_limit, and they hold
+  // different things: a key it does not explain reads as one it does, and a
+  // key it explains that nothing writes any more is one to go looking for.
+  const srcDir = fileURLToPath(new URL('.', import.meta.url));
+  const checklist = fs.readFileSync(
+    fileURLToPath(new URL('../docs/DEBUG_CHECKLIST.md', import.meta.url)),
+    'utf-8',
+  );
+  // Whole keys, and the heads of keys built from a string: a template
+  // literal's start, or a quoted part that ends in "_" and is added to.
+  const keys = new Set<string>();
+  const heads = new Set<string>();
+  for (const file of fs.readdirSync(srcDir, { recursive: true }) as string[]) {
+    if (!file.endsWith('.ts') || file.endsWith('.test.ts')) continue;
+    const code = fs.readFileSync(path.join(srcDir, file), 'utf-8');
+    for (const m of code.matchAll(/(['"`])(usage_limit[a-z_]*)(\1|\$\{)/g)) {
+      if (m[3] === '${' || m[2].endsWith('_')) heads.add(m[2]);
+      else keys.add(m[2]);
+    }
+  }
+  const named = [...checklist.matchAll(/`(usage_limit[a-z_]*)/g)].map(
+    (m) => m[1],
+  );
+
+  it('says what every usage-limit key in router_state holds', () => {
+    expect(keys.size).toBeGreaterThan(0);
+    for (const key of keys) expect(checklist, key).toContain(`\`${key}\``);
+    for (const head of heads) expect(checklist, head).toContain(`\`${head}`);
+  });
+
+  it('names no usage-limit key the code does not use', () => {
+    expect(named.length).toBeGreaterThan(0);
+    for (const name of named) {
+      const used = keys.has(name) || [...heads].some((h) => name.startsWith(h));
+      expect(used, name).toBe(true);
+    }
   });
 });

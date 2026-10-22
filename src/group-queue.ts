@@ -17,6 +17,8 @@ const BASE_RETRY_MS = 5000;
 interface GroupState {
   active: boolean;
   idleWaiting: boolean;
+  /** The running container was sent the close sentinel. */
+  closing: boolean;
   isTaskContainer: boolean;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
@@ -41,6 +43,7 @@ export class GroupQueue {
       state = {
         active: false,
         idleWaiting: false,
+        closing: false,
         isTaskContainer: false,
         pendingMessages: false,
         pendingTasks: [],
@@ -146,9 +149,14 @@ export class GroupQueue {
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
+   * Not while it has input it has not read: a pipe can land after the result
+   * this acknowledges, and the runner checks the close sentinel before it
+   * drains, so a close now would leave that input to the group's next
+   * container. The turn that input starts ends in a result of its own.
    */
   notifyIdle(groupJid: string): void {
     const state = this.getGroup(groupJid);
+    if (this.hasUnreadInput(state)) return;
     state.idleWaiting = true;
     if (state.pendingTasks.length > 0) {
       this.closeStdin(groupJid);
@@ -160,10 +168,18 @@ export class GroupQueue {
    * Returns the path of the file written, or null if no active container
    * took it. A container drains these files at start-up as well as while it
    * runs, so one it never read reaches the next container of the group.
+   * None once it was told to close: the runner checks the close sentinel
+   * before it drains input, so the message would wait for whatever container
+   * the group starts next, behind a caller who counts it delivered.
    */
   sendMessage(groupJid: string, text: string): string | null {
     const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer)
+    if (
+      !state.active ||
+      !state.groupFolder ||
+      state.isTaskContainer ||
+      state.closing
+    )
       return null;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
 
@@ -181,6 +197,17 @@ export class GroupQueue {
     }
   }
 
+  /** Whether follow-ups wait in the group's input dir for its container. */
+  private hasUnreadInput(state: GroupState): boolean {
+    if (!state.groupFolder) return false;
+    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    try {
+      return fs.readdirSync(inputDir).some((f) => f.endsWith('.json'));
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Signal the active container to wind down by writing a close sentinel.
    */
@@ -192,6 +219,7 @@ export class GroupQueue {
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_close'), '');
+      state.closing = true;
     } catch {
       // ignore
     }
@@ -204,6 +232,7 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     state.active = true;
     state.idleWaiting = false;
+    state.closing = false;
     state.isTaskContainer = false;
     state.pendingMessages = false;
     this.activeCount++;
@@ -239,6 +268,7 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     state.active = true;
     state.idleWaiting = false;
+    state.closing = false;
     state.isTaskContainer = true;
     state.runningTaskId = task.id;
     this.activeCount++;

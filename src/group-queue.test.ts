@@ -544,6 +544,43 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 
+  it('sendMessage writes nothing once the container was told to close', async () => {
+    let resolveProcess: () => void;
+    queue.setProcessMessagesFn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveProcess = () => resolve(true);
+        }),
+    );
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+    queue.registerProcess(
+      'group1@g.us',
+      {} as any,
+      'container-1',
+      'test-group',
+    );
+
+    // The runner checks the close sentinel before it drains input, so a file
+    // written after it is never read by this container.
+    queue.closeStdin('group1@g.us');
+    expect(queue.sendMessage('group1@g.us', 'hello')).toBeNull();
+
+    // The group's next container takes pipes again.
+    queue.enqueueMessageCheck('group1@g.us');
+    resolveProcess!();
+    await vi.advanceTimersByTimeAsync(10);
+    queue.registerProcess(
+      'group1@g.us',
+      {} as any,
+      'container-2',
+      'test-group',
+    );
+    expect(queue.sendMessage('group1@g.us', 'hello')).not.toBeNull();
+    resolveProcess!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
   it('preempts when idle arrives with pending tasks', async () => {
     const fs = await import('fs');
     let resolveProcess: () => void;

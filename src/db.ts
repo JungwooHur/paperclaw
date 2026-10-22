@@ -145,6 +145,16 @@ export function _initTestDatabase(): void {
   createSchema(db);
 }
 
+/** @internal - for tests only. A task's run log, oldest first. */
+export function _getTaskRunLogs(taskId: string): TaskRunLog[] {
+  return db
+    .prepare(
+      `SELECT task_id, run_at, duration_ms, status, result, error
+       FROM task_run_logs WHERE task_id = ? ORDER BY run_at, id`,
+    )
+    .all(taskId) as TaskRunLog[];
+}
+
 /**
  * Store chat metadata only (no message content).
  * Used for all chats to enable group discovery without storing sensitive content.

@@ -7,16 +7,22 @@
  * result. Taken at face value, that sentence goes out as the reply and the work
  * counts as done. This module recognises it and keeps the window it opens in
  * router_state, so the message path and the scheduler can both hold their work
- * until the reset, across a restart, and the user is told once per window.
+ * until the reset, across a restart, and the user is told once per window. An
+ * answer inside the window shows the limit has lifted and closes it.
  */
 import { OUTPUT_LANGUAGE, TIMEZONE } from './config.js';
 import { getRouterState, setRouterState } from './db.js';
+import cliSentences from './usage-limit-cli-sentences.json' with { type: 'json' };
 
 export interface UsageLimit {
   resetsAt: Date;
+  /** False when the text gave no reset that could be read: a guess. */
+  stated: boolean;
 }
 
-export interface UsageLimitHit extends UsageLimit {
+export interface UsageLimitHit {
+  /** The window's reset as recorded. */
+  resetsAt: Date;
   /** The notice to send, or null when this window was already announced. */
   notice: string | null;
 }
@@ -27,6 +33,18 @@ export interface UsageLimitHit extends UsageLimit {
 // its warnings ("You've used 90% of…") leave the request running and are not.
 const LIMIT_PATTERN =
   /^\s*(?:you['’]ve hit your (?:(?:session|weekly|opus|sonnet|usage)\s+)?limit|you['’]re out of extra usage)\b/i;
+// The error messages the CLI writes as a turn's result in place of an
+// answer. The runner forwards those results as successes (it does not pass
+// is_error on), so only the text tells them apart. Each is a whole sentence
+// the CLI's own code makes, read out of the bundle the container pins by
+// scripts/extract-usage-limit-sentences.ts, with the parts it fills in left
+// free: an answer that only starts with an error's words is an answer.
+const CLI_ERRORS = cliSentences.errors.map(errorPattern);
+// Except this head, which the CLI always follows with a status or a reason,
+// and composes in more places than any list of sentences would keep up with.
+// Without its space: the result is trimmed, and an Error with no message
+// leaves "API Error: " with nothing after it.
+const API_ERROR_PREFIX = 'API Error:';
 // "resets Oct 14, 10am (Asia/Seoul)", "resets Jan 2, 2027, 1am (Asia/Seoul)",
 // "resets 10am (Asia/Seoul)", "resets 10:30pm". The CLI adds the date only
 // when the reset is more than a day ahead, and the year only when it differs.
@@ -63,14 +81,66 @@ const JUST_PASSED_MS = 2 * MINUTE_MS;
 const MESSAGE_RESUME_MARGIN_MS = 2 * MINUTE_MS;
 /** ...and a deferred scheduled task runs a little after them. */
 const TASK_RESUME_MARGIN_MS = 5 * MINUTE_MS;
+/**
+ * A refusal this soon after an answer closed the window is the retry a close
+ * on a stray answer costs: it reopens that window, reset and all. One later
+ * opens a new window, to a user who has seen the bot answer again since.
+ */
+const CLOSE_GRACE_MS = 10 * MINUTE_MS;
 
-// router_state keys: the open window's reset, and the reset of the window the
-// user has already been told about.
+// router_state keys: the open window's reset (empty when none is open), the
+// reset of the window the user has already been told about, and the last close
+// an answer made, as JSON: when ({at}) and the reset of the window it closed
+// ({resetsAt}). Cleared by the next refusal.
 const LIMITED_UNTIL_KEY = 'usage_limited_until';
 const ANNOUNCED_KEY = 'usage_limit_announced';
+const CLOSED_KEY = 'usage_limit_closed';
+
+interface Close {
+  at: number;
+  resetsAt: number;
+}
 
 export function isUsageLimit(text: string): boolean {
   return LIMIT_PATTERN.test(text);
+}
+
+/**
+ * Whether a result is the agent's own answer: text that is neither the CLI's
+ * usage-limit refusal nor one of its error messages. Only an answer shows that
+ * a request got through and its work ran.
+ */
+export function isAgentAnswer(text: string | null | undefined): boolean {
+  const result = text?.trim();
+  if (!result) return false;
+  return (
+    !isUsageLimit(result) &&
+    !result.startsWith(API_ERROR_PREFIX) &&
+    !CLI_ERRORS.some((pattern) => pattern.test(result))
+  );
+}
+
+/**
+ * The whole text a template stands for: {message} and {value} are free, and
+ * may be empty (an Error with no message). The spaces beside a filled-in part
+ * are matched as part of it, since the text is trimmed: "API Error: " with
+ * nothing after it arrives as "API Error:". A part that opens the template is
+ * one token (the CLI puts a count there), or an answer that ends by quoting
+ * the error would be taken for it.
+ */
+function errorPattern(template: string): RegExp {
+  const parts = template.split(/\{(?:message|value)\}/);
+  const fixed = parts.map((part, i) => {
+    let text = part;
+    if (i > 0) text = text.trimStart();
+    if (i < parts.length - 1) text = text.trimEnd();
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  });
+  const free = fixed.slice(1).map((text, i) => {
+    const part = i === 0 && fixed[0] === '' ? '\\S{0,20}\\s*' : '[\\s\\S]*?';
+    return part + text;
+  });
+  return new RegExp(`^${fixed[0]}${free.join('')}$`);
 }
 
 /**
@@ -86,9 +156,12 @@ export function classifyUsageLimit(
   if (!isUsageLimit(text)) return null;
   const match = RESET_PATTERN.exec(text);
   const resetsAt = match ? parseReset(match, now, tz) : null;
-  return {
-    resetsAt: resetsAt ?? new Date(now.getTime() + UNKNOWN_RESET_HOLD_MS),
-  };
+  return resetsAt
+    ? { resetsAt, stated: true }
+    : {
+        resetsAt: new Date(now.getTime() + UNKNOWN_RESET_HOLD_MS),
+        stated: false,
+      };
 }
 
 /**
@@ -103,22 +176,39 @@ export function recordUsageLimit(
 ): UsageLimitHit | null {
   const limit = classifyUsageLimit(text, now, tz);
   if (!limit) return null;
+  const closed = readClose();
+  const retryAfterClose =
+    closed !== null && now.getTime() - closed.at <= CLOSE_GRACE_MS;
 
-  // A reset the CLI places in the past cannot be right — the request was just
-  // refused — and trusting it would send the same work straight back into the
-  // limit every couple of minutes.
-  const resetsAt =
-    limit.resetsAt.getTime() > now.getTime()
-      ? limit.resetsAt
-      : new Date(now.getTime() + UNKNOWN_RESET_HOLD_MS);
+  // A reset the text states, still ahead, is the CLI's own word: it replaces
+  // the open window, earlier or later. Otherwise the reset is a guess, an hour
+  // on. A reset the CLI places in the past cannot be right, since the request
+  // was just refused, and trusting it would send the same work straight back
+  // into the limit every couple of minutes. A guess knows less than the window
+  // already open, so it never ends one sooner, though it extends one that
+  // ends before it: a stated reset that has passed, or an earlier guess. The
+  // retry of a close counts the window it closed as open.
+  let resetsAt = limit.resetsAt;
+  if (!limit.stated || resetsAt.getTime() <= now.getTime()) {
+    const guess = now.getTime() + UNKNOWN_RESET_HOLD_MS;
+    const open =
+      usageLimitResetsAt(now)?.getTime() ??
+      (retryAfterClose ? closed.resetsAt : 0);
+    resetsAt = new Date(Math.max(guess, open));
+  }
   setRouterState(LIMITED_UNTIL_KEY, resetsAt.toISOString());
 
   // One notice per window. A refusal that moves the reset more than an hour
   // past the announced one opens a new window, as far as the user can tell:
   // without a word they wait on a time that has passed. A smaller move is the
-  // guessed hold starting again from a later refusal.
+  // guessed hold starting again from a later refusal, and a reset earlier
+  // than the announced one only means the work resumes sooner than they were
+  // told. So does a refusal well after an answer closed the window, whatever
+  // its reset: the window is open again, so the close is over.
   const announced = readTime(ANNOUNCED_KEY);
+  if (closed !== null) setRouterState(CLOSED_KEY, '');
   if (
+    (closed === null || retryAfterClose) &&
     announced !== null &&
     now.getTime() < announced + MESSAGE_RESUME_MARGIN_MS &&
     resetsAt.getTime() <= announced + UNKNOWN_RESET_HOLD_MS
@@ -134,10 +224,40 @@ export function recordUsageLimit(
  * closes a little after the reset.
  */
 export function usageLimitHeldUntil(now: Date = new Date()): Date | null {
+  const reset = usageLimitResetsAt(now);
+  return reset && new Date(reset.getTime() + MESSAGE_RESUME_MARGIN_MS);
+}
+
+/** The open window's reset, or null when no window is open. */
+export function usageLimitResetsAt(now: Date = new Date()): Date | null {
   const reset = readTime(LIMITED_UNTIL_KEY);
   if (reset === null) return null;
-  const until = reset + MESSAGE_RESUME_MARGIN_MS;
-  return now.getTime() < until ? new Date(until) : null;
+  return now.getTime() < reset + MESSAGE_RESUME_MARGIN_MS
+    ? new Date(reset)
+    : null;
+}
+
+/**
+ * Closes the open window on an answer: a request got through, so the limit no
+ * longer holds (extra usage, or quota back before the stated reset). Returns
+ * whether it closed one, so the caller can run the held work now. The
+ * announced reset stays, and the close is recorded with the window's reset:
+ * if it was wrong, the refusal of the retry, which comes within
+ * CLOSE_GRACE_MS, reopens the same window without telling the user again.
+ */
+export function closeUsageLimitOnAnswer(
+  text: string | null | undefined,
+  now: Date = new Date(),
+): boolean {
+  if (!isAgentAnswer(text)) return false;
+  const resetsAt = usageLimitResetsAt(now);
+  if (resetsAt === null) return false;
+  setRouterState(LIMITED_UNTIL_KEY, '');
+  setRouterState(
+    CLOSED_KEY,
+    JSON.stringify({ at: now.toISOString(), resetsAt: resetsAt.toISOString() }),
+  );
+  return true;
 }
 
 /** When a scheduled run refused by the limit should run instead. */
@@ -157,6 +277,18 @@ function usageLimitNotice(resetsAt: Date, tz: string, lang: string): string {
   return korean
     ? `Claude 사용 한도에 도달했습니다. 대기 중인 작업은 한도가 초기화되는 ${when} (${tz}) 이후에 자동으로 처리됩니다.`
     : `Claude usage limit reached. Pending work will run automatically after the limit resets at ${when} (${tz}).`;
+}
+
+function readClose(): Close | null {
+  try {
+    const { at, resetsAt } = JSON.parse(getRouterState(CLOSED_KEY) || '{}');
+    const close = { at: Date.parse(at), resetsAt: Date.parse(resetsAt) };
+    return Number.isNaN(close.at) || Number.isNaN(close.resetsAt)
+      ? null
+      : close;
+  } catch {
+    return null;
+  }
 }
 
 function readTime(key: string): number | null {

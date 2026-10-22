@@ -25,7 +25,13 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
-import { deferredTaskRun, recordUsageLimit } from './usage-limit.js';
+import {
+  closeUsageLimitOnAnswer,
+  deferredTaskRun,
+  isAgentAnswer,
+  recordUsageLimit,
+  usageLimitResetsAt,
+} from './usage-limit.js';
 
 // After a query turn ends, close the task container promptly. Tasks are
 // single-turn, so there is no reason to wait for the group's hard timeout; the
@@ -43,6 +49,12 @@ export interface SchedulerDependencies {
     groupFolder: string,
   ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
+  /**
+   * A run's result changed the usage-limit window: a refusal opened or moved
+   * it, or an answer closed it. Held messages follow the window, so they run
+   * at its new end, or at once when it closed.
+   */
+  onUsageLimitChanged: () => void;
 }
 
 async function runTask(
@@ -57,6 +69,28 @@ async function runTask(
       { taskId: queuedTask.id, status: task?.status ?? 'deleted' },
       'Skipping queued task that is no longer active',
     );
+    return;
+  }
+
+  // A usage-limit window is open, so the run would only be refused. Start
+  // nothing, and move this run past the reset as a refused run is moved.
+  const openReset = usageLimitResetsAt();
+  if (openReset) {
+    const deferredTo = deferredTaskRun(openReset);
+    const error = `Usage limit window open, deferred to ${deferredTo.toISOString()}`;
+    logger.info(
+      { taskId: task.id, deferredTo },
+      'Usage limit window open, task deferred',
+    );
+    logTaskRun({
+      task_id: task.id,
+      run_at: new Date().toISOString(),
+      duration_ms: 0,
+      status: 'error',
+      result: null,
+      error,
+    });
+    updateTaskAfterRun(task.id, deferredTo.toISOString(), `Error: ${error}`);
     return;
   }
 
@@ -129,8 +163,12 @@ async function runTask(
 
   let result: string | null = null;
   let error: string | null = null;
-  // Set when the run was refused by the usage limit rather than answered.
-  let limitResetsAt: Date | null = null;
+  // Set when a turn was refused by the usage limit rather than answered.
+  // Typed by assertion: set in the callback, it would otherwise narrow to null.
+  let limitResetsAt = null as Date | null;
+  // Set when a turn ended with the agent's own answer, so the run's work went
+  // out. Not read from `result`, which the run's final output can also set.
+  let answered = false;
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
@@ -171,10 +209,18 @@ async function runTask(
           if (limit) {
             // Not an answer: the work did not run. Hold it until the reset.
             limitResetsAt = limit.resetsAt;
+            // A reset the refusal states can end the window sooner than the
+            // one held messages are waiting for.
+            deps.onUsageLimitChanged();
             if (limit.notice)
               await deps.sendMessage(task.chat_jid, limit.notice);
           } else {
             result = streamedOutput.result;
+            if (isAgentAnswer(streamedOutput.result)) answered = true;
+            // A request got through: an open window is over.
+            if (closeUsageLimitOnAnswer(streamedOutput.result)) {
+              deps.onUsageLimitChanged();
+            }
             // Forward result to user (sendMessage handles formatting)
             await deps.sendMessage(task.chat_jid, streamedOutput.result);
           }
@@ -201,7 +247,8 @@ async function runTask(
     if (output.status === 'error') {
       error = output.error || 'Unknown error';
     } else if (output.result) {
-      // Messages are sent via MCP tool (IPC), result text is just logged
+      // Messages are sent via MCP tool (IPC), result text is just logged.
+      // Never a refusal: with a streaming callback every exit returns null.
       result = output.result;
     }
 
@@ -217,10 +264,22 @@ async function runTask(
   }
 
   const durationMs = Date.now() - startTime;
-  const deferredTo = limitResetsAt ? deferredTaskRun(limitResetsAt) : null;
+  // Run again after the reset only when nothing ran. A run that answered on
+  // any turn, before or after the refusal, has sent that answer: running it
+  // again would send it twice. Output sent only through send_message is not
+  // seen here, so such a run still counts as one that did nothing.
+  const deferredTo =
+    limitResetsAt && !answered ? deferredTaskRun(limitResetsAt) : null;
   if (deferredTo) {
     error = `Usage limit reached, deferred to ${deferredTo.toISOString()}`;
     logger.warn({ taskId: task.id, deferredTo }, 'Task hit the usage limit');
+  } else if (limitResetsAt) {
+    const resetsAt = limitResetsAt.toISOString();
+    error = `Usage limit reached after the run answered, not run again (resets ${resetsAt})`;
+    logger.warn(
+      { taskId: task.id, resetsAt },
+      'Task hit the usage limit after answering, keeping its schedule',
+    );
   }
 
   logTaskRun({
