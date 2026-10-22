@@ -294,7 +294,9 @@ describe('the turn attribution probe', () => {
         turn: { inputs: [] },
       },
       // ...and neither does the next success: it answers its own input only
-      // (the CLI did not send the failed prompt again, below).
+      // (the CLI did not send the failed prompt again, below). The host never
+      // pipes into a scheduled run, and its task scheduler reads no `turn`:
+      // this follow-up only shows what the CLI sends after the cap.
       {
         case: 'success after a failed turn',
         subtype: 'success',
