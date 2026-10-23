@@ -324,7 +324,51 @@ describe('the turn attribution probe', () => {
         text: false,
         turn: { inputs: ['r-cost-after-broken'] },
       },
+      // A usage-limit refusal is a result like any other: it answers the
+      // input its turn took, which the host then holds for the reset.
+      {
+        case: 'answer before a refusal',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-before-limit'] },
+      },
+      {
+        case: 'usage-limit refusal',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-refused'] },
+      },
+      // Told to close, the CLI exits 1 after the refusal.
+      {
+        case: 'error after a refusal',
+        subtype: null,
+        text: false,
+        turn: null,
+      },
+      {
+        case: 'resumed after a refusal',
+        subtype: 'success',
+        text: true,
+        turn: { inputs: ['r-resent'] },
+      },
     ]);
+  });
+
+  it('saw the refused prompt stay in the session, beside the copy sent again', () => {
+    // The host keeps the session the refused container ran in and resumes it
+    // after the reset with the refused message sent again. The CLI kept the
+    // refused prompt in that session and dropped its refusal, so the resumed
+    // request carries both copies in one user message: why the host marks
+    // the copy it sends again (RESENT_PREFIX in src/router.ts).
+    const answer = (name: string) =>
+      fixture.outputs.find((o) => o.case === name)?.result;
+    expect(answer('usage-limit refusal')).toMatch(
+      /^You've hit your limit · resets /,
+    );
+    expect(answer('resumed after a refusal')).toBe(
+      'ANSWER PROBE-RESENT after: user PROBE-BEFORELIMIT, ' +
+        'assistant PROBE-BEFORELIMIT, user PROBE-REFUSED+PROBE-RESENT',
+    );
   });
 
   it('saw the CLI keep the prompt of a failed turn where it was, not send it again', () => {

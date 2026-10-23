@@ -91,10 +91,12 @@ grep -E 'Piped messages|sendMessage' logs/paperclaw.log | tail -10
 # Check the queue state — any active containers?
 grep -E 'Starting container|Container active|concurrency limit' logs/paperclaw.log | tail -10
 
-# Is a Claude usage-limit window holding work? Times are UTC. A window is open
-# while `usage_limited_until` holds a reset that is not yet two minutes past,
-# when held messages resume. An answer that closes a window empties it; a
-# window that runs out at its reset leaves that past reset in place.
+# Is a Claude usage-limit window holding work? Times are UTC.
+#   `usage_limited_until`        the window's reset: open while it holds a reset
+#                                not yet two minutes past, when held messages
+#                                resume. An answer that closes a window empties
+#                                it; a window that runs out at its reset leaves
+#                                that past reset in place
 #   `usage_limit_announced`      the last reset the user was told about
 #   `usage_limit_closed`         JSON {at, resetsAt}: when an answer last closed a
 #                                window, and that window's reset (see docs/SPEC.md
@@ -102,8 +104,37 @@ grep -E 'Starting container|Container active|concurrency limit' logs/paperclaw.l
 #   `usage_limit_refused_input`  JSON per chat: input files a refusal put back;
 #                                deleted, and the entry dropped, when that
 #                                container exits or at the next startup
+#   `usage_limit_refused_turn`   JSON per chat {session, ranges}: the session a
+#                                refusal left its refused prompts in, and the
+#                                message ranges they took; a delivery into that
+#                                session marks those messages as sent again.
+#                                Dropped once a run ends with the cursor past them
 sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key LIKE 'usage_limit%';"
 grep -E 'Usage limit|Task hit the usage limit' logs/paperclaw.log | tail -5
+
+# Which messages are pending, and why (docs/SPEC.md "Turn Attribution").
+# Timestamps are message cursors, and a range [from, to] holds the messages
+# after its first cursor, up to its second. JSON per chat, except the first.
+# A value of another shape (a hand edit) reads as missing, logged once.
+#   `last_timestamp`             the newest message the message loop has seen
+#   `last_agent_timestamp`       the message cursor: what is after it is pending
+#   `answered_ahead`             ranges a turn already answered after the oldest
+#                                unanswered prompt. Past the cursor after a
+#                                put-back or a refusal: left out of what is
+#                                pending. Behind it while a container runs
+#                                (its pipes moved the cursor on): inert until a
+#                                restart puts the cursor back. Dropped once a
+#                                run ends with the cursor past them
+#   `turn_open_from`             while a message container runs, the start of
+#                                its oldest prompt no turn answered: a restart
+#                                puts the cursor back there. Cleared at exit
+#   `turn_put_back`              what an exit last put back, `[from, to]`: a
+#                                prompt that starts at `from` and fails again
+#                                is given up up to `to`, and what joined it
+#                                after `to` goes back. A bare `from` (older)
+#                                gives up the whole prompt
+sqlite3 store/messages.db "SELECT key, value FROM router_state WHERE key IN ('last_timestamp', 'last_agent_timestamp', 'answered_ahead', 'turn_open_from', 'turn_put_back');"
+grep -E 'putting it back|Restart stopped a container|not putting it back again|router_state value of the wrong shape' logs/paperclaw.log | tail -5
 
 # Check lastAgentTimestamp vs latest message timestamp
 sqlite3 store/messages.db "SELECT chat_jid, MAX(timestamp) as latest FROM messages GROUP BY chat_jid ORDER BY latest DESC LIMIT 5;"

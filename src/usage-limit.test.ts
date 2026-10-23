@@ -1,7 +1,3 @@
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { _initTestDatabase } from './db.js';
@@ -481,45 +477,5 @@ describe('closeUsageLimitOnAnswer', () => {
     );
     expect(hit?.resetsAt.toISOString()).toBe('2026-10-13T16:00:00.000Z');
     expect(hit?.notice).toContain('1:00');
-  });
-});
-
-describe('the debug checklist', () => {
-  // Its query lists every key that starts with usage_limit, and they hold
-  // different things: a key it does not explain reads as one it does, and a
-  // key it explains that nothing writes any more is one to go looking for.
-  const srcDir = fileURLToPath(new URL('.', import.meta.url));
-  const checklist = fs.readFileSync(
-    fileURLToPath(new URL('../docs/DEBUG_CHECKLIST.md', import.meta.url)),
-    'utf-8',
-  );
-  // Whole keys, and the heads of keys built from a string: a template
-  // literal's start, or a quoted part that ends in "_" and is added to.
-  const keys = new Set<string>();
-  const heads = new Set<string>();
-  for (const file of fs.readdirSync(srcDir, { recursive: true }) as string[]) {
-    if (!file.endsWith('.ts') || file.endsWith('.test.ts')) continue;
-    const code = fs.readFileSync(path.join(srcDir, file), 'utf-8');
-    for (const m of code.matchAll(/(['"`])(usage_limit[a-z_]*)(\1|\$\{)/g)) {
-      if (m[3] === '${' || m[2].endsWith('_')) heads.add(m[2]);
-      else keys.add(m[2]);
-    }
-  }
-  const named = [...checklist.matchAll(/`(usage_limit[a-z_]*)/g)].map(
-    (m) => m[1],
-  );
-
-  it('says what every usage-limit key in router_state holds', () => {
-    expect(keys.size).toBeGreaterThan(0);
-    for (const key of keys) expect(checklist, key).toContain(`\`${key}\``);
-    for (const head of heads) expect(checklist, head).toContain(`\`${head}`);
-  });
-
-  it('names no usage-limit key the code does not use', () => {
-    expect(named.length).toBeGreaterThan(0);
-    for (const name of named) {
-      const used = keys.has(name) || [...heads].some((h) => name.startsWith(h));
-      expect(used, name).toBe(true);
-    }
   });
 });

@@ -26,7 +26,7 @@ vi.mock('./qa-followup.js', () => ({
   worthFilingCheck: () => false,
 }));
 
-import { IDLE_TIMEOUT } from './config.js';
+import { ASSISTANT_NAME, IDLE_TIMEOUT } from './config.js';
 import {
   ContainerOutput,
   ContainerTurn,
@@ -34,7 +34,10 @@ import {
 } from './container-runner.js';
 import {
   _initTestDatabase,
+  deleteSession,
   getRouterState,
+  setRegisteredGroup,
+  setRouterState,
   setSession,
   storeChatMetadata,
   storeMessage,
@@ -43,10 +46,13 @@ import {
   _loadState,
   _pollNewMessages,
   _processGroupMessages,
+  _recoverPendingMessages,
+  _restoreStartupState,
   _schedulerDependencies,
   _setChannels,
   _setRegisteredGroups,
 } from './index.js';
+import { RESENT_PREFIX } from './router.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 
 /**
@@ -107,7 +113,11 @@ const channel: Channel = {
   },
 };
 const { queue } = _schedulerDependencies();
-const inputDir = path.join(dataDir, 'ipc', MAIN_GROUP.folder, 'input');
+/** The input dir of the group under test. */
+function groupInputDir(group: RegisteredGroup): string {
+  return path.join(dataDir, 'ipc', group.folder, 'input');
+}
+let inputDir = groupInputDir(MAIN_GROUP);
 
 /**
  * A message container as the runner behaves: it drains the input files at
@@ -242,9 +252,118 @@ async function userSays(
   return message;
 }
 
+/** Messages that arrive between two polls: the message loop sees them as one batch. */
+async function usersSay(
+  messages: [id: string, content: string, at: number][],
+): Promise<void> {
+  for (const [id, content, at] of messages) {
+    storeMessage({
+      id,
+      chat_jid: CHAT,
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content,
+      timestamp: new Date(at).toISOString(),
+    });
+  }
+  _pollNewMessages();
+  await vi.advanceTimersByTimeAsync(0);
+}
+
+/** The texts of the input files waiting for the container, oldest first. */
+function waitingTexts(): string[] {
+  return inputFiles().map(
+    (file) =>
+      JSON.parse(fs.readFileSync(path.join(inputDir, file), 'utf-8')).text,
+  );
+}
+
 /** The message cursor as saved, which is what a restart would resume from. */
 function cursor(): string | undefined {
   return JSON.parse(getRouterState('last_agent_timestamp') || '{}')[CHAT];
+}
+
+/**
+ * The new process after a restart: state from the database only, as main()
+ * starts, with the last process's containers stopped.
+ */
+function restart(): void {
+  _restoreStartupState();
+  _setRegisteredGroups({ [CHAT]: MAIN_GROUP });
+}
+
+/** The router_state keys a message run writes. */
+const RUN_STATE_KEYS = [
+  'last_timestamp',
+  'last_agent_timestamp',
+  'answered_ahead',
+  'turn_open_from',
+  'turn_put_back',
+  'usage_limit_refused_input',
+];
+
+/** Messages stored while no process polls: start-up recovery finds them. */
+function storedBeforeStart(
+  messages: [id: string, content: string, at: number][],
+): void {
+  for (const [id, content, at] of messages) {
+    storeMessage({
+      id,
+      chat_jid: CHAT,
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content,
+      timestamp: new Date(at).toISOString(),
+    });
+  }
+}
+
+/**
+ * What the process leaves behind if it dies now: its router_state and the
+ * input files waiting. Returns what puts that back, for a test that has to
+ * end the dead process's container first (the queue would pipe into it).
+ */
+function crashState(): () => void {
+  const state = RUN_STATE_KEYS.map((key) => [key, getRouterState(key)]);
+  const files = inputFiles().map((file) => [
+    file,
+    fs.readFileSync(path.join(inputDir, file), 'utf-8'),
+  ]);
+  return () => {
+    for (const [key, value] of state) setRouterState(key!, value ?? '');
+    fs.rmSync(inputDir, { recursive: true, force: true });
+    fs.mkdirSync(inputDir, { recursive: true });
+    for (const [file, text] of files) {
+      fs.writeFileSync(path.join(inputDir, file), text);
+    }
+  };
+}
+
+/**
+ * The process dies with `container` mid-run, and a new one starts: the
+ * container is stopped (cleanupOrphans), state comes from the database, and
+ * recovery runs.
+ */
+async function restartWhileRunning(container: FakeContainer): Promise<void> {
+  const deadState = crashState();
+  // The dead process starts nothing once its container is gone.
+  queue.setProcessMessagesFn(async () => true);
+  await container.exit('error');
+  queue.setProcessMessagesFn(_processGroupMessages);
+  deadState();
+  restart();
+  _recoverPendingMessages();
+  await vi.advanceTimersByTimeAsync(0);
+}
+
+/** Per chat, where a restart puts its cursor back to. */
+function openFrom(): Record<string, string> {
+  return JSON.parse(getRouterState('turn_open_from') || '{}');
+}
+
+/** Per chat, the ranges past its cursor a turn already answered. */
+function answeredAhead(): Record<string, [string, string][]> {
+  return JSON.parse(getRouterState('answered_ahead') || '{}');
 }
 
 function timesIn(text: string, part: string): number {
@@ -285,6 +404,7 @@ beforeEach(() => {
   typingHold = null;
   _initTestDatabase();
   setSession('main', 'session-old');
+  setRegisteredGroup(CHAT, MAIN_GROUP);
   _loadState();
   _setRegisteredGroups({ [CHAT]: MAIN_GROUP });
   _setChannels([channel]);
@@ -428,6 +548,127 @@ describe('a result that names the inputs it answered', () => {
   });
 });
 
+describe('a refusal with a prompt answered after the refused one', () => {
+  it('holds only the refused prompt for the reset', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    // Sent during m1's last API call: its own turn, after m1's.
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [a.startIds[0]] });
+    // Extra usage let m2's turn through, answered through send_message.
+    await a.result(null, { inputs: [p2] });
+    await a.exit();
+
+    // Not dropped after a refusal: the reset's run still needs it.
+    expect(answeredAhead()).toEqual({
+      [CHAT]: [[expect.any(String), m2.timestamp]],
+    });
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    expect(cursor()).toBe(m2.timestamp);
+    expect(answeredAhead()).toEqual({});
+    await nothingRunsAgain();
+  });
+
+  it('holds a failed prompt and the refused one, not one answered between them', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(null, { inputs: [p2] });
+    await userSays('m3', M3, NOW - 20_000);
+    const [p3] = a.drain();
+    await a.result(LIMIT, { inputs: [p3] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('Both answered.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+});
+
+describe('a message a refusal held, sent again after the reset', () => {
+  // Measured (container/agent-runner/test/turn-attribution-probe.test.ts):
+  // the refused prompt stays in the session, and the request that resumes it
+  // carries it in the same user message as the copy sent again.
+  it('is marked as sent again when the session it was refused in resumes', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [p2] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, `${RESENT_PREFIX}${M2}`)).toBe(1);
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    // Answered: a later delivery is no retry.
+    expect(getRouterState('usage_limit_refused_turn')).toBe('{}');
+  });
+
+  it('marks only the refused message, not one the window held', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [p2] });
+    await a.exit();
+    // Sent during the window: never refused, so no earlier copy exists.
+    await userSays('m3', M3, NOW - 20_000);
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, `${RESENT_PREFIX}${M2}`)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(b.prompt).not.toContain(`${RESENT_PREFIX}${M3}`);
+    await b.exit();
+  });
+
+  it('is not marked when the refused session is not the one the group keeps', async () => {
+    // A new session whose first turn was refused: the host stores none, so
+    // the next container starts another, with no copy in it.
+    deleteSession('main');
+    _loadState();
+    _setRegisteredGroups({ [CHAT]: MAIN_GROUP });
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(LIMIT, { inputs: [a.startIds[0]] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(RESENT_PREFIX);
+    await b.exit();
+  });
+
+  it('leaves a command bare, so the CLI still runs it', async () => {
+    const command = '/probe-skill run it';
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', command, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result(LIMIT, { inputs: [p2] });
+    await a.exit();
+
+    const b = await containerAfterReset();
+    expect(b.prompt).toBe(command);
+    await b.exit();
+  });
+});
+
 describe('a container that exits with input no result answered', () => {
   it('has it delivered again, once', async () => {
     const m1 = await userSays('m1', M1, NOW - 60_000);
@@ -461,23 +702,97 @@ describe('a container that exits with input no result answered', () => {
     await b.exit();
   });
 
-  it('runs an answered follow-up again behind an unanswered prompt (until #114 slice 3)', async () => {
-    // A duplicate, never a loss: the cursor goes back to the oldest prompt
-    // no result answered, and everything after it is pending again.
-    await userSays('m1', M1, NOW - 60_000);
+  it('runs only the unanswered prompt again, not an answered follow-up after it', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
     // The CLI failed the turn before it acknowledged anything.
+    await a.result(null, { inputs: [] });
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+
+    // The cursor goes back to m1, and m2's range is kept as answered.
+    expect(cursor()).toBe('');
+    expect(answeredAhead()).toEqual({
+      [CHAT]: [[m1.timestamp, m2.timestamp]],
+    });
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    // The delivery moves the cursor past the answered message too.
+    expect(cursor()).toBe(m2.timestamp);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+
+    // Behind the cursor now, so the range is dropped.
+    expect(answeredAhead()).toEqual({});
+    await nothingRunsAgain();
+  });
+
+  it('keeps answered ranges across a restart before the retry', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+
+    // The service restarts before the queue's retry: recovery runs instead.
+    restart();
+    _recoverPendingMessages();
+    await vi.advanceTimersByTimeAsync(0);
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('lets the message loop skip an answered range', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
     await a.result(null, { inputs: [] });
     await userSays('m2', M2, NOW - 40_000);
     const [p2] = a.drain();
     await a.result('It covers the experiments.', { inputs: [p2] });
     await a.exit();
 
-    const b = await containerOnRetry();
+    // A new message before the retry starts the next container itself.
+    const m3 = await userSays('m3', M3, NOW - 20_000);
+    const b = containers[1];
     expect(timesIn(b.prompt, M1)).toBe(1);
-    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(b.prompt).not.toContain(M2);
     await b.result('Both answered.', { inputs: [b.startIds[0]] });
     await b.exit();
+    expect(cursor()).toBe(m3.timestamp);
+    expect(answeredAhead()).toEqual({});
+    await nothingRunsAgain();
+  });
+
+  it('pipes a follow-up from past an answered range', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+    const b = await containerOnRetry();
+
+    await userSays('m3', M3, NOW - 20_000);
+    const [p3] = b.drain();
+    // Its range starts after m2, which no prompt here carries.
+    expect(p3.startsWith(`${m2.timestamp}|`)).toBe(true);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.result('It covers the appendix.', { inputs: [p3] });
+    await b.exit();
+    expect(answeredAhead()).toEqual({});
+    await nothingRunsAgain();
   });
 
   it('has the prompt of a turn that failed after the runner took it delivered again', async () => {
@@ -497,13 +812,27 @@ describe('a container that exits with input no result answered', () => {
     runner.turnStarted();
     runner.ack(u2);
     await a.result('It covers the experiments.', runner.result('success'));
+    // Later questions in the same session, each answered by its own turn.
+    for (const [id, text, at] of [
+      ['m3', M3, NOW - 30_000],
+      ['m4', M4, NOW - 20_000],
+    ] as const) {
+      await userSays(id, text, at);
+      const [p] = a.drain();
+      const u = runner.push(text, [p]);
+      runner.turnStarted();
+      runner.ack(u);
+      await a.result('Answered.', runner.result('success'));
+    }
     await a.exit();
 
+    // Only the failed turn's input runs again.
     const b = await containerOnRetry();
     expect(timesIn(b.prompt, M1)).toBe(1);
-    // Behind m1, until #114 slice 3.
-    expect(timesIn(b.prompt, M2)).toBe(1);
-    await b.result('Both answered.', { inputs: [b.startIds[0]] });
+    for (const answered of [M2, M3, M4]) {
+      expect(b.prompt).not.toContain(answered);
+    }
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
     await b.exit();
     await nothingRunsAgain();
   });
@@ -609,6 +938,52 @@ describe('a container that exits with input no result answered', () => {
     await c.exit();
     await nothingRunsAgain();
     expect(containers.filter((c) => c.prompt.includes(M1))).toHaveLength(2);
+  });
+
+  it('gives up only what went back, not a message that joined its retry', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await a.exit();
+    // Stored before the retry starts: it goes in the same prompt as m1.
+    const m2 = await userSays('m2', M2, NOW - 30_000);
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    await b.result(null, { inputs: [] });
+    await b.exit();
+
+    // m1 is given up; m2 never went back, so it does now.
+    expect(cursor()).toBe(m1.timestamp);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(containers).toHaveLength(3);
+    const c = containers[2];
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result(null, { inputs: [] });
+    await c.exit();
+
+    // Its own retry failed it too: given up in turn.
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('gives up the whole prompt by a put-back cursor an older process saved', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await a.exit();
+    // Saved without the end of what went back.
+    setRouterState('turn_put_back', JSON.stringify({ [CHAT]: '' }));
+    const m2 = await userSays('m2', M2, NOW - 30_000);
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    await b.result(null, { inputs: [] });
+    await b.exit();
+
+    // As before: m2 is given up with m1.
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
   });
 
   it('puts back a failed prompt with a newer one taken after it, when neither went back before', async () => {
@@ -775,9 +1150,135 @@ describe('a container that exits with input no result answered', () => {
     await b.result('Both answered.', { inputs: b.startIds });
     await b.exit();
   });
+
+  it('leaves a restart nothing to put back once it gave a prompt up', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+    const b = await containerOnRetry();
+    await b.result(null, { inputs: [] }); // fails again: given up at exit
+    await b.exit();
+    await nothingRunsAgain();
+
+    restart();
+    _recoverPendingMessages();
+    await nothingRunsAgain();
+  });
+
+  it('keeps the ranges a put-back kept when the retry is refused', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result(null, { inputs: [] });
+    await userSays('m2', M2, NOW - 40_000);
+    const [p2] = a.drain();
+    await a.result('It covers the experiments.', { inputs: [p2] });
+    await a.exit();
+    const b = await containerOnRetry();
+    expect(b.prompt).not.toContain(M2);
+    await b.result(LIMIT, { inputs: [b.startIds[0]] });
+    await b.exit();
+
+    const c = await containerAfterReset();
+    expect(timesIn(c.prompt, M1)).toBe(1);
+    expect(c.prompt).not.toContain(M2);
+  });
 });
 
 describe('an input file an earlier container left', () => {
+  /**
+   * m1's container falls back to the old rule, so its exit leaves m2's file,
+   * never drained, for the next container; m3 starts that one, which drains
+   * the file into its first prompt.
+   */
+  async function drainedLeftover(): Promise<{
+    b: FakeContainer;
+    m2: NewMessage;
+    m3: NewMessage;
+  }> {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', 'off');
+    const m2 = await userSays('m2', M2, NOW - 50_000);
+    await a.exit();
+    expect(inputFiles()).toHaveLength(1);
+    const m3 = await userSays('m3', M3, NOW - 40_000);
+    const b = containers[1];
+    expect(b.startIds).toHaveLength(2);
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    return { b, m2, m3 };
+  }
+
+  it('has it delivered again when the turn that took it is refused', async () => {
+    const { b, m3 } = await drainedLeftover();
+    await b.result(LIMIT, { inputs: b.startIds });
+    await b.exit();
+
+    const c = await containerAfterReset();
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(timesIn(c.prompt, M3)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('Both answered.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    expect(cursor()).toBe(m3.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('has it delivered again when no result answers it', async () => {
+    const { b } = await drainedLeftover();
+    // The CLI failed the start-up turn before it acknowledged anything.
+    await b.result(null, { inputs: [] });
+    await b.exit();
+
+    const c = await containerOnRetry();
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(timesIn(c.prompt, M3)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('Both answered.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    await nothingRunsAgain();
+  });
+
+  it('has it delivered again when the container dies before any result', async () => {
+    const { b } = await drainedLeftover();
+    await b.exit('error');
+
+    const c = await containerOnRetry();
+    expect(timesIn(c.prompt, M2)).toBe(1);
+    expect(timesIn(c.prompt, M3)).toBe(1);
+    expect(c.prompt).not.toContain(M1);
+    await c.result('Both answered.', { inputs: [c.startIds[0]] });
+    await c.exit();
+    await nothingRunsAgain();
+  });
+
+  it('is settled with the start-up prompt it was drained into', async () => {
+    const { b, m3 } = await drainedLeftover();
+    await b.result('Both answered.', { inputs: b.startIds });
+    await b.exit();
+    expect(cursor()).toBe(m3.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('is settled with the start-up prompt by a runner that reports no turn', async () => {
+    const { b } = await drainedLeftover();
+    await b.result('Both answered.');
+    await userSays('m4', M4, NOW - 30_000);
+    b.drain();
+    await b.result(LIMIT);
+    await b.exit();
+
+    // The old rule: the answer settled the start-up push, leftover and all.
+    const c = await containerAfterReset();
+    expect(timesIn(c.prompt, M4)).toBe(1);
+    expect(c.prompt).not.toContain(M3);
+    expect(c.prompt).not.toContain(M2);
+    await c.exit();
+  });
+
   it('settles nothing else when the next container names it', async () => {
     await userSays('m1', M1, NOW - 60_000);
     const a = containers[0];
@@ -806,6 +1307,259 @@ describe('an input file an earlier container left', () => {
     expect(c.prompt).not.toContain(M3);
     expect(c.prompt).not.toContain(M2);
     await c.exit();
+  });
+});
+
+describe('a router_state value of the wrong shape', () => {
+  // Only a hand edit or a format this process does not know writes one. It
+  // reads as missing, instead of throwing at every start-up.
+  it.each([
+    ['answered_ahead', 'null'],
+    ['answered_ahead', `{"${CHAT}": {}}`],
+    ['answered_ahead', `{"${CHAT}": [["a"]]}`],
+    ['turn_open_from', 'null'],
+    ['turn_open_from', `{"${CHAT}": 5}`],
+    ['usage_limit_refused_turn', 'null'],
+    ['usage_limit_refused_turn', `{"${CHAT}": {"session": "session-old"}}`],
+    ['turn_put_back', '"main"'],
+    ['usage_limit_refused_input', `{"${CHAT}": [null]}`],
+  ])('starts with %s = %s as if it were missing', async (key, value) => {
+    storedBeforeStart([['m1', M1, NOW - 60_000]]);
+    setRouterState(key, value);
+    restart();
+    _recoverPendingMessages();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const a = containers[0];
+    expect(timesIn(a.prompt, M1)).toBe(1);
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+});
+
+describe('a restart while a container runs', () => {
+  it('delivers again a follow-up the container took and no turn answered', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain(); // taken; its turn is running when the process dies
+    expect(openFrom()).toEqual({ [CHAT]: m1.timestamp });
+    await restartWhileRunning(a);
+
+    const b = containers[1];
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(M1);
+    expect(openFrom()).toEqual({ [CHAT]: m1.timestamp });
+    await b.result('It covers the experiments.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    expect(openFrom()).toEqual({});
+    await nothingRunsAgain();
+  });
+
+  it('delivers again the first prompt when its turn is still running', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    expect(openFrom()).toEqual({ [CHAT]: '' });
+    await restartWhileRunning(a);
+
+    const b = containers[1];
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    await b.result('It describes the method.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('keeps a follow-up answered while an older one is open', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    await userSays('m3', M3, NOW - 30_000);
+    const [p3] = a.drain();
+    // m2's turn failed, and m3's own turn answered it.
+    await a.result(null, { inputs: [] });
+    await a.result('It covers the appendix.', { inputs: [p3] });
+    await restartWhileRunning(a);
+
+    const b = containers[1];
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(M3);
+    expect(b.prompt).not.toContain(M1);
+    await b.result('It covers the experiments.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('delivers once a follow-up whose file the container never drained', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    await userSays('m3', M3, NOW - 30_000); // still in its file
+    await restartWhileRunning(a);
+
+    // Its messages are pending again, so the file goes.
+    const b = containers[1];
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(timesIn(b.prompt, M3)).toBe(1);
+    expect(inputFiles()).toEqual([]);
+    await b.result('Both answered.', { inputs: b.startIds });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('puts nothing back once the runner turned attribution off', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', 'off');
+    const m2 = await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    expect(openFrom()).toEqual({});
+    await restartWhileRunning(a);
+
+    // As before attribution: the cursor stays where it was saved.
+    expect(cursor()).toBe(m2.timestamp);
+    await nothingRunsAgain();
+  });
+
+  it('puts it back once: start-up forgets where it put back to', async () => {
+    const m1 = await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', M2, NOW - 40_000);
+    a.drain();
+    const deadState = crashState();
+    await a.exit('error');
+    deadState();
+    restart();
+
+    expect(cursor()).toBe(m1.timestamp);
+    // A second restart before any container runs puts back nothing more.
+    expect(openFrom()).toEqual({});
+  });
+});
+
+describe('a batch whose newest message is a slash command', () => {
+  // The router sends such a batch as the command alone (src/router.ts), so
+  // the messages before it never reach the model. A known limit, as on main
+  // (docs/SPEC.md, "Turn Attribution", "What remains"): these pin it, so a
+  // change to it is a decision, not a side effect.
+  const CMD = '/probe-skill run it';
+
+  it('goes as the command alone, and the cursor passes the messages before it', async () => {
+    await usersSay([
+      ['m1', M1, NOW - 60_000],
+      ['m2', CMD, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    expect(a.prompt).toBe(CMD);
+    await a.result('The skill ran.', { inputs: [a.startIds[0]] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('goes as the command alone after chatter in a group that needs the trigger', async () => {
+    const team: RegisteredGroup = {
+      name: 'Team',
+      folder: 'team',
+      trigger: `@${ASSISTANT_NAME}`,
+      added_at: '2026-10-01T00:00:00.000Z',
+      requiresTrigger: true,
+    };
+    _setRegisteredGroups({ [CHAT]: team });
+    await usersSay([
+      ['m1', `@${ASSISTANT_NAME} ${M1}`, NOW - 60_000],
+      ['m2', `@${ASSISTANT_NAME} ${CMD}`, NOW - 50_000],
+    ]);
+    const a = containers[0];
+    expect(a.prompt).toBe(CMD);
+    await a.result('The skill ran.', { inputs: [a.startIds[0]] });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('is piped into a running turn at once, where it can be merged as plain text', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await userSays('m2', CMD, NOW - 50_000);
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await a.result('It describes the method.', {
+      inputs: [a.startIds[0], command],
+    });
+    await a.exit();
+    await nothingRunsAgain();
+  });
+
+  it('holds nothing newer back after a failed turn that took two prompts', async () => {
+    await userSays('m1', M1, NOW - 90_000);
+    const a = containers[0];
+    await userSays('m2', M2, NOW - 80_000);
+    a.drain(); // merged into m1's turn
+    await a.result(null, { inputs: [] }); // which fails past its ack
+    await usersSay([
+      ['m3', M3, NOW - 60_000],
+      ['m4', CMD, NOW - 50_000],
+    ]);
+    expect(waitingTexts()).toEqual([CMD]);
+    const [command] = a.drain();
+    await userSays('m5', M4, NOW - 40_000);
+    const [later] = waitingTexts();
+    expect(timesIn(later, M4)).toBe(1);
+    const [p5] = a.drain();
+    await a.result('The skill ran.', { inputs: [command] });
+    await a.result('It surveys related work.', { inputs: [p5] });
+    await a.exit();
+
+    // Only the failed turn's two prompts run again.
+    const b = await containerOnRetry();
+    expect(timesIn(b.prompt, M1)).toBe(1);
+    expect(timesIn(b.prompt, M2)).toBe(1);
+    expect(b.prompt).not.toContain(CMD);
+    expect(b.prompt).not.toContain(M4);
+    await b.result('Sections 2 and 3, then.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('goes back as the command alone when a put-back makes a question before it pending', async () => {
+    await userSays('m0', M3, NOW - 70_000);
+    const a = containers[0];
+    await a.result('It covers the appendix.', { inputs: [a.startIds[0]] });
+    await userSays('m1', M1, NOW - 60_000);
+    await userSays('m2', CMD, NOW - 50_000);
+    expect(waitingTexts()).toHaveLength(2);
+    a.drain();
+    await a.exit('error'); // stopped before either turn ended
+
+    const b = await containerOnRetry();
+    expect(b.prompt).toBe(CMD);
+    await b.result('The skill ran.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
+  });
+
+  it('goes back as plain text when a message after it goes back with it', async () => {
+    await userSays('m1', M1, NOW - 60_000);
+    const a = containers[0];
+    await a.result('It describes the method.', { inputs: [a.startIds[0]] });
+    await userSays('m2', CMD, NOW - 40_000);
+    a.drain(); // taken, and its turn never ends
+    await userSays('m3', 'did it run?', NOW - 20_000);
+    a.drain();
+    await a.exit('error');
+
+    const b = await containerOnRetry();
+    expect(b.prompt).toContain('<messages>');
+    expect(timesIn(b.prompt, CMD)).toBe(1);
+    expect(timesIn(b.prompt, 'did it run?')).toBe(1);
+    await b.result('It did not run yet.', { inputs: [b.startIds[0]] });
+    await b.exit();
+    await nothingRunsAgain();
   });
 });
 

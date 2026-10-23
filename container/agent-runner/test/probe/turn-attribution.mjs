@@ -12,7 +12,10 @@
 // an API stream that breaks after a tool call, and the follow-up after each
 // answers with the history its request carried. The last container runs
 // the CLI through a `node` that drops --replay-user-messages, so replay is
-// broken there, with no switch in the runner. One more case drives the SDK
+// broken there, with no switch in the runner. Two containers show what a
+// usage-limit refusal leaves in the session: the first is refused, and the
+// second resumes the session the host keeps, with the refused message sent
+// again. One more case drives the SDK
 // directly, as the runner never reuses a uuid: what the CLI does with a push
 // under a uuid it has already seen. Last, it reads out of the CLI bundle the
 // prompt the CLI injects when its input closes while teammates are up, which
@@ -102,6 +105,27 @@ function brokenSse(res) {
     },
   })}\n\n`);
   res.end();
+}
+
+/**
+ * The account's usage limit, as the API refuses a request with it: a 429 whose
+ * unified rate-limit headers say rejected. The CLI words its refusal from
+ * these, for a subscription token only.
+ */
+function refusal(res) {
+  res.writeHead(429, {
+    'content-type': 'application/json',
+    'request-id': 'req_probe',
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-reset': String(Math.floor(Date.now() / 1000) + 3 * 3600),
+    'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+    'anthropic-ratelimit-unified-overage-status': 'rejected',
+    'anthropic-ratelimit-unified-overage-disabled-reason': 'org_level_disabled',
+  });
+  res.end(JSON.stringify({
+    type: 'error',
+    error: { type: 'rate_limit_error', message: 'Number of request tokens has exceeded your rate limit' },
+  }));
 }
 
 function json(res, code, body) {
@@ -204,7 +228,7 @@ function reply(b) {
   // carried: whether the CLI sent the failed turn's prompt again, or only
   // kept it where it was. Before the tool loop below: the CLI may send the
   // follow-up in the message with a tool result.
-  if (marker === 'PROBE-AFTERFAIL' || marker === 'PROBE-AFTERBROKEN') {
+  if (marker === 'PROBE-AFTERFAIL' || marker === 'PROBE-AFTERBROKEN' || marker === 'PROBE-RESENT') {
     return { blocks: [text(`ANSWER ${marker} after: ${historyOf(msgs)}`)] };
   }
   // The tool call's next API call: the stream breaks there, and on the CLI's
@@ -252,6 +276,8 @@ function reply(b) {
       return { blocks: [tool('TeamCreate', { team_name: 'probe-team', description: 'probe' })], stop: 'tool_use' };
     case 'PROBE-EMPTY':
       return { blocks: [text('')] };
+    case 'PROBE-REFUSED':
+      return { refused: true };
     case 'PROBE-NOTHING':
       // No content at all: the CLI ends the turn in error before it yields a
       // message, so it never acknowledges the prompt it consumed.
@@ -286,6 +312,7 @@ const server = http.createServer((req, res) => {
     const stop = r.stop ?? 'end_turn';
     const send = () => {
       if (r.broken) return brokenSse(res);
+      if (r.refused) return refusal(res);
       if (b.stream) return sse(res, r.blocks, stop);
       json(res, 200, {
         id: 'msg_probe', type: 'message', role: 'assistant', model: b.model,
@@ -351,7 +378,9 @@ function nodeWithoutReplay() {
 // the second resumes it, as every later container does. `cases` labels the
 // outputs in the order the runner should write them; `after[n]` runs once the
 // n-th output is out. `notResults` numbers the outputs made from no SDK
-// result (the session marker, an error), which have no subtype.
+// result (the session marker, an error), which have no subtype. `freshHome`
+// runs the CLI in a home of its own, `sameHome` in the previous container's,
+// and `subscription` signs it in with a subscription token, not an API key.
 const CONTAINERS = [
   {
     prompt: 'PROBE-START the stdin prompt',
@@ -494,6 +523,34 @@ const CONTAINERS = [
       3: close,
     },
   },
+  // A usage-limit refusal of a follow-up, after an answer in the same
+  // session. The host keeps that session (it stores no session from the
+  // refused output), and after the reset a new container resumes it, at its
+  // latest point, with the refused message sent again. Its answer shows what
+  // that request carried of the refused one.
+  {
+    freshHome: true,
+    subscription: true,
+    prompt: 'PROBE-BEFORELIMIT the stdin prompt',
+    promptRef: 'r-before-limit',
+    cases: ['answer before a refusal', 'usage-limit refusal', 'error after a refusal'],
+    notResults: [3],
+    // Told to close after the refusal, the CLI exits 1.
+    exitCode: 1,
+    after: {
+      1: () => writeInput('0075-refused.json', 'PROBE-REFUSED the limit refuses this', 'r-refused'),
+      2: close,
+    },
+  },
+  {
+    resume: true,
+    sameHome: true,
+    subscription: true,
+    prompt: 'PROBE-RESENT the refused message, sent again after the reset',
+    promptRef: 'r-resent',
+    cases: ['resumed after a refusal'],
+    after: { 1: close },
+  },
   // Replay broken: the guard trips on the first result, a textless one. Then
   // the CLI is ended cleanly, so the query ends and the runner writes its
   // session marker, and in the next query killed, so the runner fails.
@@ -535,6 +592,8 @@ function seededHome() {
   return home;
 }
 const home = seededHome();
+/** The CLI home the last container ran with. */
+let lastHome = home;
 const outputs = [];
 const notes = [];
 const cliEnv = {
@@ -558,7 +617,9 @@ function runContainer(spec, sessionId) {
     const subtypes = [];
     let session = sessionId;
 
-    const env = spec.freshHome ? { ...cliEnv, HOME: seededHome() } : { ...cliEnv };
+    const homeDir = spec.freshHome ? seededHome() : spec.sameHome ? lastHome : home;
+    lastHome = homeDir;
+    const env = { ...cliEnv, HOME: homeDir };
     if (spec.noReplay) env.PATH = `${nodeWithoutReplay()}:${env.PATH}`;
     const runner = spawn(process.execPath, [RUNNER], { env, stdio: ['pipe', 'pipe', 'pipe'] });
     runnerPid = runner.pid;
@@ -570,7 +631,10 @@ function runContainer(spec, sessionId) {
       groupFolder: 'probe',
       chatJid: 'probe@g.us',
       isMain: true,
-      secrets: { ANTHROPIC_API_KEY: 'offline-probe-key' },
+      // The CLI words a usage-limit refusal only for a subscription token.
+      secrets: spec.subscription
+        ? { CLAUDE_CODE_OAUTH_TOKEN: 'offline-probe-token' }
+        : { ANTHROPIC_API_KEY: 'offline-probe-key' },
     }));
 
     let out = '';

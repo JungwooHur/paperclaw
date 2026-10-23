@@ -39,7 +39,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { SchedulerDependencies, startSchedulerLoop } from './task-scheduler.js';
@@ -81,6 +81,11 @@ interface OpenPrompt {
   ref?: string;
   /** A result's `turn` named it, but an older prompt is still open. */
   answered?: boolean;
+  /**
+   * A file an earlier container left, which this one drained into its
+   * first prompt (leftoverPrompts).
+   */
+  leftover?: boolean;
 }
 
 /**
@@ -113,8 +118,8 @@ function shiftAnswered(prompts: OpenPrompt[]): string | undefined {
 
 /**
  * Marks the prompts a result's turn names answered. Returns the ids it names
- * that are no open prompt of this container: a file an earlier container
- * left, drained into this one's first prompt, answers no prompt here.
+ * that are no open prompt of this container: a file left with no range to
+ * register it by answers no prompt here.
  */
 function markAnswered(prompts: OpenPrompt[], inputs: string[]): string[] {
   const unknown: string[] = [];
@@ -143,22 +148,84 @@ function unansweredStarts(prompts: OpenPrompt[]): string[] {
   }
   return starts;
 }
+
+/** A cursor range `(from, to]`: the messages after `from`, up to `to`. */
+type Range = [from: string, to: string];
+
+/** The end of the unanswered prompt that starts at `from`. */
+function promptEnd(prompts: OpenPrompt[], from: string): string {
+  const prompt = prompts.find(
+    (p) => !p.answered && p.ref && refRange(p.ref)?.from === from,
+  );
+  return prompt ? prompt.cursor : from;
+}
+
+/** The ranges of the answered prompts that start at or after `from`. */
+function answeredRanges(prompts: OpenPrompt[], from: string): Range[] {
+  const ranges: Range[] = [];
+  for (const prompt of prompts) {
+    const range = prompt.answered && prompt.ref ? refRange(prompt.ref) : null;
+    if (range && range.from >= from) ranges.push([range.from, range.to]);
+  }
+  return ranges;
+}
+
+/** Sorted, with overlapping and adjoining ranges merged. */
+function mergeRanges(ranges: Range[]): Range[] {
+  const merged: Range[] = [];
+  for (const [from, to] of [...ranges].sort((a, b) =>
+    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
+  )) {
+    const last = merged[merged.length - 1];
+    if (last && from <= last[1]) {
+      if (to > last[1]) last[1] = to;
+    } else {
+      merged.push([from, to]);
+    }
+  }
+  return merged;
+}
+
 // Per group with a message container running: its open prompts, oldest first.
 const openPrompts: Record<string, OpenPrompt[]> = {};
 // Groups whose message container is closing on a usage-limit refusal, until it
 // exits. That can outlast the window, so the window alone does not cover it.
 const closingOnRefusal = new Set<string>();
+// Groups whose running message container turned attribution off: its open
+// prompts are settled the old way, and a restart puts none of them back.
+const attributionOff = new Set<string>();
 // router_state key: per group, the piped prompts the latest usage-limit
 // refusal put back, so a restart before the container exits can still drop
 // the files it left. Cleared once the files are dealt with.
 const REFUSED_INPUT_KEY = 'usage_limit_refused_input';
-// router_state key: per group, the cursor a container's exit last put back to
-// for a prompt no result answered, until an exit leaves nothing unanswered.
-// When the oldest prompt the next exit finds unanswered starts there, the
-// retry failed it the same way: that prompt is not put back a third time,
-// but a newer one is. Persisted, so a restart in between does not buy it
-// another run.
+// router_state key: per group, the range a container's exit last put back for
+// a prompt no result answered, `[from, to]`: from its start to the cursor the
+// exit found, until an exit leaves nothing unanswered. When the oldest prompt
+// the next exit finds unanswered starts at `from`, the retry failed it the
+// same way: what went back is not put back a third time, but a message
+// after `to`, which joined the retry's prompt or came later, is. An older
+// process saved `from` alone. Persisted, so a restart in between does not buy
+// it another run.
 const PUT_BACK_KEY = 'turn_put_back';
+// router_state key: per group, the ranges a turn already answered after the
+// group's oldest unanswered prompt, `[[from, to], ...]` oldest first. A
+// put-back or a refusal moves the cursor back to that prompt, so the ranges
+// are past it, and the retry runs only what is unanswered. While a container
+// runs they are written as its prompts settle, behind the cursor its pipes
+// moved on: inert there until a restart puts the cursor back. Dropped once a
+// run ends, without a refusal, with the cursor past them.
+const ANSWERED_AHEAD_KEY = 'answered_ahead';
+// router_state key: per group with a message container running, the start of
+// its oldest prompt no turn has answered yet, taken or still in its file. A
+// restart stops that container, so start-up puts the cursor back there; the
+// answered prompts past it are in answered_ahead by then. Cleared at exit.
+const OPEN_FROM_KEY = 'turn_open_from';
+// router_state key: per group, the session a usage-limit refusal left its
+// refused prompts in, and the ranges of the messages those took. The session
+// keeps them, so a delivery into it marks those messages as sent again
+// (RESENT_PREFIX). Dropped once a run ends, without a refusal, with the
+// cursor past them.
+const REFUSED_TURN_KEY = 'usage_limit_refused_turn';
 
 /**
  * Files a paper Q&A right after the answer goes out, so it does not wait for the
@@ -274,12 +341,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
+  const pending = pendingMessages(chatJid);
+  const missedMessages = pending.messages;
 
   if (missedMessages.length === 0) return true;
   if (!startsAgent(group, missedMessages)) return true;
@@ -296,13 +359,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const prompt = formatMessages(missedMessages);
+  const prompt = formatMessages(missedMessages, resentIn(chatJid));
 
+  const previousCursor = lastAgentTimestamp[chatJid] || '';
+  const end = deliveryEnd(pending);
+  // Files an earlier container left: this one drains them into its first
+  // prompt, so they are its oldest prompts, and the cursor can go back to
+  // where they start.
+  const leftovers = leftoverPrompts(group);
+  const startCursor = leftovers.length
+    ? refRange(leftovers[0].ref!)!.from
+    : previousCursor;
+  const promptRef = inputRef(previousCursor, end);
+  const prompts: OpenPrompt[] = [...leftovers, { cursor: end, ref: promptRef }];
+  // Unknown until this container's first result, whatever the last one said.
+  attributionOff.delete(chatJid);
+  // Where a restart puts the cursor back to, saved before the cursor moves.
+  trackOpenPrompts(chatJid, prompts);
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  lastAgentTimestamp[chatJid] = end;
   saveState();
 
   logger.info(
@@ -331,11 +407,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // The cursor at the end of the last prompt a turn finished on: a usage limit
   // after it puts back only the messages that came later. Not the cursor at
   // the time, which a follow-up piped in mid-answer has already moved on.
-  let answeredCursor = previousCursor;
-  const promptRef = inputRef(previousCursor, lastAgentTimestamp[chatJid]);
-  const prompts: OpenPrompt[] = [
-    { cursor: lastAgentTimestamp[chatJid], ref: promptRef },
-  ];
+  let answeredCursor = startCursor;
   openPrompts[chatJid] = prompts;
   // This container was never refused, whatever the last run left behind.
   closingOnRefusal.delete(chatJid);
@@ -370,6 +442,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (result.attribution === 'off') attribution = 'off';
       else if (result.turn) attribution = 'on';
       else if (raw !== null) attribution = 'off';
+      if (attribution === 'off') {
+        // As before attribution, a restart puts nothing back.
+        attributionOff.add(chatJid);
+        trackOpenPrompts(chatJid, prompts);
+      }
     }
     const turn = attribution === 'on' ? result.turn : undefined;
     if (raw !== null) {
@@ -386,12 +463,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // The refused turn's inputs stay unanswered.
         if (!runEnded) {
           usageLimited = true;
+          // Its prompts stay in the session the turn ran in.
+          rememberRefusedTurn(
+            chatJid,
+            result.newSessionId,
+            turn
+              ? turn.inputs.map(refRange)
+              : [prompts[0]?.ref ? refRange(prompts[0].ref) : null],
+          );
           // Put the unanswered messages back now, not when the container
           // exits: the window is already persisted, so a restart in between
           // would keep a cursor past messages nothing answered, and recovery
           // after the reset would find nothing pending.
-          lastAgentTimestamp[chatJid] = answeredCursor;
-          saveState();
+          putCursorBack(chatJid, answeredCursor, prompts);
           rememberRefusedInput(chatJid, prompts);
           closingOnRefusal.add(chatJid);
           queue.closeStdin(chatJid);
@@ -417,17 +501,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // order they were given, so it settles the oldest open prompt. A
         // turn answered only through send_message counts too. Wrong when a
         // follow-up was merged into a turn, or a turn took no prompt (#114).
-        prompts[0].answered = true;
+        // Leftover files went in one push with the stdin prompt, so they
+        // settle with it.
+        let i = 0;
+        while (i < prompts.length - 1 && prompts[i].leftover) {
+          prompts[i++].answered = true;
+        }
+        prompts[i].answered = true;
       }
       const settled = shiftAnswered(prompts);
       if (settled !== undefined) answeredCursor = settled;
+      trackOpenPrompts(chatJid, prompts);
       if (usageLimited) {
         // A turn after a refusal (extra usage, say): save what the exit
         // will, so a restart before it leaves the same messages pending.
         // Without `turn` not an exact cursor: the turn settles the oldest
         // open prompt, which is the refused one, whichever it answered.
-        lastAgentTimestamp[chatJid] = answeredCursor;
-        saveState();
+        putCursorBack(chatJid, answeredCursor, prompts);
         rememberRefusedInput(chatJid, prompts);
       }
     }
@@ -493,13 +583,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // writes a file. It must land in prompts, or be refused after a refusal.
   if (openPrompts[chatJid] === prompts) delete openPrompts[chatJid];
   closingOnRefusal.delete(chatJid);
+  attributionOff.delete(chatJid);
 
   if (usageLimited) {
     // The unanswered messages are back (since the refusal). No retry: it
     // would hit the same limit; they run when the window closes. The
     // container is gone, so the files it never drained can go too.
-    lastAgentTimestamp[chatJid] = answeredCursor;
-    saveState();
+    putCursorBack(chatJid, answeredCursor, prompts);
+    rememberOpenFrom(chatJid, undefined);
     discardRefusedInput(chatJid, prompts);
     rememberRefusedInput(chatJid, []);
     logger.warn(
@@ -509,75 +600,129 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  if (attribution === 'on' && outputsLate) {
-    // An answer still on its way would be sent twice if its prompt went back.
-    logger.warn(
-      { group: group.name },
-      'Container exited with output still being delivered, putting nothing back',
-    );
-  } else if (attribution === 'on') {
-    // Every result said what it answered, so the exit knows what was not:
-    // a prompt no result answered goes back, taken or still in its file, on
-    // an error or not, and the queue retries it. A duplicate beats a silent
-    // loss. Whatever came after it goes back too, answered or not: that
-    // reruns an answered follow-up behind an unanswered prompt (#114).
-    const starts = unansweredStarts(prompts);
-    const putBack = readPutBack();
-    if (starts.length === 0) {
-      if (chatJid in putBack) rememberPutBack(chatJid, undefined);
-      return true;
-    }
-    if (starts[0] === putBack[chatJid]) {
-      // Put back once already, and its retry answered it neither: a prompt
-      // that fails every time would otherwise run on, and take every later
-      // message along. It is given up. A newer prompt never went back, so
-      // it still does; with none, the exit ends as it did before
-      // attribution, below.
-      logger.error(
-        { group: group.name, from: starts[0] },
-        'Input no result answered again after it was put back, not putting it back again',
+  // Where the exit leaves the cursor, and whether the queue retries.
+  const settleExit = (): boolean => {
+    if (attribution === 'on' && outputsLate) {
+      // An answer still on its way would be sent twice if its prompt went back.
+      logger.warn(
+        { group: group.name },
+        'Container exited with output still being delivered, putting nothing back',
       );
-      starts.shift();
+    } else if (attribution === 'on') {
+      // Every result said what it answered, so the exit knows what was not:
+      // a prompt no result answered goes back, taken or still in its file, on
+      // an error or not, and the queue retries it. A duplicate beats a silent
+      // loss. The answered prompts after it stay answered (answered_ahead), so
+      // the retry runs only what no result answered.
+      const starts = unansweredStarts(prompts);
+      const putBack = readPutBack()[chatJid];
+      if (starts.length === 0) {
+        if (putBack) rememberPutBack(chatJid, undefined);
+        return true;
+      }
+      // The end of everything this container was given.
+      const end = lastAgentTimestamp[chatJid] || '';
+      if (putBack && starts[0] === putBack[0]) {
+        // Put back once already, and its retry answered it neither: a prompt
+        // that fails every time would otherwise run on, and take every later
+        // unanswered message along. What went back is given up. A message
+        // after it never went back, whether it joined the retry's prompt or
+        // came in a newer one, so it still does; with none, the exit ends as
+        // it did before attribution, below.
+        logger.error(
+          { group: group.name, from: starts[0] },
+          'Input no result answered again after it was put back, not putting it back again',
+        );
+        const to = putBack[1];
+        const joined = to !== undefined && to < promptEnd(prompts, starts[0]);
+        if (joined) starts[0] = to;
+        else starts.shift();
+      }
+      const from = starts[0];
+      if (from !== undefined) {
+        putCursorBack(chatJid, from, prompts);
+        rememberPutBack(chatJid, [from, end]);
+        discardRefusedInput(chatJid, prompts);
+        logger.warn(
+          { group: group.name, error: output === 'error' || hadError },
+          'Container exited with input no result answered, putting it back for retry',
+        );
+        return false;
+      }
     }
-    const from = starts[0];
-    if (from !== undefined) {
-      lastAgentTimestamp[chatJid] = from;
-      saveState();
-      rememberPutBack(chatJid, from);
+
+    if (output === 'error' || hadError) {
+      // If we already sent output to the user, don't roll back the cursor —
+      // the user got their response and re-processing would send duplicates.
+      if (outputSentToUser) {
+        logger.warn(
+          { group: group.name },
+          'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        );
+        return true;
+      }
+      // Roll back cursor so retries can re-process these messages, the
+      // files an earlier container left that this one drained at start-up
+      // included. That makes every piped one pending again, so the files the
+      // container never drained go: the retry would get them twice. Saved
+      // first, so a crash in between cannot leave a message neither pending
+      // nor in a file.
+      putCursorBack(chatJid, startCursor, prompts);
       discardRefusedInput(chatJid, prompts);
       logger.warn(
-        { group: group.name, error: output === 'error' || hadError },
-        'Container exited with input no result answered, putting it back for retry',
+        { group: group.name },
+        'Agent error, rolled back message cursor for retry',
       );
       return false;
     }
-  }
 
-  if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
-    if (outputSentToUser) {
-      logger.warn(
-        { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
-      );
-      return true;
+    return true;
+  };
+  const done = settleExit();
+  // The exit settled the cursor itself: a restart now has nothing to redo.
+  rememberOpenFrom(chatJid, undefined);
+  // Behind the cursor wherever the exit left it, so no rollback reaches them.
+  pruneAnsweredAhead(chatJid);
+  pruneRefusedTurn(chatJid);
+  return done;
+}
+
+/**
+ * The input files waiting in the group's input dir, which its next container
+ * drains into its first prompt, as prompts of that container: oldest first,
+ * each by the range its ref names. A file the runner would skip (not a
+ * message), or one with no range to put back to (written by an older
+ * process), is none.
+ */
+function leftoverPrompts(group: RegisteredGroup): OpenPrompt[] {
+  const inputDir = path.join(resolveGroupIpcPath(group.folder), 'input');
+  let files: string[];
+  try {
+    files = fs.readdirSync(inputDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  const prompts: (OpenPrompt & { from: string })[] = [];
+  for (const name of files) {
+    const file = path.join(inputDir, name);
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      const range = typeof data.ref === 'string' ? refRange(data.ref) : null;
+      if (data.type !== 'message' || !data.text || !range) continue;
+      prompts.push({
+        cursor: range.to,
+        file,
+        ref: data.ref,
+        leftover: true,
+        from: range.from,
+      });
+    } catch {
+      // Gone meanwhile, or unreadable: the runner skips it too.
     }
-    // Roll back cursor so retries can re-process these messages. That makes
-    // every piped one pending again, so the files the container never drained
-    // go: the retry would get them twice. Saved first, so a crash in between
-    // cannot leave a message neither pending nor in a file.
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    discardRefusedInput(chatJid, prompts);
-    logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
-    );
-    return false;
   }
-
-  return true;
+  return prompts
+    .sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0))
+    .map(({ from: _from, ...prompt }) => prompt);
 }
 
 /**
@@ -780,16 +925,12 @@ function pollNewMessages(): void {
 
       // Pull all messages since lastAgentTimestamp so non-trigger
       // context that accumulated between triggers is included.
-      const allPending = getMessagesSince(
-        chatJid,
-        lastAgentTimestamp[chatJid] || '',
-        ASSISTANT_NAME,
-      );
+      const pending = pendingMessages(chatJid);
       // None: the cursor is already past these. Recovery piped them, or a
       // container took them at start-up, before this poll saw them.
-      if (allPending.length === 0) continue;
+      if (pending.messages.length === 0) continue;
 
-      deliverMessages(chatJid, channel, allPending);
+      deliverMessages(chatJid, channel, pending);
     }
   }
 }
@@ -815,38 +956,54 @@ function startsAgent(group: RegisteredGroup, messages: NewMessage[]): boolean {
 function deliverMessages(
   chatJid: string,
   channel: Channel,
-  messages: NewMessage[],
+  pending: Pending,
 ): void {
-  if (!pipeToActiveContainer(chatJid, channel, messages)) {
+  if (
+    !pipeToActiveContainer(
+      chatJid,
+      channel,
+      pending.messages,
+      deliveryEnd(pending),
+    )
+  ) {
     queue.enqueueMessageCheck(chatJid);
   }
 }
 
 /**
  * Hands messages to the group's running container, if it has one, and moves
- * the cursor past them. Returns false when no container is running.
+ * the cursor to `end`: past them, and past any answered message among or
+ * after them. Returns false when no container is running.
  */
 function pipeToActiveContainer(
   chatJid: string,
   channel: Channel,
   messages: NewMessage[],
+  end = messages[messages.length - 1].timestamp,
 ): boolean {
   // Nothing into a container closing on a refusal: it checks the close
   // sentinel before draining, so the file would be left for the next one,
   // on top of the messages being pending. Pending is enough; they are held
   // while the window is open, and start the next container once it closes.
   if (usageLimitHeldUntil() || closingOnRefusal.has(chatJid)) return false;
-  const to = messages[messages.length - 1].timestamp;
-  const ref = inputRef(lastAgentTimestamp[chatJid] || '', to);
-  const file = queue.sendMessage(chatJid, formatMessages(messages), ref);
+  const ref = inputRef(lastAgentTimestamp[chatJid] || '', end);
+  const file = queue.sendMessage(
+    chatJid,
+    formatMessages(messages, resentIn(chatJid)),
+    ref,
+  );
   if (!file) return false;
   logger.debug(
     { chatJid, count: messages.length },
     'Piped messages to active container',
   );
-  lastAgentTimestamp[chatJid] = to;
+  const prompts = openPrompts[chatJid];
+  if (prompts) {
+    prompts.push({ cursor: end, file, ref });
+    trackOpenPrompts(chatJid, prompts);
+  }
+  lastAgentTimestamp[chatJid] = end;
   saveState();
-  openPrompts[chatJid]?.push({ cursor: to, file, ref });
   // Show typing indicator while the container processes the piped message
   channel
     .setTyping?.(chatJid, true)
@@ -875,19 +1032,276 @@ function discardRefusedInput(chatJid: string, prompts: OpenPrompt[]): void {
   }
 }
 
-function readPutBack(): Record<string, string> {
-  try {
-    return JSON.parse(getRouterState(PUT_BACK_KEY) || '{}');
-  } catch {
-    return {};
-  }
+/** What waits for a group past its cursor. */
+interface Pending {
+  /** The messages no turn has answered, oldest first. */
+  messages: NewMessage[];
+  /** Every message past the cursor, answered ones included. */
+  all: NewMessage[];
 }
 
-/** Persists where a group's exit put back to (undefined: forget the group). */
-function rememberPutBack(chatJid: string, from: string | undefined): void {
-  const all = readPutBack();
+/**
+ * The group's messages past its cursor, without the ranges a turn already
+ * answered (answered_ahead). The message loop, recovery and a new container
+ * all take their input from here.
+ */
+function pendingMessages(chatJid: string): Pending {
+  const all = getMessagesSince(
+    chatJid,
+    lastAgentTimestamp[chatJid] || '',
+    ASSISTANT_NAME,
+  );
+  const answered = readAnsweredAhead()[chatJid] ?? [];
+  const messages = all.filter(
+    (m) =>
+      !answered.some(([from, to]) => m.timestamp > from && m.timestamp <= to),
+  );
+  return { messages, all };
+}
+
+/**
+ * Where delivering the pending messages moves the cursor: past the newest
+ * message, answered or not, so an answered range among them is behind it.
+ */
+function deliveryEnd(pending: Pending): string {
+  return pending.all[pending.all.length - 1].timestamp;
+}
+
+// router_state keys already warned about this process, once each.
+const malformedStateKeys = new Set<string>();
+
+/**
+ * A per-group router_state record, without the entries `valid` rejects. A
+ * value that is no JSON object, or an entry of another shape (a hand edit,
+ * or a format this process does not know), reads as missing instead of
+ * throwing at start-up or in delivery.
+ */
+function readGroupRecord<T>(
+  key: string,
+  valid: (value: unknown) => value is T,
+): Record<string, T> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(getRouterState(key) || '{}');
+  } catch {
+    parsed = undefined;
+  }
+  const record: Record<string, T> = {};
+  const isRecord =
+    typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed);
+  let malformed = !isRecord;
+  for (const [chatJid, value] of isRecord
+    ? Object.entries(parsed as object)
+    : []) {
+    if (valid(value)) record[chatJid] = value;
+    else malformed = true;
+  }
+  if (malformed && !malformedStateKeys.has(key)) {
+    malformedStateKeys.add(key);
+    logger.warn(
+      { key },
+      'router_state value of the wrong shape, read without it',
+    );
+  }
+  return record;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+function isRanges(value: unknown): value is Range[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (range) =>
+        Array.isArray(range) && range.length === 2 && range.every(isString),
+    )
+  );
+}
+
+function isRefusedTurn(
+  value: unknown,
+): value is { session: string; ranges: Range[] } {
+  const turn = value as { session?: unknown; ranges?: unknown } | null;
+  return (
+    typeof turn === 'object' &&
+    turn !== null &&
+    isString(turn.session) &&
+    isRanges(turn.ranges)
+  );
+}
+
+function isPrompts(value: unknown): value is OpenPrompt[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (prompt: { cursor?: unknown; file?: unknown } | null) =>
+        typeof prompt === 'object' &&
+        prompt !== null &&
+        isString(prompt.cursor) &&
+        (prompt.file === undefined || isString(prompt.file)),
+    )
+  );
+}
+
+function readAnsweredAhead(): Record<string, Range[]> {
+  return readGroupRecord(ANSWERED_AHEAD_KEY, isRanges);
+}
+
+/** Persists a group's answered ranges past its cursor (none: forget it). */
+function rememberAnsweredAhead(chatJid: string, ranges: Range[]): void {
+  const all = readAnsweredAhead();
+  if (ranges.length > 0) all[chatJid] = ranges;
+  else delete all[chatJid];
+  setRouterState(ANSWERED_AHEAD_KEY, JSON.stringify(all));
+}
+
+/**
+ * Moves the group's cursor back to `from`, the start of its oldest prompt no
+ * turn answered, and keeps the answered prompts past it as answered, beside
+ * the ranges kept before. Those go first: a crash in between leaves ranges
+ * behind the cursor, which nothing reads, never answered messages pending.
+ */
+function putCursorBack(
+  chatJid: string,
+  from: string,
+  prompts: OpenPrompt[],
+): void {
+  const kept = readAnsweredAhead()[chatJid] ?? [];
+  rememberAnsweredAhead(
+    chatJid,
+    mergeRanges([...kept, ...answeredRanges(prompts, from)]).filter(
+      ([, to]) => to > from,
+    ),
+  );
+  lastAgentTimestamp[chatJid] = from;
+  saveState();
+}
+
+function readOpenFrom(): Record<string, string> {
+  return readGroupRecord(OPEN_FROM_KEY, isString);
+}
+
+/** Persists where a restart puts the group's cursor back to (undefined: none). */
+function rememberOpenFrom(chatJid: string, from: string | undefined): void {
+  const all = readOpenFrom();
+  if (all[chatJid] === from) return;
   if (from === undefined) delete all[chatJid];
   else all[chatJid] = from;
+  setRouterState(OPEN_FROM_KEY, JSON.stringify(all));
+}
+
+/**
+ * Keeps what a restart needs while a message container runs: the start of
+ * its oldest prompt no turn has answered, and the answered prompts past it,
+ * kept as answered first. Nothing once the container turned attribution off.
+ */
+function trackOpenPrompts(chatJid: string, prompts: OpenPrompt[]): void {
+  const oldest = prompts.find((p) => !p.answered);
+  const range = oldest?.ref ? refRange(oldest.ref) : null;
+  if (!range || attributionOff.has(chatJid)) {
+    rememberOpenFrom(chatJid, undefined);
+    return;
+  }
+  const answered = answeredRanges(prompts, range.from);
+  if (answered.length > 0) {
+    const kept = readAnsweredAhead()[chatJid] ?? [];
+    rememberAnsweredAhead(chatJid, mergeRanges([...kept, ...answered]));
+  }
+  rememberOpenFrom(chatJid, range.from);
+}
+
+function readRefusedTurns(): Record<
+  string,
+  { session: string; ranges: Range[] }
+> {
+  return readGroupRecord(REFUSED_TURN_KEY, isRefusedTurn);
+}
+
+/**
+ * Records the messages a refused turn took, in the session it ran in: added
+ * to those of an earlier refusal in the same session, in place of another's.
+ */
+function rememberRefusedTurn(
+  chatJid: string,
+  session: string | undefined,
+  ranges: ({ from: string; to: string } | null)[],
+): void {
+  if (!session) return;
+  const taken = ranges
+    .filter((r): r is { from: string; to: string } => r !== null)
+    .map((r): Range => [r.from, r.to]);
+  if (taken.length === 0) return;
+  const all = readRefusedTurns();
+  const earlier = all[chatJid]?.session === session ? all[chatJid].ranges : [];
+  all[chatJid] = { session, ranges: mergeRanges([...earlier, ...taken]) };
+  setRouterState(REFUSED_TURN_KEY, JSON.stringify(all));
+}
+
+/**
+ * Which of the group's messages a delivery marks as sent again: those a
+ * refused turn took, while the group still keeps the session it ran in. A
+ * session the host never stored (a new one whose first turn was refused) is
+ * not resumed, so nothing in it is marked.
+ */
+function resentIn(chatJid: string): (message: NewMessage) => boolean {
+  const refused = readRefusedTurns()[chatJid];
+  const group = registeredGroups[chatJid];
+  if (!refused || !group || sessions[group.folder] !== refused.session) {
+    return () => false;
+  }
+  return (m) =>
+    refused.ranges.some(
+      ([from, to]) => m.timestamp > from && m.timestamp <= to,
+    );
+}
+
+/** Drops the refused ranges the group's cursor has passed. */
+function pruneRefusedTurn(chatJid: string): void {
+  const all = readRefusedTurns();
+  const refused = all[chatJid];
+  if (!refused) return;
+  const cursor = lastAgentTimestamp[chatJid] || '';
+  const ranges = refused.ranges.filter(([, to]) => to > cursor);
+  if (ranges.length > 0) all[chatJid] = { ...refused, ranges };
+  else delete all[chatJid];
+  setRouterState(REFUSED_TURN_KEY, JSON.stringify(all));
+}
+
+/** Drops the group's answered ranges that its cursor has passed. */
+function pruneAnsweredAhead(chatJid: string): void {
+  const kept = readAnsweredAhead()[chatJid];
+  if (!kept) return;
+  const cursor = lastAgentTimestamp[chatJid] || '';
+  rememberAnsweredAhead(
+    chatJid,
+    kept.filter(([, to]) => to > cursor),
+  );
+}
+
+/** What a group's exit last put back: `[from, to]`, or `[from]` (older). */
+type PutBack = [from: string, to?: string];
+
+function isPutBack(value: unknown): value is string | Range {
+  return isString(value) || isRanges([value]);
+}
+
+function readPutBack(): Record<string, PutBack> {
+  const all: Record<string, PutBack> = {};
+  for (const [chatJid, value] of Object.entries(
+    readGroupRecord(PUT_BACK_KEY, isPutBack),
+  )) {
+    all[chatJid] = isString(value) ? [value] : value;
+  }
+  return all;
+}
+
+/** Persists what a group's exit put back (undefined: forget the group). */
+function rememberPutBack(chatJid: string, range: Range | undefined): void {
+  const all = readPutBack();
+  if (range === undefined) delete all[chatJid];
+  else all[chatJid] = range;
   setRouterState(PUT_BACK_KEY, JSON.stringify(all));
 }
 
@@ -901,11 +1315,7 @@ function rememberRefusedInput(chatJid: string, prompts: OpenPrompt[]): void {
 }
 
 function readRefusedInput(): Record<string, OpenPrompt[]> {
-  try {
-    return JSON.parse(getRouterState(REFUSED_INPUT_KEY) || '{}');
-  } catch {
-    return {};
-  }
+  return readGroupRecord(REFUSED_INPUT_KEY, isPrompts);
 }
 
 /**
@@ -973,15 +1383,14 @@ function recoverPendingMessages(): void {
     return;
   }
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
-    if (pending.length > 0) {
+    const pending = pendingMessages(chatJid);
+    if (pending.messages.length > 0) {
       logger.info(
-        { group: group.name, pendingCount: pending.length },
+        { group: group.name, pendingCount: pending.messages.length },
         'Recovery: found unprocessed messages',
       );
       const channel = findChannel(channels, chatJid);
-      if (channel && startsAgent(group, pending)) {
+      if (channel && startsAgent(group, pending.messages)) {
         deliverMessages(chatJid, channel, pending);
       } else {
         queue.enqueueMessageCheck(chatJid);
@@ -992,14 +1401,43 @@ function recoverPendingMessages(): void {
 
 /**
  * Startup, after the database opens and before any container starts, in the
- * order the refused-input sweep needs: stop the last process's containers, so
- * none can still drain a file; load the cursors the files are judged against;
- * then drop the files a refusal put back.
+ * order the input-file sweeps need: stop the last process's containers, so
+ * none can still drain a file; load the cursors the files are judged against,
+ * and put back what those containers left unanswered; then drop the files
+ * whose messages are pending, and those a refusal put back.
  */
 function restoreStartupState(): void {
   cleanupOrphans();
   loadState();
+  restoreOpenPrompts();
   discardRefusedInputAfterRestart();
+}
+
+/**
+ * Startup: the last process stopped with message containers running, which
+ * cleanupOrphans has stopped. Each group's cursor goes back to the oldest
+ * prompt no turn answered (turn_open_from); the answered ones past it stay
+ * answered. An input file whose messages are pending then goes, so the next
+ * container does not also drain it; one behind the cursor stays for it.
+ */
+function restoreOpenPrompts(): void {
+  for (const [chatJid, from] of Object.entries(readOpenFrom())) {
+    if (from < (lastAgentTimestamp[chatJid] || '')) {
+      logger.warn(
+        { chatJid, from },
+        'Restart stopped a container with input no turn answered, putting it back',
+      );
+      lastAgentTimestamp[chatJid] = from;
+    }
+  }
+  saveState();
+  for (const [chatJid, group] of Object.entries(registeredGroups)) {
+    const cursor = lastAgentTimestamp[chatJid] || '';
+    for (const { file, cursor: end } of leftoverPrompts(group)) {
+      if (end > cursor) fs.rmSync(file!, { force: true });
+    }
+  }
+  setRouterState(OPEN_FROM_KEY, '{}');
 }
 
 /** What the scheduler is started with: this process's queue and channels. */
