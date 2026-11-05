@@ -132,6 +132,46 @@ describe('customize', () => {
     expect(() => commitCustomize()).toThrow(/diff error/i);
   });
 
+  // diffutils 3.12 (Ubuntu 26.04) reads `diff -ruN <dir> <file>` as
+  // <dir>/<file's name> against the file, finds the first missing, and exits 1
+  // with a patch against that invented path. 3.10 exits 2. A base path that is
+  // a directory must be refused whichever diff is installed.
+  it('commitCustomize refuses a base path that is a directory, whatever diff makes of it', () => {
+    const trackedFile = path.join(tmpDir, 'src', 'app.ts');
+    fs.mkdirSync(path.dirname(trackedFile), { recursive: true });
+    fs.writeFileSync(trackedFile, 'export const x = 1;');
+    recordSkillApplication('test-skill', '1.0.0', {
+      'src/app.ts': computeFileHash(trackedFile),
+    });
+    startCustomize('diff-dir test');
+    fs.writeFileSync(trackedFile, 'export const x = 2;');
+    fs.mkdirSync(path.join(tmpDir, '.paperclaw', 'base', 'src', 'app.ts'), {
+      recursive: true,
+    });
+
+    const fakeBin = path.join(tmpDir, 'fake-bin');
+    fs.mkdirSync(fakeBin);
+    fs.writeFileSync(
+      path.join(fakeBin, 'diff'),
+      '#!/bin/sh\necho "--- a/invented\\n+++ b/app.ts\\n@@ -0,0 +1 @@\\n+x"\nexit 1\n',
+      { mode: 0o755 },
+    );
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}${path.delimiter}${originalPath}`;
+    try {
+      expect(() => commitCustomize()).toThrow(/diff error.*directory/i);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+    // No patch for the invented path was written; the session stays pending.
+    expect(
+      fs
+        .readdirSync(path.join(tmpDir, CUSTOM_DIR))
+        .filter((f) => f.endsWith('.patch')),
+    ).toEqual([]);
+    expect(isCustomizeActive()).toBe(true);
+  });
+
   it('startCustomize while active throws', () => {
     const trackedFile = path.join(tmpDir, 'src', 'app.ts');
     fs.mkdirSync(path.dirname(trackedFile), { recursive: true });

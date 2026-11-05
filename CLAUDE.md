@@ -346,6 +346,16 @@ red build is caught before the push instead of a minute later on GitHub.
 Verified by staging deliberately mangled TypeScript: the file inside the resulting
 commit came out formatted.
 
+### …or the runner image moves under a test
+
+`ubuntu-latest` became Ubuntu 26.04 between two runs, and its diffutils 3.12
+reads `diff -ruN <dir> <file>` as the directory's same-named entry against the
+file: exit 1 and a patch, where 3.10 exited 2. A test that leaned on the error
+went red on every branch at once, with no change in the repo. **When CI fails on
+code nobody touched, compare the `Runner Image` lines of the last green run and
+the red one** (`gh run view <id> --log | grep -A2 "Runner Image"`), and make the
+code decide for itself rather than read a system tool's exit code.
+
 ### …and it must stay off the repository it is running in
 
 Git exports `GIT_DIR`, `GIT_INDEX_FILE` and friends to every hook it launches,

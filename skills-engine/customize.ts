@@ -95,6 +95,17 @@ export function commitCustomize(): void {
     const basePath = path.join(baseDir, relativePath);
     const currentPath = path.join(cwd, relativePath);
 
+    // A tracked path is a file. diffutils 3.10 refuses a directory on either
+    // side (exit 2), while 3.12 diffs <dir>/<name of the file> against the
+    // file and writes a patch for that invented path, so decide here.
+    for (const side of [basePath, currentPath]) {
+      if (fs.existsSync(side) && fs.statSync(side).isDirectory()) {
+        throw new Error(
+          `diff error for ${relativePath}: ${side} is a directory, expected a file`,
+        );
+      }
+    }
+
     // Use /dev/null if either side doesn't exist
     const oldPath = fs.existsSync(basePath) ? basePath : '/dev/null';
     const newPath = fs.existsSync(currentPath) ? currentPath : '/dev/null';
