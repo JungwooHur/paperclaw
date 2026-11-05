@@ -170,7 +170,7 @@ Known fixes accumulated so far:
 | Notion PATCH image 400 error | Including `"type"` field in image update | Use `{"image": {"external": {"url": "..."}}}` — no `type` field |
 | Q&A callout blank line | `"rich_text": []` in a `default`-color callout renders as a blank line | Use `"color": "gray_background"` on the callout — its tinted band visually anchors the empty rich_text and the toggle child sits flush inside (toggle-style layout, see save_qa_callout.py) |
 | Long documents / books came out heavily summarized (pages at 1–24% of source length) with duplicated paragraph runs | The per-section "translate section X.Y" NotebookLM loop does not preserve a long document: adjacent section answers OVERLAP (same paragraph twice) and the spans BETWEEN them are DROPPED (whole paragraphs vanish). The heading-count and heading-DUPLICATE checks passed these pages. Recurred across 6 books | Translate long docs with `research-papers/translate_fulltext.py`: pulls each source's raw indexed text (`notebooklm source fulltext`), tiling sentence-bounded chunks (no gap/overlap), one bounded `notebooklm ask --json` per chunk (bounded "translate THIS" doesn't summarize), length-checked, assembled via build_answer_blocks, rate-safe rebuild. Plus `verify_sections.py` PARA_DUP detects verbatim paragraph duplication the heading check missed. See "Long documents / books" |
-| Non-arxiv paper translated from slide deck | First Google hit was a 10-page talk PDF (ends "THANK YOU") — agent uploaded that to NotebookLM as if it were the full paper | For non-arxiv papers, fetch from OpenReview/conference site with browser UA + Referer; then run a `fitz` page-count + last-page text check to reject slide decks before adding the source |
+| Non-arxiv paper translated from slide deck | First Google hit was a 10-page talk PDF (ends "THANK YOU") — agent uploaded that to NotebookLM as if it were the full paper | For non-arxiv papers, fetch from OpenReview/conference site with browser UA + Referer; then run `pdf_check.py` to reject slide decks before adding the source. **It judges density, not length**: its first form, a snippet pasted here, called anything under 20 pages a deck, which refused every short conference paper (8 pages at NeurIPS, 17 for an ICLR paper with its appendix) and sent the agent looking for a "real" PDF that does not exist. A deck averages a few hundred characters a page, a paper 2,500 or more; "THANK YOU" counts only on an almost empty last page, since a paper thanks people in its acknowledgments. Gated by `tests/test_pdf_check.py` |
 | OpenReview PDF returns HTTP 403 | Default curl UA is blocked | Use `curl -L -A "Mozilla/5.0..." -H "Referer: https://openreview.net/forum?id=..." "https://openreview.net/pdf?id=..."` |
 | Wrap `\n` mid-paragraph on Notion | NotebookLM replies are ~80-char soft-wrapped; uploading raw text makes Notion render breaks inside sentences | Step 2-B prompt forbids mid-paragraph `\n`; `build_answer_blocks` collapses single `\n` to space while preserving `\n\n` paragraph breaks |
 | Section title shown twice — a `heading_1` block plus a body paragraph that restates the same title (e.g. heading `1. Introduction (서론)` followed by paragraph `1 Introduction (서론)`) | NotebookLM emits the section title as the first line of its answer; the assembler created a heading block from the section name AND kept that first line as a paragraph. Differs from the heading only by the `N.`/Korean-parenthetical, so a naive equality check misses it | (1) **Prevent:** Phase 4 step 2 drops a leading paragraph whose normalized text (label + `(translation)` stripped) equals the heading being created. (2) **Detect:** `verify_sections.py` HEADING_ECHO check (source-free) flags any echo paragraph with its block id to archive |
@@ -671,18 +671,9 @@ The output **MUST** be a section-by-section verbatim treatment (one `notebooklm 
           -H "Referer: https://openreview.net/forum?id=XXXX" \
           "PAPER_PDF_URL" -o /tmp/paper.pdf
 
-     # MANDATORY sanity check — slide decks have ~10 pages with sparse text and end in
-     # "THANK YOU" / "Q&A" / "Questions". Real long-form papers have 20+ pages of dense text.
-     python3 -c "
-     import fitz
-     d = fitz.open('/tmp/paper.pdf')
-     pages = d.page_count
-     last_text = d[-1].get_text().upper()
-     avg_chars = sum(len(d[i].get_text()) for i in range(pages)) / pages
-     is_slides = pages < 20 or avg_chars < 1500 or 'THANK YOU' in last_text or 'Q&A' in last_text
-     print(f'pages={pages} avg_chars={avg_chars:.0f} slides_suspect={is_slides}')
-     assert not is_slides, 'PDF looks like a slide deck — find the real paper PDF'
-     "
+     # MANDATORY sanity check: a slide deck or talk is refused (exit 1). It judges
+     # text DENSITY, never page count: an 8-page conference paper is a paper.
+     python3 /workspace/group/research-papers/pdf_check.py /tmp/paper.pdf
 
      notebooklm source add /tmp/paper.pdf --notebook <id>
      ```
