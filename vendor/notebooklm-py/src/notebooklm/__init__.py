@@ -46,6 +46,9 @@ except PackageNotFoundError:
         __version__,
     )
 
+# Public API: Android Live Voice
+from ._live import LiveSession
+
 # Public API: Authentication
 from .auth import AuthTokens
 
@@ -98,6 +101,9 @@ from .exceptions import (
     NoteNotFoundError,
     # Cross-domain umbrellas
     NotFoundError,
+    OperationTimeoutError,
+    # Domain: Sources
+    PlayBookNotExportableError,
     RateLimitError,
     ResearchError,
     ResearchStartUnavailableError,
@@ -107,23 +113,41 @@ from .exceptions import (
     RPCResponseTooLargeError,
     RPCTimeoutError,
     ServerError,
-    # Domain: Sources
     SourceAddError,
     SourceError,
     SourceNotFoundError,
     SourceProcessingError,
     SourceTimeoutError,
     UnknownRPCMethodError,
+    UnsupportedOperationError,
     ValidationError,
     # Cross-domain umbrellas (wait/poll timeouts)
     WaitTimeoutError,
+)
+from .live import (
+    LiveAudio,
+    LiveBufferOverflowError,
+    LiveEstablished,
+    LiveEvent,
+    LiveGoAway,
+    LiveInterrupted,
+    LiveSessionClosedError,
+    LiveTranscript,
+    LiveTurnComplete,
 )
 
 # Public API: Types and dataclasses
 from .types import (
     AccountLimits,
     Artifact,
+    ArtifactCreationCapability,
+    ArtifactCustomizationChoices,
     ArtifactInfographic,
+    ArtifactListing,
+    ArtifactListingComponent,
+    ArtifactListingFailure,
+    ArtifactLookup,
+    ArtifactLookupStatus,
     ArtifactMedia,
     ArtifactMediaType,
     ArtifactSlide,
@@ -140,17 +164,22 @@ from .types import (
     ChatReference,
     ChatResponseLength,
     ChatSession,
+    ChatSessionStatus,
     CitedSourceSelection,
     ClientMetricsSnapshot,
     Collection,
     ConnectionLimits,
     ConversationTurn,
     ConversationTurnKey,
+    CopiedArtifact,
+    CopiedSource,
+    CustomizationChoice,
     DiscoveryMode,
     DocumentAnnotation,
     DocumentBlock,
     DriveMimeType,
     DriveSourceStatus,
+    ExpertIntelligenceSourceMetadata,
     ExportType,
     FlashcardArtifactUserState,
     GenerationState,
@@ -170,11 +199,15 @@ from .types import (
     Notebook,
     NotebookDescription,
     NotebookMetadata,
+    PlayBook,
+    PlayBookExportReason,
     PremiumFeatureInfo,
     PromptSuggestion,
     QuizDifficulty,
     QuizQuantity,
+    RelevantChunk,
     ReportFormat,
+    ReportPreset,
     ReportSuggestion,
     ResearchSource,
     ResearchStart,
@@ -190,6 +223,7 @@ from .types import (
     SlideDeckFormat,
     SlideDeckLength,
     Source,
+    SourceDeleteOutcome,
     SourceFulltext,
     SourceGuide,
     SourceStatus,
@@ -203,6 +237,13 @@ from .types import (
     UnknownArtifactUserState,
     # Warnings
     UnknownTypeWarning,
+    UsageAction,
+    UsageActionCostTier,
+    UsageActionKind,
+    UsageSummary,
+    UsageSummaryStatus,
+    UsageWindow,
+    UsageWindowKind,
     UserSettings,
     VideoFormat,
     VideoStyle,
@@ -213,9 +254,22 @@ from .types import (
 from .utils import resolve_chat_reference_passage
 
 __all__ = [
+    "SourceDeleteOutcome",
+    "ArtifactCreationCapability",
     "__version__",
     # Client (main entry point)
     "NotebookLMClient",
+    # Android Live Voice
+    "LiveSession",
+    "LiveAudio",
+    "LiveBufferOverflowError",
+    "LiveEstablished",
+    "LiveEvent",
+    "LiveGoAway",
+    "LiveInterrupted",
+    "LiveSessionClosedError",
+    "LiveTranscript",
+    "LiveTurnComplete",
     # Auth
     "AuthTokens",
     # Observability
@@ -226,20 +280,30 @@ __all__ = [
     # Types
     "AccountLimits",
     "UserSettings",
+    "UsageSummary",
+    "UsageWindow",
+    "UsageAction",
     "ConnectionLimits",
     "ClientMetricsSnapshot",
     "RpcTelemetryEvent",
     "Notebook",
     "PremiumFeatureInfo",
     "ChatSession",
+    "ChatSessionStatus",
     "NotebookDescription",
     "NotebookMetadata",
     "SuggestedTopic",
     "Source",
     "SourceFulltext",
+    "RelevantChunk",
     "SourceGuide",
     "SourceSummary",
     "Artifact",
+    "ArtifactListing",
+    "ArtifactListingComponent",
+    "ArtifactListingFailure",
+    "ArtifactLookup",
+    "ArtifactLookupStatus",
     "ArtifactInfographic",
     "ArtifactMedia",
     "ArtifactMediaType",
@@ -250,6 +314,7 @@ __all__ = [
     "UnknownArtifactUserState",
     "GenerationState",
     "GenerationStatus",
+    "ReportPreset",
     "ReportSuggestion",
     "MindMap",
     "MindMapKind",
@@ -259,6 +324,13 @@ __all__ = [
     "Collection",
     "ConversationTurn",
     "ConversationTurnKey",
+    "ArtifactCustomizationChoices",
+    "CopiedArtifact",
+    "CopiedSource",
+    "PlayBook",
+    "PlayBookExportReason",
+    "ExpertIntelligenceSourceMetadata",
+    "CustomizationChoice",
     "NextStepSuggestion",
     "ChatReference",
     "AskResult",
@@ -278,6 +350,7 @@ __all__ = [
     "NotebookLMError",
     "ValidationError",
     "ConfigurationError",
+    "UnsupportedOperationError",
     "MissingDependencyError",
     # Cross-domain umbrellas
     "NotFoundError",
@@ -304,6 +377,7 @@ __all__ = [
     "ChatResponseParseError",
     # Domain Exceptions: Sources
     "SourceError",
+    "PlayBookNotExportableError",
     "SourceAddError",
     "SourceProcessingError",
     "SourceTimeoutError",
@@ -338,11 +412,16 @@ __all__ = [
     "CollectionNotFoundError",
     # Cross-domain umbrella: wait/poll timeouts
     "WaitTimeoutError",
+    "OperationTimeoutError",
     # Warnings
     "UnknownTypeWarning",
     # User-facing type enums (str enums for .kind property)
     "SourceType",
     "ArtifactType",
+    "UsageSummaryStatus",
+    "UsageWindowKind",
+    "UsageActionKind",
+    "UsageActionCostTier",
     # Configuration enums
     "AudioFormat",
     "AudioLength",

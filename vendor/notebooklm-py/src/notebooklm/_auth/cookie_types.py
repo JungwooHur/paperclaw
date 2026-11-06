@@ -35,7 +35,11 @@ deliberately does not.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+import copy
+import http.cookiejar
+import logging
+import math
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, cast
 
@@ -43,6 +47,22 @@ import httpx
 
 from . import cookie_policy as _cookie_policy
 from . import cookie_semantics as _cookie_semantics
+
+logger = logging.getLogger("notebooklm.auth")
+
+_PSIDTS_COOKIE = "__Secure-1PSIDTS"
+_CookieConverter = Callable[[dict[str, Any]], http.cookiejar.Cookie]
+
+
+class StorageStateValidationError(ValueError):
+    """Storage JSON has no usable Playwright ``cookies`` list."""
+
+
+StorageStateValidationError.__module__ = "notebooklm._auth.cookies"
+
+
+class _SanitizedCookieEntry(dict[str, Any]):
+    """Marker for a row already sanitized within the current load operation."""
 
 
 class CookieIdentity(NamedTuple):
@@ -365,6 +385,45 @@ class CookieJar:
         return f"CookieJar({len(self._cookies)} cookies: {sorted(self.names())})"
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _LoadedCookiePair:
+    """One raw-state sample projected to live and persistence-safe forms."""
+
+    live: httpx.Cookies = field(repr=False)
+    baseline: CookieJar = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.live, httpx.Cookies) or not isinstance(self.baseline, CookieJar):
+            raise TypeError("loaded cookie pair fields are invalid")
+        object.__setattr__(self, "baseline", CookieJar(tuple(self.baseline)))
+
+
+_LoadedCookiePair.__module__ = "notebooklm._auth.cookies"
+
+
+def _bounded_row_field(entry: Any, field: str) -> str:
+    if not isinstance(entry, dict):
+        return type(entry).__name__
+    value = entry.get(field)
+    return value[:80] if isinstance(value, str) else type(value).__name__
+
+
+def _sanitize_cookie_entry(entry: Any) -> dict[str, Any] | None:
+    if isinstance(entry, _SanitizedCookieEntry):
+        return entry
+    try:
+        return _cookie_semantics.sanitize_cookie_entry(entry)
+    except _cookie_semantics.CookieRowError as exc:
+        logger.debug(
+            "Skipping malformed cookie row name=%s domain=%s row_type=%s error=%s",
+            _bounded_row_field(entry, "name"),
+            _bounded_row_field(entry, "domain"),
+            type(entry).__name__,
+            type(exc).__name__,
+        )
+        return None
+
+
 def _sanitized_auth_entries(storage_state: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Return the pure sanitized, allowlisted typed view of storage rows."""
     raw_entries = storage_state.get("cookies", [])
@@ -372,11 +431,8 @@ def _sanitized_auth_entries(storage_state: Mapping[str, Any]) -> list[dict[str, 
         return []
     entries: list[dict[str, Any]] = []
     for raw_entry in raw_entries:
-        try:
-            entry = _cookie_semantics.sanitize_cookie_entry(raw_entry)
-        except _cookie_semantics.CookieRowError:
-            continue
-        if _cookie_policy._is_allowed_auth_domain(entry["domain"]):
+        entry = _sanitize_cookie_entry(raw_entry)
+        if entry is not None and _cookie_policy._is_allowed_auth_domain(entry["domain"]):
             entries.append(entry)
     return entries
 
@@ -399,3 +455,218 @@ def _cookie_from_entry(entry: Mapping[str, Any]) -> Cookie:
         secure=bool(entry.get("secure", False)),
         same_site=same_site if isinstance(same_site, str) else None,
     )
+
+
+def _sanitize_routing_entry(
+    entry: Any,
+    *,
+    bounded_row_field: Callable[[Any, str], str] | None = None,
+) -> dict[str, Any] | None:
+    """Revalidate a row for routing, including rows marked by a source pass."""
+    try:
+        return _cookie_semantics.sanitize_cookie_entry(entry)
+    except _cookie_semantics.CookieRowError as exc:
+        field_value = bounded_row_field or _bounded_row_field
+        logger.debug(
+            "Skipping malformed cookie row name=%s domain=%s row_type=%s error=%s",
+            field_value(entry, "name"),
+            field_value(entry, "domain"),
+            type(entry).__name__,
+            type(exc).__name__,
+        )
+        return None
+
+
+def _try_cookie(
+    entry: Any,
+    converter: _CookieConverter,
+    *,
+    bounded_row_field: Callable[[Any, str], str] | None = None,
+) -> http.cookiejar.Cookie | None:
+    field_value = bounded_row_field or _bounded_row_field
+    try:
+        _cookie_semantics.validate_cookie_shape(entry)
+    except _cookie_semantics.CookieRowError as exc:
+        logger.debug(
+            "Skipping malformed cookie row name=%s domain=%s row_type=%s error=%s",
+            field_value(entry, "name"),
+            field_value(entry, "domain"),
+            type(entry).__name__,
+            type(exc).__name__,
+        )
+        return None
+    try:
+        return converter(entry)
+    except (ValueError, TypeError, OverflowError) as exc:
+        logger.debug(
+            "Skipping unusable cookie row name=%s domain=%s error=%s",
+            field_value(entry, "name"),
+            field_value(entry, "domain"),
+            type(exc).__name__,
+        )
+        return None
+
+
+def _allowed_cookie_name(
+    entry: Any,
+    *,
+    sanitize: Callable[[Any], dict[str, Any] | None] | None = None,
+    is_allowed_domain: Callable[[str], bool] | None = None,
+) -> str | None:
+    sanitize_row = sanitize or _sanitize_routing_entry
+    domain_allowed = is_allowed_domain or _cookie_policy._is_allowed_auth_domain
+    normalized = sanitize_row(entry)
+    if normalized is None or not domain_allowed(normalized["domain"]):
+        return None
+    return normalized["name"]
+
+
+def _is_expired(cookie: http.cookiejar.Cookie, now: float | None) -> bool:
+    return cookie.is_expired(None if now is None else math.floor(now))
+
+
+def _iter_routable_psidts_cookies(
+    entries: Iterable[dict[str, Any]],
+    *,
+    to_cookie: _CookieConverter,
+    now: float | None = None,
+    allowed_cookie_name: Callable[[Any], str | None] | None = None,
+    try_cookie: Callable[[Any, _CookieConverter], http.cookiejar.Cookie | None] | None = None,
+    is_expired: Callable[[http.cookiejar.Cookie, float | None], bool] | None = None,
+) -> Iterator[http.cookiejar.Cookie]:
+    cookie_name = allowed_cookie_name or _allowed_cookie_name
+    convert_cookie = try_cookie or _try_cookie
+    cookie_expired = is_expired or _is_expired
+    live: dict[tuple[str, str, str], http.cookiejar.Cookie] = {}
+    dead: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        if cookie_name(entry) != _PSIDTS_COOKIE:
+            continue
+        cookie = convert_cookie(entry, to_cookie)
+        if cookie is None:
+            continue
+        identity = (cookie.name, cookie.domain, cookie.path)
+        if cookie_expired(cookie, now):
+            dead.add(identity)
+        else:
+            live[identity] = cookie
+    for identity, cookie in live.items():
+        if identity not in dead:
+            yield cookie
+
+
+def _cookie_header_names(header: str) -> set[str]:
+    return {part.split("=", 1)[0].strip() for part in header.split(";") if "=" in part}
+
+
+def _cookies_route_psidts(
+    cookies: Iterable[http.cookiejar.Cookie],
+    *,
+    rotate_url: str,
+    cookie_header_names: Callable[[str], set[str]] | None = None,
+) -> bool:
+    jar = httpx.Cookies()
+    found = False
+    for cookie in cookies:
+        if cookie.name != _PSIDTS_COOKIE or not cookie.value:
+            continue
+        jar.jar.set_cookie(cookie)
+        found = True
+    if not found:
+        return False
+    request = httpx.Request("POST", rotate_url)
+    jar.set_cookie_header(request)
+    header_names = cookie_header_names or _cookie_header_names
+    return _PSIDTS_COOKIE in header_names(request.headers.get("cookie", ""))
+
+
+def _psidts_routes_to_rotate(
+    entries: Iterable[dict[str, Any]],
+    *,
+    to_cookie: _CookieConverter,
+    rotate_url: str,
+    now: float | None = None,
+    iter_routable: Callable[..., Iterator[http.cookiejar.Cookie]] | None = None,
+    cookies_route: Callable[[Iterable[http.cookiejar.Cookie]], bool] | None = None,
+) -> bool:
+    probes = []
+    iter_cookies = iter_routable or _iter_routable_psidts_cookies
+    for cookie in iter_cookies(entries, to_cookie=to_cookie, now=now):
+        probe = copy.copy(cookie)
+        probe.expires = None
+        probes.append(probe)
+    if cookies_route is not None:
+        return cookies_route(probes)
+    return _cookies_route_psidts(probes, rotate_url=rotate_url)
+
+
+def _build_cookie_pair_from_storage_state(
+    storage_state: Mapping[str, Any],
+    *,
+    context: str = "",
+    require_routable: bool,
+    rotate_url: str,
+    converter: Callable[..., http.cookiejar.Cookie] | None = None,
+) -> _LoadedCookiePair:
+    """Project one raw sample without losing typed cookie provenance."""
+    entries = [_SanitizedCookieEntry(entry) for entry in _sanitized_auth_entries(storage_state)]
+    convert = converter or _cookie_semantics.cookie_from_normalized_entry
+    converted_rows: list[tuple[dict[str, Any], http.cookiejar.Cookie | None]] = []
+    for entry in entries:
+        try:
+            converted = convert(entry, http_only_key="httpOnly")
+        except (ValueError, TypeError, OverflowError) as exc:
+            logger.debug(
+                "Skipping unusable cookie row name=%s domain=%s error=%s",
+                _bounded_row_field(entry, "name"),
+                _bounded_row_field(entry, "domain"),
+                type(exc).__name__,
+            )
+            converted_rows.append((entry, None))
+            continue
+        converted_rows.append((entry, converted))
+
+    live = httpx.Cookies()
+    baseline: list[Cookie] = []
+    seen_keys: set[CookieIdentity] = set()
+    converted_by_row = {id(entry): converted for entry, converted in converted_rows}
+    for normalized, selected_cookie in converted_rows:
+        if selected_cookie is None:
+            continue
+        key = CookieIdentity(normalized["name"], normalized["domain"], normalized["path"])
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        live.jar.set_cookie(selected_cookie)
+        raw_same_site = normalized.get("sameSite", normalized.get("same_site"))
+        baseline.append(
+            Cookie(
+                name=selected_cookie.name,
+                domain=selected_cookie.domain,
+                path=selected_cookie.path or "/",
+                value=cast(str, selected_cookie.value),
+                expires=selected_cookie.expires,
+                secure=bool(selected_cookie.secure),
+                http_only=_cookie_semantics.cookie_is_http_only(selected_cookie),
+                same_site=raw_same_site if isinstance(raw_same_site, str) else None,
+            )
+        )
+
+    def reuse_converted(entry: dict[str, Any]) -> http.cookiejar.Cookie:
+        converted = converted_by_row.get(id(entry))
+        if converted is None:
+            raise ValueError("cookie row was unusable")
+        return converted
+
+    _cookie_policy._validate_required_cookies({entry["name"] for entry in entries}, context=context)
+    if require_routable and not _psidts_routes_to_rotate(
+        entries,
+        to_cookie=reuse_converted,
+        rotate_url=rotate_url,
+    ):
+        raise _cookie_policy.RequiredCookieValidationError(
+            f"Required cookie __Secure-1PSIDTS is not routable{context}.\n"
+            f"{_cookie_policy._EXTRACTION_HINT}",
+            reason="psidts_unroutable",
+        )
+    return _LoadedCookiePair(live=live, baseline=CookieJar(baseline))

@@ -1,14 +1,21 @@
 # RPC & UI Reference
 
 **Status:** Active
-**Last Updated:** 2026-08-12
-**Source of Truth:** `src/notebooklm/rpc/types.py` for method IDs; payload builders in `src/notebooklm/` and golden tests under `tests/unit/`
-**Purpose:** Complete reference for RPC methods, UI selectors, and payload structures
+**Last Updated:** 2026-09-02
+**Source of Truth:** `src/notebooklm/rpc/_identifiers.py` for method IDs; payload builders under `src/notebooklm/_web/` and golden tests under `tests/unit/`
+**Purpose:** Reference for the Web backend's batchexecute methods, UI selectors, and payload structures
+
+This reference is deliberately Web-specific: `RPCMethod` and
+`client.rpc_call(...)` describe the batchexecute transport even when an
+explicitly selected Android client installs native implementations for all 11
+typed namespaces. For Android gRPC method contracts, start with the
+[Android evidence index](android/README.md) and
+[`android/endpoints.md`](android/endpoints.md).
 
 > **Note:** Payload structures are extracted from the implementation builders in
-> `src/notebooklm/` and pinned by golden unit tests. Each payload includes a
+> `src/notebooklm/_web/` and pinned by golden unit tests. Each payload includes a
 > reference to its owning source file. The CREATE_ARTIFACT payloads below were
-> re-verified against the live builders in `_artifact/payloads.py` on
+> re-verified against the live builders in `_web/params/artifacts.py` on
 > 2026-06-11 (AUDIO, VIDEO_EXPLAINER, VIDEO_BRIEF, VIDEO_CINEMATIC,
 > STUDY_GUIDE, BRIEFING_DOC, BLOG_POST, MIND_MAP, QUIZ, FLASHCARDS,
 > INFOGRAPHIC, SLIDE_DECK, DATA_TABLE). Read-only notebook/source/artifact/chat/
@@ -24,53 +31,65 @@
 
 | RPC ID | Method | Purpose | Implementation |
 |--------|--------|---------|----------------|
-| `wXbhsf` | LIST_NOTEBOOKS | List all notebooks | `_notebooks.py` |
-| `CCqFvf` | CREATE_NOTEBOOK | Create new notebook | `_notebooks.py` |
-| `rLM1Ne` | GET_NOTEBOOK | Get notebook details + sources | `_notebooks.py` |
-| `s0tc2d` | RENAME_NOTEBOOK | Rename, chat config, share access | `_notebooks.py`, `_chat/api.py` |
-| `WWINqb` | DELETE_NOTEBOOK | Delete a notebook | `_notebooks.py` |
-| `izAoDd` | ADD_SOURCE | Add URL/text/YouTube/Drive source | `_source/add.py` via `_sources.py` |
-| `o4cbdc` | ADD_SOURCE_FILE | Register uploaded file (PDF, DOCX, EPUB, etc.) | `_source/upload.py`, `_source/upload_payloads.py` |
-| `tGMBJ` | DELETE_SOURCE | Delete a source | `_sources.py` |
-| `b7Wfje` | UPDATE_SOURCE | Rename source | `_sources.py` |
-| `tr032e` | GET_SOURCE_GUIDE | Get source summary | `_sources.py` |
-| `hizoJc` | GET_SOURCE | Get clean fulltext content of a source | `_source/content.py` |
-| `agX4Bc` | CREATE_LABEL | AI-generate label groupings and create manual labels | `_labels.py` |
-| `I3xc3c` | LIST_LABELS | List source labels for a notebook | `_labels.py` |
-| `le8sX` | UPDATE_LABEL | Rename label, set emoji, add/remove sources | `_labels.py`, `_label/params.py` |
-| `GyzE7e` | DELETE_LABEL | Delete one or more labels (batch) | `_labels.py` |
-| `R7cb6c` | CREATE_ARTIFACT | Unified artifact generation | `_artifacts.py` |
-| `gArtLc` | LIST_ARTIFACTS | List artifacts in a notebook | `_artifacts.py` |
-| `V5N4be` | DELETE_ARTIFACT | Delete artifact | `_artifacts.py` |
-| `KmcKPe` | REVISE_SLIDE | Revise an individual slide via prompt | `_artifacts.py` |
-| `Rytqqe` | RETRY_ARTIFACT | Retry a failed Studio artifact in place | `_artifacts.py` |
-| `hPTbtc` | GET_LAST_CONVERSATION_ID | Get most recent conversation ID | `_chat/api.py` |
-| `khqZz` | GET_CONVERSATION_TURNS | Get Q&A turns for a conversation | `_chat/api.py` |
-| `J7Gthc` | DELETE_CONVERSATION | Delete a conversation (web UI's "Delete history") | `_chat/api.py` |
-| `otmP3b` | SUGGEST_PROMPTS | Get AI-suggested prompts for a notebook | `_notebooks.py` |
-| `CYK0Xb` | CREATE_NOTE | Create a note (placeholder) | `_notes.py` |
-| `cYAfTb` | UPDATE_NOTE | Update note content/title | `_notes.py` |
-| `AH0mwd` | DELETE_NOTE | Delete a note | `_notes.py` |
-| `cFji9` | GET_NOTES_AND_MIND_MAPS | List notes and mind maps | `_notes.py` |
-| `yyryJe` | GENERATE_MIND_MAP | Mind map generation | `_artifacts.py` |
-| `VfAZjd` | SUMMARIZE | Get notebook summary | `_notebooks.py` |
-| `FLmJqe` | REFRESH_SOURCE | Refresh URL/Drive source | `_sources.py` |
-| `yR9Yof` | CHECK_SOURCE_FRESHNESS | Check if source needs refresh | `_sources.py` |
-| `Ljjv0c` | START_FAST_RESEARCH | Start fast research | `_research.py` |
-| `QA9ei` | START_DEEP_RESEARCH | Start deep research | `_research.py` |
-| `e3bVqc` | POLL_RESEARCH | Poll research status | `_research.py` |
-| `LBwxtb` | IMPORT_RESEARCH | Import research results | `_research.py` |
-| `Zbrupe` | CANCEL_RESEARCH | Cancel in-flight research run | `_research.py` |
-| `rc3d8d` | RENAME_ARTIFACT | Rename artifact | `_artifacts.py` |
-| `Krh3pd` | EXPORT_ARTIFACT | Export to Docs/Sheets | `_artifacts.py` |
-| `RGP97b` | SHARE_ARTIFACT | Legacy notebook/artifact share-link toggle | `_sharing_manager.py` |
-| `QDyure` | SHARE_NOTEBOOK | Set notebook visibility (restricted/public) | `_sharing.py` |
-| `JFMDGd` | GET_SHARE_STATUS | Get notebook share settings | `_sharing.py` |
-| `ciyUvf` | GET_SUGGESTED_REPORTS | Get AI-suggested report formats | `_artifacts.py` |
-| `v9rmvd` | GET_INTERACTIVE_HTML | Fetch quiz/flashcard HTML (`[0][9][0]`) / interactive mind-map tree (`[0][9][3]`) | `_artifact/downloads.py` |
-| `fejl7e` | REMOVE_RECENTLY_VIEWED | Remove notebook from recent list | `_notebooks.py` |
-| `ZwVcOc` | GET_USER_SETTINGS | Get user settings including output language | `_settings.py` |
-| `hT54vc` | SET_USER_SETTINGS | Set user settings (e.g., output language) | `_settings.py` |
+| `wXbhsf` | LIST_NOTEBOOKS | List all notebooks | `_web/notebooks.py` |
+| `CCqFvf` | CREATE_NOTEBOOK | Create new notebook | `_web/notebooks.py` |
+| `te3DCe` | COPY_NOTEBOOK | Copy notebook sources and Studio artifacts | `_web/notebooks.py` |
+| `rLM1Ne` | GET_NOTEBOOK | Get notebook details + sources | `_web/notebooks.py` |
+| `s0tc2d` | RENAME_NOTEBOOK | Rename, chat config, share access | `_web/notebooks.py`, `_web/chat.py` |
+| `WWINqb` | DELETE_NOTEBOOK | Delete a notebook | `_web/notebooks.py` |
+| `izAoDd` | ADD_SOURCE | Add URL/text/YouTube/Drive source | `_web/sources/add.py` via `_web/sources/__init__.py` |
+| `o4cbdc` | ADD_SOURCE_FILE | Register uploaded file (PDF, DOCX, EPUB, etc.) | `_web/sources/upload.py`, `_web/params/sources.py` |
+| `tGMBJ` | DELETE_SOURCE | Delete a source | `_web/sources/__init__.py` |
+| `b7Wfje` | UPDATE_SOURCE | Rename source | `_web/sources/__init__.py` |
+| `tr032e` | GET_SOURCE_GUIDE | Get source summary | `_web/sources/content.py` |
+| `hizoJc` | GET_SOURCE | Get clean fulltext content of a source | `_web/sources/content.py` |
+| `agX4Bc` | CREATE_LABEL | AI-generate label groupings and create manual labels | `_web/labels.py` |
+| `I3xc3c` | LIST_LABELS | List source labels for a notebook | `_web/labels.py` |
+| `le8sX` | UPDATE_LABEL | Rename label, set emoji, add/remove sources | `_web/labels.py`, `_web/params/labels.py` |
+| `GyzE7e` | DELETE_LABEL | Delete one or more labels (batch) | `_web/labels.py` |
+| `R7cb6c` | CREATE_ARTIFACT | Unified artifact generation | `_artifacts.py`, `_web/artifact/generation.py` |
+| `gArtLc` | LIST_ARTIFACTS | List artifacts in a notebook | `_web/artifacts.py` |
+| `V5N4be` | DELETE_ARTIFACT | Delete artifact | `_web/artifacts.py` |
+| `KmcKPe` | REVISE_SLIDE | Revise an individual slide via prompt | `_web/artifacts.py` |
+| `Rytqqe` | RETRY_ARTIFACT | Retry a failed Studio artifact in place | `_web/artifacts.py` |
+| `hPTbtc` | GET_LAST_CONVERSATION_ID | Get most recent conversation ID | `_web/chat.py` |
+| `khqZz` | GET_CONVERSATION_TURNS | Get Q&A turns for a conversation | `_web/chat.py` |
+| `oXwmh` | GET_CHAT_SESSION_STATUS | Read idle/generating state and token for a chat session | `_web/chat.py` |
+| `XgrPMd` | CANCEL_GENERATION | Stop active generation for a chat session | `_web/chat.py` |
+| `J7Gthc` | DELETE_CONVERSATION | Delete a conversation (web UI's "Delete history") | `_web/chat.py` |
+| `otmP3b` | SUGGEST_PROMPTS | Get AI-suggested prompts for a notebook | `_web/notebooks.py` |
+| `CYK0Xb` | CREATE_NOTE | Create a note (placeholder) | `_web/notes.py` |
+| `cYAfTb` | UPDATE_NOTE | Update note content/title | `_web/notes.py` |
+| `AH0mwd` | DELETE_NOTE | Delete a note | `_web/notes.py` |
+| `cFji9` | GET_NOTES_AND_MIND_MAPS | List notes and mind maps | `_web/notes.py` |
+| `yyryJe` | GENERATE_MIND_MAP | Mind map generation | `_web/artifact/generation.py` |
+| `VfAZjd` | SUMMARIZE | Get notebook summary | `_web/notebooks.py` |
+| `FLmJqe` | REFRESH_SOURCE | Refresh URL/Drive source | `_web/sources/__init__.py` |
+| `yR9Yof` | CHECK_SOURCE_FRESHNESS | Check if source needs refresh | `_web/sources/__init__.py` |
+| `Es3dTe` | DISCOVER_SOURCES | Synchronous source discovery | `_web/research.py` |
+| `Ljjv0c` | START_FAST_RESEARCH | Start fast research | `_web/research.py` |
+| `QA9ei` | START_DEEP_RESEARCH | Start deep research | `_web/research.py` |
+| `e3bVqc` | POLL_RESEARCH | Poll research status | `_web/research.py` |
+| `LBwxtb` | IMPORT_RESEARCH | Import research results | `_web/research.py` |
+| `Zbrupe` | CANCEL_RESEARCH | Cancel in-flight research run | `_web/research.py` |
+| `rc3d8d` | RENAME_ARTIFACT | Rename artifact | `_web/artifacts.py` |
+| `Krh3pd` | EXPORT_ARTIFACT | Export to Docs/Sheets | `_web/artifacts.py` |
+| `RGP97b` | SHARE_ARTIFACT | Legacy notebook/artifact share-link toggle | `_web/sharing.py` |
+| `QDyure` | SHARE_NOTEBOOK | Set notebook visibility (restricted/public) | `_web/sharing.py` |
+| `JFMDGd` | GET_SHARE_STATUS | Get notebook share settings | `_web/sharing.py` |
+| `ciyUvf` | GET_SUGGESTED_REPORTS | Get AI-suggested report formats | `_web/artifacts.py` |
+| `v9rmvd` | GET_INTERACTIVE_HTML | Fetch quiz/flashcard HTML (`[0][9][0]`) / interactive mind-map tree (`[0][9][3]`) | `_web/artifact/downloads.py` |
+| `fejl7e` | REMOVE_RECENTLY_VIEWED | Remove notebook from recent list | `_web/notebooks.py` |
+| `ZwVcOc` | GET_USER_SETTINGS | Get user settings including output language | `_web/settings.py` |
+| `hT54vc` | SET_USER_SETTINGS | Set user settings (e.g., output language) | `_web/settings.py` |
+| `X1snv` | ADD_SOURCES_ASYNC | Queue URL sources without waiting for ingest (batch; per-source acks) | `_web/sources/transfers.py` |
+| `QsNTEd` | APPEND_SOURCE | Append a plain-text block to an existing source in place | `_web/sources/transfers.py` |
+| `R27wvc` | COPY_SOURCES | Copy sources into another notebook (original → copy mapping) | `_web/sources/transfers.py` |
+| `mVtEUb` | LIST_EXPERT_INTELLIGENCE_CONTENT | List the account's Google Play Books library — every title, with per-row exportability (Expert Intelligence; Android uses its native RPC counterpart) | `_web/sources/play_books.py` |
+| `ASU5Oe` | RETRIEVE_RELEVANT_CHUNKS | Search ranked passages across notebook sources, optionally filtered by source id | `_web/sources/search.py` |
+| `mKDdke` | COPY_ARTIFACTS | Copy Studio artifacts into another notebook (full new rows inline) | `_web/artifacts.py` |
+| `OcvKNc` | SUGGEST_NEXT_STEPS | Grounded follow-up questions (the chat `next_steps` block, standalone) | `_web/notebooks.py` |
+| `sqTeoe` | GET_CUSTOMIZATION_CHOICES | Studio "Customize" option tables (account-level) | `_web/artifacts.py` |
 
 ### Content Type Codes (ArtifactTypeCode)
 
@@ -89,7 +108,9 @@
 
 ### Source Type Codes (file uploads & sources)
 
-Internal integer codes returned by `GET_NOTEBOOK` / `LIST_SOURCES` and consumed by `Source.from_api_response()` (mapped to `SourceType` in `src/notebooklm/types.py`).
+Internal integer codes returned by `GET_NOTEBOOK` / `LIST_SOURCES` and consumed by
+`Source.from_api_response()` (mapped to `SourceType` in
+`src/notebooklm/_types/sources.py`).
 
 | Code | `SourceType` | Used By |
 |------|--------------|---------|
@@ -99,18 +120,32 @@ Internal integer codes returned by `GET_NOTEBOOK` / `LIST_SOURCES` and consumed 
 | 4 | `PASTED_TEXT` | Inline pasted text |
 | 5 | `WEB_PAGE` | Web URL source |
 | 6 | `POWERPOINT` | PowerPoint upload (`.pptx`) |
+| 7 | `GOOGLE_SPREADSHEET` | Native Google Sheets source after MIME disambiguation |
 | 8 | `MARKDOWN` | Markdown file |
 | 9 | `YOUTUBE` | YouTube URL |
 | 10 | `MEDIA` | Audio / video upload |
 | 11 | `DOCX` | Word document |
+| 12 | `EXCEL` | Recovered-schema member; no reachable producer is known |
 | 13 | `IMAGE` | Image upload |
-| 14 | `GOOGLE_SPREADSHEET` | Google Sheets source **and** Drive-hosted binaries (see overload note) |
+| 14 | `GOOGLE_DRIVE` | Generic Drive source before MIME disambiguation (see note) |
+| 15 | `GMAIL` | Recovered-schema member; no reachable producer is known |
 | 16 | `CSV` | CSV upload |
 | 17 | `EPUB` | EPUB upload (added in v0.4.0) |
+| 18 | `GEMINI_CHAT` | Gemini chat source observed through Android `AddSources` |
+| 19 | `AI_MODE_CHAT` | Recovered-schema member; no reachable producer is known |
+| 20 | `EXPERT_INTELLIGENCE` | Google Play Books source added via `sources.add_play_book` (#2292); carries `ExpertIntelligenceSourceMetadata` at `metadata[18]` |
 
 > Codes outside this map are surfaced as `SourceType.UNKNOWN` and emit `UnknownTypeWarning` on first occurrence so unmapped types don't crash callers.
 
-> **Code `14` is overloaded** (live-captured #1828/#1832): the backend returns `14` for a native Google Sheet *and* for a Drive-hosted PDF. Drive sources carry no URL (`metadata[5]/[7]` are null and `metadata[0]` holds the Drive metadata block, not a URL — see `SourceRow.drive_document_id`), so the two are disambiguated by the original-content MIME at `source[7][2]`, falling back to the Drive-only MIME at `metadata[19]` / `metadata[9][2]`: `application/vnd.google-apps.spreadsheet` → `GOOGLE_SPREADSHEET`, `application/pdf` → `PDF`. See `_disambiguate_type_code` in `src/notebooklm/_types/sources.py`.
+> **Code `14` is a generic Drive code** (live-captured #1828/#1832): the backend
+> returns it for a native Google Sheet and for Drive-hosted binaries such as a
+> PDF. Drive sources carry no URL (`metadata[5]/[7]` are null and `metadata[0]`
+> holds the Drive metadata block, not a URL — see
+> `SourceRow.drive_document_id`), so recognized original-content MIME values at
+> `source[7][2]`, with a Drive-only metadata fallback, refine a Sheet to code 7
+> (`GOOGLE_SPREADSHEET`) and a PDF to code 3 (`PDF`). An absent or unrecognized
+> MIME remains `GOOGLE_DRIVE`; see `_disambiguate_type_code` in
+> `src/notebooklm/_types/sources.py`.
 
 ### Source Settings Block (`source[3]`)
 
@@ -160,7 +195,7 @@ wire evidence rather than schema mappings.
 > `0` means the same thing, so the decoder normalizes it to `None` rather than
 > modelling it (recorded in `ENUM_GAPS`). Only `ACTIVE` has
 > been observed live; the degraded members come from the backend enum recovered
-> from the official Android app (`docs/mobile/enums.txt`) and are pinned in
+> from the official Android app (`docs/android/enums.txt`) and are pinned in
 > `tests/_guardrails/_wire_contract.py`. A populated-but-unmapped code decodes to
 > `DriveSourceStatus.UNKNOWN` (never `None`) and warns once (#2111).
 
@@ -177,11 +212,11 @@ or local convenience that has no stable web-control equivalent in the capture.
 |-----------------|------------------|-------|
 | `NotebooksAPI.list/create/get/rename/delete/remove_from_recent` | Partial UI coverage | Home create/card/action-menu selectors are covered. Rename/delete/remove-recent are represented by project action menus and RPC payloads; destructive menu items were not re-mutated in the live probe. |
 | `NotebooksAPI.get_summary/get_description/get_metadata/get_raw/get_share_url` | Library-only/read-derived | Summary content is visible in the chat panel, but these are read/format helpers rather than direct UI controls. |
-| `SourcesAPI.list/get/add_url/add_text/add_file/add_drive/delete/rename` | UI covered | Source cards, add-source modal tabs, upload/Drive entry points, source menus, and submit selectors are documented. |
+| `SourcesAPI.list/get/search/add_url/add_text/add_file/add_drive/delete/rename` | UI covered | Source cards, indexed passage search, add-source modal tabs, upload/Drive entry points, source menus, and submit selectors are documented. |
 | `SourcesAPI.get_guide/get_fulltext` | UI covered/read-derived | Opening a source exposes the source viewer, source guide toggle, title input, and source content; `get_fulltext()` is the programmatic extraction path. |
 | `SourcesAPI.wait_*`, `refresh`, `check_freshness` | Library-only/partial UI | Wait methods are polling helpers. Refresh/freshness RPCs are documented, but no stable refresh selector was captured in the current source-list/label-list state. |
 | `LabelsAPI.list/sources/generate/create/update/rename/set_emoji/add_sources/remove_sources/delete` | UI covered | Auto-label, Reorganize all sources, manual label creation, inline rename, emoji picker, delete, label panels, and source Move to label checkboxes are documented. |
-| `ChatAPI.ask/get_history/delete_conversation/configure/save_answer_as_note` | UI covered | Chat input/send, options/delete history, configure dialog, and `Save message to a note` buttons are documented. `get_conversation_id`, cache methods, and history parsing are backend/local conveniences. |
+| `ChatAPI.ask/get_history/session_status/cancel/delete_conversation/configure/save_answer_as_note` | UI covered | Chat input/send, live generation state/cancel, options/delete history, configure dialog, and `Save message to a note` buttons are documented. `get_conversation_id`, cache methods, and history parsing are backend/local conveniences. |
 | `ArtifactsAPI.generate_*`, `suggest_reports`, `list/get/get_prompt/delete/rename/share/export` | UI covered/partial | All live Studio generation tiles and option sets are documented. Artifact list/open/menu/view-prompt/share/delete selectors are covered; export/download/retry availability depends on artifact type/status. |
 | `ArtifactsAPI.download_*`, `wait_for_completion`, `poll_status`, `revise_slide`, `retry_failed` | Library-only/conditional UI | Downloads, polling, and slide revision are programmatic conveniences. Retry requires a failed artifact row; the RPC is documented but no failed-row retry selector was present in the probe. |
 | `NotesAPI.list/get/create/update/delete` | UI covered/partial | Add note, note row, note view close/title input, and note menu delete are documented. Rich body editing uses NotebookLM's internal editor; keep selectors conservative. |
@@ -210,6 +245,7 @@ async def try_selectors(page, selectors: list[str], action="click", timeout=5000
         except Exception:
             continue
     raise Exception(f"None of the selectors worked: {selectors}")
+
 
 # Example usage
 await try_selectors(page, HOME_SELECTORS["create_notebook"])
@@ -267,15 +303,15 @@ The home project action menu is now labeled `Project Actions Menu`; older
 
 ### RPC: LIST_NOTEBOOKS (wXbhsf)
 
-**Source:** `_notebooks.py::list()`
+**Source:** `_web/notebooks.py::WebNotebooksAPI.list()`
 
 ```python
 # Minimal client builder (`NotebooksAPI.list()`), accepted by the backend:
 params = [
-    None,   # 0
-    1,      # 1: Fixed value
-    None,   # 2
-    [2],    # 3: Fixed flag
+    None,  # 0
+    1,  # 1: Fixed value
+    None,  # 2
+    [2],  # 3: Fixed flag
 ]
 
 # Live web UI/CDP capture on 2026-06-15:
@@ -291,55 +327,84 @@ params = [
 
 ### RPC: CREATE_NOTEBOOK (CCqFvf)
 
-**Source:** `_notebooks.py::create()`
+**Source:** `_notebooks.py::NotebooksAPI.create()`, `_web/notebooks.py::WebNotebooksAPI._send_create()`
 
 ```python
 params = [
     title,  # 0: Notebook title
-    None,   # 1
-    None,   # 2
+    None,  # 1
+    None,  # 2
     [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
-            # 3: Shared request-options wrapper (`build_template_block()`)
+    # 3: Shared request-options wrapper (`build_template_block()`)
 ]
 ```
 
+### RPC: COPY_NOTEBOOK (te3DCe)
+
+**Server method:** `CopyProject`
+
+**Source:** `_web/notebooks.py::WebNotebooksAPI.copy()` /
+`_web/params/notebooks.py::build_copy_notebook_params()`
+
+```python
+params = [
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
+    source_notebook_id,
+    destination_title,
+]
+```
+
+The response is a bare Project row and is decoded as the newly allocated
+`Notebook`. Live validation on 2026-08-27 copied a notebook containing 50
+sources and 5 Studio artifacts; all copied child IDs differed from the
+originals. The method has no caller-supplied idempotency token, so internal
+transport retry is disabled to avoid creating duplicate full copies after a
+lost response.
+
 ### RPC: DELETE_NOTEBOOK (WWINqb)
 
-**Source:** `_notebooks.py::delete()`
+**Source:** `_web/notebooks.py::WebNotebooksAPI.delete()`
 
 ```python
 params = [
     [notebook_id],  # 0: Single-nested notebook ID
-    [2],            # 1: Fixed flag
+    [2],  # 1: Fixed flag
 ]
 ```
 
 ### RPC: GET_NOTEBOOK (rLM1Ne)
 
-**Source:** `_notebooks.py::get()`, `_source/listing.py::SourceLister.list()`
+**Source:** `_web/notebooks.py::WebNotebooksAPI.get()`, `_web/sources/listing.py::SourceLister.list()`
 
 ```python
 params = [
-    notebook_id,                                           # 0
-    None,                                                  # 1
+    notebook_id,  # 0
+    None,  # 1
     [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
-                                                           # 2: Shared request-options wrapper
-    None,                                                  # 3
-    0,                                                     # 4: Fixed value
+    # 2: Shared request-options wrapper
+    None,  # 3
+    0,  # 4: Fixed value
 ]
 ```
 
 The slot `[2]` wrapper replaced the older bare `[2]` read-path tail. Live
 capture on 2026-06-15 confirmed the nested shape in `f.req`; keep
-`_notebooks.build_get_notebook_params()` and `_source/listing.py` in sync.
+`_web.params.notebooks.build_get_notebook_params()` and `_web/sources/listing.py` in sync.
 The live web UI also sends a sixth filter/tail slot:
 `[[None, None, []]]`. Initial page load used slot `[4] == 0`; a follow-up
 refresh used slot `[4] == 1`. The client builder currently omits that sixth
 slot because the backend accepts the compact form.
 
+In the response notebook row, chat settings live at `[7]` as
+`[[goal_code, custom_prompt?], [response_length_code]]`. A default-valued
+component may be elided as an empty child list: `[[], []]` means
+DEFAULT/DEFAULT, while `[[2, "persona"], []]` means a custom goal with the
+default response length. Older never-configured rows may instead carry `null`
+for the whole slot.
+
 ### RPC: REMOVE_RECENTLY_VIEWED (fejl7e)
 
-**Source:** `_notebooks.py::remove_from_recent()`
+**Source:** `_web/notebooks.py::WebNotebooksAPI.remove_from_recent()`
 
 Remove a notebook from the recently viewed list (doesn't delete the notebook).
 
@@ -449,32 +514,35 @@ button (`mattooltip='Close source view'`).
 
 ### RPC: ADD_SOURCE (izAoDd) - URL
 
-**Sources:** `_source/add.py::SourceAddService.add_url_source()` (single item),
-`_source/batch.py::SourceBatchAddService.add_urls()` (true batch)
+**Sources:** `_web/sources/add.py::SourceAddService.add_url_source()` (single item),
+`SourcesAPI.add_urls_batch()` backed by
+`_web/sources/batch.py::SourceBatchAddService.add_urls()` (true batch)
 
 ```python
 # URL goes at position [2] in an 11-element source spec.
 params = [
     [[None, None, [url], None, None, None, None, None, None, None, 1]],
-    notebook_id,                                           # 1: Notebook ID
+    notebook_id,  # 1: Notebook ID
     [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
-                                                           # 2: Shared request-options wrapper
+    # 2: Shared request-options wrapper
 ]
 ```
 
-The existing MCP `source_add(urls=[...])` and REST `/sources/batch` endpoints
-put multiple URL specs in `params[0]` and issue this RPC once. `AddSources` is
+The public Python method plus the existing MCP `source_add(urls=[...])` and REST
+`/sources/batch` endpoints put multiple URL specs in `params[0]` and issue this RPC once. `AddSources` is
 per-item rather than atomic: successful Source rows remain in request order,
 while failed entries are silently omitted unless every entry fails (then the
 RPC raises). The adapters reconcile omissions with an ERROR-status source list
-and restore positional result rows. This true-batch path disables transport
+and restore positional `SourceBatchItemOutcome` rows. Each row carries explicit
+confirmed/rejected/unknown/not-sent evidence; adapters do not derive continuation
+policy from an HTTP status or exception category. This true-batch path disables transport
 retries because a timeout leaves the committed subset unknown; the ordinary
-single-item `sources.add_url()` path still uses its dedicated probe-then-create
-recovery unchanged.
+single-item `sources.add_url()` path also sends its mutation once and surfaces
+an unknown outcome without automatic replay.
 
 ### RPC: ADD_SOURCE (izAoDd) - Text
 
-**Source:** `_source/add.py::SourceAddService.add_text()`
+**Source:** `_web/sources/add.py::SourceAddService.add_text()`
 
 ```python
 # [title, content] at position [1] in an 11-element source spec; slot [3] is
@@ -488,34 +556,41 @@ params = [
 
 ### RPC: ADD_SOURCE (izAoDd) - YouTube
 
-**Source:** `_source/add.py::SourceAddService.add_youtube_source()`
+**Source:** `_web/sources/add.py::SourceAddService.add_youtube_source()`
 
 ```python
 # YouTube URL at position [7] in the source spec (different from regular URL).
 params = [
     [[None, None, None, None, None, None, None, [url], None, None, 1]],  # 0
-    notebook_id,                                                          # 1
+    notebook_id,  # 1
     [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
-                                                                            # 2: Shared wrapper
+    # 2: Shared wrapper
 ]
 ```
 
 ### RPC: ADD_SOURCE (izAoDd) - Google Drive
 
-**Source:** `_source/add.py::SourceAddService.add_drive()`
+**Source:** `_web/sources/add.py::SourceAddService.add_drive()`
 
 ```python
 # Drive source structure - single-wrapped (not double!)
 source_data = [
     [file_id, mime_type, 1, title],  # 0: File info
-    None, None, None, None, None,    # 1-5: Padding
-    None, None, None, None,          # 6-9: Padding
-    1,                               # 10: Trailing flag
+    None,
+    None,
+    None,
+    None,
+    None,  # 1-5: Padding
+    None,
+    None,
+    None,
+    None,  # 6-9: Padding
+    1,  # 10: Trailing flag
 ]
 params = [
     [source_data],  # 0: Single-wrapped (NOT [[source_data]])
-    notebook_id,    # 1: Notebook ID
-    [2],            # 2: Source type flag
+    notebook_id,  # 1: Notebook ID
+    [2],  # 2: Source type flag
     [1, None, None, None, None, None, None, None, None, None, [1]],  # 3: Config
 ]
 ```
@@ -523,13 +598,13 @@ params = [
 **Note:** Drive add is intentionally still on the older `[2]`,
 `[1, ..., [1]]` tail pending a fresh live Drive capture. URL, YouTube, text,
 CREATE_NOTEBOOK, and ADD_SOURCE_FILE use the shared nested wrapper from
-`_source/upload_payloads.py::build_template_block()`.
+`_web/params/sources.py::build_template_block()`.
 
 ### RPC: ADD_SOURCE_FILE (o4cbdc) - File Upload Registration
 
-**Source:** `_source/upload.py::SourceUploadPipeline.register_file_source()`,
-`_source/upload_payloads.py::build_register_file_source_params()`,
-`_source/upload_payloads.py::build_resumable_upload_start_request()`
+**Source:** `_web/sources/upload.py::SourceUploadPipeline.register_file_source()`,
+`_web/params/sources.py::build_register_file_source_params()`,
+`_web/params/sources.py::build_resumable_upload_start_request()`
 
 File uploads are a two-step flow. First, `ADD_SOURCE_FILE` registers the file
 source and returns a `SOURCE_ID`; then the client starts a Scotty resumable
@@ -538,10 +613,10 @@ that start request.
 
 ```python
 params = [
-    [[filename]],    # 0: Filename wrapped twice
-    notebook_id,     # 1: Notebook ID
+    [[filename]],  # 0: Filename wrapped twice
+    notebook_id,  # 1: Notebook ID
     [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
-                     # 2: Shared request-options wrapper
+    # 2: Shared request-options wrapper
 ]
 
 # Called with source_path:
@@ -554,10 +629,10 @@ await rpc_call(
 )
 ```
 
-Registration is mutating, so the upload pipeline uses the same
-probe-then-create idempotency pattern as URL and Drive sources. Because
-filenames are not unique, the probe records source IDs before the create and
-only trusts a same-title source if it is new since that baseline.
+Registration is mutating, so the upload pipeline sends it once. A correlated
+response ID is authoritative; a missing response ID or ambiguous transport
+failure is surfaced as an unknown outcome. Bounded list matches may be attached
+as reconciliation candidates but are never trusted as proof of success.
 
 ```python
 # Start resumable upload after SOURCE_ID registration:
@@ -592,7 +667,7 @@ upload_headers = {
 
 ### RPC: DELETE_SOURCE (tGMBJ)
 
-**Source:** `_sources.py::delete()`
+**Source:** `_web/sources/__init__.py::WebSourcesAPI.delete()`
 
 **IMPORTANT:** `notebook_id` is passed via `source_path`, NOT in params!
 
@@ -609,20 +684,20 @@ await rpc_call(
 
 ### RPC: UPDATE_SOURCE / Rename (b7Wfje)
 
-**Source:** `_sources.py::rename()`
+**Source:** `_web/sources/__init__.py::WebSourcesAPI.rename()`
 
 ```python
 # Different structure: None at [0], source_id at [1], title triple-nested at [2]
 params = [
-    None,               # 0
-    [source_id],        # 1: Single-nested source ID
-    [[[new_title]]],    # 2: Triple-nested title
+    None,  # 0
+    [source_id],  # 1: Single-nested source ID
+    [[[new_title]]],  # 2: Triple-nested title
 ]
 ```
 
 ### RPC: GET_SOURCE_GUIDE (tr032e)
 
-**Source:** `_sources.py::get_guide()`
+**Source:** `_web/sources/content.py::SourceContentRenderer.get_guide()`
 
 ```python
 # Quadruple-nested source ID!
@@ -631,7 +706,7 @@ params = [[[[source_id]]]]
 
 ### RPC: GET_SOURCE (hizoJc)
 
-**Source:** `_source/content.py::get_fulltext()`
+**Source:** `_web/sources/content.py::get_fulltext()`
 
 **Purpose:** Get raw text or clean HTML/markdown content of a source.
 
@@ -642,8 +717,8 @@ params = [[[[source_id]]]]
 # Position 2: Format selector matching position 1
 params = [
     [source_id],  # 0
-    [2],          # 1
-    [2],          # 2
+    [2],  # 1
+    [2],  # 2
 ]
 
 # Markdown/HTML source rendering uses the same selector in both slots:
@@ -663,6 +738,40 @@ await rpc_call(
 )
 ```
 
+### RPC: RETRIEVE_RELEVANT_CHUNKS (ASU5Oe)
+
+**Source:** `_web/sources/search.py::SourceSearchService.search()`
+
+**Purpose:** Search the indexed source corpus and return globally ranked source
+passages. An omitted or empty source filter searches the whole notebook.
+
+```python
+params = [
+    notebook_id,
+    query,
+    None,
+    [1],
+]
+
+# Optional source filter at position 4:
+params.append([[[source_id] for source_id in source_ids]])
+
+await rpc_call(
+    RPCMethod.RETRIEVE_RELEVANT_CHUNKS,
+    params,
+    source_path=f"/notebook/{notebook_id}",
+    allow_null=True,
+    raise_on_null_status=True,
+)
+```
+
+The live response is `[[[source_id, [chunk, ...]], ...]]]`, where each chunk is
+`[[[[text_part, ...]]], rank, [[None, start, end], ...]]`. The decoder joins
+text parts and returns `RelevantChunk` values. This rpcid is registered by a
+lazy feature module, so the eager-homepage registry monitor reports it as
+`LAZY-MODULE`; the direct read-only RPC health probe remains its rotation
+canary.
+
 ---
 
 ## Source Labels
@@ -671,7 +780,7 @@ Source labels group a notebook's sources into AI-generated (or manually named)
 topic buckets. A label is a standalone entity — a source carries no
 back-reference; the label owns a list of source IDs, and membership is
 many-to-many (a source can belong to multiple labels). Every label RPC's first
-argument is the recurring request-options wrapper used by `_settings.py`:
+argument is the recurring request-options wrapper used by `_web/settings.py`:
 
 ```python
 OPTS = [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]]
@@ -741,7 +850,7 @@ Live label-flow notes:
 
 ### RPC: CREATE_LABEL (agX4Bc)
 
-**Source:** `_labels.py::generate()`, `_labels.py::create()` (builders in `_label/params.py`)
+**Source:** `_web/labels.py::generate()`, `_web/labels.py::create()` (builders in `_web/params/labels.py`)
 
 A single multi-mode RPC; the mode is selected by which slot is populated. Slot
 `[4]` drives AI auto-labeling (`generate`); slot `[5]` creates manual labels
@@ -762,7 +871,7 @@ params = [OPTS, notebook_id, None, None, None, [["New Label", ""]]]
 
 ### RPC: LIST_LABELS (I3xc3c)
 
-**Source:** `_labels.py::list()`
+**Source:** `_web/labels.py::list()`
 
 ```python
 params = [OPTS, notebook_id]
@@ -774,8 +883,8 @@ its source UUIDs, so one `list()` call gives the complete source→label mapping
 
 ### RPC: UPDATE_LABEL (le8sX)
 
-**Source:** `_labels.py::update()`, `rename()`, `set_emoji()`,
-`add_sources()`, `remove_sources()` (builder: `_label/params.py`)
+**Source:** `_web/labels.py::update()`, `rename()`, `set_emoji()`,
+`add_sources()`, `remove_sources()` (builder: `_web/params/labels.py`)
 
 A unified label-update RPC covering rename, emoji, and source membership. Slot
 `[3]` is a fieldmask `[[name_emoji, sources_add, sources_remove]]`; populate
@@ -807,7 +916,7 @@ wire shape honors only the first id in each group.
 
 ### RPC: DELETE_LABEL (GyzE7e)
 
-**Source:** `_labels.py::delete()`
+**Source:** `_web/labels.py::delete()`
 
 Batch-capable — label IDs are passed as an array. Deleting a label does **not**
 delete its sources (they become unlabeled).
@@ -838,8 +947,8 @@ CHAT_SELECTORS = {
         "[role='log']",
     ],
     "message_bubble": [
-        ".to-user-container",      # AI messages
-        ".from-user-container",    # User messages
+        ".to-user-container",  # AI messages
+        ".from-user-container",  # User messages
     ],
     "save_to_note": "button[aria-label='Save message to a note']",
     "copy_response": "button[aria-label='Copy model response to clipboard']",
@@ -850,20 +959,17 @@ CHAT_SELECTORS = {
 CHAT_CONFIG = {
     "modal": "configure-notebook-settings",
     "goal_default": (
-        "configure-notebook-settings .prompt-section-toggles "
-        "button[aria-label='Default button']"
+        "configure-notebook-settings .prompt-section-toggles button[aria-label='Default button']"
     ),
     "goal_learning_guide": (
         "configure-notebook-settings .prompt-section-toggles "
         "button[aria-label='Learning Guide prompt button']"
     ),
     "goal_custom": (
-        "configure-notebook-settings .prompt-section-toggles "
-        "button[aria-label='Custom button']"
+        "configure-notebook-settings .prompt-section-toggles button[aria-label='Custom button']"
     ),
     "length_default": (
-        "configure-notebook-settings .style-section-toggles "
-        "button[aria-label='Default button']"
+        "configure-notebook-settings .style-section-toggles button[aria-label='Default button']"
     ),
     "length_shorter": "configure-notebook-settings button[aria-label='Concise style guide button']",
     "length_longer": "configure-notebook-settings button[aria-label='Verbose style guide button']",
@@ -948,19 +1054,19 @@ as `AskResult.turn_key`.
 
 ### RPC: RENAME_NOTEBOOK (s0tc2d) - Rename Only
 
-**Source:** `_notebooks.py::rename()`
+**Source:** `_notebooks.py::NotebooksAPI.rename()`, `_web/notebooks.py::WebNotebooksAPI.update()`
 
 ```python
 # Just rename, no chat config
 params = [
-    notebook_id,                                    # 0
-    [[None, None, None, [None, new_title]]],        # 1: Nested title at [[[3][1]]]
+    notebook_id,  # 0
+    [[None, None, None, [None, new_title]]],  # 1: Nested title at [[[3][1]]]
 ]
 ```
 
 ### RPC: RENAME_NOTEBOOK (s0tc2d) - Configure Chat
 
-**Source:** `_chat/api.py::configure()`
+**Source:** `_web/chat.py::WebChatAPI.configure()`
 
 ```python
 # Chat goal codes (ChatGoal enum)
@@ -974,20 +1080,20 @@ CHAT_LENGTH_LONGER = 4
 CHAT_LENGTH_SHORTER = 5
 
 # Build goal array
-goal_array = [goal_value]                    # e.g., [1] for DEFAULT
+goal_array = [goal_value]  # e.g., [1] for DEFAULT
 # For CUSTOM: goal_array = [2, custom_prompt]
 
 chat_settings = [goal_array, [response_length_value]]
 
 params = [
-    notebook_id,                                              # 0
+    notebook_id,  # 0
     [[None, None, None, None, None, None, None, chat_settings]],  # 1: Settings at [[[7]]]
 ]
 ```
 
 ### RPC: GET_LAST_CONVERSATION_ID (hPTbtc)
 
-**Source:** `_chat/api.py::get_conversation_id()`
+**Source:** `_web/chat.py::WebChatAPI.get_conversation_id()`
 
 Returns the most recent conversation ID for a notebook. The server always returns
 exactly one ID regardless of the `limit` param. Use `GET_CONVERSATION_TURNS` to
@@ -995,10 +1101,10 @@ fetch the actual messages for the returned conversation.
 
 ```python
 params = [
-    [],           # 0: Empty sources array
-    None,         # 1
+    [],  # 0: Empty sources array
+    None,  # 1
     notebook_id,  # 2
-    1,            # 3: Limit (server ignores this; always returns one ID)
+    1,  # 3: Limit (server ignores this; always returns one ID)
 ]
 
 # Live web UI/CDP capture on 2026-06-15:
@@ -1016,17 +1122,17 @@ params = [
 
 ### RPC: GET_CONVERSATION_TURNS (khqZz)
 
-**Source:** `_chat/api.py::get_conversation_turns()`
+**Source:** `_web/chat.py::WebChatAPI.get_conversation_turns()`
 
 Returns the Q&A turns for a specific conversation. Turns are ordered newest-first.
 
 ```python
 params = [
-    [],              # 0: Empty
-    None,            # 1
-    None,            # 2
-    conversation_id, # 3
-    limit,           # 4: Max turns to return (e.g., 2 for latest Q&A pair)
+    [],  # 0: Empty
+    None,  # 1
+    None,  # 2
+    conversation_id,  # 3
+    limit,  # 4: Max turns to return (e.g., 2 for latest Q&A pair)
 ]
 
 # Live web UI/CDP capture on 2026-06-15:
@@ -1045,9 +1151,45 @@ params = [
 
 ---
 
+### RPC: GET_CHAT_SESSION_STATUS (oXwmh)
+
+**Source:** shared `_chat.py::ChatAPI.session_status()` selection and
+`_web/chat.py::WebChatAPI._get_session_status()` send/decode.
+
+```python
+params = [
+    None,  # 0: reserved
+    conversation_id,  # 1: chat session id
+]
+```
+
+**Response:** `[None, 1]` when idle; `[generation_token, 2]` while generating.
+Unknown status codes or a missing token in state 2 fail closed as wire drift.
+
+---
+
+### RPC: CANCEL_GENERATION (XgrPMd)
+
+**Source:** shared `_chat.py::ChatAPI.cancel()` selection and
+`_web/chat.py::WebChatAPI._cancel_generation()` send.
+
+```python
+params = [
+    None,  # 0: reserved
+    conversation_id,  # 1: chat session id
+]
+```
+
+**Response:** empty `[]`. Generation stops, but an already-open Web streaming
+HTTP response does not close; its owner must abandon the local stream after
+this RPC succeeds.
+
+---
+
 ### RPC: DELETE_CONVERSATION (J7Gthc)
 
-**Source:** `_chat/api.py::delete_conversation()`
+**Source:** shared `_chat.py::ChatAPI.delete_conversation()` orchestration,
+with the Web RPC send in `_web/chat.py::WebChatAPI._send_delete_conversation()`
 
 Deletes a conversation server-side. Mirrors the NotebookLM web UI's "Delete
 history" button. After the call, the next `ask()` with no `conversation_id`
@@ -1055,10 +1197,10 @@ starts a brand-new conversation instead of extending the deleted one.
 
 ```python
 params = [
-    [],              # 0: Empty / reserved
-    conversation_id, # 1: Conversation to delete
-    None,            # 2
-    1,               # 3: Always observed as 1; meaning unconfirmed
+    [],  # 0: Empty / reserved
+    conversation_id,  # 1: Conversation to delete
+    None,  # 2
+    1,  # 3: Always observed as 1; meaning unconfirmed
 ]
 # source_path = f"/notebook/{notebook_id}"  — notebook scope rides on the URL
 ```
@@ -1070,7 +1212,7 @@ is signaled by the absence of an error — there is no return payload.
 
 ### RPC: SUGGEST_PROMPTS (otmP3b)
 
-**Source:** `_notebooks.py::NotebooksAPI.suggest_prompts()`
+**Source:** `_web/notebooks.py::WebNotebooksAPI.suggest_prompts()`
 
 Returns AI-suggested prompts for a notebook (the live
 `GeneratePromptSuggestions` method) — a general notebook-prompt endpoint whose
@@ -1083,12 +1225,12 @@ backend serves it regardless of the web UI's experiment flag.
 params = [
     # 0: client context (capability envelope; same family as artifact RPCs)
     [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
-    notebook_id,                  # 1: Notebook to suggest prompts for
-    [[source_id], ...],           # 2: Source-id wrappers (one [id] per source)
-    mode,                         # 3: REQUIRED int "mode/surface" enum (1..10;
-                                  #    0/omitted -> server INTERNAL). Default 4.
-    None,                         # 4: Reserved (always null)
-    query,                        # 5: Optional free-text steer (or null)
+    notebook_id,  # 1: Notebook to suggest prompts for
+    [[source_id], ...],  # 2: Source-id wrappers (one [id] per source)
+    mode,  # 3: REQUIRED int "mode/surface" enum (1..10;
+    #    0/omitted -> server INTERNAL). Default 4.
+    None,  # 4: Reserved (always null)
+    query,  # 5: Optional free-text steer (or null)
 ]
 # source_path = f"/notebook/{notebook_id}"
 ```
@@ -1234,7 +1376,7 @@ await page.locator(".create-artifact-button-container[aria-label='Audio Overview
 
 **All artifact types use `R7cb6c` with different content type codes and nested configs.**
 
-**Source:** `_artifacts.py` (param builders: `_artifact/payloads.py`)
+**Source:** `_artifacts.py` and `_web/artifact/generation.py` (param builders: `_web/params/artifacts.py`)
 
 Live UI captures on 2026-06-15 for Data Table and interactive Mind Map showed
 the web client sending the full client-options block below as param `0` (not
@@ -1257,11 +1399,11 @@ interactive Mind Map:
 ```python
 result = [
     [
-        artifact_id,      # [0][0]: task/artifact id
-        title,            # [0][1]
-        artifact_type,    # [0][2]
-        None,             # [0][3]
-        status_code,      # [0][4]: 1 in both captures = ARTIFACT_STATUS_INITIALIZED ("pending")
+        artifact_id,  # [0][0]: task/artifact id
+        title,  # [0][1]
+        artifact_type,  # [0][2]
+        None,  # [0][3]
+        status_code,  # [0][4]: 1 in both captures = ARTIFACT_STATUS_INITIALIZED ("pending")
         # ... additional artifact metadata slots; first row len was 20
     ]
 ]
@@ -1272,52 +1414,54 @@ and `result[0][4]`, which matches both live responses.
 
 #### Audio Overview (Type 1)
 
-**Source:** `_artifacts.py::ArtifactsAPI` (param builders: `_artifact/payloads.py`)
+**Source:** `_artifacts.py::ArtifactsAPI.generate_audio()` orchestration;
+`_web/artifact/generation.py` RPC dispatch (param builders: `_web/params/artifacts.py`)
 
 ```python
 source_ids_triple = [[[sid]] for sid in source_ids]  # [[[s1]], [[s2]], ...]
-source_ids_double = [[sid] for sid in source_ids]    # [[s1], [s2], ...]
+source_ids_double = [[sid] for sid in source_ids]  # [[s1], [s2], ...]
 
 params = [
-    create_artifact_options,          # 0: Client options/capabilities
-    notebook_id,                      # 1
+    create_artifact_options,  # 0: Client options/capabilities
+    notebook_id,  # 1
     [
-        None,                         # [0]
-        None,                         # [1]
-        1,                            # [2]: ArtifactTypeCode.AUDIO
-        source_ids_triple,            # [3]
-        None,                         # [4]
-        None,                         # [5]
+        None,  # [0]
+        None,  # [1]
+        1,  # [2]: ArtifactTypeCode.AUDIO
+        source_ids_triple,  # [3]
+        None,  # [4]
+        None,  # [5]
         [
             None,
             [
-                instructions,         # Focus/instructions text
-                length_code,          # 1=SHORT, 2=DEFAULT, 3=LONG
+                instructions,  # Focus/instructions text
+                length_code,  # 1=SHORT, 2=DEFAULT, 3=LONG
                 None,
                 source_ids_double,
-                language,             # "en"
+                language,  # "en"
                 None,
-                format_code,          # 1=DEEP_DIVE, 2=BRIEF, 3=CRITIQUE, 4=DEBATE
+                format_code,  # 1=DEEP_DIVE, 2=BRIEF, 3=CRITIQUE, 4=DEBATE
             ],
-        ],                            # [6]
-    ],                                # 2: Source config
+        ],  # [6]
+    ],  # 2: Source config
 ]
 ```
 
 #### Video Overview (Type 3)
 
-**Source:** `_artifacts.py::generate_video()`
+**Source:** `_artifacts.py::ArtifactsAPI.generate_video()` orchestration;
+`_web/artifact/generation.py` RPC dispatch (param builders: `_web/params/artifacts.py`)
 
 ```python
 # Build the inner video config. Explainer and Brief expose visual styles;
 # Cinematic and Short use a fixed style (Short ignores any style code server-side).
 video_config = [
     source_ids_double,
-    language,             # "en"
-    instructions,          # Focus/customization prompt
+    language,  # "en"
+    instructions,  # Focus/customization prompt
     None,
-    format_code,          # 1=EXPLAINER, 2=BRIEF, 3=CINEMATIC, 4=SHORT
-    style_code,           # None=CUSTOM, 1=AUTO_SELECT, 2=CLASSIC, 3=WHITEBOARD, ...
+    format_code,  # 1=EXPLAINER, 2=BRIEF, 3=CINEMATIC, 4=SHORT
+    style_code,  # None=CUSTOM, 1=AUTO_SELECT, 2=CLASSIC, 3=WHITEBOARD, ...
 ]
 if video_style == VideoStyle.CUSTOM and style_prompt:
     video_config.append(style_prompt)
@@ -1326,15 +1470,15 @@ params = [
     create_artifact_options,
     notebook_id,
     [
-        None,                         # [0]
-        None,                         # [1]
-        3,                            # [2]: ArtifactTypeCode.VIDEO
-        source_ids_triple,            # [3]
-        None,                         # [4]
-        None,                         # [5]
-        None,                         # [6]
-        None,                         # [7]
-        [None, None, video_config],   # [8]
+        None,  # [0]
+        None,  # [1]
+        3,  # [2]: ArtifactTypeCode.VIDEO
+        source_ids_triple,  # [3]
+        None,  # [4]
+        None,  # [5]
+        None,  # [6]
+        None,  # [7]
+        [None, None, video_config],  # [8]
     ],
 ]
 ```
@@ -1352,15 +1496,16 @@ custom visual-style prompt in the 7th slot:
     "en",
     "Focus prompt",
     None,
-    2,                    # VideoFormat.BRIEF
-    None,                 # VideoStyle.CUSTOM omitted/defaulted
+    2,  # VideoFormat.BRIEF
+    None,  # VideoStyle.CUSTOM omitted/defaulted
     "Custom visual style",
 ]
 ```
 
 #### Cinematic Video Overview (Type 3, format=3)
 
-**Source:** `_artifacts.py::generate_cinematic_video()`
+**Source:** `_artifacts.py::ArtifactsAPI.generate_cinematic_video()` orchestration;
+`_web/artifact/generation.py` RPC dispatch (param builders: `_web/params/artifacts.py`)
 
 Cinematic videos use AI-generated documentary footage (Veo 3) instead of
 slide-deck animations. They share the standard video RPC (Type 3) but omit
@@ -1372,84 +1517,85 @@ params = [
     create_artifact_options,
     notebook_id,
     [
-        None,                         # [0]
-        None,                         # [1]
-        3,                            # [2]: ArtifactTypeCode.VIDEO
-        source_ids_triple,            # [3]
-        None,                         # [4]
-        None,                         # [5]
-        None,                         # [6]
-        None,                         # [7]
+        None,  # [0]
+        None,  # [1]
+        3,  # [2]: ArtifactTypeCode.VIDEO
+        source_ids_triple,  # [3]
+        None,  # [4]
+        None,  # [5]
+        None,  # [6]
+        None,  # [7]
         [
             None,
             None,
             [
                 source_ids_double,
-                language,             # "en"
+                language,  # "en"
                 instructions,
                 None,
-                3,                    # VideoFormat.CINEMATIC
+                3,  # VideoFormat.CINEMATIC
             ],
-        ],                            # [8]
+        ],  # [8]
     ],
 ]
 ```
 
 #### Report (Type 2)
 
-**Source:** `_artifacts.py::generate_report()`
+**Source:** `_artifacts.py::ArtifactsAPI.generate_report()` orchestration;
+`_web/artifact/generation.py` RPC dispatch (param builders: `_web/params/artifacts.py`)
 
 ```python
 params = [
     create_artifact_options,
     notebook_id,
     [
-        None,                         # [0]
-        None,                         # [1]
-        2,                            # [2]: ArtifactTypeCode.REPORT
-        source_ids_triple,            # [3]
-        None,                         # [4]
-        None,                         # [5]
-        None,                         # [6]
+        None,  # [0]
+        None,  # [1]
+        2,  # [2]: ArtifactTypeCode.REPORT
+        source_ids_triple,  # [3]
+        None,  # [4]
+        None,  # [5]
+        None,  # [6]
         [
             None,
             [
-                title,                # "Briefing Doc" / "Study Guide" / etc.
-                description,          # Short description
+                title,  # "Briefing Doc" / "Study Guide" / etc.
+                description,  # Short description
                 None,
                 source_ids_double,
-                language,             # "en"
-                prompt,               # Detailed generation prompt
+                language,  # "en"
+                prompt,  # Detailed generation prompt
                 None,
                 True,
             ],
-        ],                            # [7]
+        ],  # [7]
     ],
 ]
 ```
 
 #### Quiz (Type 4, Variant 2)
 
-**Source:** `_artifact/payloads.py::build_quiz_artifact_params()`
+**Source:** `_web/params/artifacts.py::build_quiz_artifact_params()`
 
 ```python
 params = [
     create_artifact_options,
     notebook_id,
     [
-        None,                         # [0]
-        None,                         # [1]
-        4,                            # [2]: ArtifactTypeCode.QUIZ_FLASHCARD
-        source_ids_triple,            # [3]
-        None,                         # [4]
-        None,                         # [5]
-        None,                         # [6]
-        None,                         # [7]
-        None,                         # [8]
+        None,  # [0]
+        None,  # [1]
+        4,  # [2]: ArtifactTypeCode.QUIZ_FLASHCARD
+        source_ids_triple,  # [3]
+        None,  # [4]
+        None,  # [5]
+        None,  # [6]
+        None,  # [7]
+        None,  # [8]
         [
             None,
             [
-                2,                    # Variant: 2=quiz, 1=flashcards, 4=interactive mind map
+                2,  # Variant: 2=quiz, 1=flashcards, 4=interactive mind map
                 None,
                 instructions,
                 None,
@@ -1457,66 +1603,77 @@ params = [
                 None,
                 None,
                 [quantity_code, difficulty_code],  # quantity: 1=FEWER, 2=STANDARD, 3=MORE
-            ],                                     # difficulty: 1=EASY, 2=MEDIUM, 3=HARD
-        ],                            # [9]
+            ],  # difficulty: 1=EASY, 2=MEDIUM, 3=HARD
+        ],  # [9]
     ],
 ]
 ```
 
 #### Flashcards (Type 4, Variant 1)
 
-**Source:** `_artifact/payloads.py::build_flashcards_artifact_params()`
+**Source:** `_web/params/artifacts.py::build_flashcards_artifact_params()`
 
 ```python
 params = [
     create_artifact_options,
     notebook_id,
     [
-        None,                         # [0]
-        None,                         # [1]
-        4,                            # [2]: ArtifactTypeCode.QUIZ_FLASHCARD
-        source_ids_triple,            # [3]
-        None,                         # [4]
-        None,                         # [5]
-        None,                         # [6]
-        None,                         # [7]
-        None,                         # [8]
+        None,  # [0]
+        None,  # [1]
+        4,  # [2]: ArtifactTypeCode.QUIZ_FLASHCARD
+        source_ids_triple,  # [3]
+        None,  # [4]
+        None,  # [5]
+        None,  # [6]
+        None,  # [7]
+        None,  # [8]
         [
             None,
             [
-                1,                    # Variant: 1=flashcards (vs 2=quiz, 4=interactive mind map)
+                1,  # Variant: 1=flashcards (vs 2=quiz, 4=interactive mind map)
                 None,
                 instructions,
                 None,
                 None,
                 None,
                 [quantity_code, difficulty_code],  # Same order as quiz (#2116).
-            ],                                     # quantity: 1=FEWER, 2=STANDARD, 3=MORE
-        ],                            # [9]         # difficulty: 1=EASY, 2=MEDIUM, 3=HARD
+            ],  # quantity: 1=FEWER, 2=STANDARD, 3=MORE
+        ],  # [9]         # difficulty: 1=EASY, 2=MEDIUM, 3=HARD
     ],
 ]
 ```
 
 #### Infographic (Type 7)
 
-**Source:** `_artifacts.py::generate_infographic()`
+**Source:** `_artifacts.py::ArtifactsAPI.generate_infographic()` orchestration;
+`_web/artifact/generation.py` RPC dispatch (param builders: `_web/params/artifacts.py`)
 
 ```python
 # Orientation: 1=LANDSCAPE, 2=PORTRAIT, 3=SQUARE
 # Detail:      1=CONCISE, 2=STANDARD, 3=DETAILED
 # Style:       InfographicStyle enum (1=AUTO_SELECT, 2=SKETCH_NOTE,
 #              3=PROFESSIONAL, 4=BENTO_GRID, 5=EDITORIAL, ...).
-#              See rpc/types.py::InfographicStyle for the full list.
+#              See _types/enums.py::InfographicStyle for the canonical list
+#              (public import: notebooklm.types.InfographicStyle).
 
 params = [
     create_artifact_options,
     notebook_id,
     [
-        None,                         # [0]
-        None,                         # [1]
-        7,                            # [2]: ArtifactTypeCode.INFOGRAPHIC
-        source_ids_triple,            # [3]
-        None, None, None, None, None, None, None, None, None, None,  # [4-13]
+        None,  # [0]
+        None,  # [1]
+        7,  # [2]: ArtifactTypeCode.INFOGRAPHIC
+        source_ids_triple,  # [3]
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,  # [4-13]
         [[instructions, language, None, orientation_code, detail_code, style_code]],  # [14]
     ],
 ]
@@ -1528,7 +1685,8 @@ infographic style preset feature; pass `None` to let the backend auto-select.
 
 #### Slide Deck (Type 8)
 
-**Source:** `_artifacts.py::generate_slide_deck()`
+**Source:** `_artifacts.py::ArtifactsAPI.generate_slide_deck()` orchestration;
+`_web/artifact/generation.py` RPC dispatch (param builders: `_web/params/artifacts.py`)
 
 ```python
 # Format: 1=DETAILED_DECK, 2=PRESENTER_SLIDES
@@ -1538,11 +1696,22 @@ params = [
     create_artifact_options,
     notebook_id,
     [
-        None,                         # [0]
-        None,                         # [1]
-        8,                            # [2]: ArtifactTypeCode.SLIDE_DECK
-        source_ids_triple,            # [3]
-        None, None, None, None, None, None, None, None, None, None, None, None,  # [4-15]
+        None,  # [0]
+        None,  # [1]
+        8,  # [2]: ArtifactTypeCode.SLIDE_DECK
+        source_ids_triple,  # [3]
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,  # [4-15]
         [[instructions, language, format_code, length_code]],  # [16]
     ],
 ]
@@ -1550,18 +1719,32 @@ params = [
 
 #### Data Table (Type 9)
 
-**Source:** `_artifacts.py::generate_data_table()`
+**Source:** `_artifacts.py::ArtifactsAPI.generate_data_table()` orchestration;
+`_web/artifact/generation.py` RPC dispatch (param builders: `_web/params/artifacts.py`)
 
 ```python
 params = [
     create_artifact_options,
     notebook_id,
     [
-        None,                         # [0]
-        None,                         # [1]
-        9,                            # [2]: ArtifactTypeCode.DATA_TABLE
-        source_ids_triple,            # [3]
-        None, None, None, None, None, None, None, None, None, None, None, None, None, None,  # [4-17]
+        None,  # [0]
+        None,  # [1]
+        9,  # [2]: ArtifactTypeCode.DATA_TABLE
+        source_ids_triple,  # [3]
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,  # [4-17]
         [None, [instructions, language]],  # [18]
     ],
 ]
@@ -1569,7 +1752,7 @@ params = [
 
 #### Mind Map (Type 5) - Uses GENERATE_MIND_MAP (yyryJe)
 
-**Source:** `_artifacts.py::generate_mind_map()`
+**Source:** `_web/artifact/generation.py::generate_mind_map()`
 
 **Note:** Mind map uses a different RPC method than other artifacts.
 
@@ -1578,25 +1761,25 @@ params = [
 # Python signature:
 #   generate_mind_map(notebook_id, source_ids=None, language="en", instructions=None)
 params = [
-    source_ids_nested,                            # 0: [[[sid]] for sid in source_ids]
-    None,                                         # 1
-    None,                                         # 2
-    None,                                         # 3
-    None,                                         # 4
+    source_ids_nested,  # 0: [[[sid]] for sid in source_ids]
+    None,  # 1
+    None,  # 2
+    None,  # 3
+    None,  # 4
     [
-        "interactive_mindmap",                    # 5[0]: command name
-        [["[CONTEXT]", instructions or ""]],      # 5[1]: instructions (added in v0.4.0)
-        language,                                 # 5[2]: language code, e.g. "en" (added in v0.4.0)
+        "interactive_mindmap",  # 5[0]: command name
+        [["[CONTEXT]", instructions or ""]],  # 5[1]: instructions (added in v0.4.0)
+        language,  # 5[2]: language code, e.g. "en" (added in v0.4.0)
     ],
-    None,                                         # 6
-    [2, None, [1]],                               # 7: Fixed config
+    None,  # 6
+    [2, None, [1]],  # 7: Fixed config
 ]
 ```
 
 #### Interactive Mind Map (Type 4 / variant 4) - Uses CREATE_ARTIFACT (R7cb6c)
 
-**Source:** `_artifact/payloads.py::build_interactive_mind_map_artifact_params()`,
-`_mind_maps_api.py::MindMapsAPI.generate()`
+**Source:** `_web/params/artifacts.py::build_interactive_mind_map_artifact_params()`,
+`_web/mind_maps.py::WebMindMapsAPI.generate()`
 
 NotebookLM's web app now generates an **interactive** mind map — a studio
 artifact in the type-4 family with `variant 4` (distinct from the note-backed
@@ -1611,11 +1794,16 @@ params = [
     create_artifact_options,
     notebook_id,
     [
-        None, None,
-        4,                                        # 2: artifact type (type-4 family)
-        [[[sid]] for sid in source_ids],          # 3: nested source ids
-        None, None, None, None, None,
-        [None, [4]],                              # 9: [_, [variant]] → variant 4 = interactive mind map
+        None,
+        None,
+        4,  # 2: artifact type (type-4 family)
+        [[[sid]] for sid in source_ids],  # 3: nested source ids
+        None,
+        None,
+        None,
+        None,
+        None,
+        [None, [4]],  # 9: [_, [variant]] → variant 4 = interactive mind map
     ],
 ]
 
@@ -1636,7 +1824,7 @@ kinds behind a single `MindMapKind` discriminator.
 
 ### RPC: LIST_ARTIFACTS (gArtLc)
 
-**Source:** `_artifacts.py::list()`, `_artifacts.py::poll_status()`
+**Source:** `_web/artifacts.py::list()`, `_artifacts.py::poll_status()`
 
 ```python
 params = [
@@ -1675,13 +1863,13 @@ generation options and returns them on every listing, inside the same type-4
 options block that carries the variant and the free-text prompt:
 
 ```python
-row[9][1][0]   # variant: 1=flashcards, 2=quiz, 4=interactive mind map
-row[9][1][2]   # free-text prompt
-row[9][1][6]   # flashcards [quantity, difficulty] — null on a quiz row
-row[9][1][7]   # quiz       [quantity, difficulty] — null on a flashcards row
+row[9][1][0]  # variant: 1=flashcards, 2=quiz, 4=interactive mind map
+row[9][1][2]  # free-text prompt
+row[9][1][6]  # flashcards [quantity, difficulty] — null on a quiz row
+row[9][1][7]  # quiz       [quantity, difficulty] — null on a flashcards row
 ```
 
-Positions follow `AppArtifactGenerationOptions` in `docs/mobile/schema.proto`
+Positions follow `AppArtifactGenerationOptions` in `docs/android/schema.proto`
 (`flashcardsGenerationOptions` = tag 7, `quizGenerationOptions` = tag 8), and
 each pair is `[quantity, difficulty]` — the same order both builders send. Read
 them through `ArtifactRow.quiz_options` / `ArtifactRow.flashcards_options`, which
@@ -1713,19 +1901,20 @@ observations worth knowing:
 ```python
 # Creates note with fixed placeholder values
 params = [
-    notebook_id,   # 0
-    "",            # 1: Empty string (ignored)
-    [1],           # 2: Fixed flag
-    None,          # 3
-    "New Note",    # 4: Placeholder title (ignored)
+    notebook_id,  # 0
+    "",  # 1: Empty string (ignored)
+    [1],  # 2: Fixed flag
+    None,  # 3
+    "New Note",  # 4: Placeholder title (ignored)
 ]
 # Then call UPDATE_NOTE to set real title/content
 ```
 
 ### RPC: CREATE_NOTE (saved-from-chat variant) (CYK0Xb)
 
-**Source:** `_chat/notes.py::save_chat_answer_as_note()` (canonical owner) —
-exposed publicly as `ChatAPI.save_answer_as_note(...)`.
+**Source:** `_web/chat.py::save_chat_answer_as_note()` (Web adapter), with the
+payload encoded by `_web/params/chat_note.py` — exposed through the shared
+`ChatAPI.save_answer_as_note(...)` workflow.
 
 **Note:** This is the same RPC method ID as plain CREATE_NOTE above, but uses a **7-element** params array (vs the 5-element blank-note form) and **mode flag `[2]`** to tell the server the note carries a saved chat answer. The server stores per-citation source-passage metadata so `[N]` markers in the answer render as hover-anchored links in the NotebookLM web UI. No follow-up UPDATE_NOTE is needed — this is a single round-trip.
 
@@ -1733,13 +1922,13 @@ Reverse-engineered from a captured web-UI "Save to note" request (issue #660). P
 
 ```python
 params = [
-    notebook_id,           # [0]
-    answer_with_markers,   # [1] str — full answer text INCLUDING [N] markers
-    [2],                   # [2] mode flag — [2] = saved-from-chat (vs [1] = blank-note)
-    source_passages,       # [3] list — one descriptor per UNIQUE cited chunk_id
-    title,                 # [4] str — requested title; server may auto-generate a smart one
-    rich_content,          # [5] list — cleaned answer + per-marker anchors (see below)
-    [2],                   # [6] trailer flag
+    notebook_id,  # [0]
+    answer_with_markers,  # [1] str — full answer text INCLUDING [N] markers
+    [2],  # [2] mode flag — [2] = saved-from-chat (vs [1] = blank-note)
+    source_passages,  # [3] list — one descriptor per UNIQUE cited chunk_id
+    title,  # [4] str — requested title; server may auto-generate a smart one
+    rich_content,  # [5] list — cleaned answer + per-marker anchors (see below)
+    [2],  # [6] trailer flag
 ]
 ```
 
@@ -1747,11 +1936,13 @@ params = [
 
 ```python
 [
-    None, None, None,
-    [[None, source_start, source_end]],   # passage span in source document
-    [passage_text_wrapper],                # cited text wrapped with offsets + render flags
-    [[[passage_id], source_id]],           # passage_id + source_id pair
-    [chunk_id],                             # standalone chunk_id
+    None,
+    None,
+    None,
+    [[None, source_start, source_end]],  # passage span in source document
+    [passage_text_wrapper],  # cited text wrapped with offsets + render flags
+    [[[passage_id], source_id]],  # passage_id + source_id pair
+    [chunk_id],  # standalone chunk_id
 ]
 ```
 
@@ -1779,12 +1970,12 @@ params = [
 
 ```python
 [
-    note_id,                                # [0] server-assigned UUID
-    answer_with_markers,                    # [1] echoed
-    [2, user_id, [ts_sec, ts_nanos]],       # [2] metadata: type=2 (saved-from-chat)
-    source_passages,                        # [3] echoed
-    server_title,                           # [4] may differ from request (smart title)
-    rich_content,                           # [5] echoed
+    note_id,  # [0] server-assigned UUID
+    answer_with_markers,  # [1] echoed
+    [2, user_id, [ts_sec, ts_nanos]],  # [2] metadata: type=2 (saved-from-chat)
+    source_passages,  # [3] echoed
+    server_title,  # [4] may differ from request (smart title)
+    rich_content,  # [5] echoed
 ]
 ```
 
@@ -1793,7 +1984,7 @@ params = [
 - The server appears to apply a "smart title" pass for `[2]`-mode notes — the captured response title differed from the captured request title (the request sent `"New Saved Note"`; the response stored `"Le Verger de la Connaissance : Le Cas de la Pomme"`). `ChatAPI.save_answer_as_note()` surfaces the server-stored title in the returned `Note`.
 
 **Known gaps**:
-- The `passage_id` UUID at slot `[3][0][5][0][0]` does NOT appear in the streaming chat response shape we currently parse. `_build_source_passage_descriptor` falls back to `chunk_id` as a placeholder when `ChatReference.passage_id` is unset (which is always, in production today). Empirically the server accepts this and the web UI still renders hover anchors. If a future capture reveals where this UUID comes from, populate `ChatReference.passage_id` in `_chat/wire.py::parse_single_citation()` and the encoder will use it automatically.
+- The `passage_id` UUID at slot `[3][0][5][0][0]` does NOT appear in the streaming chat response shape we currently parse. `_build_source_passage_descriptor` falls back to `chunk_id` as a placeholder when `ChatReference.passage_id` is unset (which is always, in production today). Empirically the server accepts this and the web UI still renders hover anchors. If a future capture reveals where this UUID comes from, populate `ChatReference.passage_id` in `_web/rows/chat_stream.py::parse_single_citation()` and the encoder will use it automatically.
 - Multi-citation segmentation uses a *cumulative-span* heuristic (each `[N]` anchors `clean_text[0..position]` rather than a per-segment span). This matches the captured single-citation payload exactly but is unverified against multi-citation captures. See issue #660 PR description.
 
 ### RPC: UPDATE_NOTE (cYAfTb)
@@ -1802,9 +1993,9 @@ params = [
 
 ```python
 params = [
-    notebook_id,                       # 0
-    note_id,                           # 1
-    [[[content, title, [], 0]]],       # 2: Triple-nested [content, title, [], 0]
+    notebook_id,  # 0
+    note_id,  # 1
+    [[[content, title, [], 0]]],  # 2: Triple-nested [content, title, [], 0]
 ]
 ```
 
@@ -1816,9 +2007,9 @@ params = [
 
 ```python
 params = [
-    notebook_id,   # 0
-    None,          # 1
-    [note_id],     # 2: Single-nested note ID
+    notebook_id,  # 0
+    None,  # 1
+    [note_id_1, note_id_2],  # 2: One or more note IDs (batch-capable)
 ]
 
 # BEFORE delete:
@@ -1828,7 +2019,15 @@ params = [
 # ['note_id', None, 2]  # Status 2 = deleted/cleared
 ```
 
-**Note:** Same behavior applies to mind maps via `delete_mind_map()`. The Python API filters out items with status=2 in `list()` and `list_mind_maps()` to match UI behavior.
+`notes.delete(notebook_id, str | list[str])` sends this request once; missing IDs
+silently no-op. MCP resolves an explicit subset before deletion to distinguish
+`deleted` from `not_found`. The existing idempotent delete policy covers batches;
+there is no separate client-token slot.
+
+**Note:** Same behavior applies to note-backed mind maps via `delete_mind_map()`.
+Interactive maps use `DELETE_ARTIFACT` and never enter the bulk text-note request.
+The Python API filters out items with status=2 in `list()` and `list_mind_maps()`
+to match UI behavior.
 
 ### RPC: GET_NOTES_AND_MIND_MAPS (cFji9)
 
@@ -1856,18 +2055,18 @@ Notes and mind maps share the same storage system and are distinguished by conte
 
 ```python
 [
-    "note_id",           # Position 0: Note ID
+    "note_id",  # Position 0: Note ID
     [
-        "note_id",       # [1][0]: ID (duplicate)
-        "content",       # [1][1]: Note content text
-        [                # [1][2]: Metadata
-            1,           # Type flag
-            "user_id",   # User ID
-            [ts, ns]     # [timestamp_seconds, nanoseconds]
+        "note_id",  # [1][0]: ID (duplicate)
+        "content",  # [1][1]: Note content text
+        [  # [1][2]: Metadata
+            1,  # Type flag
+            "user_id",  # User ID
+            [ts, ns],  # [timestamp_seconds, nanoseconds]
         ],
-        None,            # [1][3]: Unknown
-        "title"          # [1][4]: Note title
-    ]
+        None,  # [1][3]: Unknown
+        "title",  # [1][4]: Note title
+    ],
 ]
 ```
 
@@ -1875,14 +2074,14 @@ Notes and mind maps share the same storage system and are distinguished by conte
 
 ```python
 [
-    "mind_map_id",       # Position 0: Mind map ID
+    "mind_map_id",  # Position 0: Mind map ID
     [
-        "mind_map_id",   # [1][0]: ID (duplicate)
+        "mind_map_id",  # [1][0]: ID (duplicate)
         '{"name": "Root", "children": [...]}',  # [1][1]: JSON with children/nodes
-        [metadata],      # [1][2]: Same as notes
-        None,            # [1][3]: Unknown
-        "Mind Map Title" # [1][4]: Title
-    ]
+        [metadata],  # [1][2]: Same as notes
+        None,  # [1][3]: Unknown
+        "Mind Map Title",  # [1][4]: Title
+    ],
 ]
 ```
 
@@ -1941,14 +2140,14 @@ source_ids_triple = [[[sid]] for sid in source_ids]
 
 ### RPC: SUMMARIZE (VfAZjd)
 
-**Source:** `_notebooks.py::get_summary()`, `_notebooks.py::get_description()`
+**Source:** `_web/notebooks.py::WebNotebooksAPI.get_summary()`, `_web/notebooks.py::WebNotebooksAPI.get_description()`
 
 Gets AI-generated summary and suggested topics for a notebook.
 
 ```python
 params = [
     notebook_id,  # 0: Notebook ID
-    [2],          # 1: Fixed flag
+    [2],  # 1: Fixed flag
 ]
 
 # Live web UI/CDP capture on 2026-06-15:
@@ -1980,14 +2179,14 @@ await rpc_call(
 
 ### RPC: GET_SHARE_STATUS (JFMDGd)
 
-**Source:** `_sharing.py::get_status()`
+**Source:** `_web/sharing.py::get_status()`
 
 Get the current share settings for a notebook, including users with access and public status.
 
 ```python
 params = [
     notebook_id,  # 0: Notebook ID
-    [2],          # 1: Fixed flag
+    [2],  # 1: Fixed flag
 ]
 
 # Live web UI/CDP capture on 2026-06-15:
@@ -2055,8 +2254,8 @@ collaborator cap.
 
 ### RPC: SHARE_NOTEBOOK (QDyure)
 
-**Source:** `_sharing.py::set_public()`, `_sharing.py::add_user()`,
-`_sharing.py::set_users()`, `_sharing.py::remove_user()`
+**Source:** `_web/sharing.py::set_public()`, `_sharing.py::add_user()`,
+`_web/sharing.py::set_users()`, `_web/sharing.py::remove_user()`
 
 Multi-purpose RPC for managing notebook sharing: toggle public access, add/update users, or remove users.
 
@@ -2067,14 +2266,14 @@ params = [
     [
         [
             notebook_id,
-            None,                  # no user changes
-            [access_value],        # [0]=restricted, [1]=public
-            [access_value, ""]     # [flag, welcome_message]
+            None,  # no user changes
+            [access_value],  # [0]=restricted, [1]=public
+            [access_value, ""],  # [flag, welcome_message]
         ]
     ],
-    1,      # action type
+    1,  # action type
     None,
-    [2]     # fixed flag
+    [2],  # fixed flag
 ]
 
 # Response: [] (empty on success)
@@ -2094,14 +2293,14 @@ params = [
     [
         [
             notebook_id,
-            entries,                       # users to add/update
-            None,                          # no public access change
-            [message_flag, welcome_message]
+            entries,  # users to add/update
+            None,  # no public access change
+            [message_flag, welcome_message],
         ]
     ],
     notify_flag,  # 0 or 1
     None,
-    [2]
+    [2],
 ]
 
 # Response: [] (empty on success)
@@ -2146,18 +2345,18 @@ params = [
             notebook_id,
             [[email, None, 4]],  # 4 = remove permission
             None,
-            [0, ""]
+            [0, ""],
         ]
     ],
-    0,      # no notification
+    0,  # no notification
     None,
-    [2]
+    [2],
 ]
 ```
 
 ### RPC: SET_VIEW_LEVEL (via RENAME_NOTEBOOK s0tc2d)
 
-**Source:** `_sharing.py::set_view_level()`
+**Source:** `_web/sharing.py::set_view_level()`
 
 Set what viewers can access (full notebook vs chat only).
 
@@ -2169,9 +2368,15 @@ params = [
     notebook_id,  # 0: Notebook ID
     [
         [
-            None, None, None, None,   # indices 0-3
-            None, None, None, None,   # indices 4-7
-            [[view_level]],           # index 8: [[0]] or [[1]]
+            None,
+            None,
+            None,
+            None,  # indices 0-3
+            None,
+            None,
+            None,
+            None,  # indices 4-7
+            [[view_level]],  # index 8: [[0]] or [[1]]
         ]
     ],
 ]
@@ -2235,15 +2440,15 @@ independent public resource outside the notebook. Mind Maps cannot be shared
 
 ### RPC: REFRESH_SOURCE (FLmJqe)
 
-**Source:** `_sources.py::refresh()`
+**Source:** `_web/sources/__init__.py::WebSourcesAPI.refresh()`
 
 Refresh a source to get updated content (for URL/Drive sources).
 
 ```python
 params = [
-    None,           # 0
-    [source_id],    # 1: Single-nested source ID
-    [2],            # 2: Fixed flag
+    None,  # 0
+    [source_id],  # 1: Single-nested source ID
+    [2],  # 2: Fixed flag
 ]
 
 # Called with source_path:
@@ -2251,20 +2456,28 @@ await rpc_call(
     RPCMethod.REFRESH_SOURCE,
     params,
     source_path=f"/notebook/{notebook_id}",
+    allow_null=True,  # success is a null payload with nothing at index 5
+    raise_on_null_status=True,  # a status-tagged null ([3] live) raises (#2290)
 )
 ```
 
+Success is an empty reply; a rejection arrives as the same null payload tagged
+with a gRPC status at index 5 (live 2026-09-01: `[3]` INVALID_ARGUMENT for every
+shape tried, on an account where the plural `dtT1F BatchRefreshSources` accepts
+the same source id — see #2290 / #2283). `raise_on_null_status=True` keeps the
+two apart; without it both decoded to `None`.
+
 ### RPC: CHECK_SOURCE_FRESHNESS (yR9Yof)
 
-**Source:** `_sources.py::check_freshness()`
+**Source:** `_web/sources/__init__.py::WebSourcesAPI.check_freshness()`
 
 Check if a source needs to be refreshed.
 
 ```python
 params = [
-    None,           # 0
-    [source_id],    # 1: Single-nested source ID
-    [2],            # 2: Fixed flag
+    None,  # 0
+    [source_id],  # 1: Single-nested source ID
+    [2],  # 2: Fixed flag
 ]
 
 # Called with source_path:
@@ -2294,9 +2507,48 @@ Research allows searching the web or Google Drive for sources to add to notebook
 | 1 | Web |
 | 2 | Google Drive |
 
+### RPC: DISCOVER_SOURCES (Es3dTe)
+
+**Source:** `_web/research.py::discover()`
+
+Discover web sources for a query in one synchronous round trip (the web UI's
+"Discover sources" dialog). Same request message as `START_FAST_RESEARCH`
+(`DiscoverSourcesRequest`), a different verb: the call blocks (~8 s live) and
+answers with the results directly, and the backend also records it as a
+completed job that `POLL_RESEARCH` lists (live-verified on both transports
+in issue #2283).
+
+```python
+params = [
+    [query, 1],  # 0: DiscoveryContext — query text, corpus 1 = Web (Drive fails on this route)
+    None,  # 1: RequestContext (optional)
+    mode,  # 2: DiscoveryMode — 1 DEFAULT_LLM_SEARCH, 2 RAW_SEARCH, 3 CURIOUS_SEARCH,
+    #             4 CURIOUS_RAW_SEARCH (3/4 take an empty query). 5 DEEP_RESEARCH is
+    #             rejected (INVALID_ARGUMENT) and 6 LITE_LLM_SEARCH faults (INTERNAL).
+    notebook_id,  # 3: Notebook ID (required; unknown id → NOT_FOUND)
+]
+
+await rpc_call(
+    RPCMethod.DISCOVER_SOURCES,
+    params,
+    source_path=f"/notebook/{notebook_id}",
+)
+
+# Response: [sources, overview, [job_id]]
+#
+#   sources  — [[url, title, hint, corpus_type], ...]; ten rows on every live
+#              call, corpus_type always 1 (150/150 rows), no favicon or deep
+#              payload slots. Identical to the [sources, summary] bundle a
+#              POLL_RESEARCH task row carries at task_info[3].
+#   overview — one sentence summarising the set.
+#   job_id   — DiscoverSourcesFeedbackKey[0]: the id of the completed job the
+#              call recorded; `discover()` returns it as ``task_id`` so the
+#              result imports through IMPORT_RESEARCH like any run.
+```
+
 ### RPC: START_FAST_RESEARCH (Ljjv0c)
 
-**Source:** `_research.py::start()` with `mode="fast"`
+**Source:** `_web/research.py::start()` with `mode="fast"`
 
 Start a fast research session.
 
@@ -2304,9 +2556,9 @@ Start a fast research session.
 # source_type: 1=Web, 2=Drive
 params = [
     [query, source_type],  # 0: Query and source type
-    None,                   # 1
-    1,                      # 2: DiscoveryMode — 1 = DEFAULT_LLM_SEARCH
-    notebook_id,            # 3: Notebook ID
+    None,  # 1
+    1,  # 2: DiscoveryMode — 1 = DEFAULT_LLM_SEARCH
+    notebook_id,  # 3: Notebook ID
 ]
 
 # Called with source_path:
@@ -2328,18 +2580,20 @@ await rpc_call(
 
 ### RPC: START_DEEP_RESEARCH (QA9ei)
 
-**Source:** `_research.py::start()` with `mode="deep"`
+**Source:** `_web/research.py::start()` with `mode="deep"`
 
-Start a deep research session (web only, more thorough).
+Start the Web batchexecute form of a deep research session. The public Android
+research namespace implements its native gRPC counterpart; this payload is only
+the Web wire contract.
 
 ```python
-# Deep research only supports Web (source_type=1)
+# This Web RPC's deep-research form supports only source_type=1 (Web research).
 params = [
-    None,                   # 0
-    [1],                    # 1: Fixed flag
-    [query, source_type],   # 2: Query and source type
-    5,                      # 3: DiscoveryMode — 5 = DEEP_RESEARCH
-    notebook_id,            # 4: Notebook ID
+    None,  # 0
+    [1],  # 1: Fixed flag
+    [query, source_type],  # 2: Query and source type
+    5,  # 3: DiscoveryMode — 5 = DEEP_RESEARCH
+    notebook_id,  # 4: Notebook ID
 ]
 
 # Called with source_path:
@@ -2365,15 +2619,15 @@ flow, the returned `report_id` later becomes important during polling and import
 
 ### RPC: POLL_RESEARCH (e3bVqc)
 
-**Source:** `_research.py::poll()`
+**Source:** `_web/research.py::poll()`
 
 Poll for research results.
 
 ```python
 params = [
-    None,          # 0
-    None,          # 1
-    notebook_id,   # 2: Notebook ID
+    None,  # 0
+    None,  # 1
+    notebook_id,  # 2: Notebook ID
 ]
 
 # Called with source_path:
@@ -2538,7 +2792,8 @@ Notes:
 
 ### RPC: IMPORT_RESEARCH (LBwxtb)
 
-**Source:** `_research.py::import_sources()`
+**Source:** `_research.py::BaseResearchAPI.import_sources()` (classification) and
+`_web/research.py::WebResearchAPI._send_import()` (Web encoding/decoding)
 
 Import selected research sources into the notebook.
 
@@ -2549,45 +2804,49 @@ Import selected research sources into the notebook.
 # NOTE: this is the REQUEST the client sends. It is a different shape from the
 # POLL_RESEARCH *response* row documented above — the report body rides at index 1
 # here, whereas a response row carries it in the src[6] kind-3 content block. Built
-# by `_research.py::_build_report_import_entry` / `_build_web_import_entry`.
+# by `_web/research.py::_build_report_import_entry` / `_build_web_import_entry`.
 source_array = []
 
 # Deep research report entry (outgoing import request):
-source_array.append([
-    None,                 # 0
-    [title, markdown],    # 1: Report title and full markdown body
-    None,                 # 2
-    3,                    # 3: Special report marker
-    None,                 # 4
-    None,                 # 5
-    None,                 # 6
-    None,                 # 7
-    None,                 # 8
-    None,                 # 9
-    3,                    # 10: Special report marker
-])
+source_array.append(
+    [
+        None,  # 0
+        [title, markdown],  # 1: Report title and full markdown body
+        None,  # 2
+        3,  # 3: Special report marker
+        None,  # 4
+        None,  # 5
+        None,  # 6
+        None,  # 7
+        None,  # 8
+        None,  # 9
+        3,  # 10: Special report marker
+    ]
+)
 
 # Standard web source entry:
-source_array.append([
-    None,           # 0
-    None,           # 1
-    [url, title],   # 2: URL and title
-    None,           # 3
-    None,           # 4
-    None,           # 5
-    None,           # 6
-    None,           # 7
-    None,           # 8
-    None,           # 9
-    2,              # 10: Standard web-source marker
-])
+source_array.append(
+    [
+        None,  # 0
+        None,  # 1
+        [url, title],  # 2: URL and title
+        None,  # 3
+        None,  # 4
+        None,  # 5
+        None,  # 6
+        None,  # 7
+        None,  # 8
+        None,  # 9
+        2,  # 10: Standard web-source marker
+    ]
+)
 
 params = [
-    None,           # 0
-    [1],            # 1: Fixed flag
-    task_id,        # 2: Research task ID (for deep research, use the polled task ID)
-    notebook_id,    # 3: Notebook ID
-    source_array,   # 4: Array of sources to import
+    None,  # 0
+    [1],  # 1: Fixed flag
+    task_id,  # 2: Research task ID (for deep research, use the polled task ID)
+    notebook_id,  # 3: Notebook ID
+    source_array,  # 4: Array of sources to import
 ]
 
 # Called with source_path:
@@ -2622,7 +2881,7 @@ await rpc_call(
 
 ### RPC: CANCEL_RESEARCH (Zbrupe)
 
-**Source:** `_research.py::ResearchAPI.cancel()`
+**Source:** `_web/research.py::WebResearchAPI.cancel()`
 
 Cancel an in-flight research (DiscoverSources) run. An IN_PROGRESS run
 transitions to a terminal `FAILED` state shortly after this call; cancelling an
@@ -2630,8 +2889,8 @@ already-terminal run is a silent no-op.
 
 ```python
 params = [
-    None,    # 0: optional client context — omitted (matches start/poll)
-    None,    # 1
+    None,  # 0: optional client context — omitted (matches start/poll)
+    None,  # 1
     run_id,  # 2: the poll-level run id (== ResearchTask.task_id from poll())
 ]
 
@@ -2667,13 +2926,13 @@ Global user settings that affect all notebooks in an account.
 
 ### RPC: GET_USER_SETTINGS (ZwVcOc)
 
-**Source:** `_settings.py::get_output_language()`
+**Source:** `_web/settings.py::get_output_language()`
 
 Get user settings including the current output language.
 
 ```python
 params = [
-    None,                                                    # 0
+    None,  # 0
     [1, None, None, None, None, None, None, None, None, None, [1]],  # 1: Fixed config
 ]
 
@@ -2718,7 +2977,7 @@ The full per-tier notebook/source/studio limits these enum values map to are doc
 
 ### RPC: SET_USER_SETTINGS (hT54vc)
 
-**Source:** `_settings.py::set_output_language()`
+**Source:** `_web/settings.py::set_output_language()`
 
 Set user settings (currently used for output language).
 
@@ -2761,14 +3020,14 @@ Common language codes include:
 
 ### RPC: RENAME_ARTIFACT (rc3d8d)
 
-**Source:** `_artifacts.py::rename()`
+**Source:** `_web/artifacts.py::rename()`
 
 Rename an artifact.
 
 ```python
 params = [
     [artifact_id, new_title],  # 0: Artifact ID and new title
-    [["title"]],               # 1: Field mask (update title)
+    [["title"]],  # 1: Field mask (update title)
 ]
 
 # Called with source_path:
@@ -2781,7 +3040,7 @@ await rpc_call(
 
 ### RPC: EXPORT_ARTIFACT (Krh3pd)
 
-**Source:** `_artifacts.py::export_report()`, `_artifacts.py::export_data_table()`, `_artifacts.py::export()`
+**Source:** `_web/artifacts.py::export_report()`, `_web/artifacts.py::export_data_table()`, `_web/artifacts.py::export()`
 
 Export an artifact to Google Docs or Sheets.
 
@@ -2791,11 +3050,11 @@ Export an artifact to Google Docs or Sheets.
 # 2 = Google Sheets
 
 params = [
-    None,          # 0
-    artifact_id,   # 1: Artifact ID
-    content,       # 2: Content to export (optional, can be None)
-    title,         # 3: Title for exported document
-    export_type,   # 4: 1=Docs, 2=Sheets
+    None,  # 0
+    artifact_id,  # 1: Artifact ID
+    content,  # 2: Content to export (optional, can be None)
+    title,  # 3: Title for exported document
+    export_type,  # 4: 1=Docs, 2=Sheets
 ]
 
 # Called with source_path:
@@ -2810,17 +3069,17 @@ await rpc_call(
 
 ### RPC: REVISE_SLIDE (KmcKPe)
 
-**Source:** `_artifacts.py::revise_slide()`,
-`_artifact/generation.py::ArtifactGenerationService.revise_slide()`,
-`_artifact/payloads.py::build_revise_slide_params()`
+**Source:** `_web/artifacts.py::revise_slide()`,
+`_web/artifact/generation.py::ArtifactGenerationService.revise_slide()`,
+`_web/params/artifacts.py::build_revise_slide_params()`
 
 Revise one slide in an existing completed slide deck. `slide_index` is
 zero-based and must be non-negative.
 
 ```python
 params = [
-    [2],                        # 0: Fixed flag
-    artifact_id,                # 1: Slide deck artifact ID
+    [2],  # 0: Fixed flag
+    artifact_id,  # 1: Slide deck artifact ID
     [[[slide_index, prompt]]],  # 2: Revision request
 ]
 
@@ -2840,7 +3099,7 @@ propagates as `RateLimitError` / `RPCError`; a null result raises
 
 ### RPC: RETRY_ARTIFACT (Rytqqe)
 
-**Source:** `_artifacts.py::retry_failed()`
+**Source:** `_web/artifacts.py::retry_failed()`
 
 Retry a failed Studio artifact in place — the equivalent of the NotebookLM web
 UI "Retry" button. The failed artifact is **not** deleted first; the same
@@ -2852,7 +3111,7 @@ infographic artifacts (issue #1319).
 ```python
 params = [
     retry_options,  # 0: fixed client capability blob (see below)
-    artifact_id,    # 1: ID of the failed artifact to retry
+    artifact_id,  # 1: ID of the failed artifact to retry
 ]
 
 # retry_options is a type-agnostic literal, sent verbatim regardless of
@@ -2890,7 +3149,7 @@ callers decide whether to re-invoke.
 
 ### RPC: SHARE_ARTIFACT (RGP97b)
 
-**Source:** `_sharing_manager.py::ShareManager.share()` (legacy share-link toggle)
+**Source:** `_web/sharing.py::ShareManager.share()` (legacy share-link toggle)
 
 Toggle the legacy share-link state for a notebook URL, optionally with an
 artifact deep-link target. Distinct from `SHARE_NOTEBOOK` (`QDyure`), which
@@ -2927,7 +3186,7 @@ await rpc_call(
 
 ### RPC: GET_INTERACTIVE_HTML (v9rmvd)
 
-**Source:** `_artifact/downloads.py::_get_artifact_content()` (quiz/flashcard HTML), `_artifact/downloads.py::_get_interactive_mind_map_tree()` (interactive mind-map tree)
+**Source:** `_web/artifact/downloads.py::_get_artifact_content()` (quiz/flashcard HTML), `_web/artifact/downloads.py::_get_interactive_mind_map_tree()` (interactive mind-map tree)
 
 Fetch the interactive payload for a studio artifact. Used both for quiz/flashcard
 HTML and for the **interactive** mind-map JSON node tree (issue #1256) — the same
@@ -2961,14 +3220,14 @@ await rpc_call(
 
 ### RPC: GET_SUGGESTED_REPORTS (ciyUvf)
 
-**Source:** `_artifacts.py::suggest_reports()`
+**Source:** `_web/artifacts.py::suggest_reports()`
 
 Get AI-suggested report formats based on notebook content.
 
 ```python
 params = [
-    [2],            # 0: Fixed flag (same pattern as LIST_ARTIFACTS)
-    notebook_id,    # 1: Notebook ID
+    [2],  # 0: Fixed flag (same pattern as LIST_ARTIFACTS)
+    notebook_id,  # 1: Notebook ID
 ]
 
 # Called with source_path:
@@ -3003,7 +3262,7 @@ When a `batchexecute` RPC is rejected, the server answers with a `wrb.fr` frame
 whose *result* slot (index 2) is `null` and whose index 5 carries a
 JSON-array-encoded [`google.rpc.Status`](https://github.com/googleapis/googleapis/blob/master/google/rpc/status.proto).
 That is a **public** Google type, not a Tailwind message, so it is absent from
-`docs/mobile/schema.proto` and its positions are the proto tags minus one:
+`docs/android/schema.proto` and its positions are the proto tags minus one:
 
 | Index | `google.rpc.Status` field | Observed |
 |-------|---------------------------|----------|
@@ -3016,18 +3275,19 @@ Observed codes:
 | Payload | RPC | Where |
 |---------|-----|-------|
 | `[3]` INVALID_ARGUMENT | `CREATE_ARTIFACT` (`R7cb6c`) | Live 2026-08-13: audio overview on a source-less notebook |
-| `[3]` INVALID_ARGUMENT | streamed chat | `tests/cassettes/chat_ask_oversized_rejection.yaml` (#1472) |
-| `[3]` INVALID_ARGUMENT | `SHARE_NOTEBOOK` (`QDyure`) | `tests/cassettes/cli_share_add.yaml`, `cli_share_remove.yaml` — swallowed; the flow reports success |
-| `[3]` INVALID_ARGUMENT | `SHARE_ARTIFACT` (`RGP97b`) | `tests/cassettes/notebooks_share.yaml` — swallowed; the flow reports success |
+| `[3]` INVALID_ARGUMENT | streamed chat | `tests/cassettes/web/chat_ask_oversized_rejection.yaml` (#1472) |
+| `[3]` INVALID_ARGUMENT | `SHARE_NOTEBOOK` (`QDyure`) | `tests/cassettes/web/cli_share_add.yaml`, `cli_share_remove.yaml` — swallowed; the flow reports success |
+| `[3]` INVALID_ARGUMENT | `SHARE_ARTIFACT` (`RGP97b`) | `tests/cassettes/web/notebooks_share.yaml` — swallowed; the flow reports success |
 | `[5]` NOT_FOUND | `CREATE_ARTIFACT`, `RETRY_ARTIFACT`, `REVISE_SLIDE`, `GET_NOTEBOOK` | Live 2026-08-13 (unknown notebook / artifact id); #114 / #294 |
-| `[13]` INTERNAL | `REMOVE_RECENTLY_VIEWED` (`fejl7e`) | `tests/cassettes/notebooks_remove_from_recent.yaml` — treated as a **successful** no-op |
+| `[13]` INTERNAL | `REMOVE_RECENTLY_VIEWED` (`fejl7e`) | `tests/cassettes/web/notebooks_remove_from_recent.yaml` — treated as a **successful** no-op |
 | `[8, null, [[…UserDisplayableError…]]]` | any | The rate-limit / quota shape |
 
 A sweep of all 141 cassettes found 397 `wrb.fr` frames, only 5 of them
 null-result — and all 5 carried one of the shapes above. Four are `batchexecute`
 RPCs, across three method ids (`SHARE_NOTEBOOK` ×2, `SHARE_ARTIFACT`,
 `REMOVE_RECENTLY_VIEWED`); the fifth is the streamed-chat `[3]` from #1472,
-which carries no rpc id and is decoded by `_chat/wire.py`, not `decode_response`.
+which carries no rpc id and is decoded by `_web/rows/chat_stream.py`, not
+`decode_response`.
 
 **Open question.** Only `REMOVE_RECENTLY_VIEWED`'s tolerance has ever been
 reasoned about (a cosmetic no-op). Whether the two share rejections are benign
@@ -3069,7 +3329,7 @@ at DEBUG, so the remaining cases are findable.
 
 ### Artifact failures have no reason at all
 
-`Artifact` in `docs/mobile/schema.proto` has **no error or failure field**. An
+`Artifact` in `docs/android/schema.proto` has **no error or failure field**. An
 artifact accepted at create time that later transitions to
 `ARTIFACT_STATUS_FAILED` therefore carries nothing to explain itself: no cassette
 contains a status-4 row, and a live sweep of 27 notebooks / 99 rows found index 3
@@ -3122,12 +3382,12 @@ When automating, poll for completion rather than using fixed timeouts. Check art
 
 ## Legacy/Unused RPC Methods
 
-These RPC method IDs exist in `rpc/types.py` but are either legacy (superseded by other methods) or not currently used in the implementation. Documented here for completeness.
+These RPC method IDs exist in `rpc/_identifiers.py` but are either legacy (superseded by other methods) or not currently used in the implementation. Documented here for completeness.
 
 | RPC ID | Method | Status | Notes |
 |--------|--------|--------|-------|
 
-> **Note:** `GET_SOURCE` (`hizoJc`) was previously listed here as "Broken" but is now active — used by `_source/content.py::get_fulltext()`. See [RPC Method Status](#rpc-method-status) and the detailed section above.
+> **Note:** `GET_SOURCE` (`hizoJc`) was previously listed here as "Broken" but is now active — used by `_web/sources/content.py::get_fulltext()`. See [RPC Method Status](#rpc-method-status) and the detailed section above.
 
 **Why keep these?** These IDs are preserved in the codebase in case:
 1. Google re-enables or changes their functionality
@@ -3135,3 +3395,140 @@ These RPC method IDs exist in `rpc/types.py` but are either legacy (superseded b
 3. They become useful for specific edge cases
 
 **Note:** The unified `CREATE_ARTIFACT` (R7cb6c) method handles all artifact generation (audio, video, reports, quizzes, etc.).
+
+## Transfer & Suggestion RPCs (#2283)
+
+Six RPCs the web bundle registers but the web UI never calls from a visible
+control. Their request shapes were recovered with the mobile tag oracle
+(`docs/android/copy-append-suggestion-evidence.md`): the same
+`LabsTailwindOrchestrationService` serves both front doors, so web index `i` is
+proto tag `i+1`. All six are also served natively to the Android backend.
+
+### RPC: ADD_SOURCES_ASYNC (X1snv)
+
+**Source:** `_web/sources/transfers.py::SourceTransferService.add_urls_async()` (`WebSourcesAPI.add_urls_async`)
+
+Same request as the batch `ADD_SOURCE` (`AddSources`), but the server answers as
+soon as the sources are queued (~0.65 s for two URLs vs ~2 s per synchronous
+add in the #2283 web probe) with stub rows.
+
+```python
+params = [
+    [<source spec>, ...],   # 0: repeated UserContent — the same URL / YouTube specs ADD_SOURCE sends
+    notebook_id,            # 1
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],  # 2: RequestContext
+]
+# source_path = f"/notebook/{notebook_id}"
+```
+
+**Response:** `[[Source, ...], null, [[Source, ack], ...]]` — stub `Source`
+rows at `[0]` (`[[id], url, [null, null, null, null, type]]`; no word count or
+ingest timestamps), and a per-source acknowledgement list at `[2]` pairing each
+row with an `int` status (`0` on every live observation). Decoded via
+`AddSourcesAsyncResponseRow`; never replayed on a transport failure.
+
+### RPC: APPEND_SOURCE (QsNTEd)
+
+**Source:** `_web/sources/transfers.py::SourceTransferService.append_text()` (`WebSourcesAPI.append_text`)
+
+```python
+# AppendSourceRequest { SourceId source_id = 2; SourceContent content = 4 }
+# SourceContent { PlainTextSourceContent plain_text = 2 }  ->  { header = 1; body = 2 }
+params = [
+    None,  # 0: unused
+    [source_id],  # 1: SourceId
+    None,  # 2: unused
+    [
+        None,
+        [header, body],
+    ],  # 3: SourceContent.plain_text — doubly nested: a bare string here draws
+    #    INVALID_ARGUMENT, a string in the plain_text slot draws INTERNAL
+]
+```
+
+**Response:** empty on success (`body` lands at the very end of the fulltext;
+`header` does not appear in it). Called with `allow_null=True,
+raise_on_null_status=True` so a rejected call is not read as that empty success.
+
+### RPC: COPY_SOURCES (R27wvc)
+
+**Source:** `_web/sources/transfers.py::SourceTransferService.copy()` (`WebSourcesAPI.copy`)
+
+Live method `CopySourcesAsync`. The synchronous twin `CopySources` (`Z8UXi`) is
+dead on both front doors and is not modelled.
+
+```python
+# CopySourcesAsyncRequest { repeated SourceId source_ids = 3; string target_project_id = 4 }
+params = [None, None, [[source_id], ...], target_notebook_id]
+```
+
+**Response:** `[[ [[original_id], <source entry>], ... ]]` — one mapping entry
+per copied source; the entry row is the standard `[[id], title, metadata,
+settings]` shape (`CopiedSourceRow`). An unknown source id or target notebook
+draws `NOT_FOUND` (live-verified); an empty mapping on success is treated as
+`SourceNotFoundError` so a silent no-op never reads as a copy.
+
+### RPC: COPY_ARTIFACTS (mKDdke)
+
+**Source:** `_web/artifacts.py::WebArtifactsAPI.copy()`
+
+Live method `CopyArtifactsAsync`. The synchronous twin `CopyArtifacts`
+(`zVGIdd`) validates arity, ignores the ids and copies nothing while reporting
+success — never model it.
+
+```python
+# CopyArtifactsAsyncRequest { RequestContext = 1; repeated string artifact_ids = 2; string target_project_id = 3 }
+params = [
+    [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
+    [artifact_id, ...],  # bare strings, not [id] wrappers
+    target_notebook_id,
+]
+```
+
+**Response:** `[[ [original_id, <artifact row>], ... ]]` — the full new artifact
+row inline (`CopiedArtifactRow` → `Artifact.from_api_response`). Verified live by
+re-listing the target.
+
+### RPC: SUGGEST_NEXT_STEPS (OcvKNc)
+
+**Source:** `_web/notebooks.py::WebNotebooksAPI.suggest_next_steps()`
+
+Live method `NextStepSuggestions` — the standalone form of the block every chat
+answer carries at `inner[5]`, so no prior conversation is needed.
+
+```python
+# NextStepSuggestionsRequest { string project_id = 2; repeated InputSource sources = 3 }
+params = [None, notebook_id]  # all sources
+params = [None, notebook_id, [[[source_id]], ...]]  # scoped (nest_source_ids depth 2)
+```
+
+**Response:** `[[ [question, MagicArtifactType], ... ]]` — three questions per
+call live, each with type `9` (`CONVERSATIONAL_TEXT_CHIP`). Decoded through the
+chat `NextStepSuggestionRow`. A bogus notebook draws `NOT_FOUND`; a bare
+`[id]` at index 2 draws `INVALID_ARGUMENT`.
+
+### RPC: GET_CUSTOMIZATION_CHOICES (sqTeoe)
+
+**Source:** `_web/artifacts.py::WebArtifactsAPI.get_customization_choices()`
+
+Live method `GetArtifactCustomizationChoices`. **Account-level:** `[]`, a bogus
+notebook id and every artifact type return the same ~3.3 KB table on both front
+doors, so only the request context is sent (the notebook id is appended when
+the caller has one; it only fills the ``project_id`` slot). Called with `allow_null=False`: the
+server always serves the table, so a null or re-shaped envelope is drift
+(`DecodingError`), never "no choices".
+
+```python
+params = [[2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]]]
+params = [<context>, notebook_id]   # when a notebook id is supplied
+```
+
+**Response:** `[[ <audio>, <video>, <slide-deck>, <report presets> ]]` — one
+`ArtifactCustomizationChoices` message whose four one-field families each hold
+`[[row, ...]]`. Format rows are `[code, title, description]` (codes use
+`AudioFormat` / `VideoFormat` / `SlideDeckFormat` values), but this account/UI
+availability table is not an exhaustive enum manifest: dedicated options such
+as cinematic video may be omitted. Report rows are
+`[report_type, description, directive]`. The audio and video families (tags 1–2)
+are live-only — the APK schema declares only slides (3) and reports (4).
+Decoded via `_web/rows/customization.py`.

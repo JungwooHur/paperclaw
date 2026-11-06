@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from notebooklm import NotebookLMClient
-from notebooklm._auth import session as auth_session
+from notebooklm._web.transport import session_auth as auth_session
 
 from ._contract import ScenarioError, ScenarioResult, require, run_scenario
 
@@ -50,7 +50,7 @@ async def scenario() -> ScenarioResult:
     async with NotebookLMClient.from_storage(profile=PROFILE) as c:
         before = await c.notebooks.list()
         before_ids = tuple(sorted(item.id for item in before))
-        live = c._collaborators.kernel.get_http_client().cookies
+        live = c._require_web_runtime().kernel.get_http_client().cookies
         live.clear()
         after = await c.notebooks.list()
         after_ids = tuple(sorted(item.id for item in after))

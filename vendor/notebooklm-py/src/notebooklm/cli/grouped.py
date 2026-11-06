@@ -35,11 +35,21 @@ def _json_requested(args: Sequence[str] | None) -> bool:
     return False
 
 
+class ConfigurationClickException(click.ClickException):
+    """A configuration problem found before any command runs.
+
+    Rendered like any ``ClickException``, but reported as ``CONFIG_ERROR`` in
+    the ``--json`` envelope, matching configuration errors raised by commands.
+    """
+
+    error_code = "CONFIG_ERROR"
+
+
 def _emit_json_click_error(exc: click.ClickException) -> NoReturn:
     """Emit a Click exception through the canonical JSON error envelope."""
     output_error(
         exc.format_message(),
-        "VALIDATION_ERROR",
+        getattr(exc, "error_code", "VALIDATION_ERROR"),
         json_output=True,
         exit_code=exc.exit_code,
     )
@@ -49,9 +59,9 @@ class SectionedGroup(click.Group):
     """Click group that displays commands organized in sections.
 
     Instead of a flat alphabetical list, commands are grouped by function:
-    - Session: login, use, status, clear, doctor, auth, completion
-    - Notebooks: list, create, delete, rename, summary, metadata
-    - Chat: ask, suggest-prompts, configure, history
+    - Session: login, use, status, usage, clear, doctor, auth, completion
+    - Notebooks: list, create, copy, delete, rename, summary, metadata
+    - Chat: ask, suggest-prompts, suggest-next-steps, configure, history
     - Command Groups: source, artifact, note, label, collection, share, research,
       profile, agent, skill, language, mcp (show subcommands)
     - Artifact Actions: generate, download (show types)
@@ -61,9 +71,12 @@ class SectionedGroup(click.Group):
     # Regular commands - show help text
     command_sections = OrderedDict(
         [
-            ("Session", ["login", "use", "status", "clear", "doctor", "auth", "completion"]),
-            ("Notebooks", ["list", "create", "delete", "rename", "summary", "metadata"]),
-            ("Chat", ["ask", "suggest-prompts", "configure", "history"]),
+            (
+                "Session",
+                ["login", "use", "status", "usage", "clear", "doctor", "auth", "completion"],
+            ),
+            ("Notebooks", ["list", "create", "copy", "delete", "rename", "summary", "metadata"]),
+            ("Chat", ["ask", "suggest-prompts", "suggest-next-steps", "configure", "history"]),
         ]
     )
 

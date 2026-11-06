@@ -2,7 +2,7 @@
 """RPC Health Check - Verify NotebookLM RPC method IDs are still valid.
 
 This script makes minimal API calls to exercise RPC methods and verify
-that the method IDs in rpc/types.py still match what the API returns.
+that the method IDs in rpc/_identifiers.py still match what the API returns.
 
 Exit codes:
     0 - All RPC methods OK (or only transient errors: rate-limits / ReadTimeouts)
@@ -10,11 +10,9 @@ Exit codes:
     2 - Authentication or infrastructure failure (not an RPC problem)
     3 - One or more RPC methods returned a non-transient ERROR
         (timeouts, parse failures, unexpected HTTP errors)
-    4 - Studio-customization cohort flip: the ``sqTeoe`` tripwire
-        (GetArtifactCustomizationChoices) returned non-null, meaning our
-        account migrated to the new customization surface and the VideoStyle /
-        format codes must be re-captured. GATED-null is the expected steady
-        state and is NOT a failure.
+    4 - Studio option-table drift: ``GetArtifactCustomizationChoices`` served
+        an unknown format code or omitted a required AudioFormat / VideoFormat /
+        SlideDeckFormat choice (re-capture the contract; #1597 class)
     5 - Stale frontend build label: the ``bl`` value pinned in
         ``_env.DEFAULT_BL`` trails the label the app shell actually serves by
         more than ``_env.BUILD_LABEL_STALE_AFTER_DAYS``. Ordinary week-to-week
@@ -22,7 +20,7 @@ Exit codes:
         clears as soon as it is bumped (#2073).
 
 Priority order when multiple statuses are present:
-    MISMATCH (1) > AUTH (2) > non-transient ERROR (3) > cohort MIGRATED (4)
+    MISMATCH (1) > AUTH (2) > non-transient ERROR (3) > customization DRIFT (4)
     > build label STALE (5) > OK (0)
 
 Transient errors that still exit 0 are limited to rate-limit signals
@@ -73,7 +71,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
+import traceback
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
@@ -84,12 +84,12 @@ from uuid import uuid4
 
 import httpx
 
-from notebooklm._artifact.payloads import build_retry_artifact_params
+try:
+    from scripts._ci_rpc_progress import live_progress, progress_note, progress_phase, trace_probe
+except ModuleNotFoundError:
+    from _ci_rpc_progress import live_progress, progress_note, progress_phase, trace_probe
+
 from notebooklm._auth.tokens import LoadPolicy, _load_stored_auth
-from notebooklm._chat.wire import (
-    build_streaming_chat_request,
-    parse_streaming_chat_response,
-)
 from notebooklm._env import (
     BUILD_LABEL_STALE_AFTER_DAYS,
     DEFAULT_BL,
@@ -102,9 +102,29 @@ from notebooklm._env import (
     get_default_language,
 )
 from notebooklm._logging import scrub_secrets
-from notebooklm._notebooks import build_create_notebook_params
+from notebooklm._url_utils import is_notebooklm_unavailable_redirect
+from notebooklm._web.params.artifacts import (
+    build_customization_choices_params as _build_customization_choices_params,
+)
+from notebooklm._web.params.artifacts import build_retry_artifact_params
+from notebooklm._web.params.chat_stream import build_streaming_chat_request
+from notebooklm._web.params.notebooks import build_create_notebook_params
+from notebooklm._web.rows.chat_stream import parse_streaming_chat_response
+from notebooklm._web.rows.customization import unwrap_customization_choices
+from notebooklm._web.wire.decoder import (
+    collect_rpc_ids,
+    decode_response,
+    parse_chunked_response,
+    strip_anti_xssi,
+)
 from notebooklm.auth import AuthTokens
-from notebooklm.exceptions import ChatError, ChatResponseParseError, DecodingError
+from notebooklm.exceptions import (
+    ChatError,
+    ChatResponseParseError,
+    DecodingError,
+    RateLimitError,
+    UnknownRPCMethodError,
+)
 from notebooklm.paths import get_storage_path
 from notebooklm.rpc import (
     RPCError,
@@ -113,13 +133,8 @@ from notebooklm.rpc import (
     encode_rpc_request,
     get_batchexecute_url,
 )
-from notebooklm.rpc.decoder import (
-    collect_rpc_ids,
-    decode_response,
-    parse_chunked_response,
-    strip_anti_xssi,
-)
 from notebooklm.rpc.types import _QUERY_ENDPOINT_PATH
+from notebooklm.types import AudioFormat, SlideDeckFormat, VideoFormat
 
 
 class CheckStatus(str, Enum):
@@ -131,20 +146,27 @@ class CheckStatus(str, Enum):
     SKIPPED = "SKIPPED"
 
 
-class CohortStatus(str, Enum):
-    """Result of the ``sqTeoe`` studio-customization cohort tripwire.
+class CustomizationStatus(str, Enum):
+    """Result of the ``GET_CUSTOMIZATION_CHOICES`` studio option-table cross-check.
 
-    ``GetArtifactCustomizationChoices`` (rpc id ``sqTeoe``) is gated off for our
-    consumer cohort and returns ``null`` unconditionally today (``GATED`` — the
-    expected steady state, NOT a failure). The day it starts returning a
-    non-null payload our account has been migrated to the new studio-customization
-    surface (``MIGRATED`` — a loud signal: the VideoStyle/format codes must be
-    re-captured). ``UNKNOWN`` covers a transient/transport failure on the probe
-    itself (no cohort conclusion drawn — never an alarm).
+    ``GetArtifactCustomizationChoices`` serves the Studio "Customize" tables —
+    the audio / video / slide-deck format rows whose integer codes the client
+    hardcodes as ``AudioFormat`` / ``VideoFormat`` / ``SlideDeckFormat``. The
+    probe compares the served ``(code, label)`` pairs against those enums while
+    allowing documented availability-table omissions: ``MATCH`` is the steady
+    state; ``DRIFT`` means a served family has a new code or dropped a required
+    choice and the contract must be re-captured (#1597 was exactly this failure
+    class); ``UNKNOWN`` covers a transport / parse failure on the probe itself
+    (no conclusion drawn — never an alarm). Label changes are reported only.
+
+    Replaces the earlier ``sqTeoe`` "cohort tripwire", which sent a shape the
+    server rejects (``[nbctx, None, 3]`` draws ``INVALID_ARGUMENT``) and then
+    read its own rejection as the expected gated steady state, so it could
+    never fire (#2284).
     """
 
-    GATED = "GATED"
-    MIGRATED = "MIGRATED"
+    MATCH = "MATCH"
+    DRIFT = "DRIFT"
     UNKNOWN = "UNKNOWN"
 
 
@@ -158,7 +180,8 @@ class RebrandProbeStatus(str, Enum):
     state change, and never suppress a real one later.
 
     ``UNKNOWN`` is server-side or transport noise (rate limit, 5xx, connection
-    failure). ``UNAUTHENTICATED`` is the answer "we were not signed in for that
+    failure), or a redirect to a known marketing/access gate.
+    ``UNAUTHENTICATED`` is the answer "we were not signed in for that
     request" — an HTTP 401/403 or a redirect into Google's sign-in flow. That
     is a statement about this run's credentials, NOT about the endpoint, so it
     must never overwrite a recorded PRESENT: measured 2026-08-04 across five
@@ -182,9 +205,20 @@ RECORDED_REBRAND_STATUSES: frozenset[RebrandProbeStatus] = frozenset(
 )
 
 
-# Studio-customization cohort tripwire RPC. NOT in ``RPCMethod`` (it is gated off
-# for our consumer cohort, so there is no typed/public path), called by raw id.
-_CUSTOMIZATION_CHOICES_RPC_ID = "sqTeoe"
+# The Studio option-table cross-check compares these served families against the
+# client enums (``compare_customization_choices``). The third item lists modelled
+# codes whose absence is not drift. ``sqTeoe`` is an account/UI availability
+# table, not an exhaustive wire-enum manifest: CINEMATIC uses a dedicated
+# generation flow and has been observed both present (2026-09-01) and absent
+# (2026-09-02, #2313) while format code 3 remains supported. Report presets are
+# free text and only checked for presence. NOTE: the served table has no
+# VideoStyle family, so the ``VideoStyle`` codes (#1597) are still not watched by
+# any lane.
+_CUSTOMIZATION_FAMILIES: tuple[tuple[str, type[Enum], frozenset[int]], ...] = (
+    ("audio", AudioFormat, frozenset()),
+    ("video", VideoFormat, frozenset({VideoFormat.CINEMATIC.value})),
+    ("slide_deck", SlideDeckFormat, frozenset()),
+)
 
 
 class BuildLabelStatus(str, Enum):
@@ -250,6 +284,7 @@ FULL_MODE_ONLY_METHODS = {
     RPCMethod.CREATE_NOTE,
     RPCMethod.CREATE_ARTIFACT,  # Main RPC for all artifacts - test with flashcards (fast)
     RPCMethod.START_FAST_RESEARCH,  # Starts research (verify RPC ID, don't wait)
+    RPCMethod.DISCOVER_SOURCES,  # Synchronous discovery (~8 s; also records a job)
     # Delete operations (tested after creates)
     RPCMethod.DELETE_NOTE,
     RPCMethod.DELETE_SOURCE,
@@ -376,6 +411,9 @@ async def load_auth(storage_path: Path | None) -> AuthTokens:
         )
         return loaded.auth
     except FileNotFoundError as e:
+        progress_note(
+            "Authentication failed: credentials missing; configure CI auth or run notebooklm login"
+        )
         # ``e`` names the storage path that was actually checked — under
         # profiles that is the only way to see which one the script resolved.
         print(
@@ -385,6 +423,9 @@ async def load_auth(storage_path: Path | None) -> AuthTokens:
         )
         sys.exit(2)
     except ValueError as e:
+        progress_note(
+            "Authentication failed: stored credentials invalid or expired; inspect auth report"
+        )
         # Name the auth source. The file branch of ``_load_storage_state``
         # re-raises a bare ``json`` error carrying no context at all, so a
         # corrupt storage_state.json would otherwise print only
@@ -395,6 +436,9 @@ async def load_auth(storage_path: Path | None) -> AuthTokens:
         )
         sys.exit(2)
     except httpx.HTTPError as e:
+        progress_note(
+            "Authentication failed: network error while fetching tokens; inspect auth report"
+        )
         # ``httpx`` exception strings can echo full request URLs including
         # ``f.sid=<session_id>`` query params, so scrub before logging.
         print(
@@ -472,9 +516,10 @@ async def make_rpc_request(
     except httpx.HTTPStatusError as e:
         return None, f"HTTP {e.response.status_code}"
     except httpx.RequestError as e:
-        # ``httpx.ReadTimeout`` can stringify to ``""``; fall back to the
-        # class name so callers don't mislabel it as an empty response (#864).
-        return None, str(e) or type(e).__name__
+        # RequestError messages can contain the complete request URL, including
+        # the managed notebook handle in ``source-path``. Reports are durable,
+        # so expose only the useful transport category.
+        return None, type(e).__name__
 
 
 async def make_rpc_call(
@@ -508,9 +553,10 @@ async def make_rpc_call(
         found_ids = collect_rpc_ids(chunks)
         return found_ids, None
     except (json.JSONDecodeError, ValueError, IndexError, TypeError) as e:
-        return [], f"Parse error: {e}"
+        return [], f"Parse error: {type(e).__name__}"
 
 
+@trace_probe()
 async def test_rpc_method(
     client: httpx.AsyncClient,
     auth: AuthTokens,
@@ -552,6 +598,7 @@ async def test_rpc_method(
     )
 
 
+@trace_probe()
 async def test_rpc_method_with_data(
     client: httpx.AsyncClient,
     auth: AuthTokens,
@@ -604,7 +651,7 @@ async def test_rpc_method_with_data(
             status=CheckStatus.ERROR,
             expected_id=expected_id,
             found_ids=[],
-            error=f"Parse error: {e}",
+            error=f"Parse error: {type(e).__name__}",
         ), None
 
     status = CheckStatus.OK if expected_id in found_ids else CheckStatus.ERROR
@@ -644,6 +691,12 @@ def get_test_params(method: RPCMethod, notebook_id: str | None) -> list[Any] | N
     if method == RPCMethod.LIST_NOTEBOOKS:
         return []
 
+    if method == RPCMethod.GET_ACCOUNT:
+        return []
+
+    if method == RPCMethod.LIST_QUOTA_SUMMARY:
+        return [None]
+
     # Global settings (no notebook required)
     if method == RPCMethod.GET_USER_SETTINGS:
         # Params to read current settings
@@ -653,6 +706,11 @@ def get_test_params(method: RPCMethod, notebook_id: str | None) -> list[Any] | N
         # Params structure: [[[null,[[null,null,null,null,["language_code"]]]]]]
         # Use "en" as safe language code
         return [[[None, [[None, None, None, None, ["en"]]]]]]
+
+    # An unknown chat session is safe and does not require a notebook ID. Keep
+    # this above the notebook guard so quick mode still probes the read-only RPC.
+    if method == RPCMethod.GET_CHAT_SESSION_STATUS:
+        return [None, "placeholder_conv_id"]
 
     # Methods that require a notebook ID
     if not notebook_id:
@@ -714,6 +772,26 @@ def get_test_params(method: RPCMethod, notebook_id: str | None) -> list[Any] | N
             None,
         ]
 
+    # SUGGEST_NEXT_STEPS (NextStepSuggestions): like SUGGEST_PROMPTS the
+    # follow-up questions only exist once a notebook has indexed sources, so
+    # route to a stable read-only notebook when one is configured. Field 1 is
+    # unused (leading None); omitting field 3 scopes to every source. A bogus
+    # notebook draws NOT_FOUND, which still echoes the RPC id.
+    if method == RPCMethod.SUGGEST_NEXT_STEPS:
+        stable_id = (
+            os.environ.get("NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID")
+            or os.environ.get("NOTEBOOKLM_GENERATION_NOTEBOOK_ID")
+            or notebook_id
+        )
+        return [None, stable_id]
+
+    # GET_CUSTOMIZATION_CHOICES (GetArtifactCustomizationChoices) is account-
+    # level: the server ignores the notebook id (an empty request returns the
+    # same 3.3 KB table), so only the request context is sent. This is the
+    # shape the former ``sqTeoe`` probe should have used (#2284).
+    if method == RPCMethod.GET_CUSTOMIZATION_CHOICES:
+        return build_customization_choices_params(None)
+
     # LIST_ARTIFACTS has special params
     if method == RPCMethod.LIST_ARTIFACTS:
         return [[2], notebook_id, 'NOT artifact.status = "ARTIFACT_STATUS_SUGGESTED"']
@@ -732,6 +810,14 @@ def get_test_params(method: RPCMethod, notebook_id: str | None) -> list[Any] | N
     # Source operations (read-only - use placeholder IDs)
     if method == RPCMethod.GET_SOURCE:
         return [[notebook_id], ["placeholder_source_id"]]
+
+    if method == RPCMethod.RETRIEVE_RELEVANT_CHUNKS:
+        stable_id = (
+            os.environ.get("NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID")
+            or os.environ.get("NOTEBOOKLM_GENERATION_NOTEBOOK_ID")
+            or notebook_id
+        )
+        return [stable_id, "RPC health check", None, [1]]
 
     if method in (RPCMethod.REFRESH_SOURCE, RPCMethod.CHECK_SOURCE_FRESHNESS):
         return [[notebook_id], [["placeholder"]]]
@@ -790,6 +876,7 @@ def get_test_params(method: RPCMethod, notebook_id: str | None) -> list[Any] | N
     return None
 
 
+@trace_probe()
 async def check_method(
     client: httpx.AsyncClient,
     auth: AuthTokens,
@@ -910,6 +997,7 @@ class _ChatQueryProbe:
 CHAT_QUERY_PROBE = _ChatQueryProbe()
 
 
+@trace_probe("CHAT GENERATE_FREE_FORM_STREAMED", proof="streamed-chat framing recognized")
 async def check_chat_query(
     client: httpx.AsyncClient,
     auth: AuthTokens,
@@ -972,15 +1060,14 @@ async def check_chat_query(
             error=f"HTTP {e.response.status_code}",
         )
     except httpx.RequestError as e:
-        # ``httpx.ReadTimeout`` can stringify to ``""``; fall back to the class
-        # name so the downstream transient classifier (and the operator) sees a
-        # usable signal — same posture as ``make_rpc_request`` (#864).
+        # Keep the transport class while withholding the request URL, which can
+        # carry the managed notebook handle.
         return CheckResult(
             method=CHAT_QUERY_PROBE,  # type: ignore[arg-type]
             status=CheckStatus.ERROR,
             expected_id=CHAT_QUERY_PROBE.value,
             found_ids=[],
-            error=str(e) or type(e).__name__,
+            error=type(e).__name__,
         )
 
     try:
@@ -998,20 +1085,20 @@ async def check_chat_query(
             status=CheckStatus.ERROR,
             expected_id=CHAT_QUERY_PROBE.value,
             found_ids=[],
-            error=f"Parse error: {e}",
+            error=f"Parse error: {type(e).__name__}",
         )
-    except ChatError as e:
+    except (ChatError, RateLimitError) as e:
         # A recognized server-side ``"er"`` / rate-limit frame: the wire shape
         # is INTACT (the parser identified the frame), the server simply
         # declined this request. Treat as OK — the contract is healthy. The
-        # message is preserved for the operator (and so a rate-limit frame
-        # stays visible), but it does not fail the canary.
+        # exception category stays visible, but the raw server message does
+        # not enter a durable report.
         return CheckResult(
             method=CHAT_QUERY_PROBE,  # type: ignore[arg-type]
             status=CheckStatus.OK,
             expected_id=CHAT_QUERY_PROBE.value,
             found_ids=[CHAT_QUERY_PROBE.value],
-            error=f"Server declined (recognized frame): {e}",
+            error=f"Server declined (recognized frame): {type(e).__name__}",
         )
 
     return CheckResult(
@@ -1022,24 +1109,82 @@ async def check_chat_query(
     )
 
 
-def build_customization_choices_params(notebook_id: str) -> list[Any]:
-    """Build ``sqTeoe`` (GetArtifactCustomizationChoices) params for ``notebook_id``.
+def build_customization_choices_params(notebook_id: str | None) -> list[Any]:
+    """Params for ``GET_CUSTOMIZATION_CHOICES``: the request context, plus the
+    notebook id when one is known.
 
-    Reverse-engineered (live-verified) request shape: ``[nbctx, None, artifact_type]``
-    where ``nbctx`` is the standard notebook-context options wrapper and
-    ``artifact_type`` is ``3`` (video) — the surface whose VideoStyle/format codes
-    we most want an early migration signal for. Extracted as a helper so the wire
-    shape is testable without a live call.
+    Delegates to the production builder so the canary probes exactly the shape
+    the client sends. The earlier hand-rolled ``[nbctx, None, 3]`` drew
+    ``INVALID_ARGUMENT`` on every account, which the old tripwire then read as
+    its expected null steady state (#2284).
     """
-    nbctx = [
-        2,
-        None,
-        None,
-        [1, None, None, None, None, None, None, None, None, None, [1]],
-        [notebook_id],
-    ]
-    artifact_type = 3  # video
-    return [nbctx, None, artifact_type]
+    return _build_customization_choices_params(notebook_id)
+
+
+def _normalize_choice_label(title: str) -> str:
+    """``"Deep Dive"`` -> ``"DEEP_DIVE"`` (the enum member-name convention)."""
+    return re.sub(r"[^A-Z0-9]+", "_", title.upper()).strip("_")
+
+
+def compare_customization_choices(data: Any) -> tuple[CustomizationStatus, str]:
+    """Compare a decoded ``GET_CUSTOMIZATION_CHOICES`` payload with the client enums.
+
+    ``DRIFT`` is drawn on the **wire codes** only: a served code the enum lacks,
+    a required choice the server no longer offers, an empty family, an
+    unmodelled fifth family, or no well-formed report preset. A documented
+    optional row may be absent without implying that its wire format was
+    removed. Labels are compared too but only *reported* in the detail string —
+    the probe sends ``hl`` from ``NOTEBOOKLM_HL`` and Google renames copy freely,
+    so a label delta must not file a breakage issue on its own (#1597 was a code
+    move, not a rename).
+    """
+    view = unwrap_customization_choices(
+        data, method_id=RPCMethod.GET_CUSTOMIZATION_CHOICES.value, source="rpc-health"
+    )
+    rows_by_family = {
+        "audio": view.audio_rows,
+        "video": view.video_rows,
+        "slide_deck": view.slide_deck_rows,
+    }
+    problems: list[str] = []
+    notes: list[str] = []
+    for family, enum_type, optional_codes in _CUSTOMIZATION_FAMILIES:
+        served = {row.code: row.title for row in rows_by_family[family] if row.is_well_formed}
+        expected = {member.value: member.name for member in enum_type}
+        if not served:
+            problems.append(f"{family}: no rows served")
+            continue
+        extra = sorted(set(served) - set(expected))
+        missing = sorted(set(expected) - optional_codes - set(served))
+        if extra:
+            problems.append(
+                f"{family}: served codes not modelled {[(code, served[code]) for code in extra]}"
+            )
+        if missing:
+            problems.append(
+                f"{family}: modelled codes not served "
+                f"{[(code, expected[code]) for code in missing]}"
+            )
+        renamed = [
+            (code, served[code], expected[code])
+            for code in sorted(set(served) & set(expected))
+            if _normalize_choice_label(served[code]) != expected[code]
+        ]
+        if renamed:
+            notes.append(f"{family}: label differs from member name {renamed}")
+    families_raw = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else []
+    if len(families_raw) > len(_CUSTOMIZATION_FAMILIES) + 1:
+        problems.append(
+            f"{len(families_raw) - len(_CUSTOMIZATION_FAMILIES) - 1} unmodelled family slot(s) served"
+        )
+    if not any(row.is_well_formed for row in view.report_rows):
+        problems.append("reports: no well-formed presets served")
+    if problems:
+        return CustomizationStatus.DRIFT, "; ".join(problems + notes)
+    detail = "served codes are modelled and all required customization choices are present"
+    if notes:
+        detail += " (" + "; ".join(notes) + ")"
+    return CustomizationStatus.MATCH, detail
 
 
 async def make_raw_rpc_request(
@@ -1051,12 +1196,10 @@ async def make_raw_rpc_request(
 ) -> tuple[str | None, str | None]:
     """Issue a batchexecute call by *raw* rpc id (for methods not in ``RPCMethod``).
 
-    The cohort tripwire probes ``sqTeoe``, which has no ``RPCMethod`` member (it
-    is gated for our cohort), so it cannot go through ``make_rpc_request``. This
-    mirrors that function's wire assembly but threads the id straight into both
-    the ``rpcids=`` query param and ``encode_rpc_request``'s ``rpc_id_override``
-    (the two MUST stay in sync). It calls the executor directly — there is no
-    idempotency registry in this script, so no retries to disable.
+    Not called by the health lanes themselves any more (the former ``sqTeoe``
+    probe was its last caller); kept for the tests and for ad-hoc probes of ids
+    that have no ``RPCMethod`` member yet (see #2283). ``make_rpc_request``
+    covers the modelled methods.
     """
     query_params = {
         "rpcids": rpc_id,
@@ -1080,59 +1223,59 @@ async def make_raw_rpc_request(
     except httpx.HTTPStatusError as e:
         return None, f"HTTP {e.response.status_code}"
     except httpx.RequestError as e:
-        # httpx.RequestError subclasses can stringify the failed request URL,
-        # which carries f.sid; scrub before it reaches a live print site.
-        return None, scrub_secrets(str(e) or type(e).__name__)
+        return None, type(e).__name__
 
 
-async def check_customization_cohort(
+@trace_probe("CUSTOMIZATION GET_CUSTOMIZATION_CHOICES (sqTeoe)")
+async def check_customization_table(
     client: httpx.AsyncClient,
     auth: AuthTokens,
     notebook_id: str | None,
-) -> tuple[CohortStatus, str]:
-    """Probe ``sqTeoe`` to detect a studio-customization cohort flip.
+) -> tuple[CustomizationStatus, str]:
+    """Probe ``GET_CUSTOMIZATION_CHOICES`` and cross-check the served enums.
 
-    ``GetArtifactCustomizationChoices`` returns ``null`` for our gated consumer
-    cohort. We decode with ``allow_null=True`` so a genuine null payload is
-    ``GATED`` (the steady state, not a failure) — but the *absent-id* drift guard
-    inside ``decode_response`` still fires if the id stopped being echoed (that
-    surfaces as a parse error here and is reported as ``UNKNOWN``, not silently
-    swallowed). A non-null payload means our account was migrated to the new
-    customization surface (``MIGRATED`` — re-capture VideoStyle codes).
+    The table is account-level (the server ignores the notebook id), so the
+    probe runs with or without a notebook. ``UNKNOWN`` is drawn for any
+    transport / parse failure so a transient flake never alarms; a decoded
+    table is compared by :func:`compare_customization_choices`.
 
-    Returns ``(status, detail)``. ``UNKNOWN`` is drawn for any transport/parse
-    failure so the tripwire never alarms on a transient flake; only a clean,
-    decoded non-null result is ``MIGRATED``.
+    ``RPCError`` (including ``UnknownRPCMethodError`` from the absent-id drift
+    guard) must propagate so an id rotation / protocol break surfaces LOUDLY
+    rather than degrading to a quiet ``UNKNOWN``; any other ``RPCError`` is a
+    probe failure and draws ``UNKNOWN`` rather than crashing the canary.
     """
-    if not notebook_id:
-        return CohortStatus.UNKNOWN, "No notebook ID provided (cohort tripwire needs one)"
-
-    response_text, error = await make_raw_rpc_request(
+    response_text, error = await make_rpc_request(
         client,
         auth,
-        _CUSTOMIZATION_CHOICES_RPC_ID,
+        RPCMethod.GET_CUSTOMIZATION_CHOICES,
         build_customization_choices_params(notebook_id),
-        source_path=f"/notebook/{notebook_id}",
+        source_path=f"/notebook/{notebook_id}" if notebook_id else "/",
     )
     if error is not None:
-        return CohortStatus.UNKNOWN, error
+        return CustomizationStatus.UNKNOWN, error
     if response_text is None:
-        return CohortStatus.UNKNOWN, "Empty response from server"
+        return CustomizationStatus.UNKNOWN, "Empty response from server"
 
-    # RPCError (incl. UnknownRPCMethodError from the absent-id drift guard) must
-    # propagate so the tripwire LOUDLY surfaces an id rotation / protocol break
-    # rather than degrading it to a quiet UNKNOWN. Bare ValueError likewise
-    # propagates — it signals a code bug (e.g. an invalid int() conversion), not
-    # API shape drift. Only a genuinely unreadable/malformed JSON root is caught
-    # and reported as UNKNOWN here.
+    # ``UnknownRPCMethodError`` (the absent-id drift guard) must propagate so an
+    # id rotation surfaces LOUDLY; every other RPCError — a status-bearing null,
+    # a server rejection — is a probe failure, not an enum conclusion, and must
+    # not take the whole canary down (the regular GET_CUSTOMIZATION_CHOICES row
+    # already reports the id echo). ``allow_null=False`` keeps a null from being
+    # read as an empty table.
     try:
-        data = decode_response(response_text, _CUSTOMIZATION_CHOICES_RPC_ID, allow_null=True)
+        data = decode_response(
+            response_text, RPCMethod.GET_CUSTOMIZATION_CHOICES.value, allow_null=False
+        )
+    except UnknownRPCMethodError:
+        raise
+    except RPCError as e:
+        return CustomizationStatus.UNKNOWN, f"RPC error: {scrub_secrets(e)}"
     except (json.JSONDecodeError, TypeError) as e:
-        return CohortStatus.UNKNOWN, f"Parse error: {scrub_secrets(e)}"
-
-    if data is None:
-        return CohortStatus.GATED, "null (gated — expected steady state)"
-    return CohortStatus.MIGRATED, "non-null payload (cohort migrated)"
+        return CustomizationStatus.UNKNOWN, f"Parse error: {scrub_secrets(e)}"
+    try:
+        return compare_customization_choices(data)
+    except DecodingError as e:
+        return CustomizationStatus.DRIFT, f"unrecognized envelope: {scrub_secrets(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1242,8 +1385,9 @@ def classify_rebrand_status(
 ) -> tuple[RebrandProbeStatus, str] | None:
     """Map a non-200 HTTP status to a lane verdict, or None to keep inspecting.
 
-    Rate limits and 5xx are ``UNKNOWN`` (server-side noise — never a state
-    change). 401/403 and redirects into the sign-in flow are
+    Rate limits, 5xx, and redirects to marketing/access-gate hosts are
+    ``UNKNOWN`` (no endpoint availability evidence — never a state change).
+    401/403 and redirects into the sign-in flow are
     ``UNAUTHENTICATED``: they establish that *this request* was not
     authenticated, which is not evidence the endpoint is absent, so they must
     not overwrite a recorded PRESENT (#2062). Everything else non-200 is
@@ -1260,6 +1404,11 @@ def classify_rebrand_status(
             f"HTTP {status_code} (not authenticated for this host — no conclusion drawn)",
         )
     if 300 <= status_code < 400:
+        if location and is_notebooklm_unavailable_redirect(location):
+            return (
+                RebrandProbeStatus.UNKNOWN,
+                f"HTTP {status_code} redirect to access gate — no conclusion drawn",
+            )
         if is_login_redirect(location):
             return (
                 RebrandProbeStatus.UNAUTHENTICATED,
@@ -1269,6 +1418,7 @@ def classify_rebrand_status(
     return RebrandProbeStatus.ABSENT, f"HTTP {status_code}"
 
 
+@trace_probe("REBRAND LIST_NOTEBOOKS (wXbhsf)")
 async def probe_rebrand_batchexecute(
     client: httpx.AsyncClient,
     auth: AuthTokens,
@@ -1312,7 +1462,7 @@ async def probe_rebrand_batchexecute(
         return RebrandProbe(
             REBRAND_BATCHEXECUTE,
             RebrandProbeStatus.UNKNOWN,
-            scrub_secrets(str(e) or type(e).__name__),
+            type(e).__name__,
         )
 
     verdict = classify_rebrand_status(response.status_code, response.headers.get("location"))
@@ -1344,6 +1494,7 @@ async def probe_rebrand_batchexecute(
     )
 
 
+@trace_probe("REBRAND GENERATE_FREE_FORM_STREAMED")
 async def probe_rebrand_chat(
     client: httpx.AsyncClient,
     auth: AuthTokens,
@@ -1386,7 +1537,7 @@ async def probe_rebrand_chat(
         return RebrandProbe(
             REBRAND_CHAT,
             RebrandProbeStatus.UNKNOWN,
-            scrub_secrets(str(e) or type(e).__name__),
+            type(e).__name__,
         )
 
     verdict = classify_rebrand_status(response.status_code, response.headers.get("location"))
@@ -1405,7 +1556,7 @@ async def probe_rebrand_chat(
             RebrandProbeStatus.ABSENT,
             "HTTP 200 but the body is not a streamed-chat response",
         )
-    except ChatError as e:
+    except (ChatError, RateLimitError) as e:
         return RebrandProbe(
             REBRAND_CHAT,
             RebrandProbeStatus.PRESENT,
@@ -1614,7 +1765,7 @@ async def fetch_app_shell(client: httpx.AsyncClient, url: str) -> tuple[str | No
         try:
             response = await client.get(url)
         except httpx.RequestError as e:
-            return None, scrub_secrets(str(e) or type(e).__name__)
+            return None, type(e).__name__
         if response.status_code == 200:
             return response.text, ""
         if not 300 <= response.status_code < 400:
@@ -1692,6 +1843,7 @@ def classify_build_label(served: str | None, detail: str) -> BuildLabelProbe:
     return BuildLabelProbe(BuildLabelStatus.DRIFTED, drift, DEFAULT_BL, served, days)
 
 
+@trace_probe("BUILD_LABEL app shell")
 async def check_build_label(client: httpx.AsyncClient) -> BuildLabelProbe:
     """Read the served build label off the app shell and score the pin against it.
 
@@ -1771,6 +1923,9 @@ async def setup_temp_resources(
     # Response format: [title, None, notebook_id, ...]
     temp.notebook_id = extract_id(data, 2)
     if not temp.notebook_id:
+        progress_note(
+            "WARNING: notebook ID not returned; dependent probes cannot run; cleanup may be needed"
+        )
         print(
             "WARNING: Notebook created but ID not found in response. May need manual cleanup.",
             file=sys.stderr,
@@ -1810,15 +1965,7 @@ async def setup_temp_resources(
     if result.status == CheckStatus.OK:
         temp.source_id = extract_id(data, 0, 0)
         if not temp.source_id:
-            # Decoded response may carry residual credential-shaped substrings
-            # (cookies/CSRF tokens echoed in error payloads, etc.). Scrub the
-            # FULL repr before slicing — slicing first risks chopping a
-            # secret-shaped substring (e.g. ``cookie: SID=ab|cd``) at the
-            # 200-char boundary, leaving the prefix outside the scrub
-            # patterns. Scrub-then-truncate keeps the redaction intact even
-            # if the bytes after position 200 carried the matching anchor.
-            preview = scrub_secrets(repr(data))[:200]
-            print(f"  WARNING: ADD_SOURCE ID extraction failed. Response: {preview}")
+            print("  WARNING: ADD_SOURCE ID extraction failed; response body withheld")
 
     # Test ADD_SOURCE_FILE - registers file source intent (no actual upload needed)
     # Params format: [[[filename]], notebook_id, [2], [1, None, ...]]
@@ -1850,6 +1997,21 @@ async def setup_temp_resources(
     )
     results.append(result)
     print(format_check_with_success(result, "research started"))
+
+    # Test DISCOVER_SOURCES - one synchronous discovery round trip (~8 s live).
+    # Same request message as START_FAST_RESEARCH; the response is
+    # [sources, overview, [job_id]] and the job it records is deleted with the
+    # temp notebook.
+    await asyncio.sleep(CALL_DELAY)
+    result = await test_rpc_method(
+        client,
+        auth,
+        RPCMethod.DISCOVER_SOURCES,
+        [["test query", 1], None, 1, temp.notebook_id],  # 1 = Web search, mode 1 = default
+        source_path=f"/notebook/{temp.notebook_id}",
+    )
+    results.append(result)
+    print(format_check_with_success(result, "sources discovered"))
 
     # Test CREATE_NOTE - extract note_id from response[0]
     # Params format: [notebook_id, "", [1], None, title]
@@ -1912,12 +2074,7 @@ async def setup_temp_resources(
             # Artifact ID is at response[0][0]
             temp.artifact_id = extract_id(data, 0, 0)
             if not temp.artifact_id:
-                # Same scrub-then-truncate ordering as the ADD_SOURCE
-                # failure site upstream — slicing first risks chopping a
-                # cookie / CSRF token at the 200-char boundary and
-                # missing the scrub-pattern anchor.
-                preview = scrub_secrets(repr(data))[:200]
-                print(f"  WARNING: CREATE_ARTIFACT ID extraction failed. Response: {preview}")
+                print("  WARNING: CREATE_ARTIFACT ID extraction failed; response body withheld")
 
         # Probe LIST_ARTIFACTS briefly so artifact generation gets a grace
         # period before DELETE_ARTIFACT cleanup.
@@ -1955,6 +2112,9 @@ async def setup_temp_resources(
                 )
     else:
         # Skip artifact tests - no source_id available
+        progress_note(
+            "setup: SKIPPED CREATE_ARTIFACT; source creation did not yield a usable source"
+        )
         print("SKIP     CREATE_ARTIFACT - No source_id available (source extraction failed)")
 
     return temp
@@ -1988,7 +2148,7 @@ async def cleanup_temp_resources(
             results.append(result)
             print(format_check_with_success(result, "temp note deleted"))
         except Exception as e:
-            print(f"ERROR    DELETE_NOTE - {e}")
+            print(f"ERROR    DELETE_NOTE - {type(e).__name__}")
 
     # Test DELETE_SOURCE if we have a source (best effort)
     if temp.source_id:
@@ -2004,7 +2164,7 @@ async def cleanup_temp_resources(
             results.append(result)
             print(format_check_with_success(result, "temp source deleted"))
         except Exception as e:
-            print(f"ERROR    DELETE_SOURCE - {e}")
+            print(f"ERROR    DELETE_SOURCE - {type(e).__name__}")
 
     # Test DELETE_ARTIFACT if we have an artifact (best effort)
     if temp.artifact_id:
@@ -2020,7 +2180,7 @@ async def cleanup_temp_resources(
             results.append(result)
             print(format_check_with_success(result, "temp artifact deleted"))
         except Exception as e:
-            print(f"ERROR    DELETE_ARTIFACT - {e}")
+            print(f"ERROR    DELETE_ARTIFACT - {type(e).__name__}")
 
     # ALWAYS delete notebook - this is critical to avoid orphaned notebooks
     try:
@@ -2029,8 +2189,11 @@ async def cleanup_temp_resources(
         results.append(result)
         print(format_check_with_success(result, "temp notebook deleted"))
     except Exception as e:
-        print(f"ERROR    DELETE_NOTEBOOK - {e}")
-        print(f"WARNING: Notebook {temp.notebook_id} may need manual cleanup", file=sys.stderr)
+        print(f"ERROR    DELETE_NOTEBOOK - {type(e).__name__}")
+        print(
+            "WARNING: A temporary RPC-health notebook may need manual cleanup",
+            file=sys.stderr,
+        )
 
 
 async def run_health_check(
@@ -2040,13 +2203,13 @@ async def run_health_check(
     rebrand_state_path: Path | None = None,
     rebrand_previous_state_path: Path | None = None,
     rebrand_run_id: str | None = None,
-) -> tuple[list[CheckResult], CohortStatus, dict[str, Any], BuildLabelProbe]:
+) -> tuple[list[CheckResult], CustomizationStatus, dict[str, Any], BuildLabelProbe]:
     """Run health check on all RPC methods.
 
-    Returns ``(results, cohort_status, rebrand_state, build_label)``: the
-    per-method ``CheckResult`` list, the ``sqTeoe`` studio-customization cohort
-    tripwire verdict (reported and exit-coded separately from RPC drift; see
-    :class:`CohortStatus`), the rebrand-host lane's state document (reported
+    Returns ``(results, customization_status, rebrand_state, build_label)``: the
+    per-method ``CheckResult`` list, the ``sqTeoe`` studio option-table cross-check
+    verdict (reported and exit-coded separately from RPC drift; see
+    :class:`CustomizationStatus`), the rebrand-host lane's state document (reported
     separately and NEVER exit-coded; see :func:`probe_rebrand_host`), and the
     pinned-vs-served build-label verdict (its own exit code; see
     :func:`check_build_label`).
@@ -2071,7 +2234,7 @@ async def run_health_check(
 
     results: list[CheckResult] = []
     temp_resources = TempResources()
-    cohort_status = CohortStatus.UNKNOWN
+    customization_status = CustomizationStatus.UNKNOWN
     # A no-observation verdict, so an early failure yields a well-formed lane that
     # alarms about nothing rather than a missing attribute in the summary.
     build_label = classify_build_label(None, "lane did not run")
@@ -2082,9 +2245,11 @@ async def run_health_check(
     )
     previous_state_path = rebrand_previous_state_path or rebrand_state_path
 
+    progress_phase("authentication")
     storage_path = resolve_storage_path()
     print(f"Fetching auth tokens... (source: {describe_auth_source(storage_path)})")
     auth = await load_auth(storage_path)
+    progress_note("Authentication ready; RPC-ID checks validate response IDs, not full behavior")
     print(f"Auth OK (CSRF token length: {len(auth.csrf_token)})")
     print(f"  base host:     {httpx.URL(get_base_url()).host} (from: {base_url_source})")
     print(f"  account route: {auth.account_route}")
@@ -2095,6 +2260,7 @@ async def run_health_check(
     async with build_probe_client(auth) as client:
         try:
             if full_mode:
+                progress_phase("setup")
                 print("Creating temp resources for full testing...")
                 temp_resources = await setup_temp_resources(client, auth, results)
                 if temp_resources.notebook_id:
@@ -2107,6 +2273,10 @@ async def run_health_check(
             print(f"Checking {total} RPC methods...")
             print("=" * 60)
 
+            progress_phase("method inventory")
+            progress_note(
+                f"Checking {total} registered RPC methods; skipped probes include a reason"
+            )
             for i, method in enumerate(methods, 1):
                 result = await check_method(client, auth, method, notebook_id, full_mode)
                 results.append(result)
@@ -2130,6 +2300,7 @@ async def run_health_check(
             # so it is checked separately from the method-ID loop above — but
             # its ``CheckResult`` flows through the same summary + exit-code
             # machinery so chat drift fails the canary like any other probe.
+            progress_phase("chat framing")
             chat_result = await check_chat_query(client, auth, notebook_id)
             results.append(chat_result)
             chat_icon = STATUS_ICONS[chat_result.status]
@@ -2138,16 +2309,17 @@ async def run_health_check(
                 chat_line += f" - {scrub_secrets(chat_result.error)}"
             print(chat_line)
 
-            # Studio-customization cohort tripwire. Distinct from the RPC-drift
-            # probes: GATED-null is the expected steady state (NOT a failure),
-            # MIGRATED is a loud signal that the customization surface flipped and
-            # the VideoStyle/format codes must be re-captured.
-            cohort_status, cohort_detail = await check_customization_cohort(
+            # Studio option-table cross-check. Distinct from the RPC-drift probes
+            # (the id echo is already covered by the regular GET_CUSTOMIZATION_CHOICES
+            # row): MATCH is the steady state, DRIFT is the loud signal that the
+            # served format codes / labels no longer agree with the client enums.
+            progress_phase("customization tables")
+            customization_status, customization_detail = await check_customization_table(
                 client, auth, notebook_id
             )
             print(
-                "COHORT   sqTeoe customization choices: "
-                f"{cohort_status.value} - {scrub_secrets(cohort_detail)}"
+                "CUSTOMIZATION sqTeoe option tables: "
+                f"{customization_status.value} - {scrub_secrets(customization_detail)}"
             )
 
             # Build-label lane. One plain GET of the app shell, scored against
@@ -2155,6 +2327,7 @@ async def run_health_check(
             # only STALE is exit-coded, and it clears itself the moment the
             # constant is bumped.
             await asyncio.sleep(CALL_DELAY)
+            progress_phase("build label")
             build_label = await check_build_label(client)
             for line in format_build_label_lane(build_label):
                 print(line)
@@ -2163,6 +2336,7 @@ async def run_health_check(
             # never join ``results``, so they cannot reach ``partition_errors``
             # / ``compute_exit_code`` and cannot poison the main lane's
             # title-deduped issue.
+            progress_phase("rebrand endpoints")
             rebrand_probes = await probe_rebrand_host(client, auth, notebook_id)
             rebrand_state = build_rebrand_state(
                 rebrand_probe_host(),
@@ -2177,10 +2351,11 @@ async def run_health_check(
         finally:
             if full_mode and temp_resources.notebook_id:
                 print()
+                progress_phase("cleanup")
                 print("Testing DELETE operations during cleanup...")
                 await cleanup_temp_resources(client, auth, temp_resources, results)
 
-    return results, cohort_status, rebrand_state, build_label
+    return results, customization_status, rebrand_state, build_label
 
 
 # Substrings that mark an ERROR as a transient signal. Keep this list
@@ -2189,11 +2364,9 @@ async def run_health_check(
 # Currently classified as transient:
 #   * ``HTTP 429`` and gRPC ``RESOURCE_EXHAUSTED`` — explicit rate-limit
 #     signals from the backend.
-#   * ``API rate limit`` — catches the decoder's user-displayable messages
-#     raised as ``RateLimitError`` ("API rate limit exceeded..." and
-#     "API rate limit or quota exceeded..."). These reach the canary via
-#     the ``except RPCError`` parse-error branch in
-#     ``test_rpc_method_with_data`` and were previously misclassified.
+#   * ``Parse error: RateLimitError`` — the redacted typed marker emitted
+#     when the decoder rejects a user-displayable quota response. The legacy
+#     ``API rate limit`` marker remains for older safe reports.
 #   * ``ReadTimeout`` — ``httpx.ReadTimeout`` against Google's RPC
 #     endpoints is almost always server-side slowness, not an RPC
 #     contract change. It consistently passes on retry (see #1004 and
@@ -2209,6 +2382,8 @@ TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
     "HTTP 429",
     "RESOURCE_EXHAUSTED",
     "API rate limit",
+    "Parse error: RateLimitError",
+    "Chat rate limit",
     "ReadTimeout",
 )
 
@@ -2250,7 +2425,7 @@ def partition_errors(
 def compute_exit_code(
     counts: Counter[CheckStatus],
     non_transient_errors: list[CheckResult],
-    cohort_status: CohortStatus = CohortStatus.UNKNOWN,
+    customization_status: CustomizationStatus = CustomizationStatus.UNKNOWN,
     build_label_status: BuildLabelStatus = BuildLabelStatus.UNKNOWN,
 ) -> int:
     """Compute the script exit code from result counts.
@@ -2259,12 +2434,12 @@ def compute_exit_code(
         1. MISMATCH  -> 1
         2. AUTH      -> 2 (signaled by the caller via sys.exit, never reached here)
         3. non-transient ERROR -> 3
-        4. cohort MIGRATED -> 4 (sqTeoe tripwire flipped; loud but not RPC drift)
+        4. customization DRIFT -> 4 (served studio option codes disagree with the client enums)
         5. build label STALE -> 5 (DEFAULT_BL left unattended; hygiene, not an outage)
         6. OK        -> 0
 
-    The cohort flip sits *below* the RPC-drift codes so a run that has both real
-    drift AND a cohort flip still surfaces the higher-severity drift exit; the
+    The option-table drift sits *below* the RPC-drift codes so a run that has both
+    real drift AND an enum drift still surfaces the higher-severity drift exit; the
     flip is reported in the summary either way. A stale build label sits lower
     still: it is a maintenance signal about a constant the server does not even
     validate today (#2073), so it must never mask a live breakage.
@@ -2279,7 +2454,7 @@ def compute_exit_code(
         return 1
     if non_transient_errors:
         return 3
-    if cohort_status == CohortStatus.MIGRATED:
+    if customization_status == CustomizationStatus.DRIFT:
         return 4
     if build_label_status == BuildLabelStatus.STALE:
         return 5
@@ -2288,7 +2463,7 @@ def compute_exit_code(
 
 def print_summary(
     results: list[CheckResult],
-    cohort_status: CohortStatus = CohortStatus.UNKNOWN,
+    customization_status: CustomizationStatus = CustomizationStatus.UNKNOWN,
     rebrand_state: dict[str, Any] | None = None,
     build_label: BuildLabelProbe | None = None,
 ) -> int:
@@ -2329,7 +2504,10 @@ def print_summary(
             print(f"  {r.method.name}:")
             print(f"    Expected: '{r.expected_id}'")
             print(f"    Found:    {r.found_ids}")
-            print(f"    Action:   Update RPCMethod.{r.method.name} in src/notebooklm/rpc/types.py")
+            print(
+                f"    Action:   Update RPCMethod.{r.method.name} in "
+                "src/notebooklm/rpc/_identifiers.py"
+            )
             print()
 
     # Print details for errors, split into non-transient (real failures)
@@ -2349,9 +2527,9 @@ def print_summary(
             print(f"  [transient]     {r.method.name} ({r.expected_id}): {scrub_secrets(r.error)}")
         print()
 
-    # Cohort tripwire line. GATED-null is the expected steady state (a PASS, not
-    # a failure); MIGRATED is the loud flip the canary exists to surface.
-    print(f"COHORT:   sqTeoe customization choices = {cohort_status.value}")
+    # Option-table cross-check line. MATCH is the steady state (a PASS); DRIFT is
+    # the loud enum-recapture signal the canary exists to surface.
+    print(f"CUSTOMIZATION: sqTeoe option tables = {customization_status.value}")
 
     # Rebrand-host lane summary. Informational only — it is printed after the
     # exit-coded buckets and read by none of them. ``upload`` is always
@@ -2376,10 +2554,12 @@ def print_summary(
         )
 
     # Return exit code.
-    # Priority: MISMATCH (1) > non-transient ERROR (3) > cohort MIGRATED (4)
+    # Priority: MISMATCH (1) > non-transient ERROR (3) > customization DRIFT (4)
     # > build label STALE (5) > OK (0).
     # AUTH (2) is signaled earlier via sys.exit(2) and never reaches here.
-    exit_code = compute_exit_code(counts, non_transient_errors, cohort_status, build_label_status)
+    exit_code = compute_exit_code(
+        counts, non_transient_errors, customization_status, build_label_status
+    )
 
     if exit_code == 1:
         print("RESULT: FAIL - RPC ID mismatches detected")
@@ -2390,8 +2570,12 @@ def print_summary(
         print("       These are real failures (not rate-limit transients).")
         return 3
     if exit_code == 4:
-        print("RESULT: COHORT FLIP - sqTeoe returned non-null (studio customization migrated)")
-        print("       Re-capture VideoStyle / format codes in src/notebooklm/rpc/types.py.")
+        print(
+            "RESULT: CUSTOMIZATION DRIFT - served studio format codes/labels differ from the client"
+        )
+        print(
+            "       Re-capture AudioFormat / VideoFormat / SlideDeckFormat in src/notebooklm/_types/enums.py."
+        )
         return 4
     if exit_code == 5:
         detail = build_label.detail if build_label else ""
@@ -2505,6 +2689,12 @@ def main() -> int:
             "consumer can verify the document it reads was produced by this run."
         ),
     )
+    parser.add_argument(
+        "--progress-fd",
+        type=int,
+        default=None,
+        help="Additional file descriptor for safe live probe diagnostics (CI)",
+    )
     args = parser.parse_args()
 
     source = describe_base_url_source(args.base_url is not None)
@@ -2514,21 +2704,37 @@ def main() -> int:
         except ValueError as e:
             parser.error(str(e))
 
-    mode_str = "FULL" if args.full else "QUICK"
-    print(f"RPC Health Check ({mode_str} mode)")
-    print("=" * 60)
-    print()
+    with live_progress(args.progress_fd):
+        mode_str = "FULL" if args.full else "QUICK"
+        print(f"RPC Health Check ({mode_str} mode)")
+        print("=" * 60)
+        print()
 
-    results, cohort_status, rebrand_state, build_label = asyncio.run(
-        run_health_check(
-            full_mode=args.full,
-            base_url_source=source,
-            rebrand_state_path=args.rebrand_state_file,
-            rebrand_previous_state_path=args.rebrand_previous_state_file,
-            rebrand_run_id=args.rebrand_run_id,
-        )
-    )
-    return print_summary(results, cohort_status, rebrand_state, build_label)
+        try:
+            results, customization_status, rebrand_state, build_label = asyncio.run(
+                run_health_check(
+                    full_mode=args.full,
+                    base_url_source=source,
+                    rebrand_state_path=args.rebrand_state_file,
+                    rebrand_previous_state_path=args.rebrand_previous_state_file,
+                    rebrand_run_id=args.rebrand_run_id,
+                )
+            )
+            exit_code = print_summary(results, customization_status, rebrand_state, build_label)
+            counts = Counter(result.status.value for result in results)
+            progress_note(
+                f"RPC health finished: exit={exit_code}; "
+                + " ".join(f"{status}={count}" for status, count in sorted(counts.items()))
+            )
+            return exit_code
+        except SystemExit as error:
+            progress_note(f"RPC health stopped: exit={error.code}; see authentication diagnostics")
+            raise
+        except Exception as e:
+            progress_note("RPC health crashed: exit=2; see full diagnostic report")
+            print(f"\nFATAL: RPC health check crashed: {scrub_secrets(e)}", file=sys.stderr)
+            print(scrub_secrets(traceback.format_exc()), file=sys.stderr)
+            return 2
 
 
 if __name__ == "__main__":

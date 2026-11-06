@@ -1,25 +1,63 @@
 """Generate content CLI commands — thin Click handlers (ADR-0008).
 
-Plan validation, enum mapping, retry/wait orchestration, and per-kind
-generation execution live in the transport-neutral ``_app.generate`` core plus
-the CLI adapter in ``cli/services/generate.py``. Command-layer rendering and
-exit policy stay in this module. Tests patch ``console`` /
+Request validation, retry/wait orchestration, and per-kind generation execution
+live in the transport-neutral ``_app.generate`` core. This module constructs the
+typed requests and owns rendering and exit policy. Tests patch ``console`` /
 ``json_error_response`` / ``json_output_response`` / ``get_language`` /
 ``_output_mind_map_result`` as module-level attributes here, so those names
 remain imported at module scope and ``_output_mind_map_result`` +
 ``resolve_language`` remain defined inline rather than re-exported.
 """
 
+import contextlib
 import os
+from functools import wraps
 from typing import Any
 
 import click
 from click.core import ParameterSource
 
-from .._app.generate_retry import (
-    GenerationOutcome,
+from .._app.generate import GenerationExecutionResult, execute_generation
+from .._app.generate_retry import GenerationOutcome
+from .._app.generation_requests import (
+    UNSET,
+    AudioGenerationRequest,
+    DataTableGenerationRequest,
+    FlashcardsGenerationRequest,
+    GenerationRequest,
+    GenerationRequestValidationError,
+    GenerationValidationCode,
+    InfographicGenerationRequest,
+    MindMapGenerationRequest,
+    QuizGenerationRequest,
+    ReportGenerationRequest,
+    ReviseSlideGenerationRequest,
+    SlideDeckGenerationRequest,
+    SourceSelection,
+    build_generation_request,
 )
-from ..types import MindMap, MindMapResult
+from ..types import (
+    AudioFormat,
+    AudioLength,
+    InfographicDetail,
+    InfographicOrientation,
+    InfographicStyle,
+    MindMap,
+    MindMapKind,
+    MindMapResult,
+    QuizDifficulty,
+    QuizQuantity,
+    ReportFormat,
+    SlideDeckFormat,
+    SlideDeckLength,
+    VideoFormat,
+    VideoStyle,
+)
+from ._generate_render import (
+    format_generation_wait,
+    generation_display_name,
+    generation_exit_code,
+)
 from .auth_runtime import resolve_client_factory, with_client
 from .error_handler import current_json_output, output_error
 from .input import resolve_prompt
@@ -42,18 +80,92 @@ from .rendering import (
     json_error_response,
     json_output_response,
 )
-from .resolve import require_notebook
-from .services.generate import (
-    _INFOGRAPHIC_STYLE_MAP,
-    _QUIZ_DIFFICULTY_MAP,
-    _QUIZ_QUANTITY_MAP,
-    GenerationExecutionResult,
-    GenerationPlanValidationError,
-    build_generation_plan,
-    execute_generation,
-)
+from .resolve import require_notebook, resolve_notebook_id, resolve_source_ids
 
 DEFAULT_LANGUAGE = "en"
+
+_AUDIO_FORMAT_MAP = {
+    "deep-dive": AudioFormat.DEEP_DIVE,
+    "brief": AudioFormat.BRIEF,
+    "critique": AudioFormat.CRITIQUE,
+    "debate": AudioFormat.DEBATE,
+}
+_AUDIO_LENGTH_MAP = {
+    "short": AudioLength.SHORT,
+    "default": AudioLength.DEFAULT,
+    "long": AudioLength.LONG,
+}
+_VIDEO_FORMAT_MAP = {
+    "explainer": VideoFormat.EXPLAINER,
+    "brief": VideoFormat.BRIEF,
+    "cinematic": VideoFormat.CINEMATIC,
+    "short": VideoFormat.SHORT,
+}
+_VIDEO_STYLE_MAP = {
+    "auto": VideoStyle.AUTO_SELECT,
+    "custom": VideoStyle.CUSTOM,
+    "classic": VideoStyle.CLASSIC,
+    "whiteboard": VideoStyle.WHITEBOARD,
+    "kawaii": VideoStyle.KAWAII,
+    "anime": VideoStyle.ANIME,
+    "watercolor": VideoStyle.WATERCOLOR,
+    "retro-print": VideoStyle.RETRO_PRINT,
+    "heritage": VideoStyle.HERITAGE,
+    "paper-craft": VideoStyle.PAPER_CRAFT,
+}
+_VIDEO_VALIDATION_MESSAGES: dict[GenerationValidationCode, str] = {
+    "cinematic_style_prompt": "--style-prompt cannot be used with cinematic video",
+    "short_video_style": (
+        "--style/--style-prompt cannot be used with --format short "
+        "(short video has a fixed visual style)"
+    ),
+    "custom_style_prompt_required": "--style custom requires --style-prompt",
+    "style_prompt_requires_custom": "--style-prompt requires --style custom",
+}
+_SLIDE_FORMAT_MAP = {
+    "detailed": SlideDeckFormat.DETAILED_DECK,
+    "presenter": SlideDeckFormat.PRESENTER_SLIDES,
+}
+_SLIDE_LENGTH_MAP = {"default": SlideDeckLength.DEFAULT, "short": SlideDeckLength.SHORT}
+_QUIZ_QUANTITY_MAP = {
+    "fewer": QuizQuantity.FEWER,
+    "standard": QuizQuantity.STANDARD,
+    "more": QuizQuantity.MORE,
+}
+_QUIZ_DIFFICULTY_MAP = {
+    "easy": QuizDifficulty.EASY,
+    "medium": QuizDifficulty.MEDIUM,
+    "hard": QuizDifficulty.HARD,
+}
+_INFOGRAPHIC_ORIENTATION_MAP = {
+    "landscape": InfographicOrientation.LANDSCAPE,
+    "portrait": InfographicOrientation.PORTRAIT,
+    "square": InfographicOrientation.SQUARE,
+}
+_INFOGRAPHIC_DETAIL_MAP = {
+    "concise": InfographicDetail.CONCISE,
+    "standard": InfographicDetail.STANDARD,
+    "detailed": InfographicDetail.DETAILED,
+}
+_INFOGRAPHIC_STYLE_MAP = {
+    "auto": InfographicStyle.AUTO_SELECT,
+    "sketch-note": InfographicStyle.SKETCH_NOTE,
+    "professional": InfographicStyle.PROFESSIONAL,
+    "bento-grid": InfographicStyle.BENTO_GRID,
+    "editorial": InfographicStyle.EDITORIAL,
+    "instructional": InfographicStyle.INSTRUCTIONAL,
+    "bricks": InfographicStyle.BRICKS,
+    "clay": InfographicStyle.CLAY,
+    "anime": InfographicStyle.ANIME,
+    "kawaii": InfographicStyle.KAWAII,
+    "scientific": InfographicStyle.SCIENTIFIC,
+}
+_REPORT_FORMAT_MAP = {
+    "briefing-doc": ReportFormat.BRIEFING_DOC,
+    "study-guide": ReportFormat.STUDY_GUIDE,
+    "blog-post": ReportFormat.BLOG_POST,
+    "custom": ReportFormat.CUSTOM,
+}
 
 
 def resolve_language(language: str | None) -> str:
@@ -161,20 +273,29 @@ def _output_mind_map_result(result: Any, json_output: bool) -> None:
         console.print(mind_map)
 
 
-def _output_generation_outcome(outcome: GenerationOutcome, json_output: bool) -> None:
+def _output_generation_outcome(
+    outcome: GenerationOutcome,
+    json_output: bool,
+    display_name: str | None = None,
+) -> None:
     """Render a generation outcome and apply command-layer exit policy."""
+    display_name = display_name or outcome.kind.replace("-", " ")
     if outcome.status in {"failed", "rate_limited"}:
-        message = outcome.error or f"{outcome.artifact_type.title()} generation failed"
-        if outcome.hint is None:
-            output_error(message, outcome.error_code, json_output, outcome.exit_code)
-        else:
+        exit_code = generation_exit_code(outcome)
+        if outcome.status == "rate_limited":
             output_error(
-                message,
-                outcome.error_code,
+                f"{display_name.title()} generation rate limited by Google.",
+                "RATE_LIMITED",
                 json_output,
-                outcome.exit_code,
-                hint=outcome.hint,
+                exit_code,
+                hint=(
+                    "Daily quota may be exceeded. Try again in 1-24 hours, "
+                    "or use --retry N to retry automatically."
+                ),
             )
+        else:
+            message = outcome.error or f"{display_name.title()} generation failed"
+            output_error(message, "GENERATION_FAILED", json_output, exit_code)
         raise AssertionError("unreachable")  # pragma: no cover
 
     if json_output:
@@ -183,110 +304,121 @@ def _output_generation_outcome(outcome: GenerationOutcome, json_output: bool) ->
                 {"task_id": outcome.task_id, "status": "completed", "url": outcome.url}
             )
         else:
-            json_output_response({"task_id": outcome.task_id, "status": "pending"})
+            json_output_response({"task_id": outcome.task_id, "status": outcome.status})
         return
 
     if outcome.status == "completed":
         if outcome.url:
-            console.print(f"[green]{outcome.artifact_type.title()} ready:[/green] {outcome.url}")
+            console.print(f"[green]{display_name.title()} ready:[/green] {outcome.url}")
         else:
-            console.print(f"[green]{outcome.artifact_type.title()} ready[/green]")
+            console.print(f"[green]{display_name.title()} ready[/green]")
+    elif outcome.status == "scheduled":
+        console.print(f"[yellow]Scheduled:[/yellow] {outcome.task_id}")
+        console.print("Generation will run later at a time chosen by the server.")
     else:
         console.print(f"[yellow]Started:[/yellow] {outcome.task_id or outcome.raw_status}")
 
 
-def _render_generation_result(result: GenerationExecutionResult, json_output: bool) -> None:
+def _render_generation_result(
+    result: GenerationExecutionResult,
+    request: GenerationRequest,
+    json_output: bool,
+) -> None:
     if result.kind == "mind-map":
         _output_mind_map_result(result.mind_map, json_output)
         return
     if result.generation is None:
+        display_name = generation_display_name(request)
         output_error(
-            f"{result.display_name.title()} generation failed",
+            f"{display_name.title()} generation failed",
             "GENERATION_FAILED",
             json_output,
             1,
         )
         raise AssertionError("unreachable")  # pragma: no cover
-    _output_generation_outcome(result.generation, json_output)
+    _output_generation_outcome(
+        result.generation,
+        json_output,
+        display_name=generation_display_name(request),
+    )
 
 
-# Click-handler params that are not part of the service-layer raw_args
-# contract. ``ctx`` carries the parameter-source probe; ``client_auth`` is
-# the AuthTokens injected by ``@with_client``; ``prompt_file`` has already
-# been merged into ``description`` via ``resolve_prompt`` by the time the
-# handler calls ``_run_generate``.
-_NON_RAW_ARG_KEYS = frozenset({"ctx", "client_auth", "prompt_file"})
+def _source_selection(ctx: click.Context, source_ids: tuple[str, ...]) -> SourceSelection:
+    if ctx.get_parameter_source("source_ids") == ParameterSource.COMMANDLINE:
+        return tuple(source_ids)
+    return UNSET
 
 
-def _run_generate(*, kind: str, **handler_locals: Any) -> Any:
-    """Bridge a Click handler invocation into the service-layer pipeline.
+def _run_generate(
+    *,
+    ctx: click.Context,
+    client_auth: Any,
+    request: GenerationRequest,
+    json_output: bool,
+    notices: tuple[str, ...] = (),
+) -> Any:
+    """Resolve adapter references, execute a typed request, and render it."""
 
-    Each handler calls ``_run_generate(kind="...", **locals())`` after
-    resolving its description prompt. This shim filters out the
-    handler-only keys (``ctx`` / ``client_auth`` / ``prompt_file``),
-    runs ``require_notebook``, builds the plan (Click-time validation
-    runs here, so UsageErrors surface synchronously), then opens the
-    client and dispatches the async executor. Returns the coroutine the
-    ``@with_client`` decorator will run via ``asyncio.run``.
-    """
-    ctx = handler_locals["ctx"]
-    client_auth = handler_locals["client_auth"]
-    raw_args = {k: v for k, v in handler_locals.items() if k not in _NON_RAW_ARG_KEYS}
-    raw_args["notebook_id"] = require_notebook(raw_args["notebook_id"])
-    try:
-        plan = build_generation_plan(
-            kind,
-            raw_args,
-            parameter_explicit=lambda name: (
-                ctx.get_parameter_source(name) == ParameterSource.COMMANDLINE
-            ),
-            language_resolver=resolve_language,
-        )
-    except GenerationPlanValidationError as exc:
-        output_error(exc.message, exc.code, raw_args["json_output"], 1)
-        raise AssertionError("unreachable") from exc  # pragma: no cover
-
-    # Behavioral warnings (an input was actually dropped) surface even under
-    # --json — stdout stays pure JSON, but stderr must tell the caller. Purely
-    # informational notices (deprecations, format hints) are human-mode only.
-    for line in plan.stderr_warnings:
-        click.echo(line, err=True)
-    if not plan.json_output:
-        for line in plan.warnings:
+    if not json_output:
+        for line in notices:
             click.echo(line, err=True)
 
     async def _run() -> Any:
         async with resolve_client_factory(ctx)(client_auth) as client:
+            display_name = generation_display_name(request)
+
+            async def notebook_resolver(current_client: Any, reference: str) -> str:
+                return await resolve_notebook_id(
+                    current_client,
+                    reference,
+                    json_output=json_output,
+                )
+
+            async def source_resolver(
+                current_client: Any,
+                notebook_id: str,
+                references: tuple[str, ...],
+            ) -> list[str] | None:
+                return await resolve_source_ids(
+                    current_client,
+                    notebook_id,
+                    references,
+                    json_output=json_output,
+                )
+
             result = await execute_generation(
-                plan,
+                request,
                 client,
+                notebook_resolver=notebook_resolver,
+                source_resolver=source_resolver,
                 retry_sink=(
                     None
-                    if plan.json_output
+                    if json_output
                     else lambda event: console.print(
-                        f"[yellow]{plan.display_name.title()} rate limited. "
+                        f"[yellow]{display_name.title()} rate limited. "
                         f"Retrying in {int(event.delay)}s "
                         f"(attempt {event.next_attempt_number}/{event.total_attempts})...[/yellow]"
                     )
                 ),
-                wait_context=lambda message, resume_hint: status_with_elapsed(
-                    message,
-                    json_output=plan.json_output,
-                    resume_hint=resume_hint,
+                wait_context=lambda event: status_with_elapsed(
+                    format_generation_wait(event),
+                    json_output=json_output,
+                    resume_hint=f"notebooklm artifact poll {event.task_id}",
                 ),
                 wait_start_sink=(
                     None
-                    if plan.json_output
-                    else lambda task_id: console.print(
-                        f"[yellow]Generating {plan.display_name}...[/yellow] Task: {task_id}"
+                    if json_output
+                    else lambda event: console.print(
+                        f"[yellow]Generating {display_name}...[/yellow] Task: {event.task_id}"
                     )
                 ),
-                mind_map_context=lambda: status_with_elapsed(
-                    "Generating mind map...",
-                    json_output=plan.json_output,
+                mind_map_context=(
+                    contextlib.nullcontext
+                    if json_output
+                    else lambda: status_with_elapsed("Generating mind map...", json_output=False)
                 ),
             )
-            _render_generation_result(result, plan.json_output)
+            _render_generation_result(result, request, json_output)
 
     return _run()
 
@@ -320,7 +452,29 @@ def generate():
     pass
 
 
+def _with_deferred_client(f):
+    """Validate deferred CLI flags before authentication can perform network I/O."""
+    authenticated = with_client(f)
+
+    @wraps(f)
+    @click.pass_context
+    def wrapper(ctx, *args, **kwargs):
+        """Fail fast for conflicting or unsupported deferred generation flags."""
+        if kwargs.get("later"):
+            message = None
+            if kwargs.get("wait"):
+                message = "--later cannot be combined with --wait"
+            elif kwargs.get("video_format") == "cinematic" or ctx.info_name == "cinematic-video":
+                message = "Deferred generation is not supported for cinematic video"
+            if message is not None:
+                output_error(message, "VALIDATION_ERROR", kwargs.get("json_output", False), 1)
+        return authenticated(*args, **kwargs)
+
+    return wrapper
+
+
 @generate.command("audio")
+@click.option("--later", is_flag=True, help="Queue generation for later (usually a few hours).")
 @click.argument("description", default="", required=False)
 @prompt_file_option
 @notebook_option
@@ -344,7 +498,7 @@ def generate():
 @wait_polling_options(default_timeout=1200, default_interval=2)
 @retry_option
 @json_option
-@with_client
+@_with_deferred_client
 def generate_audio(
     ctx,
     description,
@@ -352,6 +506,7 @@ def generate_audio(
     notebook_id,
     audio_format,
     audio_length,
+    later,
     language,
     source_ids,
     wait,
@@ -373,10 +528,24 @@ def generate_audio(
       notebooklm generate audio -s src_001 -s src_002 "from specific sources"
     """
     description = resolve_prompt(description, prompt_file, "description")
-    return _run_generate(kind="audio", **locals())
+    request = AudioGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        source_ids=_source_selection(ctx, source_ids),
+        language=resolve_language(language),
+        instructions=description or None,
+        audio_format=_AUDIO_FORMAT_MAP[audio_format],
+        audio_length=_AUDIO_LENGTH_MAP[audio_length],
+        later=later,
+        wait=wait,
+        timeout=timeout,
+        interval=interval,
+        max_retries=max_retries,
+    )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 @generate.command("video")
+@click.option("--later", is_flag=True, help="Queue generation for later (usually a few hours).")
 @click.argument("description", default="", required=False)
 @prompt_file_option
 @notebook_option
@@ -423,7 +592,7 @@ def generate_audio(
 )
 @retry_option
 @json_option
-@with_client
+@_with_deferred_client
 def generate_video(
     ctx,
     description,
@@ -434,6 +603,7 @@ def generate_video(
     style_prompt,
     language,
     source_ids,
+    later,
     wait,
     timeout,
     interval,
@@ -458,12 +628,50 @@ def generate_video(
       notebooklm generate video -s src_001 "from specific source"
     """
     description = resolve_prompt(description, prompt_file, "description")
-    # ctx.info_name distinguishes the `cinematic-video` alias (which shares
-    # this callback) from the canonical `video` command. The alias kind
-    # enforces `--format cinematic` and the longer Veo-3 timeout default;
-    # see services/generate.py _build_cinematic_video_plan.
-    kind = "cinematic-video" if ctx.info_name == "cinematic-video" else "video"
-    return _run_generate(kind=kind, **{k: v for k, v in locals().items() if k != "kind"})
+    source_selection = _source_selection(ctx, source_ids)
+    alias_is_cinematic = ctx.info_name == "cinematic-video"
+    is_cinematic = alias_is_cinematic or video_format == "cinematic"
+    if alias_is_cinematic:
+        if (
+            ctx.get_parameter_source("video_format") == ParameterSource.COMMANDLINE
+            and video_format != "cinematic"
+        ):
+            output_error(
+                "--format must be 'cinematic' for the cinematic-video subcommand "
+                "(use 'generate video --format <other>' for other formats)",
+                "VALIDATION_ERROR",
+                json_output,
+                1,
+            )
+    try:
+        request = build_generation_request(
+            "cinematic-video" if alias_is_cinematic else "video",
+            notebook_id=require_notebook(notebook_id),
+            source_ids=source_selection,
+            language=resolve_language(language),
+            instructions=description or None,
+            video_format=_VIDEO_FORMAT_MAP[video_format],
+            video_style=_VIDEO_STYLE_MAP[style],
+            style_prompt=style_prompt,
+            later=later,
+            wait=wait,
+            timeout=(
+                timeout
+                if not is_cinematic
+                or ctx.get_parameter_source("timeout") == ParameterSource.COMMANDLINE
+                else 3600.0
+            ),
+            interval=interval,
+            max_retries=max_retries,
+        )
+    except GenerationRequestValidationError as exc:
+        output_error(
+            _VIDEO_VALIDATION_MESSAGES[exc.code],
+            "VALIDATION_ERROR",
+            json_output,
+            1,
+        )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 # Convenience alias: 'generate cinematic-video' delegates to 'generate video --format cinematic'.
@@ -486,6 +694,7 @@ alias_command(
 
 
 @generate.command("slide-deck")
+@click.option("--later", is_flag=True, help="Queue generation for later (usually a few hours).")
 @click.argument("description", default="", required=False)
 @prompt_file_option
 @notebook_option
@@ -509,7 +718,7 @@ alias_command(
 @wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
-@with_client
+@_with_deferred_client
 def generate_slide_deck(
     ctx,
     description,
@@ -519,6 +728,7 @@ def generate_slide_deck(
     deck_length,
     language,
     source_ids,
+    later,
     wait,
     timeout,
     interval,
@@ -537,7 +747,20 @@ def generate_slide_deck(
       notebooklm generate slide-deck "executive summary" --format presenter --length short
     """
     description = resolve_prompt(description, prompt_file, "description")
-    return _run_generate(kind="slide-deck", **locals())
+    request = SlideDeckGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        source_ids=_source_selection(ctx, source_ids),
+        language=resolve_language(language),
+        instructions=description or None,
+        slide_format=_SLIDE_FORMAT_MAP[deck_format],
+        slide_length=_SLIDE_LENGTH_MAP[deck_length],
+        later=later,
+        wait=wait,
+        timeout=timeout,
+        interval=interval,
+        max_retries=max_retries,
+    )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 @generate.command("revise-slide")
@@ -589,10 +812,21 @@ def generate_revise_slide(
       notebooklm generate revise-slide "Remove taxonomy" --artifact <id> --slide 3 --wait
     """
     description = resolve_prompt(description, prompt_file, "description", required=True)
-    return _run_generate(kind="revise-slide", **locals())
+    request = ReviseSlideGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        artifact_id=artifact_id,
+        slide_index=slide_index,
+        prompt=description,
+        wait=wait,
+        timeout=timeout,
+        interval=interval,
+        max_retries=max_retries,
+    )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 @generate.command("quiz")
+@click.option("--later", is_flag=True, help="Queue generation for later (usually a few hours).")
 @click.argument("description", default="", required=False)
 @prompt_file_option
 @notebook_option
@@ -613,7 +847,7 @@ def generate_revise_slide(
 @wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
-@with_client
+@_with_deferred_client
 def generate_quiz(
     ctx,
     description,
@@ -622,6 +856,7 @@ def generate_quiz(
     quantity,
     difficulty,
     source_ids,
+    later,
     wait,
     timeout,
     interval,
@@ -640,10 +875,23 @@ def generate_quiz(
       notebooklm generate quiz "test key concepts" --difficulty hard --quantity more
     """
     description = resolve_prompt(description, prompt_file, "description")
-    return _run_generate(kind="quiz", **locals())
+    request = QuizGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        source_ids=_source_selection(ctx, source_ids),
+        instructions=description or None,
+        quantity=_QUIZ_QUANTITY_MAP[quantity],
+        difficulty=_QUIZ_DIFFICULTY_MAP[difficulty],
+        later=later,
+        wait=wait,
+        timeout=timeout,
+        interval=interval,
+        max_retries=max_retries,
+    )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 @generate.command("flashcards")
+@click.option("--later", is_flag=True, help="Queue generation for later (usually a few hours).")
 @click.argument("description", default="", required=False)
 @prompt_file_option
 @notebook_option
@@ -664,7 +912,7 @@ def generate_quiz(
 @wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
-@with_client
+@_with_deferred_client
 def generate_flashcards(
     ctx,
     description,
@@ -673,6 +921,7 @@ def generate_flashcards(
     quantity,
     difficulty,
     source_ids,
+    later,
     wait,
     timeout,
     interval,
@@ -691,10 +940,23 @@ def generate_flashcards(
       notebooklm generate flashcards --quantity more --difficulty easy
     """
     description = resolve_prompt(description, prompt_file, "description")
-    return _run_generate(kind="flashcards", **locals())
+    request = FlashcardsGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        source_ids=_source_selection(ctx, source_ids),
+        instructions=description or None,
+        quantity=_QUIZ_QUANTITY_MAP[quantity],
+        difficulty=_QUIZ_DIFFICULTY_MAP[difficulty],
+        later=later,
+        wait=wait,
+        timeout=timeout,
+        interval=interval,
+        max_retries=max_retries,
+    )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 @generate.command("infographic")
+@click.option("--later", is_flag=True, help="Queue generation for later (usually a few hours).")
 @click.argument("description", default="", required=False)
 @prompt_file_option
 @notebook_option
@@ -722,7 +984,7 @@ def generate_flashcards(
 @wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
-@with_client
+@_with_deferred_client
 def generate_infographic(
     ctx,
     description,
@@ -733,6 +995,7 @@ def generate_infographic(
     style,
     language,
     source_ids,
+    later,
     wait,
     timeout,
     interval,
@@ -751,7 +1014,21 @@ def generate_infographic(
       notebooklm generate infographic --orientation portrait --detail detailed
     """
     description = resolve_prompt(description, prompt_file, "description")
-    return _run_generate(kind="infographic", **locals())
+    request = InfographicGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        source_ids=_source_selection(ctx, source_ids),
+        language=resolve_language(language),
+        instructions=description or None,
+        orientation=_INFOGRAPHIC_ORIENTATION_MAP[orientation],
+        detail_level=_INFOGRAPHIC_DETAIL_MAP[detail],
+        style=_INFOGRAPHIC_STYLE_MAP[style],
+        later=later,
+        wait=wait,
+        timeout=timeout,
+        interval=interval,
+        max_retries=max_retries,
+    )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 @generate.command("data-table")
@@ -790,7 +1067,17 @@ def generate_data_table(
       notebooklm generate data-table -s src_001 "timeline of events"
     """
     description = resolve_prompt(description, prompt_file, "description", required=True)
-    return _run_generate(kind="data-table", **locals())
+    request = DataTableGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        source_ids=_source_selection(ctx, source_ids),
+        language=resolve_language(language),
+        instructions=description,
+        wait=wait,
+        timeout=timeout,
+        interval=interval,
+        max_retries=max_retries,
+    )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 @generate.command("mind-map")
@@ -833,10 +1120,20 @@ def generate_mind_map(
     \b
     Use --json for machine-readable output.
     """
-    return _run_generate(kind="mind-map", **locals())
+    request = MindMapGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        source_ids=_source_selection(ctx, source_ids),
+        language=resolve_language(language),
+        instructions=instructions,
+        map_kind=(
+            MindMapKind.INTERACTIVE if map_kind == "interactive" else MindMapKind.NOTE_BACKED
+        ),
+    )
+    return _run_generate(ctx=ctx, client_auth=client_auth, request=request, json_output=json_output)
 
 
 @generate.command("report")
+@click.option("--later", is_flag=True, help="Queue generation for later (usually a few hours).")
 @click.argument("description", default="", required=False)
 @prompt_file_option
 @click.option(
@@ -859,7 +1156,7 @@ def generate_mind_map(
 @wait_polling_options(default_timeout=300, default_interval=2)
 @retry_option
 @json_option
-@with_client
+@_with_deferred_client
 def generate_report_cmd(
     ctx,
     description,
@@ -869,6 +1166,7 @@ def generate_report_cmd(
     source_ids,
     language,
     append_instructions,
+    later,
     wait,
     timeout,
     interval,
@@ -891,4 +1189,34 @@ def generate_report_cmd(
       notebooklm generate report --format study-guide --append "Target audience: beginners"
     """
     description = resolve_prompt(description, prompt_file, "description")
-    return _run_generate(kind="report", **locals())
+    actual_format = report_format
+    custom_prompt = description or None
+    if description and report_format == "briefing-doc":
+        actual_format = "custom"
+    notices: tuple[str, ...] = ()
+    if append_instructions and actual_format == "custom":
+        notices = (
+            "Warning: --append has no effect with --format custom. "
+            "Use the description argument instead.",
+        )
+        append_instructions = None
+    request = ReportGenerationRequest(
+        notebook_id=require_notebook(notebook_id),
+        source_ids=_source_selection(ctx, source_ids),
+        language=resolve_language(language),
+        report_format=_REPORT_FORMAT_MAP[actual_format],
+        custom_prompt=custom_prompt,
+        extra_instructions=append_instructions,
+        later=later,
+        wait=wait,
+        timeout=timeout,
+        interval=interval,
+        max_retries=max_retries,
+    )
+    return _run_generate(
+        ctx=ctx,
+        client_auth=client_auth,
+        request=request,
+        json_output=json_output,
+        notices=notices,
+    )

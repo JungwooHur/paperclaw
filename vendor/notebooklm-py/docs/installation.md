@@ -1,6 +1,6 @@
 # Installation
 
-**Last Updated:** 2026-08-05
+**Last Updated:** 2026-10-12
 
 This is the canonical installation guide for `notebooklm-py`. The README has a quickstart; everything else lives here.
 
@@ -28,7 +28,7 @@ This is the canonical installation guide for `notebooklm-py`. The README has a q
 
 ## Prerequisites
 
-- **Python 3.10 or later.** Tested and classified for 3.10, 3.11, 3.12, 3.13, 3.14. The CLI hard-fails with a clear error on older versions (see `_version_check.py`).
+- **Python 3.10 or later.** Tested and classified for 3.10, 3.11, 3.12, 3.13, 3.14, 3.15. The CLI hard-fails with a clear error on older versions (see `_version_check.py`).
 - **Operating systems.** macOS (primary development platform), Linux (Debian/Ubuntu, Fedora), Windows 10/11, WSL.
 - **`uv` (optional but recommended for contributors).** Install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or `brew install uv` / `winget install astral-sh.uv`. End users can use plain `pip` or `pipx`.
 - **Disk and bandwidth.** Base install is small (~10 MB). The first `notebooklm login` downloads Chromium (~170 MB; 30–90 s; **no progress bar** — be patient).
@@ -55,7 +55,19 @@ This is the canonical installation guide for `notebooklm-py`. The README has a q
 | **C — Library user** | `uv add notebooklm-py` (or `pip install notebooklm-py` inside your project venv) |
 | **D — Headless server / CI** | `pip install notebooklm-py` inside a venv/container; ship a `storage_state.json` (no Playwright) |
 | **E — Contributor** | `uv sync --frozen --extra browser --extra dev --extra markdown && uv run playwright install chromium && uv run pre-commit install` |
-| **F — Power user** | `uv tool install --python 3.12 "notebooklm-py[browser,cookies,markdown]"` (the `cookies` extra needs Python ≤ 3.12; `--python 3.12` makes uv provision a matching interpreter even if your default is 3.13+) |
+| **F — Power user** | `uv tool install "notebooklm-py[browser,cookies,markdown]"` |
+
+The Android backend is an opt-in runtime choice: install
+`notebooklm-py[android]` (plus `[browser]` for the one-time interactive
+bootstrap), create the profile's durable credential with
+`notebooklm login --master-token --account EMAIL`, then select Android with `--backend android`,
+`NOTEBOOKLM_BACKEND=android`, or `backend="android"` in Python. It mints
+short-lived mobile bearer tokens from `master_token.json`; typed namespace
+operations do not use Web cookies or fall back to the Web transport. Android
+dependencies are excluded from `[all]`. See the
+[Android backend guide](android/README.md) for setup and security details.
+The [selection workflow](https://teng-lin.github.io/notebooklm-py/diagrams/28-profile-auth-backend-selection.workflow.html) summarizes the
+argument, environment, and profile precedence used by every frontend.
 
 ---
 
@@ -75,19 +87,13 @@ The project ships `notebooklm skill install`, [SKILL.md](../SKILL.md), and [AGEN
 ```bash
 pip install "notebooklm-py[browser]"   # mandatory; errors must propagate
 
-# [cookies] (rookiepy) is optional and known to FAIL TO BUILD on Python 3.13+.
-# Skip it deliberately on 3.13+ rather than swallowing the error — that lets
-# *real* install failures (typos, network, PyPI outages) surface for the agent.
-if python -c "import sys; sys.exit(0 if sys.version_info < (3, 13) else 1)"; then
-    pip install "notebooklm-py[cookies]"   # errors propagate
-else
-    echo "Skipping [cookies] on Python 3.13+ (rookiepy unavailable). Use 'notebooklm login' interactively."
-fi
+pip install "notebooklm-py[cookies]"   # optional browser-cookie extraction
 ```
 
 > If `pip install` errors with `externally-managed-environment` (modern macOS / Debian system Python, [PEP 668](https://peps.python.org/pep-0668/)), retry with `uv tool install "notebooklm-py[browser]"` or `pipx install "notebooklm-py[browser]"` — isolated installs that don't touch system Python. Inside an active virtualenv, `pip` works as-is.
 
-**Why two separate calls (not `[browser,cookies]`):** the combined form is atomic — if `rookiepy` fails to compile, the whole install fails and the user gets **nothing**. Splitting means `[browser]` always succeeds; `[cookies]` is recoverable.
+The `[cookies]` extra is optional; install it only when importing cookies from an
+already signed-in browser. Interactive `notebooklm login` needs only `[browser]`.
 
 **Skill install (separate from the Python package):**
 
@@ -113,16 +119,16 @@ After login, `storage_state.json` persists at `~/.notebooklm/profiles/default/st
 
 <!-- not mirrored: headless-agent auth path; out of scope for the contributor README -->
 ```bash
-notebooklm login --browser-cookies auto    # rookiepy autodetects an installed browser
+notebooklm login --browser-cookies auto    # rookie-cookies autodetects an installed browser
 ```
 
-If the agent is in a no-display sandbox AND `[cookies]` isn't installed (Python 3.13+ skipped it), ask the user to run `notebooklm login` on a workstation and copy the resulting `~/.notebooklm/profiles/default/storage_state.json` to the agent's environment (or set `NOTEBOOKLM_AUTH_JSON`).
+If the agent is in a no-display sandbox and `[cookies]` isn't installed, ask the user to run `notebooklm login` on a workstation and copy the resulting `~/.notebooklm/profiles/default/storage_state.json` to the agent's environment (or set `NOTEBOOKLM_AUTH_JSON`).
 
 #### Sandboxed agents (Claude Cowork)
 
 **Claude Cowork** (Anthropic's sandboxed desktop agent for non-developers) and similar no-display sandboxes are a special case of the headless path above: there is no browser for `notebooklm login`, and the sandbox resets between sessions. Two adjustments make everything except `login` work:
 
-- **Bootstrap each session** with the base install — `[browser]`/Playwright is *not* needed here, only for `login` (which you run elsewhere, once):
+- **Bootstrap each session** with the base install — `[browser]`/Playwright is *not* needed for ordinary RPC use. It is needed only for interactive `login` or the explicitly enabled browser-backed L3 recovery path:
   <!-- not mirrored: Cowork per-session bootstrap; not part of the contributor flow -->
   ```bash
   pip install notebooklm-py    # queries/generation/download need no extras
@@ -155,7 +161,7 @@ notebooklm list --json                  # JSON list (may be empty for new accoun
 **Error strings the agent should grep:**
 
 - `"Playwright not installed"` → install `[browser]`
-- `"rookiepy"` (in stderr of `pip install`) → expected on Python 3.13+; skip `[cookies]` and use interactive `notebooklm login`
+- `"rookie-cookies"` → install or repair the `[cookies]` extra when using `--browser-cookies`
 - `"status": "ok"` (in `auth check --json`) → auth file present and parses; pair with `--test` for network validation
 
 ### B. End user
@@ -201,12 +207,13 @@ Embedding `notebooklm-py` in a Python application.
 
 **Post-install:** None for runtime use. To programmatically run interactive login from your app, add `[browser]` and run `playwright install chromium`.
 
-**Why no extras by default:** all RPC traffic uses `httpx`; auth is cookie-based (`src/notebooklm/auth.py`). Apps can ship a pre-generated `storage_state.json` and never touch Playwright.
+**Why no extras by default:** all RPC traffic uses `httpx`; auth is cookie-based (`src/notebooklm/auth.py`). Apps can ship a pre-generated `storage_state.json` and never touch Playwright. The optional browser-backed L3 recovery rung is unavailable unless `[browser]` is installed and explicitly enabled.
 
 **Verify:**
 
 ```python
 import notebooklm
+
 print(notebooklm.__version__)
 ```
 
@@ -216,7 +223,7 @@ print(notebooklm.__version__)
 
 **Recommended:** `pip install notebooklm-py`
 
-**Post-install (3-step recipe — Playwright is *not* required on the server):**
+**Post-install (3-step recipe — Playwright is *not* required on the server unless you explicitly opt into browser-backed L3 recovery):**
 
 1. **On a workstation with a display**, install with `[browser]` and log in once:
    <!-- not mirrored: headless-server bootstrap step 1 (Persona D); not part of contributor flow -->
@@ -233,7 +240,7 @@ print(notebooklm.__version__)
    ```
    **For CI, ship the master token — not a cookie snapshot.** A cookie snapshot
    is superseded by any other active client within ~10 minutes and is rejected
-   shortly after (see [auth-cookie-lifecycle.md §2.5](auth-cookie-lifecycle.md#25-four-timers-people-confuse)),
+   shortly after; use the session-refresh guidance in [Troubleshooting](troubleshooting.md#cookie-freshness-for-long-running--unattended-use),
    so a secret exported on a workstation is routinely dead before the run starts.
    A master token does not rotate. Write it to a file and mint a session per run:
 
@@ -242,7 +249,8 @@ print(notebooklm.__version__)
    # one-off, on the workstation: mint the master token, then ship it.
    # Plain `notebooklm login` (step 1) does NOT create master_token.json.
    pip install "notebooklm-py[headless]"
-   notebooklm login --master-token   # writes ~/.notebooklm/profiles/default/master_token.json
+   notebooklm login --master-token --account you@example.com
+   # writes ~/.notebooklm/profiles/default/master_token.json
    gh secret set NOTEBOOKLM_MASTER_TOKEN_JSON < ~/.notebooklm/profiles/default/master_token.json
 
    # in the job, before anything that authenticates.
@@ -338,7 +346,7 @@ pre-commit install
 
 **Why `uv sync --frozen` and not `uv pip install -e ".[all]"`:** the repo has a checked-in `uv.lock`. `uv sync --frozen` enforces the lockfile and fails fast on drift; `uv pip install` ignores the lockfile and re-resolves transitively (will silently get newer versions of `playwright`, `ruff`, etc.).
 
-**Why three extras and not `[all]`:** `[all]` is `pip` extras semantics. `uv sync --extra X` is the `uv` equivalent. `[all]` itself expands to six extras — `[browser, dev, headless, markdown, mcp, server]` — but the command above installs only three of them (`browser, dev, markdown`), the contributor subset. `cookies` is intentionally excluded from both (`rookiepy` build issues on Python 3.13+); `headless` / `mcp` / `server` are the other three `[all]` extras, omitted from the default contributor flow because those adapters are not needed for the standard local suite. Opt in via `--extra headless` / `--extra cookies` / `--extra mcp` / `--extra server` if needed.
+**Why three extras and not `[all]`:** `[all]` is `pip` extras semantics. `uv sync --extra X` is the `uv` equivalent. `[all]` itself expands to six extras — `[browser, dev, headless, markdown, mcp, server]` — but the command above installs only three of them (`browser, dev, markdown`), the contributor subset. `cookies` is intentionally excluded because browser-cookie extraction is optional; `headless` / `mcp` / `server` are the other three `[all]` extras, omitted from the default contributor flow because those adapters are not needed for the standard local suite. Opt in via `--extra headless` / `--extra cookies` / `--extra mcp` / `--extra server` if needed.
 
 **Why `browser` is part of the contributor install:** the default local test suite includes unit tests that import and patch `playwright.sync_api`, even though they do not launch a real browser. `uv sync --frozen --extra dev` installs pytest/ruff/mypy but not Playwright, so `uv run pytest` will fail with `ModuleNotFoundError: No module named 'playwright'`. Use the full contributor command above before running the default test suite.
 
@@ -366,11 +374,14 @@ uv run pre-commit run --all-files
 
 Non-default browsers, cookie extraction, markdown source dumps.
 
-> **Why this section uses the combined `[browser,cookies]` form** — unlike Persona A, which uses two separate `pip install` calls so a `rookiepy` build failure doesn't leave the user with nothing: power users explicitly opted in, know what `rookiepy` is, and prefer the all-or-nothing tradeoff (single command, no wrapping logic).
+The `[cookies]` extra is optional and can be installed alongside `[browser]` when
+you want browser-cookie extraction.
 
-> ⚠️  **Don't use `[all]` for power-user setups.** `[all]` deliberately *excludes* `cookies` (see [§ All vs All-Extras](#all-vs-all-extras)). If you `pip install "notebooklm-py[all]"` and then try `--browser-cookies`, you'll get an opaque `rookiepy` import error. For everything-and-the-kitchen-sink, use `pip install "notebooklm-py[browser,cookies,markdown]"` explicitly (Python ≤ 3.12 only).
+> **Don't use `[all]` for power-user setups.** `[all]` deliberately *excludes*
+> `cookies` (see [§ All vs All-Extras](#all-vs-all-extras)). Add the explicit
+> `[cookies]` extra when using `--browser-cookies`.
 
-- **`--browser-cookies` (no Playwright login):** `pip install "notebooklm-py[browser,cookies]"`. **Caveat:** `rookiepy` may fail to install on Python 3.13/3.14; use Python 3.12 or accept the risk. See [cli-reference.md#authentication-login](cli-reference.md#authentication-login) for the full `--browser-cookies` syntax, including `chrome::<profile-name-or-directory>` for one Chromium user-profile and `firefox::<container>` for Firefox Multi-Account Containers (on every OS — not just macOS). Use `notebooklm auth inspect --browser <browser>` for previewing available accounts before import.
+- **`--browser-cookies` (no Playwright login):** `pip install "notebooklm-py[browser,cookies]"`. The `cookies` extra installs `rookie-cookies` and supports Python 3.13+. See [cli-reference.md#authentication-login](cli-reference.md#authentication-login) for the full syntax, including `chrome::<profile-name-or-directory>` and `firefox::<container>`. Use `notebooklm auth inspect --browser <browser>` for previewing available accounts before import.
 - **Markdown source dumps:** `pip install "notebooklm-py[markdown]"` for `notebooklm source fulltext -f markdown`.
 - **Edge instead of Chromium:** install Microsoft Edge from [microsoft.com/edge](https://www.microsoft.com/edge) first — `--browser msedge` does NOT auto-install Edge (only `--browser chromium` auto-installs). Then `notebooklm login --browser msedge`.
 - **Multi-account (personal + work):** see [configuration.md#multiple-accounts](configuration.md#multiple-accounts). Common power-user flow: `notebooklm profile create work && notebooklm -p work login --browser-cookies edge --account work@corp.com`. Use `--all-accounts` to bootstrap profiles for every signed-in Google account in one command.
@@ -385,14 +396,15 @@ Source of truth: `pyproject.toml` `[project.optional-dependencies]`.
 |---|---|---|---|---|
 | (none) | `httpx`, `click`, `rich`, `filelock` | All RPC operations, all CLI commands except `login`. Suffices when you ship a `storage_state.json`. | `pip install notebooklm-py` | `uv add notebooklm-py` |
 | `browser` | `playwright>=1.40.0` | `notebooklm login` (interactive). | `pip install "notebooklm-py[browser]"` | `uv add "notebooklm-py[browser]"` |
-| `cookies` | `rookiepy>=0.1.0` | `notebooklm login --browser-cookies <browser>`, `notebooklm auth inspect`. | `pip install "notebooklm-py[cookies]"` | `uv add "notebooklm-py[cookies]"` |
-| `headless` | `gpsoauth>=1.1.0` | `notebooklm login --master-token` — headless auth that mints/refreshes web cookies from a durable master token, no per-session browser. Pure-Python (in `all`). See [§ D](#d-headless-server-or-ci). | `pip install "notebooklm-py[headless]"` | `uv add "notebooklm-py[headless]"` |
-| `impersonate` | `curl_cffi>=0.11` | **Experimental.** Browser TLS/JA3 impersonation transport — set `NOTEBOOKLM_TRANSPORT=curl_cffi` to route the authenticated API surface through a Chrome-fingerprinted connection (insurance vs TLS fingerprint-gating); override the profile with `NOTEBOOKLM_IMPERSONATE` (default `chrome`, e.g. `safari`, `chrome131`). Native wheels. | `pip install "notebooklm-py[impersonate]"` | `uv add "notebooklm-py[impersonate]"` |
+| `cookies` | `rookie-cookies>=0.1.0` | `notebooklm login --browser-cookies <browser>`, `notebooklm auth inspect`. | `pip install "notebooklm-py[cookies]"` | `uv add "notebooklm-py[cookies]"` |
+| `headless` | `gpsoauth>=1.1.0` | `notebooklm login --master-token --account EMAIL` — headless auth that mints/refreshes web cookies from a durable master token, no per-session browser. Pure-Python (in `all`). See [§ D](#d-headless-server-or-ci). | `pip install "notebooklm-py[headless]"` | `uv add "notebooklm-py[headless]"` |
+| `android` | exact pinned `grpcio` + `protobuf`, plus `gpsoauth>=1.1.0` | Android backend runtime dependencies. Install before selecting `backend="android"` / `--backend android`; all public namespaces stay on Android transport with no Web fallback. Requires the selected profile's `master_token.json`. Excluded from `all`. | `pip install "notebooklm-py[android]"` | `uv add "notebooklm-py[android]"` |
+| `impersonate` | `curl_cffi>=0.15.0` | **Experimental.** Browser TLS/JA3 impersonation transport — set `NOTEBOOKLM_TRANSPORT=curl_cffi` to route the authenticated API surface through a Chrome-fingerprinted connection (insurance vs TLS fingerprint-gating); override the profile with `NOTEBOOKLM_IMPERSONATE` (default `chrome`, e.g. `safari`, `chrome131`). Native wheels. | `pip install "notebooklm-py[impersonate]"` | `uv add "notebooklm-py[impersonate]"` |
 | `markdown` | `markdownify>=0.14.1` | `notebooklm source fulltext -f markdown`. | `pip install "notebooklm-py[markdown]"` | `uv add "notebooklm-py[markdown]"` |
 | `mcp` | `fastmcp==3.4.2` (exact pin) | Run the MCP server (`notebooklm-mcp`) so an MCP client/agent can drive NotebookLM as tools. | `pip install "notebooklm-py[mcp]"` | `uv add "notebooklm-py[mcp]"` |
 | `server` | `fastapi`, `uvicorn[standard]`, `python-multipart` | The localhost REST API server (`notebooklm-server`, experimental). See [§ REST API server](#rest-api-server). | `pip install "notebooklm-py[server]"` | `uv add "notebooklm-py[server]"` |
 | `dev` | pytest stack, mypy, ruff (`==0.16.1` exact pin), pre-commit (`>=4.5.1`), vcrpy | Contributor tooling only. Not sufficient for this repo's default `uv run pytest`; add `browser` too because some unit tests import Playwright. | `pip install "notebooklm-py[dev]"` | `uv add "notebooklm-py[dev]"` (in your project) — but contributors *to this repo* use the [Persona E](#e-contributor) `uv sync` flow instead |
-| `all` | Resolves to `browser` + `dev` + `headless` + `markdown` + `mcp` + `server` (**not `cookies`**) | Contributors who do not need `rookiepy`. | `pip install "notebooklm-py[all]"` | `uv add "notebooklm-py[all]"` (in your project) — see [All vs All-Extras](#all-vs-all-extras) |
+| `all` | Resolves to `browser` + `dev` + `headless` + `markdown` + `mcp` + `server` (**not the `android`, `cookies`, or `impersonate` extra**) | Contributors using the established web stack. Because it includes `dev`, it still installs the pinned protobuf compiler/runtime used to verify checked-in stubs; it does not select an Android backend. | `pip install "notebooklm-py[all]"` | `uv add "notebooklm-py[all]"` (in your project) — see [All vs All-Extras](#all-vs-all-extras) |
 
 > **Note on `uv` columns:** the `uv (in your project)` column is for users adding `notebooklm-py` as a dependency in **their own** project (requires a `pyproject.toml` in that project). Contributors working inside *this* repo use the Persona E flow (`uv sync --frozen --extra ...`), governed by this repo's `uv.lock`. Do not run `uv sync` outside a project — it errors with `No pyproject.toml found`.
 
@@ -402,7 +414,10 @@ Source of truth: `pyproject.toml` `[project.optional-dependencies]`.
 
 > **⚠️ Experimental.** Like the MCP adapter, the REST server is experimental: the `/v1` surface and behavior may change in a minor release, and it is excluded from the public-API compatibility gate. Pin a version before relying on it for automation. The server also logs an experimental warning on every startup.
 
-A single-tenant, localhost REST API over the same transport-neutral core as the CLI — the natural shape for scripting and agent automation (feed a notebook, generate an artifact, pull it down) without spawning a CLI process per call.
+A local-first REST API over the same transport-neutral core as the CLI — the natural shape for scripting and agent automation (feed a notebook, generate an artifact, pull it down) without spawning a CLI process per call.
+
+The [REST subsystem diagram](https://teng-lin.github.io/notebooklm-py/diagrams/18-rest-server-subsystem.html) shows its
+lifespan-owned client, route guards, concurrency limits, and response projection.
 
 <!-- not mirrored: the server extra is end-user/automation tooling, not part of the contributor `uv sync` flow; CONTRIBUTING.md tracks only browser/dev/markdown. -->
 ```bash
@@ -420,11 +435,148 @@ export NOTEBOOKLM_SERVER_TOKEN="$(openssl rand -hex 32)"   # REQUIRED — the se
 notebooklm-server --host 127.0.0.1 --port 8000            # loopback-only by default
 ```
 
+### Android multi-profile mode
+
+To serve several already-provisioned profiles from one process:
+
+<!-- not mirrored: REST-server operator configuration, not a contributor install. -->
+```bash
+uv tool install --force "notebooklm-py[server,android]"
+# Or, inside your active virtual environment:
+# pip install "notebooklm-py[server,android]"
+notebooklm-server --backend android --profiles work,personal
+# Or set NOTEBOOKLM_SERVER_PROFILES=work,personal and NOTEBOOKLM_BACKEND=android.
+curl -H "Authorization: Bearer $NOTEBOOKLM_SERVER_TOKEN" \
+     -H 'X-NotebookLM-Profile: work' http://127.0.0.1:8000/v1/notebooks
+```
+
+Every `/v1` request, including `/v1/server/info`, must select exactly one configured
+profile with `X-NotebookLM-Profile`. Missing selection returns `400 profile_required`,
+unknown selection `404 unknown_profile`, and multiple header values
+`400 invalid_profile` (codes are in `error.code`). There is no default account in
+multi-profile mode. Responses vary by this header and use `Cache-Control: no-store`;
+proxies and client retry/cache keys must preserve the selected profile.
+
+Each profile needs a valid `master_token.json`. Multi-profile startup does not load
+Web cookies, visit the Web homepage, rotate Web cookies, or persist a Web jar.
+It opens one Android client per profile and validates it with a read-only notebook
+list. Distinct profile paths may contain copies of the same master token; each
+client keeps its own bearer cache and retry state. Profiles for the same account
+still share Google's account quotas. This is not a universal guarantee about
+Google's credential-concurrency behavior.
+
+Duplicate names and canonical storage paths are rejected before opening clients,
+including case-only aliases on all platforms. Request header values still select
+the exact configured spelling.
+A failed profile stays unavailable (`503 profile_unavailable`) while healthy profiles
+serve requests. Its next client-dependent request attempts recovery; concurrent
+requests coalesce and failed retries have a five-second cooldown.
+
+Each profile's complete startup or recovery attempt has a 30-second timeout,
+including credential inspection and its readiness read. Set
+`NOTEBOOKLM_SERVER_PROFILE_STARTUP_TIMEOUT` to positive finite seconds to adjust
+it. An expired attempt is cancelled and marked unavailable immediately. Cleanup
+continues in an owned task without blocking healthy profiles; another attempt for
+that profile cannot start until cleanup finishes. Shutdown drains these owned
+tasks. Cancellation cannot stop filesystem work already running in a thread, but
+that work cannot later publish a client.
+
+Authenticated `/v1/server/info` reports the selected profile's Android credential presence, startup
+error, and `ready` state (whether a client was bound after its startup read, not a
+new upstream health probe). `?include_account=true` also attempts recovery and
+fetches account settings. Public `/healthz` remains minimal liveness.
+
+Pending resource IDs are isolated per profile. The route-group concurrency limits
+below are shared across the process; each client also has its own SDK RPC limit.
+The launcher pins one worker, including when `WEB_CONCURRENCY` is set. Multiple
+server processes do not share pending state or these limits. Profile selection is
+routing, not authorization: the server bearer token grants access to every
+configured profile. Dynamic profile changes and public multi-tenant hosting are
+outside this feature. The default Web backend can serve several profiles too; see
+[Web multi-profile mode](#web-multi-profile-mode). MCP supports the same profile
+isolation with per-tool selection; see below.
+
+### Web multi-profile mode
+
+The default Web backend also serves several profiles from one process, as long as
+each profile owns its own Web session:
+
+<!-- not mirrored: REST-server operator configuration, not a contributor install. -->
+```bash
+notebooklm -p work login
+notebooklm -p personal login
+notebooklm-server --profiles work,personal
+# Or set NOTEBOOKLM_SERVER_PROFILES=work,personal (NOTEBOOKLM_BACKEND unset or web).
+curl -H "Authorization: Bearer $NOTEBOOKLM_SERVER_TOKEN" \
+     -H 'X-NotebookLM-Profile: work' http://127.0.0.1:8000/v1/notebooks
+```
+
+Header selection and its error codes, `Cache-Control`/`Vary` handling, per-profile
+pending state, shared route limits, the per-attempt startup timeout, and the
+five-second recovery cooldown behave as in
+[Android multi-profile mode](#android-multi-profile-mode). An unavailable Web
+profile returns `503 profile_unavailable` (`Selected Web profile is unavailable`)
+while healthy profiles keep serving.
+
+Each profile loads, rotates, and persists only its own `storage_state.json`, opened
+by explicit path with its own keepalive. A profile can open when its
+`storage_state.json` exists, or when it has only a readable `master_token.json`: the
+server then mints a fresh Web session for it before opening. Several profiles may
+hold copies of one account's `master_token.json`; each mints its own session.
+Copying one `storage_state.json` between profiles is **not** supported, because two
+clients would share and rotate a single cookie session. A profile that
+shares either session cookie (`__Secure-1PSID` or `SID`) with another configured
+profile is refused with
+`503 profile_unavailable`, and a warning names the profiles involved (never cookie
+values). To fix it, log the profile in separately (`notebooklm -p <name> login`), or
+delete the copied `storage_state.json` and keep `master_token.json` so a fresh
+session is minted.
+
+This check reads local files only and runs whenever a profile's client opens, at
+startup and on each recovery attempt. A copy made after both profiles are already
+serving is not detected until one of them opens again (for example after a restart).
+
+Web profile opens (the check, any master-token bootstrap, and the session load) take
+turns: one profile at a time. Waiting for another profile's turn does not count
+against `NOTEBOOKLM_SERVER_PROFILE_STARTUP_TIMEOUT`, so startup takes roughly the sum
+of the profiles' opens, and a request that must reopen a profile can wait behind
+other profiles' queued attempts (at most one timeout each). An attempt that times out
+releases its turn at once; cancellation cannot stop work already running in a thread
+(such as a master-token mint or headless re-auth), which may finish during the next
+profile's turn.
+
+Web multi-profile mode refuses to start when:
+
+- `NOTEBOOKLM_AUTH_JSON` is set, even to an empty value. Inline auth is process-wide
+  and bypasses per-profile storage.
+- `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL` is non-blank. One attached Chrome would
+  re-authenticate every profile into the same browser session.
+  `NOTEBOOKLM_HEADLESS_REAUTH=1` without it uses each profile's own browser directory.
+
+Authenticated `/v1/server/info` reports `backend: "web"` and the selected profile's
+file-only health: `storage_exists`, `json_valid`, `cookies_present`, `sid_cookie`,
+`master_token_present`, `session_conflict`, `ready`, and `authenticated`.
+`session_conflict` reflects the files as they are now, which is what a reopen would
+find; a profile that is already serving stays `authenticated`. When the profile could
+not open, `startup_error.code` records why that open failed: `session_conflict` or
+`profile_unavailable`. Public `/healthz` remains minimal liveness. Profiles for the
+same account still share Google's account quotas.
+
+### Profile selection and server configuration
+
+With no profile list or a one-entry list, existing single-profile behavior remains:
+the selection header is ignored and the existing storage bootstrap is used.
+`--profile` and `--profiles` are mutually exclusive. Explicit `--profile` overrides
+`NOTEBOOKLM_SERVER_PROFILES`; a profile list overrides the implicit
+`NOTEBOOKLM_PROFILE`. Profile names in lists must be printable ASCII without spaces
+or commas so they can be selected unambiguously through HTTP headers.
+
 Configuration is read from `NOTEBOOKLM_SERVER_*` env vars (overridable by the matching flags):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NOTEBOOKLM_SERVER_TOKEN` | *(unset)* | Bearer token every request must present. **Required** — fail-closed if unset. |
+| `NOTEBOOKLM_SERVER_PROFILES` | *(unset)* | Comma-separated explicit profiles; more than one requires `X-NotebookLM-Profile` on every `/v1` request (Web or Android). `--profiles` overrides this. |
 | `NOTEBOOKLM_SERVER_HOST` | `127.0.0.1` | Bind host. Non-loopback is refused unless the elevated-risk override below is set. |
 | `NOTEBOOKLM_SERVER_PORT` | `8000` | Bind port. |
 | `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND` | *(unset)* | ⚠️ Set to `1` to bind a non-loopback interface. Only behind a trusted reverse proxy — this exposes account-fronting credentials to the network. |
@@ -437,7 +589,7 @@ Configuration is read from `NOTEBOOKLM_SERVER_*` env vars (overridable by the ma
 
 The concurrency knobs are route-group backpressure for expensive work. They do not gate `/healthz` or cheap read/list/poll routes.
 
-**Surface:** every route is under `/v1` and requires `Authorization: Bearer <token>` plus a loopback `Host` header (a DNS-rebinding guard). `/healthz` is the one public, token-less route. The auto-generated `/docs` / `/openapi.json` schema UI is disabled (it would otherwise be reachable token-less).
+**Surface:** every `/v1` route requires `Authorization: Bearer <token>` plus a loopback `Host` header (a DNS-rebinding guard). `/healthz` is the one public, token-less **liveness** probe — it returns `{"ok": true}` even when the NotebookLM client failed to open. Readiness would be a separate contract. The auto-generated `/docs` / `/openapi.json` schema UI is disabled (it would otherwise be reachable token-less). Operator threat model: [SECURITY.md](../SECURITY.md).
 
 <!-- not mirrored: REST-server curl examples (end-user/automation tooling); not part of the contributor install flow. -->
 ```bash
@@ -455,7 +607,16 @@ curl -H "Authorization: Bearer $TOKEN" -d '{"question":"Summarize"}' \
 curl -H "Authorization: Bearer $TOKEN" $BASE/v1/notebooks/<id>/share # sharing status
 ```
 
-Endpoints: `/v1/notebooks` (list/get/create/delete); `/v1/notebooks/{id}/sources` (list/get/add via `url`·`text`·`file`/delete); `/v1/notebooks/{id}/notes` (list/get/create/update via `PUT`/delete); `/v1/notebooks/{id}/chat` (blocking ask, no streaming); `/v1/notebooks/{id}/artifacts` (list / generate / poll / download); `/v1/notebooks/{id}/share` (status / public link / users / view level). Long-running work (source ingest, artifact generation) is **poll-the-resource**: the create call returns immediately and the matching `GET` reports `pending` until the resource is ready (`200`), `404` for an id the server never created, `409`/`410` for a failed/removed artifact.
+Endpoints: `/v1/notebooks` (list/get/create/delete); `/v1/notebooks/{id}/sources` (list/get/add via `url`·`text`·`file`·`batch`/delete); `/v1/notebooks/{id}/notes` (list/get/create/update via `PUT`/delete); `/v1/notebooks/{id}/chat` (blocking ask, no streaming); `/v1/notebooks/{id}/artifacts` (list / generate / poll / download); `/v1/notebooks/{id}/share` (status / public link / users / view level). Long-running work (source ingest, artifact generation) is **poll-the-resource**: the create call returns immediately and the matching `GET` reports `pending` until the resource is ready (`200`), `404` for an id the server never created, `409`/`410` for a failed/removed artifact.
+
+Routes own Pydantic input, HTTP status, and JSON/error projection. REST and MCP use the same central
+builder and per-kind option table to construct exact frozen generation requests. The CLI constructs
+the same typed variants but maps most Click inputs directly; all three adapters reuse neutral domain
+validation, and the transport-neutral cores contain no HTTP or presentation policy. The batch source
+route validates local members, sends all valid URLs once, and returns one ordered result per input
+with `commit_state` `confirmed`, `rejected`, `unknown`, or `not_sent`. Continuation follows that
+typed evidence rather than the HTTP status. Inputs and titles are capped and credential-redacted
+before public and JSON projection.
 
 **Artifacts & uploads:**
 
@@ -481,8 +642,8 @@ curl -H "Authorization: Bearer $TOKEN" -F 'file=@./notes.pdf' \
 
 ### `playwright install chromium` — when required, when auto-installed
 
-- **Required**: when you'll use `notebooklm login` (the interactive Playwright flow), unless the CLI auto-installs Chromium for you (it does — see `ensure_chromium_installed()` in `cli/services/playwright_login.py`, which runs `python -m playwright install chromium` on first login if Chromium is missing).
-- **Not required**: for headless servers (Persona D), library use (Persona C), or `--browser-cookies`-based auth (Persona A/F with `[cookies]`).
+- **Required**: when you'll use `notebooklm login` (the interactive Playwright flow) or explicitly enable browser-backed layer-3 recovery. Login auto-installs Chromium when it is missing; the probe lives in `cli/services/playwright_login.py` and runs `python -m playwright install chromium`.
+- **Not required**: for headless servers (Persona D) and library users (Persona C) that supply storage state without opting into L3, or for `--browser-cookies`-based auth (Persona A/F with `[cookies]`).
 
 ### `playwright install-deps chromium` — Linux system libraries
 
@@ -519,6 +680,81 @@ notebooklm skill install               # writes ~/.claude/skills/notebooklm/, ~/
 
 Optional — only needed if your agent harness reads from those directories and the skill isn't already present.
 
+### Android multi-profile MCP
+
+MCP can serve several already-provisioned Android profiles over either stdio or HTTP:
+
+<!-- not mirrored: MCP operator configuration, not a contributor install. -->
+```bash
+uv tool install --force "notebooklm-py[mcp,android]"
+notebooklm-mcp --backend android --profiles work,personal
+# Or set NOTEBOOKLM_MCP_PROFILES=work,personal and NOTEBOOKLM_BACKEND=android.
+# Add --transport http to use the existing HTTP authentication and bind settings.
+```
+
+With two or more profiles, **every tool call requires a `profile` argument**:
+
+```json
+{"name": "notebook_list", "arguments": {"profile": "work"}}
+```
+
+This applies to diagnostics (`server_info`), confirmations, and subsequent task
+polls as well as notebook operations. `tools/list` advertises the required argument,
+and server instructions list the configured names. There is no session-wide active
+account and no fallback profile. Use the exact configured spelling; unknown names
+fail validation. A single entry in `--profiles` retains the existing single-profile
+behavior and tool schemas. `--profile` and `--profiles` are mutually exclusive;
+an explicit `--profile` overrides `NOTEBOOKLM_MCP_PROFILES`.
+
+As in REST multi-profile mode, each profile needs a valid `master_token.json`.
+Profile names and canonical storage paths must be distinct (including case aliases).
+Distinct paths may hold the same credentials, but still share upstream account quotas.
+Each profile owns an Android client, bearer/retry state, detached chat jobs, and
+research cancellation tracking. Chat job capacity and concurrency are per profile;
+signed file-transfer route limits remain process-wide. Web cookies are never loaded,
+rotated, or persisted by these clients. For Web profiles, see
+[Web multi-profile MCP](#web-multi-profile-mcp).
+
+Client warm-up runs in the background so `initialize` and tool discovery do not
+wait for upstream authentication. A healthy profile keeps serving when another
+fails. Client-dependent calls to an unavailable profile return a retriable `SERVER`
+error; failed attempts have a five-second recovery cooldown, and concurrent calls
+share one attempt. `NOTEBOOKLM_MCP_PROFILE_STARTUP_TIMEOUT` configures the positive,
+finite per-attempt deadline (default: 30 seconds, including the readiness read).
+Expired attempts cannot publish a client; retries wait for their cancellation
+cleanup to settle, and shutdown drains owned tasks after cancelling detached chats.
+`server_info(profile=...)` reports Android credential health and readiness without
+probing Web credentials.
+
+Signed upload/download URLs bind the issuing profile. Upload receipt polling and
+widget confirmation use that same profile. The HTTP bearer or OAuth credential
+authorizes **all** configured profiles; selection is routing, not per-account
+access control. Existing HTTP bind and authentication requirements still apply.
+
+### Web multi-profile MCP
+
+The default Web backend serves several profiles the same way:
+
+<!-- not mirrored: MCP operator configuration, not a contributor install. -->
+```bash
+notebooklm-mcp --profiles work,personal
+# Or set NOTEBOOKLM_MCP_PROFILES=work,personal (NOTEBOOKLM_BACKEND unset or web).
+```
+
+The required `profile` argument, per-profile state, background warm-up, recovery
+cooldown, `NOTEBOOKLM_MCP_PROFILE_STARTUP_TIMEOUT`, and signed file links behave as
+in Android mode above. Web profile requirements match
+[REST Web multi-profile mode](#web-multi-profile-mode): each profile needs its own
+`storage_state.json` or a readable `master_token.json`; a profile holding a copy of
+another configured profile's Web session is refused, and its tool calls fail with
+the retriable `SERVER: Selected Web profile is unavailable`; `NOTEBOOKLM_AUTH_JSON`
+and a non-blank `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL` are refused at startup. Profile
+opens take turns in the background, so `initialize` and tool discovery never wait
+for them, and the wait does not count against the startup timeout. A first or
+recovering tool call for a profile can wait behind other profiles' queued attempts.
+`server_info(profile=...)` reports `backend: "web"` with the same file-only health
+fields as REST, including `session_conflict`.
+
 ### Running the MCP server (`mcp` extra)
 
 The MCP server ships behind the optional `mcp` extra (see the extras matrix above) and exposes the same `_app/` business logic over the Model Context Protocol.
@@ -537,7 +773,7 @@ For a **self-hosted remote connector** (claude.ai / mobile / ChatGPT over a tunn
 attaches a version-baked `docker-compose.yml` + `env.example` — no repo clone: `curl` them, fill
 `.env`, `docker compose --profile cloudflare up -d`. See [`deploy/README.md`](../deploy/README.md#quick-start--end-users-no-repo-cloudflare-tunnel).
 
-Full usage walkthrough (auth, transports, the 33 tools, workflows, troubleshooting): **[mcp-guide.md](mcp-guide.md)**.
+Full usage walkthrough (auth, transports, the 38 tools, workflows, troubleshooting): **[mcp-guide.md](mcp-guide.md)**.
 
 ---
 
@@ -572,7 +808,7 @@ For the full CLI surface, see [cli-reference.md](cli-reference.md).
 |---|---|---|
 | **macOS** | Chromium auto-downloads on first login. `--browser-cookies` from Chrome/Edge/Brave/Opera may prompt for Keychain access. | [troubleshooting.md#macos](troubleshooting.md#macos) |
 | **Linux** | (a) `playwright install-deps chromium` for system libs (Debian/Ubuntu). (b) **Known bug:** `playwright > 1.57` may fail with `TypeError: onExit is not a function` — pin `playwright==1.57.0`. | [troubleshooting.md#linux](troubleshooting.md#linux) |
-| **Windows** | The library auto-configures `WindowsSelectorEventLoopPolicy` and `PYTHONUTF8=1`. Prefer plain `pip install` (uv/pipx less common on Windows). | [troubleshooting.md#windows](troubleshooting.md#windows) |
+| **Windows** | The CLI sets `PYTHONUTF8=1` and runs on asyncio's default (Proactor) event loop; set `NOTEBOOKLM_WINDOWS_EVENT_LOOP=selector` only if commands hang inside a sandbox. Prefer plain `pip install` (uv/pipx less common on Windows). | [troubleshooting.md#windows](troubleshooting.md#windows) |
 | **WSL** | The browser opens in the Windows host (expected); `storage_state.json` lives in the WSL filesystem. | [troubleshooting.md#wsl](troubleshooting.md#wsl) |
 
 ---
@@ -603,8 +839,8 @@ rm -rf ~/.notebooklm                          # optional: remove auth state
 
 > ⚠️  **`pip install ".[all]"` and `uv sync --all-extras` are not equivalent.**
 >
-> - `pyproject.toml` defines: `all = ["notebooklm-py[browser,dev,headless,markdown,mcp,server]"]` — a self-referential extras string that resolves to **browser + dev + headless + markdown + mcp + server only**. It deliberately excludes `cookies` because `rookiepy` has install issues on Python 3.13+ ([CHANGELOG `[0.4.1]`](../CHANGELOG.md)).
-> - `uv sync --all-extras` installs **every** extra including `cookies`, and may fail on Python 3.13/3.14.
+> - `pyproject.toml` defines: `all = ["notebooklm-py[browser,dev,headless,markdown,mcp,server]"]` — a self-referential extras string that resolves to **browser + dev + headless + markdown + mcp + server only**. It omits the `android`, `cookies`, and `impersonate` extra names. Since `dev` carries the exact protobuf regeneration toolchain, `all` still resolves its pinned gRPC/protobuf packages; no Android backend is selected. The cookies extra remains separate because browser-cookie extraction is optional.
+> - `uv sync --all-extras` installs every extra, including the optional `cookies` extractor.
 > - In this repo, prefer `uv sync --frozen --extra browser --extra dev --extra markdown`.
 
 ### `uv pip install` vs `uv sync`

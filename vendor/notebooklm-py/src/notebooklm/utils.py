@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from .client import NotebookLMClient
     from .types import ChatReference, StructuredDocument
 
-__all__ = ["resolve_chat_reference_passage"]
+__all__ = ["resolve_chat_reference_passage", "html_to_markdown"]
 
 
 #: How much of ``cited_text`` to cross-check against the range it declares.
@@ -203,7 +203,7 @@ async def resolve_chat_reference_passage(
         reference: The chat citation to resolve. Must carry either a
             usable ``start_char`` / ``end_char`` range or a non-empty
             ``cited_text``. A citation whose fragment decoded no blocks at
-            all — the structural anchor ``_chat.wire`` reports as
+            all — the structural anchor ``_web.rows.chat_stream`` reports as
             ``(None, None, None)`` — has neither and raises
             :class:`ChatResponseParseError` without issuing a request. A
             fragment holding only an image or a rule is *not* that case: it
@@ -286,3 +286,10 @@ async def resolve_chat_reference_passage(
         "may have been re-indexed since the citation was emitted, or the cited "
         "span may have been transformed during chunking."
     )
+
+
+def html_to_markdown(html: str) -> str:
+    """Convert HTML to Markdown, preserving math. Requires the ``markdown`` extra."""
+    from ._source.markdown import html_to_markdown as convert
+
+    return convert(html)

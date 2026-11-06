@@ -11,7 +11,7 @@ This module imports NO ``click`` / ``rich`` / ``cli``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from ...client import NotebookLMClient
@@ -25,15 +25,13 @@ __all__ = [
 ]
 
 
-async def passthrough_notebook_id(
-    _client: NotebookLMClient, notebook_id: str, *, json_output: bool = False
-) -> str:
+async def passthrough_notebook_id(_client: NotebookLMClient, notebook_id: str) -> str:
     """Return ``notebook_id`` unchanged (the REST adapter works in full ids)."""
     return notebook_id
 
 
 async def passthrough_source_id(
-    _client: NotebookLMClient, _notebook_id: str, source_id: str, *, json_output: bool = False
+    _client: NotebookLMClient, _notebook_id: str, source_id: str
 ) -> str:
     """Return a single ``source_id`` unchanged (REST works in full ids).
 
@@ -48,10 +46,8 @@ async def passthrough_source_id(
 async def passthrough_source_ids(
     _client: NotebookLMClient,
     _notebook_id: str,
-    source_ids: Any,
-    *,
-    json_output: bool = False,
-) -> Any:
+    source_ids: tuple[str, ...],
+) -> list[str] | None:
     """Return the full source ids, or ``None`` when none were supplied.
 
     The REST adapter already works in full ids, so resolution is a pass-through —
@@ -63,7 +59,10 @@ async def passthrough_source_ids(
     bare ``POST .../artifacts`` (no ``source_ids``) generates over all sources,
     matching the CLI's no-``--source`` behavior.
     """
-    return source_ids or None
+    # The executor's legacy callback annotation says ``list[str]`` while its
+    # parsed request contract deliberately carries an immutable tuple. Preserve
+    # that adapter boundary; the callback only forwards the selection.
+    return cast(list[str] | None, source_ids or None)
 
 
 async def passthrough_download_notebook(notebook_id: str) -> str:

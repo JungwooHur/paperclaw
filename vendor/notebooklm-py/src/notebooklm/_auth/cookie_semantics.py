@@ -37,13 +37,33 @@ class NormalizedExpiry:
     session: bool
 
 
+# Firefox 142+ (schema version >= 16) stores ``moz_cookies.expiry`` in
+# milliseconds instead of seconds. Callers that can see the schema version
+# (``_firefox_containers.py``) correct for this precisely; callers that read
+# through ``rookie_cookies`` directly (unscoped ``firefox``/``auto``) cannot,
+# because the library hands back a bare epoch number with no unit tag and,
+# as of rookie-cookies 0.5.8, does not correct for the schema-16 switch
+# itself. As a magnitude-only backstop, any expiry beyond this bound is
+# implausible as a "seconds since epoch" value for a browser cookie (year
+# 3000) but lands in a plausible year once treated as milliseconds, so it is
+# rescaled. This cannot distinguish a genuine multi-millennium seconds
+# sentinel from a millisecond value — none has been observed from a real
+# browser cookie store, so treating the ambiguity as "assume milliseconds"
+# is the safer default here.
+_MAX_PLAUSIBLE_EXPIRY_SECONDS = 32_503_680_000  # 3000-01-01T00:00:00Z
+_MAX_PLAUSIBLE_EXPIRY_MILLISECONDS = 32_503_680_000_000  # 3000-01-01 in ms
+_MAX_PLAUSIBLE_EXPIRY_MICROSECONDS = 32_503_680_000_000_000  # 3000-01-01 in µs
+
+
 def normalize_cookie_expiry(raw: Any) -> NormalizedExpiry:
     """Normalize a storage expiry without allowing ``Cookie`` to guess.
 
     ``None`` and the exact non-boolean integer ``-1`` are Playwright's
     session-cookie forms.  Every other accepted numeric representation is a
     dated value, including ``-1.0`` and ``"-1"``.  Dated values use the same
-    ``int(float(value))`` conversion as ``http.cookiejar``.
+    ``int(float(value))`` conversion as ``http.cookiejar``, then get rescaled
+    from milliseconds or microseconds to seconds if implausibly large (see
+    ``_MAX_PLAUSIBLE_EXPIRY_SECONDS``).
     """
     if raw is None or (type(raw) is int and raw == -1):
         return NormalizedExpiry(None, True)
@@ -60,6 +80,11 @@ def normalize_cookie_expiry(raw: Any) -> NormalizedExpiry:
         raise
     except (ValueError, TypeError, OverflowError) as exc:
         raise CookieRowError("expires", "not numeric") from exc
+
+    if _MAX_PLAUSIBLE_EXPIRY_MILLISECONDS < value <= _MAX_PLAUSIBLE_EXPIRY_MICROSECONDS:
+        value //= 1_000_000
+    elif _MAX_PLAUSIBLE_EXPIRY_SECONDS < value <= _MAX_PLAUSIBLE_EXPIRY_MILLISECONDS:
+        value //= 1000
 
     # Preserve the distinction between a dated -1 and Playwright's session
     # sentinel after the row is handed to ``http.cookiejar.Cookie``.

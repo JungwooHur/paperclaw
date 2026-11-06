@@ -33,6 +33,7 @@ __all__ = [
     "compose_builtin_read_timeout",
     "normalize_max_concurrent_uploads",
     "resolve_chat_read_timeout",
+    "resolve_import_research_read_timeout",
     "validate_read_timeout_kwarg",
 ]
 
@@ -71,7 +72,7 @@ DEFAULT_CHAT_RESPONSE_MAX_BYTES = 256 * 1024 * 1024
 # source cap varies 50-600 by account tier) needs materially more time than
 # the shared 30s metadata window. Scaled per requested source rather than
 # flat-overridden so a small fast-research import still fails fast on a
-# genuinely broken call; see ``_research_import._import_research_read_timeout``
+# genuinely broken call; see :func:`resolve_import_research_read_timeout`
 # (#2187).
 DEFAULT_IMPORT_RESEARCH_BASE_TIMEOUT = 60.0
 DEFAULT_IMPORT_RESEARCH_PER_SOURCE_TIMEOUT = 3.0
@@ -164,9 +165,7 @@ def compose_builtin_read_timeout(builtin_window: float, base_timeout: float | No
     return max(builtin_window, base_timeout)
 
 
-def resolve_chat_read_timeout(
-    chat_timeout: float | None, base_timeout: float | None
-) -> float | None:
+def resolve_chat_read_timeout(chat_timeout: Any, base_timeout: float | None) -> float | None:
     """Resolve ``chat_timeout`` against the client's base ``timeout=`` (#2205).
 
     An explicit value — including ``None``, which means "inherit ``timeout=``
@@ -175,9 +174,49 @@ def resolve_chat_read_timeout(
     the untouched default (:data:`AUTO_READ_TIMEOUT`) composes, and composing
     can only lengthen the window.
     """
-    if chat_timeout is AUTO_READ_TIMEOUT:
+    from ..options import AUTO
+
+    if chat_timeout is AUTO_READ_TIMEOUT or chat_timeout is AUTO:
         return compose_builtin_read_timeout(DEFAULT_CHAT_TIMEOUT, base_timeout)
     return chat_timeout
+
+
+def resolve_import_research_read_timeout(
+    source_count: int,
+    *,
+    base_timeout: float | None = DEFAULT_TIMEOUT,
+    override: float | None = AUTO_READ_TIMEOUT,
+    remaining_budget: float | None = None,
+) -> float | None:
+    """Resolve one IMPORT_RESEARCH attempt's timeout budget.
+
+    The untouched default scales with the number of importable entries, is
+    capped at :data:`DEFAULT_IMPORT_RESEARCH_MAX_TIMEOUT`, and is floored at
+    the client's base timeout. An explicit ``override`` replaces both scaling
+    and that floor; ``None`` inherits the transport's base timeout. A retry's
+    remaining aggregate budget clamps the resolved window last.
+
+    This transport-neutral resolver is shared by the web and Android
+    implementations so both backends honor ``import_research_timeout`` with
+    the same batch-scaling and retry-budget semantics.
+    """
+    window: float | None
+    from ..options import AUTO
+
+    if override is AUTO_READ_TIMEOUT or override is AUTO:
+        window = compose_builtin_read_timeout(
+            min(
+                DEFAULT_IMPORT_RESEARCH_MAX_TIMEOUT,
+                DEFAULT_IMPORT_RESEARCH_BASE_TIMEOUT
+                + DEFAULT_IMPORT_RESEARCH_PER_SOURCE_TIMEOUT * source_count,
+            ),
+            base_timeout,
+        )
+    else:
+        window = override
+    if remaining_budget is None:
+        return window
+    return remaining_budget if window is None else min(window, remaining_budget)
 
 
 def validate_read_timeout_kwarg(value: Any, *, name: str) -> float | None:
@@ -193,7 +232,9 @@ def validate_read_timeout_kwarg(value: Any, *, name: str) -> float | None:
     ``None`` ("inherit ``timeout=``") and :data:`AUTO_READ_TIMEOUT` ("unset")
     pass through untouched; anything else must be a positive real number.
     """
-    if value is None or value is AUTO_READ_TIMEOUT:
+    from ..options import AUTO
+
+    if value is None or value is AUTO_READ_TIMEOUT or value is AUTO:
         return cast("float | None", value)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(
@@ -215,7 +256,9 @@ def assert_resolved_read_timeout(value: Any, *, name: str) -> None:
     away, as a ``TypeError`` inside the timeout *error formatter*. This turns
     that into an immediate, named failure at the boundary it crossed.
     """
-    if value is AUTO_READ_TIMEOUT:
+    from ..options import AUTO
+
+    if value is AUTO_READ_TIMEOUT or value is AUTO:
         raise TypeError(
             f"{name} received the unresolved AUTO_READ_TIMEOUT sentinel; it must "
             "be resolved (resolve_chat_read_timeout) before reaching this layer"

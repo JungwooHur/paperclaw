@@ -20,8 +20,10 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastmcp import Context
@@ -32,10 +34,16 @@ from .._confirm import READ_ONLY
 from .._context import get_file_transfer
 from .._errors import mcp_errors
 from .._filelink import UPLOAD_TTL, FileLinkError, FileTransferConfig
+from .._hostupload import spool_host_upload
 
 if TYPE_CHECKING:
     from ...client import NotebookLMClient
     from ...types import Source
+
+#: Operator-configured directories that stdio ``source_add(source_type="file",
+#: path=...)`` may read. OS pathsep-separated; unset/empty → host-path file-add
+#: is off. ``$HOME`` and ``~/.notebooklm`` are rejected as roots.
+ALLOWED_ROOTS_ENV = "NOTEBOOKLM_MCP_ALLOWED_ROOTS"
 
 #: Cap on ``source_add``'s ``bytes_base64`` payload — measured on the base64 STRING
 #: (what rides in the MCP message), NOT the decoded size. 10,000 chars ≈ 7.3 KiB of
@@ -252,6 +260,37 @@ def _seed_upload_filename(
     return None
 
 
+@contextmanager
+def _spool_stdio_upload(content: str) -> Iterator[Path]:
+    """Validate a stdio host-path file-add against operator-configured roots.
+
+    Default-deny: unset ``NOTEBOOKLM_MCP_ALLOWED_ROOTS`` refuses every host
+    path. Credential filenames and Playwright profile dirs are refused even
+    inside a configured root. Remote HTTP never calls this — it brokers a
+    signed URL and does not open ``path``.
+    """
+    try:
+        with spool_host_upload(
+            content,
+            allowed_roots=add_core.parse_upload_allowed_roots(os.environ.get(ALLOWED_ROOTS_ENV)),
+        ) as path:
+            yield path
+    except add_core.SourceAddValidationError as exc:
+        if exc.reason == "upload_root_not_configured":
+            raise ValidationError(
+                "stdio source_add(source_type='file', path=...) is off until "
+                f"{ALLOWED_ROOTS_ENV} is set to one or more upload directories "
+                "(not $HOME and not ~/.notebooklm)"
+            ) from exc
+        if exc.reason == "path_outside_allowed_root":
+            raise ValidationError(f"path is outside {ALLOWED_ROOTS_ENV}") from exc
+        if exc.reason == "credential_path_disallowed":
+            raise ValidationError(
+                "refusing to upload a credential or Playwright profile path"
+            ) from exc
+        raise
+
+
 async def _add_bytes(
     client: NotebookLMClient,
     notebook_id: str,
@@ -305,6 +344,9 @@ async def _add_one(
     title: str | None,
     mime_type: str | None,
     allow_internal: bool,
+    fallback_fetch: bool = False,
+    cleanup_on_failure: bool = False,
+    fallback_metadata: dict[str, Any] | None = None,
 ) -> Source:
     """Build the source-add plan + execute it, returning the created ``Source``.
 
@@ -313,6 +355,9 @@ async def _add_one(
     presence / host validation BEFORE reaching here — single mode via
     ``_select_content`` (which keeps the YouTube-host guard), batch mode via
     the explicit ``source_type="url"`` that forces :func:`add_core.validate_url`.
+    File inputs here are private spools: stdio paths are pinned and copied by
+    :func:`_spool_stdio_upload` before any await; in-channel bytes are already
+    supplied by the caller.
     """
     plan = add_core.build_source_add_plan(
         content=content,
@@ -326,8 +371,18 @@ async def _add_one(
     )
     result = await add_core.execute_source_add(
         client,
-        add_core.SourceAddExecutionPlan(notebook_id=notebook_id, plan=plan),
+        add_core.SourceAddExecutionPlan(
+            notebook_id=notebook_id,
+            plan=plan,
+            fallback_fetch=fallback_fetch,
+            cleanup_on_failure=cleanup_on_failure,
+        ),
     )
+    fallback = getattr(result, "fallback", None)
+    if fallback is not None and fallback_metadata is not None:
+        from ..._app.serialize import to_jsonable
+
+        fallback_metadata.update(to_jsonable(fallback))
     return result.source
 
 
@@ -385,6 +440,8 @@ async def _await_upload(
     Returns one of:
     - ``{"status": "received", "source_id": ..., "file": {...}}`` — the browser/agent
       upload committed a source (same process wrote it; ADR-0024).
+    - ``{"status": "unconfirmed", "hint": ...}`` — registration is uncertain;
+      reconcile with source_list before minting a new link. Do not retry this token.
     - ``{"status": "pending", "hint": ...}`` — nothing yet after ``timeout_s``; the
       model should re-invoke with the same link.
     - ``{"status": "expired_or_invalid", "hint": ...}`` — the link failed signature/
@@ -430,9 +487,15 @@ async def _await_upload(
             expired_payload = cfg.signer.verify(token, op="ul", allow_expired=True)
         except FileLinkError:
             return invalid
+        if not cfg.matches_profile(expired_payload):
+            return invalid
         done = cfg.jti_store.completed(str(expired_payload.get("jti") or ""))
         if done is not None:
+            if done.get("status") == "unconfirmed":
+                return done
             return {"status": "received", "source_id": done.get("source_id"), "file": done}
+        return invalid
+    if not cfg.matches_profile(payload):
         return invalid
     jti = str(payload.get("jti") or "")
     deadline = time.monotonic() + timeout_s
@@ -440,6 +503,8 @@ async def _await_upload(
     while True:
         result = cfg.jti_store.completed(jti)
         if result is not None:
+            if result.get("status") == "unconfirmed":
+                return result
             return {"status": "received", "source_id": result.get("source_id"), "file": result}
         if time.monotonic() >= deadline:
             return {
@@ -476,6 +541,9 @@ def register_file_tools(mcp: Any) -> None:
         * ``{"status":"received","source_id",...,"file":{...}}`` — the upload landed.
         * ``{"status":"pending",...}`` — nothing yet after ~``timeout`` s; **re-invoke with
           the same link** (the wait resumes; a transport reset does not lose it).
+        * ``{"status":"unconfirmed",...}`` — the upload may have landed, but its source
+          could not be confirmed. Check ``source_list`` before requesting a new link
+          to avoid adding the same file twice.
         * ``{"status":"expired_or_invalid",...}`` — the link failed; mint a fresh one via
           ``source_add(source_type="file")``.
         """

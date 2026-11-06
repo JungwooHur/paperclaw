@@ -11,7 +11,7 @@
 > The live runtime decomposition is documented in
 > [`docs/architecture.md`](../architecture.md) and
 > [`CLAUDE.md`](../../CLAUDE.md); the empty compat-bridge allowlist guard is
-> [`tests/_guardrails/test_no_session_compat_bridges.py`](../../tests/_guardrails/test_no_session_compat_bridges.py).
+> [`tests/qualification/historical/test_no_session_compat_bridges.py`](../../tests/qualification/historical/test_no_session_compat_bridges.py).
 
 ## Status
 
@@ -23,7 +23,7 @@ for the temporary property-bridge policy. The policy's built-in exit
 condition ("Be retired the moment its only readers are themselves
 retired") has now been satisfied: the staged session-shrink arc removed
 the `Session` property shims and their test readers. The permanent guard
-is [`tests/_guardrails/test_no_session_compat_bridges.py`](../../tests/_guardrails/test_no_session_compat_bridges.py),
+is [`tests/qualification/historical/test_no_session_compat_bridges.py`](../../tests/qualification/historical/test_no_session_compat_bridges.py),
 whose allowlist is empty.
 
 ## Context
@@ -62,6 +62,7 @@ The chosen mechanism is a *property-bridge policy*. Each migrated attribute keep
 @property
 def _save_lock(self) -> threading.Lock:
     return self.cookie_persistence.save_lock
+
 
 @_save_lock.setter
 def _save_lock(self, value: threading.Lock) -> None:

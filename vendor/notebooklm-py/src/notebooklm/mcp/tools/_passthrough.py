@@ -8,9 +8,9 @@ trivial resolver that returns the already-resolved id unchanged.
 
 Two shapes recur across the tool modules and live here:
 
-* :func:`passthrough_notebook_id` — ``(client, notebook_id, *, json_output) -> id``
+* :func:`passthrough_notebook_id` — ``(client, notebook_id) -> id``
   (used by ``notebook_*`` / ``note_*`` / ``artifact_*``).
-* :func:`passthrough_child_id` — ``(client, notebook_id, child_id, *, json_output)
+* :func:`passthrough_child_id` — ``(client, notebook_id, child_id)
   -> child_id`` for a notebook-scoped child id (used by ``source_*`` / ``note_*``).
 
 Resolvers with a one-off shape (e.g. a source-id *list*, or the download core's
@@ -29,9 +29,7 @@ if TYPE_CHECKING:
 __all__ = ["passthrough_child_id", "passthrough_notebook_id"]
 
 
-async def passthrough_notebook_id(
-    _client: NotebookLMClient, notebook_id: str, *, json_output: bool = False
-) -> str:
+async def passthrough_notebook_id(_client: NotebookLMClient, notebook_id: str) -> str:
     """Return ``notebook_id`` unchanged (MCP resolves refs before the executor)."""
     return notebook_id
 
@@ -40,8 +38,6 @@ async def passthrough_child_id(
     _client: NotebookLMClient,
     _notebook_id: str,
     child_id: str,
-    *,
-    json_output: bool = False,
 ) -> str:
     """Return ``child_id`` unchanged (MCP resolves notebook-scoped refs up front)."""
     return child_id

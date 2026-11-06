@@ -16,7 +16,7 @@ the caller sees a uniform outcome shape on the auth-inspect path.
 
 Imports from :mod:`.chromium_accounts`, :mod:`.firefox_accounts`,
 :mod:`.cookie_jar` (``_enumerate_one_jar`` + the
-``_ROOKIEPY_BROWSER_ALIASES`` map), :mod:`.rookiepy_errors`, and
+``_ROOKIE_COOKIES_BROWSER_ALIASES`` map), :mod:`.rookie_cookies_errors`, and
 :mod:`.cookie_domains` (the "auto" + named-alias branch of
 ``_read_browser_cookies`` builds its own domain list).
 """
@@ -32,7 +32,7 @@ from .chromium_accounts import (
     _split_chromium_profile_browser_spec,
 )
 from .cookie_domains import _build_google_cookie_domains
-from .cookie_jar import _ROOKIEPY_BROWSER_ALIASES, _enumerate_one_jar
+from .cookie_jar import _ROOKIE_COOKIES_BROWSER_ALIASES, _enumerate_one_jar
 from .firefox_accounts import (
     _maybe_warn_firefox_containers_in_use,
     _read_firefox_container_cookies,
@@ -44,7 +44,7 @@ from .outcomes import (
     UnknownBrowser,
     UnsupportedBrowser,
 )
-from .rookiepy_errors import _handle_rookiepy_error
+from .rookie_cookies_errors import _handle_rookie_cookies_error
 
 if TYPE_CHECKING:
     from ...._app.login_cookie import Account
@@ -78,11 +78,11 @@ def _enumerate_browser_accounts(
     ``chrome::<profile-name-or-directory>`` scopes discovery to one profile.
 
     For non-chromium browsers, single-profile chromium installs, and the
-    legacy path, falls back to a single rookiepy call — preserving every
+    legacy path, falls back to a single rookie-cookies call — preserving every
     existing test mock and runtime behavior.
 
     Args:
-        browser_name: rookiepy browser alias.
+        browser_name: rookie-cookies browser alias.
         verbose: Forwarded to :func:`_read_browser_cookies` to suppress the
             human-readable progress line in JSON-output paths.
         include_domains: Forwarded to :func:`_read_browser_cookies` to
@@ -99,7 +99,7 @@ def _enumerate_browser_accounts(
         On success — ``(per_profile_cookies, accounts)``:
 
         * ``per_profile_cookies`` — dict keyed by :attr:`Account.browser_profile`
-          (e.g. ``"Default"``, ``"Profile 1"``) mapping to the raw rookiepy
+          (e.g. ``"Default"``, ``"Profile 1"``) mapping to the raw rookie-cookies
           cookies that yielded that profile's accounts. The legacy / single-jar
           path uses ``None`` as the key.
         * ``accounts`` — :class:`notebooklm.auth.Account` records, each tagged
@@ -219,19 +219,19 @@ def _read_browser_cookies(
     include_domains: set[str] | None = None,
     io: LoginIO | None = None,
 ) -> list[dict[str, Any]] | BrowserCookieOutcome:
-    """Load Google cookies from an installed browser via rookiepy.
+    """Load Google cookies from an installed browser via rookie-cookies.
 
-    Wraps rookiepy import + dispatch + error handling so multiple commands
+    Wraps rookie-cookies import + dispatch + error handling so multiple commands
     (``login --browser-cookies``, ``auth inspect``) share one code path.
 
     Args:
-        browser_name: ``"auto"`` to use ``rookiepy.load()``, a specific
-            browser alias from :data:`_ROOKIEPY_BROWSER_ALIASES`, or
+        browser_name: ``"auto"`` to use the automatic browser loader, a specific
+            browser alias from :data:`_ROOKIE_COOKIES_BROWSER_ALIASES`, or
             ``"chrome::<profile-name-or-directory>"`` for a single Chromium
             user-data profile, or
             ``"firefox::<container-name>"`` (or ``"firefox::none"``) to
             extract from a single Firefox Multi-Account Container, bypassing
-            rookiepy entirely.
+            rookie-cookies entirely.
         verbose: When False, suppress the "Reading cookies from …" progress
             line. Used by ``auth inspect --json`` to keep stdout pure JSON.
         include_domains: Optional set of ``--include-domains`` labels
@@ -244,19 +244,19 @@ def _read_browser_cookies(
             firefox / chromium readers and used for the verbose progress line.
 
     Returns:
-        On success — raw cookie dicts as returned by rookiepy (or by the
-        Firefox container extractor, which mirrors rookiepy's shape).
+        On success — raw cookie dicts as returned by rookie-cookies (or by the
+        Firefox container extractor, which mirrors its shape).
 
         On failure — a :class:`.outcomes.BrowserCookieOutcome` subclass:
-        :class:`.outcomes.UnknownBrowser` (alias not in the rookiepy map),
-        :class:`.outcomes.UnsupportedBrowser` (rookiepy lacks the
+        :class:`.outcomes.UnknownBrowser` (alias not in the rookie-cookies map),
+        :class:`.outcomes.UnsupportedBrowser` (rookie-cookies lacks the
         platform-specific function), :class:`.outcomes.CookieValidationFailure`
-        (rookiepy not installed, empty Firefox container spec, or read
-        failure surfaced by :func:`_handle_rookiepy_error`).
+        (rookie-cookies not installed, empty Firefox container spec, or read
+        failure surfaced by :func:`_handle_rookie_cookies_error`).
     """
     io = resolve_login_io(io)
     # Firefox container syntax: ``firefox::<name>`` or ``firefox::none``.
-    # Routed to a direct sqlite3 reader because rookiepy does not honor
+    # Routed to a direct sqlite3 reader because rookie-cookies does not honor
     # ``originAttributes`` — see issue #367.
     if browser_name.lower().startswith("firefox::"):
         container_spec = browser_name.split("::", 1)[1].strip()
@@ -292,9 +292,9 @@ def _read_browser_cookies(
 
     canonical: str | None = None
     if browser_name != "auto":
-        canonical = _ROOKIEPY_BROWSER_ALIASES.get(browser_name.lower())
+        canonical = _ROOKIE_COOKIES_BROWSER_ALIASES.get(browser_name.lower())
         if canonical is None:
-            supported = tuple(sorted(_ROOKIEPY_BROWSER_ALIASES))
+            supported = tuple(sorted(_ROOKIE_COOKIES_BROWSER_ALIASES))
             return UnknownBrowser(
                 code="UNKNOWN_BROWSER",
                 message=(
@@ -306,16 +306,16 @@ def _read_browser_cookies(
             )
 
     try:
-        import rookiepy
+        import rookie_cookies
     except ImportError:
         return CookieValidationFailure(
             code="ROOKIEPY_NOT_INSTALLED",
             message=(
-                "[red]rookiepy is not installed.[/red]\n"
+                "[red]rookie-cookies is not installed.[/red]\n"
                 "Install it with:\n"
                 "  pip install 'notebooklm-py[cookies]'\n"
                 "or directly:\n"
-                "  pip install rookiepy"
+                "  pip install rookie-cookies"
             ),
         )
 
@@ -328,23 +328,23 @@ def _read_browser_cookies(
                 "[yellow]Reading cookies from installed browser (auto-detect)...[/yellow]",
             )
         try:
-            return rookiepy.load(domains=domains)
+            return rookie_cookies.load(domains=domains)
         except (OSError, RuntimeError) as e:
             return CookieValidationFailure(
                 code="COOKIE_READ_FAILED",
-                message=_handle_rookiepy_error(e, "auto-detect"),
+                message=_handle_rookie_cookies_error(e, "auto-detect"),
             )
 
     assert canonical is not None
     if verbose:
         _emit_progress(io, f"[yellow]Reading cookies from {browser_name}...[/yellow]")
-    browser_fn = getattr(rookiepy, canonical, None)
+    browser_fn = getattr(rookie_cookies, canonical, None)
     if browser_fn is None or not callable(browser_fn):
         return UnsupportedBrowser(
             code="UNSUPPORTED_BROWSER",
             message=(
-                f"[red]rookiepy does not support '{canonical}' on this platform.[/red]\n"
-                "Check that rookiepy is properly installed: pip install rookiepy"
+                f"[red]rookie-cookies does not support '{canonical}' on this platform.[/red]\n"
+                "Check that rookie-cookies is properly installed: pip install rookie-cookies"
             ),
             name=canonical,
         )
@@ -353,7 +353,7 @@ def _read_browser_cookies(
     except (OSError, RuntimeError) as e:
         return CookieValidationFailure(
             code="COOKIE_READ_FAILED",
-            message=_handle_rookiepy_error(e, browser_name),
+            message=_handle_rookie_cookies_error(e, browser_name),
         )
 
     # Back-compat warning: unscoped 'firefox' silently merges cookies from

@@ -62,7 +62,7 @@ Two things follow, and they are easy to conflate:
 > migrated (the legacy host is a 302), so a session's CSRF/session pair is
 > *already* minted by `notebook.google.com` today and accepted by legacy
 > `batchexecute` — visible in twelve recorded interactions in
-> `tests/cassettes/collection_*.yaml`. Flipping makes the origin coherent; it
+> `tests/cassettes/web/collection_*.yaml`. Flipping makes the origin coherent; it
 > does not introduce a new dependency. Pre-cutover profiles were measured
 > against both hosts (#2067) and reached the rebrand host successfully
 > *without* their legacy-scoped `OSID`, because the accounts-scoped `LSID`
@@ -194,8 +194,8 @@ done.
    `project.urls`, fancy-pypi-readme substitutions, badges, the OCI source
    label, the TestPyPI summary URL, and **every** `github.repository ==`
    guard — `publish-docker.yml`, `publish-mcpb.yml`,
-   `verify-package.yml:150,158`, `nightly.yml`, `rpc-health.yml`, and
-   `verify-artifacts.yml` (string compares don't get redirects; after a
+   `verify-package.yml`, `nightly.yml`, and `rpc-health.yml` (string compares
+   don't get redirects; after a
    rename those jobs silently skip). A new repo-wide guardrail test fails CI
    on any stale `github.repository` / `teng-lin/notebooklm-py` literal
    outside historical records (CHANGELOG, ADRs), so no future guard can go

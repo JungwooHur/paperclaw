@@ -94,6 +94,7 @@ if src is None:
 
 # AFTER (b) — want the raising contract: catch the typed exception
 from notebooklm import SourceNotFoundError
+
 try:
     src = await client.sources.get(nb_id, source_id)
 except SourceNotFoundError:
@@ -146,12 +147,12 @@ print(guide["summary"], guide["keywords"])
 
 # AFTER — typed attribute access (warning-free, valid on both releases)
 result = await client.research.poll(nb_id)
-if result.status == ResearchStatus.COMPLETED:   # also == "completed"
-    for source in result.sources:               # tuple[ResearchSource, ...]
+if result.status == ResearchStatus.COMPLETED:  # also == "completed"
+    for source in result.sources:  # tuple[ResearchSource, ...]
         print(source.title, source.url)
 
 guide = await client.sources.get_guide(nb_id, src_id)
-print(guide.summary, guide.keywords)            # guide.keywords is a tuple
+print(guide.summary, guide.keywords)  # guide.keywords is a tuple
 ```
 
 `ResearchStatus` is a `str` enum, so `result.status == "completed"` keeps

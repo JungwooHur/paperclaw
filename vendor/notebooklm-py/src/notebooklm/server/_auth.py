@@ -27,8 +27,8 @@ import os
 
 from fastapi import HTTPException, Request
 
-from .._serving import LOOPBACK_HOSTNAMES as _LOOPBACK_HOSTNAMES
-from .._serving import addr_is_loopback as _addr_is_loopback
+from .._adapter_support import LOOPBACK_HOSTNAMES as _LOOPBACK_HOSTNAMES
+from .._adapter_support import addr_is_loopback as _addr_is_loopback
 
 __all__ = [
     "ALLOW_EXTERNAL_BIND_ENV",

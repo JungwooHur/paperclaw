@@ -8,8 +8,8 @@ importer that does not decompose into four independent HTTP routes):
 * ``POST   .../research``               → ``client.research.start`` (202).
 * ``GET    .../research/{run_id}``      → ``_app.research.poll_and_classify``.
 * ``DELETE .../research/{run_id}``      → ``_app.research.cancel_research``.
-* ``POST   .../research/{run_id}/import`` → guard the poll, then
-  ``client.research.import_sources``.
+* ``POST   .../research/{run_id}/import`` → ``_app.research.execute_research_import``
+  (oneshot poll → import under one ``client.operation``).
 
 **The ``run_id`` land mine.** ``client.research.start`` returns BOTH a
 ``task_id`` and (for **deep** mode) a ``report_id``; poll / cancel / import must
@@ -175,16 +175,15 @@ async def import_research(
     .../sources/{id}`` poll for a just-imported id resolves to a ``200`` pending
     rather than a spurious ``404`` during the not-yet-listable window.
     """
-    # Poll FOR THE REQUESTED run and guard every non-importable state before
-    # touching ``import_sources``. The same shared helper backs the MCP
-    # ``research_import`` tool so the importable-state ladder cannot drift.
-    sources = await research_core.poll_sources_for_import(client, notebook_id, run_id)
-    # The MCP ``research_import`` tool imports via the timeout-tolerant
-    # ``import_sources_with_verification`` (#1920), but this synchronous REST route
-    # deliberately stays on the one-shot ``import_sources``: a web request must not
-    # block on a multi-minute reconcile-and-retry loop. A REST caller that hits a
-    # timeout reconciles by polling ``GET .../sources`` for what actually committed.
-    imported = await client.research.import_sources(notebook_id, run_id, sources)
+    # Poll + import share one ``client.operation`` so a configured aggregate
+    # deadline cannot restart between the read and the mutation. The MCP
+    # ``research_import`` tool drives the same helper (verified path); this
+    # synchronous REST route stays on oneshot ``import_sources`` so it cannot
+    # block on a multi-minute reconcile loop.
+    execution = await research_core.execute_research_import(
+        client, notebook_id, run_id, oneshot=True
+    )
+    imported = execution.imported
     # Record each new source id in the pending registry so the source poll route
     # can answer 200-pending (not 404) for the not-yet-listable window.
     for item in imported:
@@ -196,5 +195,5 @@ async def import_research(
         "notebook_id": notebook_id,
         "run_id": run_id,
         "imported": to_jsonable(imported),
-        "sources_found": len(sources),
+        "sources_found": len(execution.sources_found),
     }

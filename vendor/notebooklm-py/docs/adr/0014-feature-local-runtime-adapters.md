@@ -5,9 +5,10 @@
 > existed. **`Session` and `_session.py` have since been deleted** (see
 > [Revision history](#revision-history) → "2026-05-28 — Session elimination"),
 > and the former `_session_*` / `_runtime_*` collaborators now live under the
-> `_runtime/` package (for example `_runtime/init.py`,
-> `_runtime/transport.py`; the `SessionTransport` / `SessionCollaborators`
-> classes are now `RuntimeTransport` / `RuntimeCollaborators`). The
+> `_runtime/` package or the web transport owner (for example
+> `_runtime/init.py` and `_web/transport/runtime.py`; the
+> `SessionTransport` / `SessionCollaborators` classes are now
+> `RuntimeTransport` / `RuntimeCollaborators`). The
 > feature-local composite Protocols and adapter dataclasses discussed below
 > were also retired when direct keyword-only collaborator injection proved
 > clearer for their single consumers. Treat in-body references to `Session`,
@@ -15,6 +16,27 @@
 > historical; the
 > live runtime shape is documented in
 > [`docs/architecture.md`](../architecture.md).
+>
+> **Backend-subclass amendment (2026-08-27).** Rule 1's current-state table is
+> refined by the accepted web/mobile backend split: `LoopGuard` stays in the
+> transport-neutral `_runtime/contracts.py`, while web-only `RpcCaller` and
+> `Kernel` move to `_web` during Phase A, and `RuntimeTransport` lives at
+> `_web/transport/runtime.py`. `RpcExecutor` and the concrete web kernel remain
+> their direct satisfiers. Backend-neutral public namespace bases
+> do not depend on those web contracts; each `Web*API` subclass receives the
+> web collaborator it needs. Rules 2–5 otherwise remain in force.
+>
+> **Phase B lifecycle amendment (2026-08-28).** `CallSupervisor` and the root
+> `ClientLifecycle`/`TransportLifecycle` split now have multiple production
+> consumers (web and Android) and therefore pass this ADR's sharing threshold.
+> They are infrastructure services with closed lifecycle/call-policy surfaces,
+> not a resurrection of the deleted broad `Session` facade. Backend request,
+> auth, retry, codec, and exception decisions remain on their concrete stacks.
+>
+> **Runtime cleanup amendment (2026-09-03).** `CallSupervisor` is the sole
+> generation admission and drain-accounting owner. The transitional
+> `TransportDrainTracker` and its duplicate counters were removed; operation
+> scopes, child admission, idle waiting, and drain hooks all use the supervisor.
 
 ## Status
 
@@ -69,7 +91,7 @@ satisfier of every Protocol. This produces four observable consequences:
 
 4. **`RpcOwner` Protocol carries underscore-prefixed `Session` internals.**
    `RpcExecutor` declares an `RpcOwner` dependency
-   ([`_rpc_executor.py:59-78`](../../src/notebooklm/_rpc_executor.py)) listing
+   ([`executor.py`](../../src/notebooklm/_web/transport/executor.py)) listing
    `_kernel`, `_perform_authed_post`, `_await_refresh`, `_increment_metrics`.
    This is not "narrow contract"; it is "private surface of `Session`, structurally
    typed". The leakage persists because `RpcExecutor` receives a `Session`-shaped
@@ -92,12 +114,12 @@ implementation rules change how those interfaces are satisfied at runtime.
 
 | Protocol                                                             | Satisfier (post-migration)                                                                | Migration prerequisite                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RpcCaller`                                                          | `RpcExecutor` directly                                                                    | none — already structurally satisfies (TYPE_CHECKING assertion at [`_rpc_executor.py:463`](../../src/notebooklm/_rpc_executor.py))                                                                                                                                                                                                                                                                                                                               |
+| `RpcCaller`                                                          | `RpcExecutor` directly                                                                    | none — already structurally satisfies (TYPE_CHECKING assertion in [`executor.py`](../../src/notebooklm/_web/transport/executor.py))                                                                                                                                                                                                                                                                                                                               |
 | `LoopGuard`                                                          | `ClientLifecycle` directly                                                                | **push down `assert_bound_loop()`** — currently lives on `Session.assert_bound_loop` (`_session.py:486`), which calls `_loop_affinity.assert_bound_loop(self.bound_loop)`. `ClientLifecycle` already owns `get_bound_loop` (`_session_lifecycle.py:271`); the push-down adds a trivial `assert_bound_loop()` method that calls the free function with `self.get_bound_loop()`. |
-| `OperationScopeProvider`                                             | `TransportDrainTracker` directly                                                          | **push down `operation_scope(label)`** — currently lives on `Session.operation_scope` (`_session.py:495`) as an async context manager wrapping `begin_transport_post` / `finish_transport_post` (both already on `TransportDrainTracker` at [`_transport_drain.py:139,196`](../../src/notebooklm/_transport_drain.py)). The push-down moves the contextmanager wrapper to the tracker.                                       |
-| `DrainHookRegistration` (feature-local in `_artifacts.py`)           | `TransportDrainTracker` directly                                                          | **push down `register_drain_hook(name, hook)` + the underlying `_drain_hooks` storage** — currently lives on `Session.register_drain_hook` (`_session.py:421`). The push-down moves both the method and the storage onto the tracker.                                                                                                                                                                                        |
+| `OperationScopeProvider`                                             | `CallSupervisor` directly                                                                 | **push down `operation_scope(label)`** — the current implementation lives on [`CallSupervisor`](../../src/notebooklm/_runtime/call_supervisor.py), which owns the generation counter and operation lease. |
+| `DrainHookRegistration` (feature-local in `_artifacts.py`)           | `CallSupervisor` directly                                                                 | **push down `register_drain_hook(name, hook)` + the underlying `_drain_hooks` storage** — both now live on the supervisor beside the admission state they drain. |
 | `AsyncWorkRuntime` (composes `LoopGuard` + `OperationScopeProvider`) | satisfied **transitively** by `ArtifactsRuntimeAdapter` / `UploadRuntimeAdapter` (Rule 2) | depends on the push-downs above. No dedicated `_AsyncWorkAdapter` — per Rule 2, trivial composites do not get adapter middlemen.                                                                                                                                                                                                                                                                                                                                 |
-| `AuthMetadata`                                                       | `AuthTokens` (`client._auth`) directly                                                     | `SourceUploadPipeline` receives the client-owned `AuthTokens` via `auth=client._auth`; `AuthTokens` structurally provides the `authuser` and `account_email` members required by `_source/upload.py::AuthMetadata`.                                                                                                                                                                                                                                             |
+| `AuthMetadata`                                                       | `AuthTokens` (`client._auth`) directly                                                     | `SourceUploadPipeline` receives the client-owned `AuthTokens` via `auth=client._auth`; `AuthTokens` structurally provides the `authuser` and `account_email` members required by `_web/sources/upload.py::AuthMetadata`.                                                                                                                                                                                                                                             |
 | `Kernel` (Protocol)                                                  | the concrete `Kernel` class                                                               | none — unchanged                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 **Why the push-downs are part of this ADR's mandate, not pre-existing.** The
@@ -154,8 +176,8 @@ class ArtifactsRuntimeAdapter:
     """
 
     rpc: RpcCaller
-    drain: TransportDrainTracker     # satisfies OperationScopeProvider + DrainHookRegistration after Wave 0.5
-    lifecycle: ClientLifecycle       # satisfies LoopGuard after Wave 0.5
+    supervisor: CallSupervisor  # operation scopes + drain-hook registration
+    lifecycle: ClientLifecycle  # satisfies LoopGuard after Wave 0.5
 
     async def rpc_call(self, *args: Any, **kwargs: Any) -> Any:
         return await self.rpc.rpc_call(*args, **kwargs)
@@ -175,10 +197,11 @@ class ArtifactsRuntimeAdapter:
 parameters, so its adapter covers only the composite Protocol part).
 
 `ChatRuntime` does **not** get an adapter — the Rule 2 Corollary applies. Once
-`_chat_transport.chat_aware_authed_post` is refactored to take `SessionTransport`
-directly (Wave 4.1 Step 0), `ChatRuntime` has no remaining consumer and is
-deleted. `ChatAPI` takes the four underlying collaborators (`RpcExecutor`,
-`SessionTransport`, `ReqidCounter`, `ClientLifecycle`) as keyword-only
+the chat-aware POST helper takes `RuntimeTransport` directly, `ChatRuntime` has
+no remaining consumer and is deleted. The backend-neutral `ChatAPI` takes the
+`LoopGuard` and `NotebookSourceIdProvider` collaborators needed by shared
+orchestration. `WebChatAPI` adds the Web-specific `RpcCaller`,
+`RuntimeTransport`, and `ReqidCounter` collaborators as keyword-only
 constructor parameters.
 
 ### Rule 3 — `NotebookLMClient.__init__` is the composition root
@@ -221,7 +244,7 @@ After migration, `Session` owns:
   `_authed_post_chain`, `_rate_limit_max_retries`,
   `_server_error_max_retries`, `_refresh_retry_delay` — moved off `Session`
   onto `MiddlewareChainHost`
-  ([`_middleware_chain_host.py`](../../src/notebooklm/_middleware/chain_host.py))
+  ([`chain_host.py`](../../src/notebooklm/_web/transport/middleware/chain_host.py))
   in Stage B2 PR 1 (#1090). PR 2 (#1092) then split
   `wire_middleware_chain` / `build_session_transport` to take
   `chain_host: MiddlewareChainHost` directly, so the live chain reads
@@ -322,11 +345,11 @@ holding an `_owner` reference.
 in `_source_upload.py`. They are concrete implementations of feature-local
 composite Protocols.
 
-The Chat feature gets no adapter (Rule 2 Corollary): once
-`_chat_transport.chat_aware_authed_post` is refactored to take `SessionTransport`
-directly, `ChatRuntime` has no remaining consumer and is deleted. `ChatAPI`
-takes the underlying collaborators as keyword-only constructor parameters
-instead.
+The Chat feature gets no adapter (Rule 2 Corollary): the Web chat-aware POST
+helper takes `RuntimeTransport` directly, so `ChatRuntime` has no remaining
+consumer and is deleted. Neutral `ChatAPI` takes only its shared-orchestration
+collaborators; `WebChatAPI` takes the Web RPC, transport, and request-ID
+collaborators as keyword-only constructor parameters.
 
 The ADR-0013 promotion rule (≥2 consumers ⇒ shared Protocol in
 `_runtime/contracts.py`) is unchanged. Adapters are _not_ promoted to the
@@ -433,7 +456,7 @@ section of this ADR's revision history.
 Issue #1085 (deferred `MiddlewareChainHost` extraction) closed.
 
 - **#1090** introduced
-  [`_middleware_chain_host.py`](../../src/notebooklm/_middleware/chain_host.py).
+  [`chain_host.py`](../../src/notebooklm/_web/transport/middleware/chain_host.py).
   The chain's tunable storage (`_authed_post_chain_terminal`,
   `_authed_post_chain`, `_rate_limit_max_retries`,
   `_server_error_max_retries`, `_refresh_retry_delay`) moved from
@@ -475,7 +498,7 @@ are recorded in the historical deletion notes below.
 The Rule 2 example dataclasses `ArtifactsRuntimeAdapter` and
 `UploadRuntimeAdapter` introduced for the artifact and upload features
 were retired. Each adapter only hid three stable collaborators
-(`RpcCaller` + `TransportDrainTracker` + `ClientLifecycle`) and had
+(`RpcCaller` + `CallSupervisor` + `ClientLifecycle`) and had
 exactly one production satisfier, so they sat at the bottom of Rule
 2's keep-vs-delete spectrum. The feature constructors now take their
 three runtime collaborators (`rpc` + `drain` + `lifecycle`) as
@@ -519,7 +542,7 @@ the `SessionCollaborators` bundle, the `RpcExecutor`, and the public feature
 APIs. The concrete `Session` class and its module were deleted, along with the
 session-method retention document and helper factory. Lifecycle entry points
 (`__aenter__`, `__aexit__`, `close`, `drain`, and `is_connected`) call
-`ClientLifecycle` and `TransportDrainTracker` directly. Static lints now enforce
+`ClientLifecycle` and `CallSupervisor` directly. Static lints now enforce
 that the deleted module, deleted helper names, deleted client attribute, and
 `ClientComposed.collaborators` alias cannot return.
 

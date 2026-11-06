@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any, Literal
 
 from notebooklm._env import (
+    ENTERPRISE_APP_HOSTS,
     PERSONAL_APP_HOSTS,
     PERSONAL_BASE_HOST,
     PERSONAL_LEGACY_HOST,
@@ -145,6 +146,18 @@ _SECONDARY_BINDING_WARNED = False
 # pattern as keepalive's ``_POKE_STATE_LOCK`` — or the unlocked check-then-set
 # races and logs the warning 2-3x under concurrent loads.
 _SECONDARY_BINDING_WARN_LOCK = threading.Lock()
+
+
+def _reset_secondary_binding_warning_for_tests() -> None:
+    """Re-arm the process warning after synchronizing with active claimers.
+
+    Test lifecycle cleanup must use this operation rather than rebinding the
+    module flag.  Taking the same lock as the claim path prevents teardown
+    from racing a worker that is deciding whether to emit the warning.
+    """
+    global _SECONDARY_BINDING_WARNED
+    with _SECONDARY_BINDING_WARN_LOCK:
+        _SECONDARY_BINDING_WARNED = False
 
 
 def _has_valid_secondary_binding(cookie_names: set[str]) -> bool:
@@ -316,8 +329,8 @@ def app_host_scope_note() -> str:
 
     Returns:
         The note as plain text (no trailing newline), or ``""`` when the
-        configured host has no sibling — i.e. the enterprise host, which has no
-        alias, so there is no cross-host scope to warn about.
+        configured host is outside the personal app family. Enterprise hosts
+        do not use this personal-session recovery guidance.
     """
     base_host = get_base_host()
     siblings = sorted(PERSONAL_APP_HOSTS - {base_host})
@@ -432,7 +445,7 @@ def missing_cookies_hint(
 # Cookie domains we extract / accept by default.
 #
 # Empirical justification: traced cassettes
-# (``tests/cassettes/*.yaml``) and the live auth-refresh path. Only the
+# (``tests/cassettes/web/*.yaml``) and the live auth-refresh path. Only the
 # following domains are actually exercised during login + token refresh +
 # source-add + chat-ask flows:
 #   - ``notebook.google.com`` (the default app host since #2067 — CLI RPCs
@@ -480,8 +493,8 @@ REQUIRED_COOKIE_DOMAINS: frozenset[str] = frozenset(
         # not drop them at extraction / load time.
         f".{PERSONAL_BASE_HOST}",
         PERSONAL_BASE_HOST,
-        ".notebooklm.cloud.google.com",
-        "notebooklm.cloud.google.com",
+        *ENTERPRISE_APP_HOSTS,
+        *(f".{host}" for host in ENTERPRISE_APP_HOSTS),
         ".googleusercontent.com",
         "accounts.google.com",  # Required for token refresh + RotateCookies
         ".accounts.google.com",  # http.cookiejar may normalize Domain=accounts.google.com
@@ -794,8 +807,8 @@ def _auth_domain_priority(domain: str) -> int:
     wins, and reordering the file changes the result. The collisions are:
 
     - **tier 3** — ``.notebooklm.google.com``, ``.notebook.google.com``
-      (the Gemini Notebook rebrand host), ``.notebooklm.cloud.google.com``
-    - **tier 2** — the three bare (no leading dot) variants of the above
+      and both dotted enterprise hosts in ``ENTERPRISE_APP_HOSTS``
+    - **tier 2** — the four bare (no leading dot) variants of the above
     - **tier 0** — every allowlisted domain that is not a Google ccTLD:
       ``accounts.google.com``, ``drive.google.com``, ``.googleusercontent.com``,
       ``lh3.google.com``, bare ``google.com``, …
@@ -827,9 +840,9 @@ def _auth_domain_priority(domain: str) -> int:
         return 3
     if domain == PERSONAL_BASE_HOST:
         return 2
-    if domain == ".notebooklm.cloud.google.com":
+    if domain.startswith(".") and domain[1:] in ENTERPRISE_APP_HOSTS:
         return 3
-    if domain == "notebooklm.cloud.google.com":
+    if domain in ENTERPRISE_APP_HOSTS:
         return 2
     if _is_google_domain(domain):
         return 1

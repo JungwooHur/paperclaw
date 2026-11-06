@@ -1,7 +1,7 @@
 # Release Checklist
 
 **Status:** Active
-**Last Updated:** 2026-08-05
+**Last Updated:** 2026-10-01
 
 Checklist for releasing a new version of `notebooklm-py`.
 
@@ -31,14 +31,13 @@ Release Plan for vX.Y.Z:
 5. Commit changes
 6. ⏸️ CONFIRM: Create PR to main?
 7. Wait for CI to pass on PR
-8. Run E2E and RPC health checks on release branch
+8. Merge the release PR, then run E2E and RPC health checks on protected main
 9. ⏸️ CONFIRM: Publish to TestPyPI?
 10. Verify TestPyPI package
-11. Merge PR to main
-12. ⏸️ CONFIRM: Create and push tag vX.Y.Z?
-13. Wait for PyPI publish
-14. Create GitHub release (add `--prerelease` for a pre-release — see [Pre-releases](#pre-releases-alpha--beta--rc))
-15. Clean up worktree
+11. ⏸️ CONFIRM: Create and push tag vX.Y.Z?
+12. Wait for PyPI publish
+13. Create GitHub release (add `--prerelease` for a pre-release — see [Pre-releases](#pre-releases-alpha--beta--rc))
+14. Clean up worktree
 
 Proceed with release preparation?
 ```
@@ -58,7 +57,7 @@ Proceed with release preparation?
   ```bash
   # Canonical contributor install; add --extra mcp/--extra server when
   # validating those adapters locally. `[all]` also includes mcp+server
-  # and deliberately excludes cookies (Python 3.13+ rookiepy issue).
+  # and deliberately excludes optional browser-cookie extraction.
   uv sync --frozen --extra browser --extra dev --extra markdown
   uv run playwright install chromium
   ```
@@ -200,7 +199,8 @@ no break against the baseline) is a CI failure, not silent cruft.
 
 - [ ] Run all checks before committing:
   ```bash
-  uv run pre-commit run --all-files && uv run mypy src/notebooklm --ignore-missing-imports && uv run pytest
+  uv run pre-commit run --all-files && uv run mypy src/notebooklm --ignore-missing-imports && uv run pytest -m "not refactor_qualification"
+  uv run pytest -m refactor_qualification --timeout=180 --no-cov
   ```
 - [ ] Ensure CI runs the same lint gate (`pre-commit run --all-files`) as local release prep
 - [ ] Run documentation drift checks (mirror the CI gates in `.github/workflows/test.yml`):
@@ -248,26 +248,33 @@ no break against the baseline) is a CI failure, not silent cruft.
 - [ ] Wait for **test.yml** to pass:
   - Linting and formatting
   - Type checking
-  - Unit and integration tests (Python 3.10-3.14, all platforms)
+  - Unit and integration tests in the reduced 5-cell PR matrix: Python
+    3.10, 3.12, and 3.15 on Ubuntu plus Python 3.12 on macOS and Windows
+- [ ] Merge the release PR to `main`.
 
-### E2E Tests on Release Branch
+### Authenticated E2E on protected main
 
 - [ ] Go to **Actions** → **Nightly E2E Tests**
-- [ ] Click **Run workflow**, set **custom_branch** to `release/vX.Y.Z`
-- [ ] Wait for E2E tests to pass
+- [ ] After the release PR is merged, dispatch the workflow on `main`; choose
+      `account_rotation_base=auto` unless reproducing a slot-specific failure
+- [ ] Separately dispatch **Nightly Code Checks** (`nightly-checks.yml`) on the
+      same release commit. It runs the full 18-cell compatibility matrix, coverage,
+      and repository lint. These checks are independent of the live E2E workflow.
+- [ ] Wait for code checks and the full Web/Ubuntu, full Android/macOS, and
+      read-only Web/Windows E2E jobs to pass
 - [ ] If E2E tests fail:
-  1. Fix issues in the release worktree
-  2. Commit and push
+  1. Fix issues in a new release-fix PR against `main`
+  2. Merge that PR
   3. Re-run E2E tests
 
-### RPC Health Check on Release Branch
+### RPC Health Check on protected main
 
 - [ ] Go to **Actions** → **RPC Health Check**
-- [ ] Click **Run workflow**, set **custom_branch** to `release/vX.Y.Z`
+- [ ] Dispatch on `main` with `account_rotation_base=auto`
 - [ ] Wait for RPC health check to pass
 - [ ] If RPC health check fails:
-  1. Fix issues in the release worktree
-  2. Commit and push
+  1. Fix issues in a new release-fix PR
+  2. Merge that PR
   3. Re-run RPC health check
 
 ### MCP connector smoke (manual, per release)
@@ -301,6 +308,13 @@ python scripts/mcp_live_smoke.py \
     --notebook <notebook-id>
 ```
 
+The smoke follows source pagination until the uploaded source is found and Studio
+pagination until a downloadable artifact is found. For
+an Android-backed deployment pass `--backend android` so URL-less slide decks
+can use the backend's exact-download fallback. HTTP failure diagnostics omit raw
+response bodies and exception messages because they can contain signed capability
+URLs; they report HTTP status/byte counts or the exception class instead.
+
 ---
 
 ## Package Verification
@@ -311,7 +325,8 @@ python scripts/mcp_live_smoke.py \
 
 - [ ] **⏸️ CONFIRM:** Ask user "Ready to publish to TestPyPI?"
 - [ ] Go to **Actions** → **Publish to TestPyPI**
-- [ ] Click **Run workflow**, select the **release/vX.Y.Z** branch
+- [ ] Click **Run workflow**, select **main** (the release PR has already been
+      merged and all authenticated gates above ran against this protected ref)
 - [ ] Wait for upload to complete
 - [ ] Verify package appears: https://test.pypi.org/project/notebooklm-py/
 
@@ -323,17 +338,21 @@ python scripts/mcp_live_smoke.py \
 - [ ] Click **Run workflow** with **source**: `testpypi`
 - [ ] Wait for all tests to pass (unit, integration, E2E)
 - [ ] If verification fails:
-  1. Fix issues in the release worktree
-  2. Bump patch version in `pyproject.toml` (for a pre-release, bump the
+  1. Create a new release-fix worktree and branch from the latest `main`
+  2. Fix the issue there
+  3. Bump patch version in `pyproject.toml` (for a pre-release, bump the
      pre-release serial, e.g. `0.8.0a1 → 0.8.0a2`)
-  3. Update `CHANGELOG.md` with fix
-  4. Commit, push, and re-run **Publish to TestPyPI**
+  4. Update `CHANGELOG.md` with the fix
+  5. Commit, push, and create a release-fix PR against `main`
+  6. Wait for CI, merge the release-fix PR, and rerun the authenticated E2E and
+     RPC health gates on protected `main`
+  7. Re-run **Publish to TestPyPI** from `main`
 
 #### How the verify chain works
 
 The **Verify Package** workflow (`.github/workflows/verify-package.yml`) exercises a published wheel in two phases so packaging bugs cannot silently fall through to a stale PyPI mirror:
 
-1. **Dep tree from `uv.lock`.** `uv sync --frozen --extra browser --extra dev --extra markdown --extra mcp --extra server --extra headless` installs the locked dependency tree for the full non-cookies extra set into `.venv/`: browser automation, developer tooling, Markdown export, MCP, REST server, and headless master-token-auth dependencies. `cookies` stays excluded because of the Python 3.13+ `rookiepy` issue. This produces a deterministic dep tree without any TestPyPI lookups.
+1. **Dep tree from `uv.lock`.** `uv sync --frozen --extra browser --extra dev --extra markdown --extra mcp --extra server --extra headless --extra android --extra impersonate` installs the locked dependency tree for the full non-cookies extra set into `.venv/`: browser automation, developer tooling, Markdown export, MCP, REST server, headless master-token authentication, Android gRPC, and browser-impersonation dependencies. `cookies` stays excluded because published-wheel verification does not exercise browser-cookie extraction. This produces a deterministic dep tree without any TestPyPI lookups.
 2. **Wheel from the chosen index, `--no-deps`.** `uv pip install --python .venv/bin/python --no-deps --reinstall --no-cache --only-binary=:all: --index-url <testpypi|pypi> "notebooklm-py==<version>"` swaps the editable install left behind by `uv sync` for the actual published wheel. `--no-deps` is load-bearing: without it the previous `--extra-index-url https://pypi.org/simple/` fallback would mask a broken/missing TestPyPI upload by resolving an older version from PyPI. `--reinstall --no-cache --only-binary=:all:` guarantee we test the freshly-uploaded wheel and never a cached sdist. The explicit `--python .venv/bin/python` is required because `uv sync` does not seed `pip` into the project venv — a bare `source .venv/bin/activate && pip install …` would silently fall back to the runner's system pip and leave the editable install in place.
 
 The same chain runs for `source: pypi` (post-publish verification) — only the wheel index changes; the locked dep tree is identical.
@@ -342,16 +361,14 @@ The `Publish to PyPI` step in `publish.yml` also opts into **PEP 740 attestation
 
 ---
 
-## Merge to Main
+## Confirm Main State
 
-- [ ] Once TestPyPI verification passes, merge the PR:
-  ```bash
-  gh pr merge --squash --delete-branch
-  ```
-- [ ] Pull latest main (in main repo):
+- [ ] The release PR (and any release-fix PR) was merged before the protected
+      E2E, RPC, and TestPyPI gates. Pull that verified state in the main repo;
+      there is no second release-PR merge at this stage:
   ```bash
   cd /path/to/notebooklm-py
-  git pull origin main
+  git pull --ff-only origin main
   ```
 
 ---
@@ -371,6 +388,18 @@ The `Publish to PyPI` step in `publish.yml` also opts into **PEP 740 attestation
   ```
 - [ ] Wait for **publish.yml** to complete
 - [ ] Verify on PyPI: https://pypi.org/project/notebooklm-py/
+
+If a tag-triggered publish fails because of workflow tooling, fix the workflow
+through a PR and dispatch `publish.yml` from `main` with `release_tag=vX.Y.Z`.
+Recovery resolves the existing tag to an immutable commit, repeats the auth/API
+audits and wheel qualification, and publishes artifacts built from that commit.
+Do not move a published tag to incorporate a workflow-only fix. Release auth
+coverage compares against the previous stable release. PR migration allowances
+do not apply to that comparison. Any reviewed replacement coordinates must be
+listed under the exact release tag in
+`tests/fixtures/policies/auth_release_coverage_allowances.json`, bound to the
+previous stable commit, linked to a scenario, and unexpired. The same strict
+coverage validator rejects unexplained losses and stale allowances.
 
 ### PyPI Verification
 
@@ -548,9 +577,9 @@ them to normal users. Follow the normal checklist above, with these differences:
    between pre-releases.
 3. **A pre-release *is* the final version's real surface.** A `X.Y.ZaN` tag must
    already contain every breaking flip for that version with deprecation shims
-   removed. The `tests/_guardrails/test_v080_release_gate.py` version parser
-   truncates the pre-release suffix, so the v0.8.0 breaking-flip release-gate
-   fires at `0.8.0a1`. A "soft" alpha that still carries shims is not supported.
+   removed. The `tests/_guardrails/test_v100_release_gate.py` version parser
+   truncates the pre-release suffix, so the breaking-flip release-gate
+   fires at `1.0.0a1` (historically `tests/qualification/historical/test_v080_release_gate.py` at `0.8.0a1`). A "soft" alpha that still carries shims is not supported.
 4. **Re-lock after the bump.** After editing `pyproject.toml`'s version, run
    `uv sync` so `uv.lock`'s workspace-package version matches, else CI `--frozen`
    installs fail as out-of-date.
@@ -566,7 +595,7 @@ them to normal users. Follow the normal checklist above, with these differences:
 8. **Gates still apply; none are optional.** The public-API audit,
    pre-commit/mypy/pytest, CI on PR, TestPyPI, and Verify Package all run
    unchanged. Verify Package reads the version from the checked-out ref, so
-   dispatch it on the pre-release branch. Because Verify Package runs E2E, there is
+   dispatch it on protected `main` after the release PR lands. Because Verify Package runs E2E, there is
    no "skip E2E for a pre-release" shortcut.
 9. **GitHub release must be flagged as a pre-release, and the notes must extract
    the aggregate heading** (not a per-pre-release one, which would yield empty
@@ -581,6 +610,10 @@ them to normal users. Follow the normal checklist above, with these differences:
 ## Version Numbering
 
 **IMPORTANT:** Read [stability.md](stability.md) before deciding version bump.
+For a release that removes or flips compatibility behavior, also audit every
+row in the [release migration gates](deprecations.md#release-migration-gates) against the
+published stable tags. Source warnings and proposed version strings do not
+satisfy a release gate.
 
 | Change Type | Bump | Example |
 |-------------|------|---------|

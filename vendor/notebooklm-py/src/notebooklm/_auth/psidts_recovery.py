@@ -31,11 +31,9 @@ for this fix.
 
 from __future__ import annotations
 
-import copy
 import http.cookiejar
 import json
 import logging
-import math
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
@@ -47,6 +45,7 @@ import httpx
 from . import cookie_merge as _cookie_merge
 from . import cookie_policy as _cookie_policy
 from . import cookie_semantics as _cookie_semantics
+from . import cookie_types as _cookie_types
 from . import keepalive as _keepalive
 from .cookie_merge import RecoveryObservation
 from .cookie_types import CookieIdentity, CookieJar
@@ -69,99 +68,62 @@ _RECOVERY_TARGET_COOKIE_NAMES = _cookie_policy._RECOVERY_TARGET_COOKIE_NAMES
 _ROTATION_MERGE_COOKIE_NAMES = _RECOVERY_TARGET_COOKIE_NAMES | {"LSID"}
 
 _CookieConverter = Callable[[dict[str, Any]], http.cookiejar.Cookie]
-_CookieIdentity = tuple[str, str, str]
 
 
 def _bounded_row_field(entry: Any, field: str) -> str:
-    if not isinstance(entry, dict):
-        return type(entry).__name__
-    value = entry.get(field)
-    return value[:80] if isinstance(value, str) else type(value).__name__
+    return _cookie_types._bounded_row_field(entry, field)
 
 
 def _sanitize_recovery_row(entry: Any) -> dict[str, Any] | None:
-    try:
-        return _cookie_semantics.sanitize_cookie_entry(entry)
-    except _cookie_semantics.CookieRowError as exc:
-        logger.debug(
-            "Skipping malformed cookie row name=%s domain=%s row_type=%s error=%s",
-            _bounded_row_field(entry, "name"),
-            _bounded_row_field(entry, "domain"),
-            type(entry).__name__,
-            type(exc).__name__,
-        )
-        return None
+    return _cookie_types._sanitize_routing_entry(
+        entry,
+        bounded_row_field=_bounded_row_field,
+    )
+
+
+def _try_cookie(entry: Any, converter: _CookieConverter) -> http.cookiejar.Cookie | None:
+    return _cookie_types._try_cookie(
+        entry,
+        converter,
+        bounded_row_field=_bounded_row_field,
+    )
+
+
+def _cookie_header_names(header: str) -> set[str]:
+    return _cookie_types._cookie_header_names(header)
+
+
+def _allowed_cookie_name(entry: Any) -> str | None:
+    return _cookie_types._allowed_cookie_name(
+        entry,
+        sanitize=_sanitize_recovery_row,
+        is_allowed_domain=_is_allowed_auth_domain,
+    )
+
+
+def _is_expired(cookie: http.cookiejar.Cookie, now: float | None) -> bool:
+    return _cookie_types._is_expired(cookie, now)
+
+
+def _iter_routable_psidts_cookies(
+    entries: list[dict[str, Any]],
+    *,
+    to_cookie: _CookieConverter,
+    now: float | None = None,
+) -> Iterator[http.cookiejar.Cookie]:
+    return _cookie_types._iter_routable_psidts_cookies(
+        entries,
+        to_cookie=to_cookie,
+        now=now,
+        allowed_cookie_name=_allowed_cookie_name,
+        try_cookie=_try_cookie,
+        is_expired=_is_expired,
+    )
 
 
 def _storage_cookie(entry: dict[str, Any]) -> http.cookiejar.Cookie:
     normalized = _cookie_semantics.sanitize_cookie_entry(entry)
     return _cookie_semantics.cookie_from_normalized_entry(normalized, http_only_key="httpOnly")
-
-
-def _try_cookie(entry: Any, converter: _CookieConverter) -> http.cookiejar.Cookie | None:
-    try:
-        _cookie_semantics.validate_cookie_shape(entry)
-    except _cookie_semantics.CookieRowError as exc:
-        logger.debug(
-            "Skipping malformed cookie row name=%s domain=%s row_type=%s error=%s",
-            _bounded_row_field(entry, "name"),
-            _bounded_row_field(entry, "domain"),
-            type(entry).__name__,
-            type(exc).__name__,
-        )
-        return None
-    try:
-        return converter(entry)
-    except (ValueError, TypeError, OverflowError) as exc:
-        logger.debug(
-            "Skipping unusable cookie row name=%s domain=%s error=%s",
-            _bounded_row_field(entry, "name"),
-            _bounded_row_field(entry, "domain"),
-            type(exc).__name__,
-        )
-        return None
-
-
-def _cookie_header_names(header: str) -> set[str]:
-    """Return the cookie NAMES present in a ``Cookie:`` request header.
-
-    Parsing, never substring matching. ``_PSIDTS_COOKIE in header`` would
-    false-positive on a lookalike name (``X__Secure-1PSIDTSY=v``) and on any
-    cookie whose *value* embeds the literal (``NID=__Secure-1PSIDTS=oops``) —
-    and cookie values on allowlisted domains are not shape-controlled by us,
-    they come from Chrome. A false positive here makes the gate skip a needed
-    heal, so the comparison has to be exact.
-    """
-    return {part.split("=", 1)[0].strip() for part in header.split(";") if "=" in part}
-
-
-def _allowed_cookie_name(entry: Any) -> str | None:
-    """Return a row's cookie NAME if the row is usable for recovery, else ``None``.
-
-    The single row filter every recovery path shares — the two precondition
-    predicates (:func:`_recovery_cookie_names`, :func:`_iter_routable_psidts_cookies`)
-    and the request-jar builder (:func:`_build_recovery_jar`). Keeping them on one
-    predicate is what makes "the gate reasons about the rows the POST will
-    actually send" true by construction rather than by convention.
-
-    A row qualifies when it is a dict carrying a non-empty string ``name``, a
-    non-empty ``value``, and a domain on the auth allowlist. Cookie rows come
-    from Chrome via rookiepy or from a hand-editable JSON file, so none of that
-    is ours to guarantee: a nameless or valueless cookie isn't meaningfully
-    present on any path, and the domain filter stops a stray ``SID`` from an
-    unrelated site satisfying a precondition.
-
-    ``name`` and ``domain`` are both type-checked, not merely truthiness-checked.
-    :func:`_is_allowed_auth_domain` does string work, so a non-string domain
-    (``123``, a dict) raises ``AttributeError``/``TypeError`` — and it would do so
-    from inside the caller's ``except ValueError:`` handler, where it escapes as a
-    bare traceback instead of an auth diagnostic. A missing or ``null`` domain
-    normalizes to ``""``, which is simply not allowlisted.
-    """
-    normalized = _sanitize_recovery_row(entry)
-    if normalized is None or not _is_allowed_auth_domain(normalized["domain"]):
-        return None
-    return normalized["name"]
 
 
 def _recovery_cookie_names(entries: list[dict[str, Any]]) -> set[str]:
@@ -181,98 +143,6 @@ def _recovery_cookie_names(entries: list[dict[str, Any]]) -> set[str]:
     instead of by tier, so the ranking has no remaining consumer here (#2057).
     """
     return {name for entry in entries if (name := _allowed_cookie_name(entry)) is not None}
-
-
-def _is_expired(cookie: http.cookiejar.Cookie, now: float | None) -> bool:
-    """``Cookie.is_expired`` against an optional injected clock.
-
-    ``Cookie.expires`` is always an ``int`` after the constructor's
-    ``int(float(...))`` coercion, and ``is_expired`` compares ``expires <= now``.
-    For integer ``e``, ``e <= now`` iff ``e <= floor(now)`` — so flooring is
-    exact, not lossy, and it satisfies the stub's ``int | None`` signature while
-    letting callers pass the float seconds every other clock here uses.
-    ``math.floor`` rather than ``int``: the latter truncates toward zero and
-    would disagree for a negative ``now``.
-    """
-    return cookie.is_expired(None if now is None else math.floor(now))
-
-
-def _iter_routable_psidts_cookies(
-    entries: list[dict[str, Any]],
-    *,
-    to_cookie: _CookieConverter,
-    now: float | None = None,
-) -> Iterator[http.cookiejar.Cookie]:
-    """Yield the ``__Secure-1PSIDTS`` cookies a request jar would actually carry.
-
-    Feeds :func:`_psidts_routes_to_rotate` ONLY. This models the jar, so its
-    rules are the jar's rules — which is exactly why :func:`_psidts_is_live` must
-    NOT reuse it: that predicate models the caller's preflight instead, and the
-    two disagree in ways that matter (see its docstring).
-
-    Only ``__Secure-1PSIDTS`` rows are converted. Restricting by name *before*
-    conversion is not just an optimization: ``http.cookiejar.Cookie.__init__``
-    coerces eagerly (``int(float(expires))``), so a malformed ``expires`` on any
-    unrelated sibling row would otherwise raise from inside a predicate that
-    callers invoke from within an ``except ValueError:`` handler. Narrowing the
-    conversion surface to the rows the question is actually about keeps the
-    blast radius minimal, and the answer is identical either way because
-    ``http.cookiejar`` evaluates each cookie independently.
-
-    A row whose ``expires`` cannot be coerced (``""``, ``"never"``, ``nan``,
-    ``inf``, a list) is skipped: an unconvertible row cannot be put in a jar, so
-    it cannot be sent, so it must not hold the heal back. Recovery then fires,
-    which is the safe direction — one throttled POST versus an unhealed session.
-
-    Duplicate ``(name, domain, path)`` identities are resolved CONSERVATIVELY:
-    an identity routes only when *every* row carrying it is unexpired.
-    ``http.cookiejar`` keeps one cookie per identity — ``set_cookie`` assigns
-    ``_cookies[domain][path][name]`` against the LITERAL domain string, with no
-    leading-dot normalization — and lets a later row replace an earlier one, so a
-    jar built from a duplicated identity depends on entry order, precisely the
-    order-sensitivity this gate exists to remove. Poisoning from any dead row is
-    order-independent *and* never over-optimistic, at the cost of a needless POST
-    when a stale duplicate shadows a fresh one. A row that fails conversion has
-    no identity and therefore cannot poison one.
-
-    Note the identity tuple is deliberately NOT the leading-dot-equivalent key
-    from :func:`notebooklm._auth.cookies._cookie_key_variants`. That equivalence
-    exists for the disk CAS/merge stage; here it would manufacture a false
-    negative, because ``.google.com`` and ``google.com`` both route yet the jar
-    keeps them as two independent cookies, so a stale one would poison a fresh
-    one the jar still sends.
-
-    Args:
-        entries: Raw cookie dicts (storage_state entries or rookiepy rows).
-        to_cookie: Converter matching ``entries``' shape.
-        now: Injectable wall-clock seconds for deterministic tests; defaults to
-            the current time via :meth:`http.cookiejar.Cookie.is_expired`.
-
-    Yields:
-        One cookie per surviving identity, in first-seen identity order. The
-        IDENTITY SET is order-independent; both the sequence and *which*
-        duplicate occurrence is yielded are not — last-write-wins means
-        ``[fresh_a, fresh_b]`` yields ``fresh_b`` and the reverse yields
-        ``fresh_a``. Harmless while the only consumer reads a boolean, but a
-        future consumer that takes the first element, or reads a cookie's
-        VALUE, would reintroduce order-sensitivity.
-    """
-    live: dict[_CookieIdentity, http.cookiejar.Cookie] = {}
-    dead: set[_CookieIdentity] = set()
-    for entry in entries:
-        if _allowed_cookie_name(entry) != _PSIDTS_COOKIE:
-            continue
-        cookie = _try_cookie(entry, to_cookie)
-        if cookie is None:
-            continue
-        identity = (cookie.name, cookie.domain, cookie.path)
-        if _is_expired(cookie, now):
-            dead.add(identity)
-        else:
-            live[identity] = cookie
-    for identity, cookie in live.items():
-        if identity not in dead:
-            yield cookie
 
 
 def _build_recovery_jar(
@@ -389,55 +259,22 @@ def _psidts_routes_to_rotate(
     to_cookie: _CookieConverter,
     now: float | None = None,
 ) -> bool:
-    """Would the ``Cookie:`` header sent to ``KEEPALIVE_ROTATE_URL`` carry PSIDTS?
-
-    This is the "should we fire the POST?" question, and it is asked of the same
-    RFC 6265 machinery that will build the real request. The predecessor gate
-    ranked a single domain-blind global winner by ``_auth_domain_priority`` and
-    read that winner's expiry — but the POST it gates is routed, so the gate and
-    the action could answer different questions about the same cookie set. A
-    PSIDTS scoped to ``.notebooklm.google.com`` (or, post-rebrand,
-    ``.notebook.google.com``) never reaches ``accounts.google.com``, while a
-    host-scoped one on ``accounts.google.com`` — which does route — sat in the
-    *lowest* priority tier (issue #2057).
-
-    Expiry is decided by :func:`_iter_routable_psidts_cookies` against ``now``, then
-    stripped from the probe copies. ``CookieJar.add_cookie_header`` resets its
-    own clock from ``time.time()`` and re-applies its expiry policy on top of
-    whatever it is given, so an injected ``now`` would otherwise be a
-    tightening-only seam — it could mark a cookie expired but never keep one
-    fresh, and a test asserting "fresh at now=200" would silently fail against
-    the real wall clock. The probes exist only to answer the DOMAIN question.
-    """
-    probes = []
-    for cookie in _iter_routable_psidts_cookies(entries, to_cookie=to_cookie, now=now):
-        probe = copy.copy(cookie)
-        probe.expires = None
-        probes.append(probe)
-    return _cookies_route_psidts(probes)
+    return _cookie_types._psidts_routes_to_rotate(
+        entries,
+        to_cookie=to_cookie,
+        rotate_url=_keepalive.KEEPALIVE_ROTATE_URL,
+        now=now,
+        iter_routable=_iter_routable_psidts_cookies,
+        cookies_route=_cookies_route_psidts,
+    )
 
 
 def _cookies_route_psidts(cookies: Iterable[http.cookiejar.Cookie]) -> bool:
-    """Would a jar holding ``cookies`` send ``__Secure-1PSIDTS`` to the rotate URL?
-
-    The shared jar probe behind both the pre-POST gate
-    (:func:`_psidts_routes_to_rotate`, which hands it expiry-stripped copies) and
-    the post-POST mint check in :func:`_attempt_rotation` /
-    :func:`recover_psidts_in_memory` (which hand it the live response jar, expiry
-    intact, so a rotation that somehow arrives already-expired does not count).
-    """
-    jar = httpx.Cookies()
-    found = False
-    for cookie in cookies:
-        if cookie.name != _PSIDTS_COOKIE or not cookie.value:
-            continue
-        jar.jar.set_cookie(cookie)
-        found = True
-    if not found:
-        return False
-    request = httpx.Request("POST", _keepalive.KEEPALIVE_ROTATE_URL)
-    jar.set_cookie_header(request)
-    return _PSIDTS_COOKIE in _cookie_header_names(request.headers.get("cookie", ""))
+    return _cookie_types._cookies_route_psidts(
+        cookies,
+        rotate_url=_keepalive.KEEPALIVE_ROTATE_URL,
+        cookie_header_names=_cookie_header_names,
+    )
 
 
 def _resolve_recovery_path(path: Path | str | None) -> Path | None:

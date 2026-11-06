@@ -1,6 +1,6 @@
 """Per-request access to the lifespan-bound client.
 
-The REST server binds exactly one
+The REST server binds one client per configured profile. By default, it binds one
 :class:`~notebooklm.client.NotebookLMClient` for the process lifetime via the
 ASGI lifespan (one client, bound to the server's event loop, satisfying the
 ADR-0004 loop-affinity contract). Route handlers reach it through the
@@ -17,19 +17,26 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import Request
 
+from ._errors import ProfileHTTPError
 from ._limits import LimitGroup, ServerLimiters
 from ._pending import PendingRegistry
+from ._profiles import PROFILE_HEADER
 
 if TYPE_CHECKING:
+    from .._app.web_profiles import WebProfileSet
     from ..client import NotebookLMClient
 
 __all__ = [
     "AppState",
     "get_client",
+    "get_state",
+    "ProfileRegistry",
+    "require_profile",
     "get_client_error",
     "get_pending",
     "limit_chat",
@@ -43,7 +50,7 @@ __all__ = [
 
 @dataclass
 class AppState:
-    """Lifespan state: the single long-lived client bound to the server loop.
+    """Lifespan state for one profile and its long-lived client.
 
     ``pending`` is the process-lifetime provenance registry consulted by the
     source / artifact poll handlers (see :mod:`._pending`).
@@ -51,14 +58,32 @@ class AppState:
     ``client_loader`` is installed only by the application lifespan. It binds
     at most one client and lets a stale-auth startup recover after another
     process refreshes the selected profile.
+
+    ``web_profiles`` is set only for Web multi-profile states; it serves the
+    selected profile's file-only diagnostics. ``client_error_code`` records why
+    the last open failed (``"session_conflict"`` for a refused copied session),
+    so diagnostics report the recorded failure rather than today's files.
     """
 
     client: NotebookLMClient | None
     pending: PendingRegistry
     limiters: ServerLimiters
     client_error: BaseException | None = None
+    client_error_code: str | None = None
     client_loader: Callable[[int], Awaitable[NotebookLMClient]] | None = None
     client_generation: int = 0
+    profile: str | None = None
+    backend: str = "web"
+    isolated: bool = False
+    storage_path: Path | None = None
+    web_profiles: WebProfileSet | None = None
+
+
+@dataclass
+class ProfileRegistry:
+    """One isolated state per configured profile; routing is not authorization."""
+
+    profiles: dict[str, AppState]
 
 
 async def get_client(request: Request) -> NotebookLMClient:
@@ -80,10 +105,23 @@ async def get_client(request: Request) -> NotebookLMClient:
             "notebooklm_client_generation",
             state.client_generation,
         )
-        return await state.client_loader(observed_generation)
+        try:
+            return await state.client_loader(observed_generation)
+        except Exception:
+            if state.isolated:
+                raise ProfileHTTPError(
+                    503, "profile_unavailable", _unavailable_message(state)
+                ) from None
+            raise
     if state.client_error is not None:
         raise _fresh_exception(state.client_error)
     raise RuntimeError("no client bound to the server")  # pragma: no cover
+
+
+def _unavailable_message(state: AppState) -> str:
+    if state.backend == "web":
+        return "Selected Web profile is unavailable"
+    return "Selected Android profile is unavailable"
 
 
 def get_client_error(request: Request) -> BaseException | None:
@@ -140,10 +178,36 @@ async def _limit(request: Request, group: LimitGroup) -> AsyncIterator[None]:
 
 
 def _state(request: Request) -> AppState:
-    state: AppState | None = getattr(request.app.state, "notebooklm", None)
+    selected: AppState | None = getattr(request.state, "notebooklm_profile_state", None)
+    if selected is not None:
+        return selected
+    state: AppState | ProfileRegistry | None = getattr(request.app.state, "notebooklm", None)
     if state is None:  # pragma: no cover - lifespan always binds before requests
         raise RuntimeError("no client bound to the server (lifespan did not run)")
+    if isinstance(state, ProfileRegistry):
+        names = request.headers.getlist(PROFILE_HEADER)
+        name = next(iter(names), "").strip()
+        if not name:
+            raise ProfileHTTPError(400, "profile_required", f"{PROFILE_HEADER} is required")
+        if len(names) != 1 or "," in name:
+            raise ProfileHTTPError(400, "invalid_profile", "Select exactly one profile")
+        selected = state.profiles.get(name)
+        if selected is None:
+            raise ProfileHTTPError(404, "unknown_profile", "Unknown profile")
+        request.state.notebooklm_profile_state = selected
+        request.state.notebooklm_client_generation = selected.client_generation
+        return selected
     return state
+
+
+def get_state(request: Request) -> AppState:
+    """Return the explicitly selected state, including degraded diagnostics."""
+    return _state(request)
+
+
+async def require_profile(request: Request) -> None:
+    """Validate selection for every authenticated route, including diagnostics."""
+    _state(request)
 
 
 def _fresh_exception(exc: BaseException) -> BaseException:

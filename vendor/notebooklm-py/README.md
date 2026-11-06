@@ -8,7 +8,7 @@
 > **Note (July 2026):** Google rebranded **NotebookLM** to **[Gemini Notebook](https://blog.google/innovation-and-ai/products/gemini-notebook/notebooklm-gemini-notebook/)**. It remains the same standalone product (now also reachable inside the Gemini app), existing links redirect automatically, and this library drives the same underlying service and works unchanged. The package keeps the `notebooklm-py` name.
 
 [![PyPI version](https://img.shields.io/pypi/v/notebooklm-py.svg)](https://pypi.org/project/notebooklm-py/)
-[![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://pypi.org/project/notebooklm-py/)
+[![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14%20%7C%203.15-blue)](https://pypi.org/project/notebooklm-py/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://github.com/teng-lin/notebooklm-py/actions/workflows/test.yml/badge.svg)](https://github.com/teng-lin/notebooklm-py/actions/workflows/test.yml)
 <p>
@@ -81,13 +81,44 @@ These combine ordinary library primitives — see the [CLI Reference](docs/cli-r
 | **REST Server** | Local automation over guarded HTTP routes without spawning a CLI process per call |
 | **Agent Integration** | Claude Code, Codex, LLM agents, natural language automation |
 
+REST and MCP servers support multiple profiles on either backend with `--profiles`
+(see the [MCP guide](docs/mcp-guide.md)). URL ingestion can optionally recover
+failed web pages with `source add --fallback-fetch`; install the `impersonate` and
+`markdown` extras and see the [CLI reference](docs/cli-reference.md#opt-in-url-recovery).
+
+### API backends
+
+The default backend is the established Web (`batchexecute`) transport. This
+release also provides an opt-in Android backend that uses NotebookLM's mobile
+gRPC service and bearer authentication. Select it for the CLI with
+`--backend android` (or `NOTEBOOKLM_BACKEND=android`), or for the Python API
+with `NotebookLMClient.from_storage(backend="android")` / `NotebookLMClient(...,
+backend="android")`.
+
+Install the Android runtime explicitly; it is intentionally not included in
+the `all` extra:
+
+```bash
+pip install "notebooklm-py[android,browser]"
+notebooklm login --master-token --account you@example.com
+notebooklm --backend android list --json
+```
+
+Android reads `master_token.json` from the selected profile and mints
+short-lived mobile bearer tokens as needed, so typed namespace calls do not
+depend on a browser-cookie session, Web build labels, or Web RPC IDs. All
+eleven public namespaces are available without falling back to the Web
+transport. Because the durable master token is a powerful full-account
+credential, use a dedicated account and protect the profile carefully. See the
+[Android backend guide](docs/android/README.md) for setup and protocol details.
+
 ## Features
 
 ### Complete NotebookLM Coverage
 
 | Category | Capabilities |
 |----------|--------------|
-| **Notebooks** | Create, list, rename, delete |
+| **Notebooks** | Create, copy (including sources and Studio artifacts), list, rename, delete |
 | **Sources** | URLs, YouTube, files (PDF, text, Markdown, Word, EPUB, audio, video, images), Google Drive, pasted text; refresh, get guide/fulltext |
 | **Chat** | Questions, conversation history, custom personas, suggested starter prompts |
 | **Notes** | Create, list, rename, delete, save chat answers, save conversation history |
@@ -183,7 +214,7 @@ Fetches the canonical [SKILL.md](SKILL.md) directly from GitHub.
 ## Quick Start
 
 <p align="center">
-  <a href="https://asciinema.org/a/767284" target="_blank"><img src="https://asciinema.org/a/767284.svg" width="600" /></a>
+  <a href="https://asciinema.org/a/767284" target="_blank"><img src="https://raw.githubusercontent.com/teng-lin/notebooklm-py/main/docs/demo.png" alt="NotebookLM Session Demo" width="600" /></a>
   <br>
   <em>16-minute session compressed to 30 seconds</em>
 </p>
@@ -246,6 +277,8 @@ notebooklm agent show codex          # Print bundled Codex instructions
 notebooklm agent show claude         # Print bundled Claude Code skill template
 notebooklm language list             # List supported output languages
 notebooklm metadata --json           # Export notebook metadata and sources
+notebooklm usage                     # Show live compute usage and reset times
+notebooklm usage --json              # Export the full usage snapshot, including categories
 notebooklm share status              # Inspect sharing state
 notebooklm source add-research "AI" --import-all  # web research + import found sources
 notebooklm skill status              # Check local agent skill installation
@@ -260,6 +293,7 @@ Use `--prompt-file PATH` with `ask`, prompt-based `generate` commands, and `sour
 ```python
 import asyncio
 from notebooklm import NotebookLMClient, MindMapKind
+
 
 async def main():
     async with NotebookLMClient.from_storage() as client:
@@ -287,11 +321,14 @@ async def main():
         mm = await client.mind_maps.generate(nb.id, kind=MindMapKind.INTERACTIVE)
         await client.artifacts.download_mind_map(nb.id, "mindmap.json", mm.id)
 
+
 asyncio.run(main())
 ```
 
 ## Documentation
 
+- **[Installation](docs/installation.md)** - Environment, extras, login, and deployment setup
+- **[Android Backend](docs/android/README.md)** - Mobile gRPC setup, credentials, and protocol notes
 - **[CLI Reference](docs/cli-reference.md)** - Complete command documentation
 - **[Python API](docs/python-api.md)** - Full API reference
 - **[MCP Guide](docs/mcp-guide.md)** - MCP server setup, transports, and tool reference
@@ -300,6 +337,7 @@ asyncio.run(main())
 - **[Quota & Tier Limits](docs/quota-limits.md)** - Per-tier notebook/source/studio limits and how they map to `AccountLimits.tier`
 - **[Release Guide](docs/releasing.md)** - Release checklist and packaging verification
 - **[Troubleshooting](docs/troubleshooting.md)** - Common issues and solutions
+- **[Credential Security](docs/security.md)** - Secret handling and trust boundaries
 - **[API Stability](docs/stability.md)** - Versioning policy and stability guarantees
 - **[Upgrading to v0.8.0](docs/upgrading-to-0.8.0.md)** - Breaking-change migration guide for the v0.8.0 error-and-return contract
 

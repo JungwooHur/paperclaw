@@ -12,7 +12,7 @@ Example::
       --profile source-profile \
       --browser 'chromium::Profile 3' \
       --account maintainer@example.com \
-      --base-url https://notebooklm.google.com \
+      --base-url https://notebook.google.com \
       --output live-matrix.json
 
 Opt-in human-interaction cells (start a loopback CDP browser first)::
@@ -997,7 +997,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--skip-browser",
         action="store_true",
         help=(
-            "Skip rookiepy browser discovery/login and browser-refresh cells. "
+            "Skip rookie-cookies browser discovery/login and browser-refresh cells. "
             "Storage-only mid-session recovery and RPC access-gate cells still run."
         ),
     )

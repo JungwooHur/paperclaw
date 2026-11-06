@@ -48,7 +48,8 @@ from starlette.types import Receive, Scope, Send
 from .._app import download as download_core
 from .._app import source_add as add_core
 from .._app.errors import ErrorCategory, classify
-from ..exceptions import NotebookLMError, ValidationError
+from ..exceptions import AuthError, NotebookLMError, ValidationError
+from ..outcomes import format_operation_metadata, operation_metadata_payload
 from ._context import get_client_from_app
 from ._errors import redact
 from ._filelink import FileLinkError, FileTransferConfig
@@ -179,8 +180,10 @@ def _upstream_error_response(exc: NotebookLMError, *, note: str = "") -> PlainTe
     """
     status = _FILE_ROUTE_STATUS.get(classify(exc).category, 502)
     prefix = f"{redact(note)} " if note else ""
+    operation = operation_metadata_payload(exc)
+    suffix = f" Operation metadata: {format_operation_metadata(operation)}" if operation else ""
     return PlainTextResponse(
-        f"{prefix}Upstream NotebookLM error: {redact(str(exc))}",
+        f"{prefix}Upstream NotebookLM error: {redact(str(exc))}{suffix}",
         status_code=status,
         # ACAO so the cross-origin widget can read the (redacted) failure, not "Failed to fetch".
         headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", **_CORS_ORIGIN},
@@ -300,8 +303,12 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
         if spec is None:  # pragma: no cover - tokens are minted only for known types
             return PlainTextResponse("Unknown artifact type.", status_code=400)
         try:
-            client = get_client_from_app(request)
-        except RuntimeError:
+            client = await get_client_from_app(request, profile=payload.get("profile"))
+        except Exception:  # noqa: BLE001 - not-bound, shutting down, or a failed lazy open
+            # The client is opened lazily (#2330), so this now also covers an
+            # auth/network failure on the open. Never echo the cause: an auth error
+            # can carry the on-disk storage path, and this route is reachable by
+            # anyone holding the signed link.
             return PlainTextResponse("Server is not ready.", status_code=500)
 
         # ``aid`` rides inside the HMAC-signed token, so a non-string value should be
@@ -348,7 +355,11 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
         success = False
         try:
             try:
-                temp_dir = tempfile.mkdtemp(prefix="nblm-mcp-dl-")
+                temp_dir = (
+                    config._download_temp_factory()
+                    if config._download_temp_factory is not None
+                    else tempfile.mkdtemp(prefix="nblm-mcp-dl-")
+                )
             except OSError:
                 # Temp-dir creation failed (e.g. ENOSPC) — the exact temp-disk
                 # exhaustion this cap defends against. Scoped to mkdtemp ONLY (not the
@@ -401,6 +412,11 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
                     status_code=400,
                     headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
                 )
+            except AuthError as exc:
+                # A download-hop 401 remains a typed upstream auth failure; keep
+                # it out of generic/non-success result handling so classification
+                # and redaction happen at this route boundary.
+                return _upstream_error_response(exc)
             except NotebookLMError as exc:
                 # An upstream error raised out of the core (e.g. the artifact ``list``
                 # RPC inside ``execute_download`` is not wrapped) would otherwise become
@@ -496,6 +512,7 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
 
     @mcp.custom_route("/files/ul/{token}", methods=["POST", "PUT"])
     async def upload_route(request: Request) -> Response:
+        """Validate and consume a signed upload request, freezing uncertain registrations."""
         token = request.path_params["token"]
         try:
             payload = config.signer.verify(token, op="ul")
@@ -521,9 +538,12 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
             except ValueError:
                 pass
         try:
-            client = get_client_from_app(request)
-        except RuntimeError:
-            return PlainTextResponse("Server is not ready.", status_code=500)
+            client = await get_client_from_app(request, profile=payload.get("profile"))
+        except Exception:  # noqa: BLE001 - not-bound, shutting down, or a failed lazy open
+            # Same widening as the download route (#2330), and it carries the CORS
+            # header like every other /files/ul error response — a bare 500 would be
+            # invisible to the in-app widget's fetch.
+            return PlainTextResponse("Server is not ready.", status_code=500, headers=_CORS_ORIGIN)
 
         # Atomically claim the single-use jti BEFORE any concurrency slot / spool: a
         # sequential replay (jti already consumed) or a concurrent duplicate (jti
@@ -693,11 +713,12 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
                     #
                     # A post-registration rejection (``raise_partial_upload_failure()``
                     # attaches ``source_id``/``stage`` to the real cause rather than
-                    # wrapping it — see ``_source/_upload_decode.py``) additionally
+                    # wrapping it — see ``_web/sources/_upload_decode.py``) additionally
                     # names the retained row: a retry re-registers a NEW row rather
                     # than replacing this one, and #2138's own evidence is exactly
                     # this shape (an HTTP-400 upload rejection after registration).
-                    retained_id = getattr(exc, "source_id", None)
+                    operation = operation_metadata_payload(exc)
+                    retained_id = operation.get("source_id")
                     retained = (
                         f"\nRegistered source {retained_id} was left behind; "
                         "delete it to retry cleanly."
@@ -705,7 +726,12 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
                         else ""
                     )
                     return PlainTextResponse(
-                        f"Upload rejected: {redact(str(exc))}{retained}",
+                        f"Upload rejected: {redact(str(exc))}{retained}"
+                        + (
+                            f"\nOperation metadata: {format_operation_metadata(operation)}"
+                            if operation
+                            else ""
+                        ),
                         status_code=400,
                         headers={
                             "Cache-Control": "no-store",
@@ -729,8 +755,9 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
                     # Otherwise the bytes already finished uploading by here, so tell
                     # the user a retry re-sends the whole file (vs a mid-stream failure
                     # that did not).
-                    retained_id = getattr(exc, "source_id", None)
-                    stage = getattr(exc, "stage", None)
+                    operation = operation_metadata_payload(exc)
+                    retained_id = operation.get("source_id")
+                    stage = operation.get("stage")
                     if retained_id is not None:
                         return _upstream_error_response(
                             exc,
@@ -742,20 +769,37 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
                         )
                     # An UNCONFIRMED registration (#2220) reaches neither branch
                     # above: its idempotency probe could not say whether the
-                    # register committed, so there is no ``source_id`` to name —
-                    # and the "your file uploaded" note below would be flatly
-                    # false, because registration failed BEFORE the resumable
-                    # upload started. Worse, it invites the retry that duplicates.
+                    # register committed, so there is no confirmed ``source_id``.
+                    # Report that uncertainty instead of asserting either a
+                    # successful upload or an absence of upstream changes.
                     if getattr(exc, "unconfirmed", False):
-                        return _upstream_error_response(
+                        # The registration may already have committed upstream.
+                        # Freeze this capability until its signed expiry instead
+                        # of releasing it for a retry that can create a duplicate.
+                        config.jti_store.commit(
+                            jti,
+                            payload["exp"],
+                            result={
+                                "status": "unconfirmed",
+                                "hint": "The upload link is frozen. Check source_list to reconcile "
+                                "the uncertain registration before requesting a new link.",
+                            },
+                        )
+                        committed = True
+                        response = _upstream_error_response(
                             exc,
                             note=(
-                                "Nothing was uploaded. The source registration could "
-                                "not be confirmed, so it may or may not exist — check "
-                                "the notebook's source list before retrying, or a "
-                                "retry may add it twice."
+                                "The source registration could "
+                                "not be confirmed, so it may or may not exist. This "
+                                "upload link is frozen to prevent a duplicate; check "
+                                "the notebook's source list before requesting a new link."
                             ),
                         )
+                        response.headers["X-NotebookLM-Upload-Status"] = "unconfirmed"
+                        response.headers["Access-Control-Expose-Headers"] = (
+                            "X-NotebookLM-Upload-Status"
+                        )
+                        return response
                     return _upstream_error_response(
                         exc,
                         note="Your file uploaded, but adding it as a source failed "
@@ -777,9 +821,10 @@ def register_file_routes(mcp: FastMCP, config: FileTransferConfig) -> None:
                 _inflight_uploads -= 1
         finally:
             # Release a claimed-but-not-committed jti so the link can be retried: this
-            # covers the 429, the validation / upstream / OSError returns, and a
+            # covers the 429, confirmed validation / upstream / OSError returns, and a
             # mid-stream disconnect (``CancelledError`` ⊂ ``BaseException``, which
             # ``finally`` still runs on — an ``except Exception`` would miss it and wedge
-            # the jti in the active set). A committed upload keeps the jti burned.
+            # the jti in the active set). A successful or unconfirmed registration keeps
+            # the jti burned; the latter may already have committed upstream.
             if not committed:
                 config.jti_store.rollback(jti)

@@ -1,7 +1,7 @@
 # Contributing Guide
 
 **Status:** Active
-**Last Updated:** 2026-07-04
+**Last Updated:** 2026-09-07
 
 This guide covers everything you need to contribute to `notebooklm-py`: architecture overview, testing, and releasing.
 
@@ -11,6 +11,14 @@ This guide covers everything you need to contribute to `notebooklm-py`: architec
 
 ---
 
+## Deterministic operation timeout tests
+
+When testing settlement after dispatch, control the event-loop clock so the
+deadline advances only after the simulated response has recorded its commit
+evidence. Then yield to the real operation timer and assert its cancellation and
+journal outcome. A short wall-clock deadline can instead expire during admission
+on a loaded runner, which exercises a different behavior before the write occurs.
+
 ## Architecture
 
 > **Canonical post-refactor map:** see [`docs/architecture.md`](./architecture.md)
@@ -19,45 +27,62 @@ This guide covers everything you need to contribute to `notebooklm-py`: architec
 > remains as the contributor on-ramp (package layout + adding-features
 > guidance) and links out to the architecture doc rather than duplicating it.
 
-### Package Structure
+Use the [system overview](https://teng-lin.github.io/notebooklm-py/diagrams/01-system-overview.html) while orienting to the packages and
+the [testing/guardrails map](https://teng-lin.github.io/notebooklm-py/diagrams/22-testing-and-guardrails.html)
+when deciding which boundary a change must exercise.
 
-```
+### High-Level Package Layout
+
+```text
 src/notebooklm/
-├── __init__.py          # Public exports
-├── client.py            # NotebookLMClient main class
-├── auth.py              # Public auth facade
-├── types.py             # Dataclasses and type definitions
-├── _app/                # Transport-neutral business logic shared by adapters
-├── _client_composed.py  # Client-owned composition holder
-├── _runtime/            # Runtime contracts, config, lifecycle, auth, transport
-├── _notebooks.py        # NotebooksAPI implementation
-├── _notebook_metadata.py # Private notebook metadata composition service
-├── _sources.py          # SourcesAPI implementation
-├── _source/             # Private source services
-├── _artifacts.py        # ArtifactsAPI implementation
-├── _artifact/           # Private artifact services
-├── _chat/               # ChatAPI implementation (facade + chat helpers)
-├── _research.py         # ResearchAPI implementation
-├── _notes.py            # NotesAPI implementation
-├── _mind_map.py         # Private note-backed mind-map service
-├── _mind_maps_api.py    # MindMapsAPI implementation
-├── _labels.py           # LabelsAPI implementation
-├── _settings.py         # SettingsAPI implementation
-├── _sharing.py          # SharingAPI implementation
-├── _sharing_manager.py  # Private legacy notebook share-link service
-├── rpc/                 # RPC protocol layer
-│   ├── __init__.py
-│   ├── types.py         # RPCMethod enum and constants
-│   ├── encoder.py       # Request encoding
-│   └── decoder.py       # Response parsing
-├── cli/                 # Click adapter (`*_cmd.py`) plus `cli/services/`
+├── __init__.py          # Public API exports
+├── client.py            # NotebookLMClient composition root
+├── auth.py              # Public authentication facade
+├── types.py             # Public dataclasses and type definitions
+├── options.py           # Typed client construction and request options
+├── outcomes.py          # Operation and batch reconciliation outcome types
+├── downloads.py         # Representation registry and download format resolution
+├── raw.py               # Public backend-selected raw wire APIs
+├── exceptions.py        # Public exception hierarchy
+├── config.py            # Configuration facade
+├── io.py, log.py        # Public I/O and logging facades
+├── migration.py         # Profile storage migration
+├── paths.py             # Profile-aware path resolution
+├── research.py          # Research helper functions
+├── urls.py, utils.py    # Public URL and async utility helpers
+├── _app/                # Transport-neutral business logic shared by adapters (CLI/MCP/REST)
+├── _runtime/            # Neutral runtime contracts, lifecycle, call supervisor, deadlining
+├── _client_assembly.py  # Typed collaborator graph composition and sole client installer
+├── _client_compat.py    # 0.x Android-to-Web compatibility sidecar proxy and factory
+├── _client_contracts.py # Frozen assembly graph declarations and P4 carriers
+├── _client_metrics.py   # Telemetry, metrics snapshots, and event callbacks
+├── _client_options.py   # Constructor option normalization
+├── _auth/               # Credential tier: storage lock, profile store, cold recovery, tokens
+├── _browser/            # Optional Playwright-backed credential acquisition
+├── _web/                # Web backend: batchexecute codecs, transport, middleware, feature APIs
+├── _android/            # Android backend: gRPC session, codecs, Scotty uploads, feature APIs
+├── _notebooks.py        # Backend-neutral abstract NotebooksAPI
+├── _sources.py          # Backend-neutral abstract SourcesAPI
+├── _artifacts.py        # Backend-neutral abstract ArtifactsAPI
+├── _chat.py             # Backend-neutral ChatAPI orchestration
+├── _research.py         # Backend-neutral BaseResearchAPI + shared workflows
+├── _notes.py            # Backend-neutral abstract NotesAPI
+├── _mind_maps_api.py    # Backend-neutral abstract MindMapsAPI
+├── _labels.py           # Backend-neutral abstract LabelsAPI
+├── _collections.py      # Backend-neutral abstract CollectionsAPI
+├── _settings.py         # Backend-neutral abstract SettingsAPI
+├── _sharing.py          # Backend-neutral abstract SharingAPI
+├── rpc/                 # Public power-user RPC compatibility facade and identifiers
+├── cli/                 # Click CLI adapter (`*_cmd.py`) and `cli/services/`
 ├── mcp/                 # FastMCP adapter (optional `mcp` extra)
 └── server/              # FastAPI REST adapter (optional `server` extra)
 ```
 
+See [Repository Structure in `docs/architecture.md`](./architecture.md#repository-structure) for the complete, canonical module map.
+
 ### Layered Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                      Adapter Layer                          │
 │        cli/ (Click), mcp/ (FastMCP), server/ (FastAPI)       │
@@ -70,18 +95,23 @@ src/notebooklm/
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
 │                      Client Layer                           │
-│  NotebookLMClient → NotebooksAPI, SourcesAPI, ArtifactsAPI  │
+│  NotebookLMClient → 11 typed namespaces, public types       │
 │       private services compose cross-facade behavior         │
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
-│                      Runtime Layer                          │
-│          RpcExecutor, RuntimeTransport, Kernel, lifecycle    │
+│                    Shared Runtime Layer                     │
+│    CallSupervisor, ClientLifecycle, telemetry, deadlining   │
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
-│                        RPC Layer                            │
-│        encoder.py, decoder.py, types.py (RPCMethod)         │
+│           Backend Layers (`_web/` and `_android/`)          │
+│       batchexecute/HTTP or gRPC/protobuf + transfers        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│          Raw facades (`raw.py`; `rpc/` IDs are Web-only)    │
+│     WebRawAPI.call or AndroidRawAPI.unary/unary_stream      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -91,44 +121,68 @@ src/notebooklm/
 |-------|-------|----------------|
 | **Adapters** | `cli/`, `mcp/`, `server/` | User commands/tools/routes, transport-specific input/output, auth envelopes |
 | **App core** | `_app/*.py` | Transport-neutral workflows reused by adapters |
-| **Client** | `client.py`, `_*.py` | High-level Python API, returns typed dataclasses |
-| **Runtime** | `client.py`, `_client_composed.py`, `_runtime/init.py`, `_kernel.py`, runtime collaborators | `NotebookLMClient` composition root plus seam-module helpers (HTTP client lifecycle, RPC dispatch, metrics, drain bookkeeping, request-id counter, auth refresh, conversation cache, polling registry, cookie persistence) |
-| **RPC** | `rpc/*.py` | Protocol encoding/decoding, method IDs |
+| **Client** | `client.py`, `_*.py`, `downloads.py`, `options.py`, `outcomes.py`, `types.py` | High-level Python API, returns typed dataclasses |
+| **Runtime** | `client.py`, `_runtime/`, `_client_assembly.py`, `_client_metrics.py`, `_deadline.py`, `_loop_bound.py`, `_idempotency.py` | `NotebookLMClient` composition root; protocol-neutral root lifecycle and call supervision; admission, telemetry, deadlines, and idempotency journals |
+| **Auth** | `_auth/*.py`, `_auth/profile_store.py`, `_auth/storage_lock.py` | Profile store, cross-process file locks, token refresh/re-minting, and cold recovery |
+| **Web wire & transport** | `_web/wire/*.py`, `_web/transport/*.py`, `_web/*.py` | Batchexecute encoding/decoding, runtime ID overrides, HTTP transport, middleware, Web feature implementations |
+| **Android wire & transport** | `_android/codecs/`, `_android/proto/`, `_android/*.py` | Lazy generated protobuf contracts, gRPC session, Scotty uploads, Android feature implementations |
+| **Raw facades** | `raw.py`, `rpc/*.py` | Public raw wire APIs (`client.raw.call`, `client.raw.unary`) and Web RPC compatibility exports |
 
 #### Runtime seam modules
 
 The client runtime is split across `NotebookLMClient` (composition root),
-`ClientComposed` (holder), `_runtime/init.py` (construction helpers),
-`_kernel.py` (HTTP client owner), and single-responsibility collaborator
+`_client_assembly.py` (typed root composition and sole client installation),
+`_runtime/init.py` (neutral validation/shared collaborators),
+`_web/assembly.py` (complete Web graph construction),
+`_web/transport/init.py` (Web transport construction),
+`_web/transport/composed.py` (`ClientComposed` holder),
+`_web/transport/kernel.py` (HTTP client owner), and single-responsibility collaborator
 modules. (The legacy `_core.py` compatibility shim was deleted in v0.5.0;
 callers import directly from the canonical modules.) Each helper exposes
 a narrow Protocol surface so it can be unit-tested against a stub:
 
 | Module | Class | Responsibility |
 |---|---|---|
-| `_client_composed.py` | `ClientComposed` | Client-owned holder for transport, executor, chain host, middleware metadata, and session collaborator bundle. |
-| `_runtime/init.py` | `RuntimeCollaborators` helpers | Validates constructor args, builds collaborators, wires middleware, and binds `ClientComposed`. |
+| `_client_assembly.py` | typed composition root | Builds one backend-neutral `SharedRuntime`, invokes the selected branch builder, creates the sole `ClientLifecycle` over the branch's frozen participant tuples, and installs the complete result on the client once. |
+| `_runtime/init.py` | `SharedRuntime` helpers | Validates constructor args and builds only the backend-neutral metrics/supervisor pair. Lifecycle remains a separate root-owned object, and this module imports no backend implementation. |
+| `_web/assembly.py` | `WebAssembly` builder | Returns the complete typed Web graph from frozen config, credential, and dependency carriers without reading or mutating a client. |
+| `_web/transport/init.py` | `WebRuntime` helpers | Builds request-id/auth/kernel/persistence/transport only for Web selection or first deprecated sidecar use and wires middleware. Its legacy `compose_client_internals` entry point is a thin wrapper over the typed Web builder. |
+| `_android/runtime.py` | `AndroidRuntime` | Immutable owner bundle for the bearer provider, gRPC session, upload/asset transports, and Phenotype provider. |
+| `_client_compat.py` | `LazyWebSidecar`, compatibility factory | Pure factory over frozen shared/spec/dependency carriers for the 0.x Android-to-Web bridge. The composition root appends its pre-registered inert lifecycle proxy before constructing lifecycle; the proxy lazily builds the Web runtime for deprecated root `rpc_call`, with close-race serialization, reopen, and phase delegation but no drain hook or keepalive. `_web/transport/sidecar.py` is only the identity-stable compatibility re-export. |
+| `_web/transport/composed.py` | `ClientComposed` | Write-once holder for Web transport, executor, chain host, and middleware metadata. It has no back-edge to the shared runtime and owns no loop primitive or RPC semaphore. |
 | `_client_metrics.py` | `ClientMetrics` | `ClientMetricsSnapshot` counters, queue-wait recorders, `on_rpc_event` async callback. |
-| `_transport_drain.py` | `TransportDrainTracker` | In-flight transport counters, `_TransportOperationToken`, lazy `asyncio.Condition` powering `client.drain(...)`. |
-| `_reqid_counter.py` | `ReqidCounter` | Monotonic `_reqid` counter for chat backend (baseline 100000, step 100000). |
-| `_runtime/auth.py` | `AuthRefreshCoordinator` | Refresh-task lifecycle, refresh lock, `AuthSnapshot` rotation. |
-| `_runtime/contracts.py` | Runtime Protocols | Shared capability Protocols: `Kernel`, `RpcCaller`, and `LoopGuard`. Single-consumer capabilities stay local to their owner modules. |
-| `_runtime/lifecycle.py` | `ClientLifecycle` | Loop-affinity guard, `aclose` plumbing, keepalive task wiring. |
-| `_runtime/transport.py` | `RuntimeTransport` | Authenticated transport leg used by `RpcExecutor` and the middleware chain terminal. |
-| `_rpc_executor.py` | `RpcExecutor` | RPC dispatch executor with direct collaborator dependencies. |
-| `_request_types.py` | `AuthSnapshot`, `BuildRequest`, request materialization | Shared request construction Interface. |
-| `_transport_errors.py` | transport exceptions, `parse_retry_after`, `raise_mapped_post_error` | Terminal `Kernel.post` error mapping for middleware retry/auth behavior. |
-| `_streaming_post.py` | `stream_post_with_size_cap` | Low-level POST streaming and response-size guard. |
+| `_runtime/call_supervisor.py` | `CallSupervisor` | Concrete client-wide admission authority: generation-bearing call/operation leases, drain hooks, admitted child tasks, terminal RPC metrics, and the global RPC semaphore. |
+| `_auth/profile_store.py` | `ProfileStore` | Credential persistence owner: transactional `storage_state.json` mutations, CAS cookie merges, account metadata, and master token delegation. |
+| `_auth/storage_lock.py` | `StorageLockManager` | Cross-process file locks (`flock`/`msvcrt`) guarding credential writes, rotation, and refresh. |
+| `_auth/recovery.py` | `ColdRecoveryCoordinator` | Single-flight auth recovery ladder managing refresh commands, headless bootstrap, and L4 re-minting. |
+| `_deadline.py` | `RuntimeDeadline` | Aggregate operation deadline tracking and timeout budget enforcement across nested steps. |
+| `_idempotency.py` | `OperationJournal` | Mutating-operation journal, semantic-send attempts, replay gating, and idempotency recovery evidence. |
+| `_loop_bound.py` | `LoopBoundPrimitive`, `EpochFenced` | Event-loop binding guards and resource epoch fences for runtime lifecycle components. |
+| `_curl_cffi_transport.py` | `CurlCffiAsyncClient` | Opt-in browser-impersonation HTTP transport (`NOTEBOOKLM_TRANSPORT=curl_cffi`). |
+| `_web/transport/reqid_counter.py` | `ReqidCounter` | Monotonic `_reqid` counter for chat backend (baseline 100000, step 100000). |
+| `_web/transport/auth.py` | `AuthRefreshCoordinator` | Refresh-task lifecycle, refresh lock, `AuthSnapshot` rotation. |
+| `_runtime/contracts.py` | Neutral runtime Protocol | `LoopGuard`, used by transport-neutral orchestration. |
+| `_web/contracts.py` | Web transport Protocols | `Kernel` and `RpcCaller`, used only by batchexecute implementations. Single-consumer capabilities stay local to their owner modules. |
+| `_runtime/lifecycle.py` | `ClientLifecycle` | Protocol-neutral resource/admission state and transactional, coalesced open/drain/close waves over immutable transport and loop-participant tuples. |
+| `_web/transport/lifecycle.py` | `WebTransportLifecycle` | Web Kernel/auth epoch activation and fencing, keepalive, cookie persistence, and web resource teardown. |
+| `_web/transport/runtime.py` | `RuntimeTransport` | Authenticated transport leg: admission-only epoch proof for snapshot/materialization, then `CallSupervisor` terminal accounting/semaphore and the four-middleware web chain. |
+| `_web/transport/executor.py` | `RpcExecutor` | RPC dispatch executor with direct collaborator dependencies. |
+| `_web/transport/request_types.py` | `AuthSnapshot`, `BuildRequest`, request materialization | Shared request construction Interface. |
+| `_web/transport/errors.py` | transport exceptions, `parse_retry_after`, `raise_mapped_post_error` | Terminal `Kernel.post` error mapping for middleware retry/auth behavior. |
+| `_web/transport/streaming_post.py` | `stream_post_with_size_cap` | Low-level POST streaming and response-size guard. |
+| `_android/session.py` | `AndroidSession` | Selected-Android bearer/gRPC lifecycle participant: lazy channel, deadline/status mapping, and shared `CallSupervisor` admission/telemetry. |
+| `_android/epoch.py` | Android workflow epoch context | Session-tagged task-local epoch propagation shared by Android namespace scope hooks and omitted-epoch session calls. |
 | `_conversation_cache.py` | `ConversationCache` | Per-instance true-LRU conversation cache for `ChatAPI` continuity. Caps the conversation count (`MAX_CONVERSATION_CACHE_SIZE`) and the turns retained per conversation (`MAX_TURNS_PER_CONVERSATION`). |
 | `_polling_registry.py` | `PollRegistry` | Pending-poll registry shared by long-running artifact generations. |
-| `_cookie_persistence.py` | `CookiePersistence` | Per-path typed baselines, ordered `ProfileStore` cookie merges, `__Secure-1PSIDTS` rotation, and the concrete v0.x snapshot adapter. |
+| `_web/transport/cookie_persistence.py` | `CookiePersistence` | Per-path typed baselines, ordered `ProfileStore` cookie merges, `__Secure-1PSIDTS` rotation, and the concrete v0.x snapshot adapter. |
 
-The feature-facing surface is the set of **capability Protocols** in
-`notebooklm._runtime.contracts` — `Kernel`, `RpcCaller`, and
-`LoopGuard`. Single-consumer capability shapes stay in the owning
-feature module (`AuthMetadata` in `_source/upload.py`,
-`OperationScopeProvider` in `_artifact/polling.py`), and the unused
-`AsyncWorkRuntime` composite was deleted. The broad `Session` Protocol
+Transport-neutral orchestration uses `LoopGuard` from
+`notebooklm._runtime.contracts`; batchexecute implementations use `Kernel`
+and `RpcCaller` from `notebooklm._web.contracts`. The single-consumer
+`AuthMetadata` capability stays in `_web/sources/upload.py`. The supervisor-ownership refactor removed
+`OperationScopeProvider`; artifact polling and source workflows use the shared
+concrete `CallSupervisor` for operation scopes, admitted children, loop checks,
+and drain hooks. The unused `AsyncWorkRuntime` composite was deleted. The broad `Session` Protocol
 that previously bundled these together was deleted in the final phase
 of the capability refactor (see [`docs/refactor-history.md`](refactor-history.md)
 and ADR-0013); each feature now depends on the narrowest slice it needs
@@ -143,8 +197,12 @@ production consumers) that still gates adding any new shared Protocol.
 Private service modules sit inside the client layer but below the public
 facades. They own cross-facade composition without importing sibling facades:
 `_notebook_metadata.py` composes notebook metadata through a narrow source
-lister, `_sharing_manager.py` owns legacy `SHARE_ARTIFACT` link behavior, and
-`_mind_map.py` owns note-backed mind-map rows shared by notes and artifacts.
+lister without importing a concrete transport or lister; `_web/notebooks.py`
+owns the direct-construction web fallback. `_web/sharing.py` owns legacy
+`SHARE_ARTIFACT` mutation behavior while `_notebooks.py` owns the
+transport-neutral URL builder, and
+`_web/mind_maps.py` owns the web note-backed mind-map rows shared by notes and artifacts;
+`_mind_maps_api.py` owns the transport-neutral unified workflows.
 Facade modules keep the public method surface stable and delegate to these
 services.
 
@@ -163,9 +221,10 @@ The architecture tests encode the current layer contract:
   import manifest. When a docs change adds or removes a supported import path,
   update the manifest in the same PR so public API drift is intentional and
   reviewable. The behavioral half of the public-shim suite (the
-  `select_cited_sources` / `ResearchAPI` back-compat delegations, the
-  `UnknownTypeWarning` filter behaviour, and `NotebookLMClient.rpc_call`
-  forwarding) stays in `tests/unit/test_public_shims.py`.
+  `select_cited_sources` delegation, the Web-only `ResearchAPI` compatibility
+  alias and research import-order boundary, the `UnknownTypeWarning` filter
+  behaviour, and the deprecated `NotebookLMClient.rpc_call`
+  forwarding/warning contract) stays in `tests/unit/test_public_shims.py`.
 - `tests/_guardrails/test_cli_boundary.py` parses `src/notebooklm/cli/**/*.py`
   and rejects CLI imports from `notebooklm._*`, `notebooklm.rpc.*`, or
   `_private` names exposed by public modules. Promote needed symbols through a
@@ -182,10 +241,15 @@ The architecture tests encode the current layer contract:
   construct `SourcesAPI`; artifact/source/notebook composition services must
   not runtime-import facade APIs. Add new private services to those guard
   lists when they take ownership of cross-facade behavior. The construction /
-  init-order behaviour tests — `NotebookLMClient` constructs `SourcesAPI`
+  init-order behaviour tests — `NotebookLMClient` constructs `WebSourcesAPI`
   before `NotebooksAPI` and passes it through the legacy `sources_api=` slot,
   plus the mind-map decoupling flows — stay in
   `tests/unit/test_init_order.py`.
+- `tests/_guardrails/test_client_composition.py` pins the temporary Android
+  bridge to `_client_compat.py`, permits its sole `_web.assembly` import only
+  inside the nested lazy builder, preserves sidecar-last lifecycle tuple
+  placement, and requires `rpc_call` materialisation to remain inside its root
+  operation lease.
 
 ### Key Design Decisions
 
@@ -194,6 +258,26 @@ The architecture tests encode the current layer contract:
 **Why namespaced APIs?** `client.notebooks.list()` instead of `client.list_notebooks()` - better organization, scales well, tab-completion friendly.
 
 **Why async?** Google's API can be slow. Async enables concurrent operations and non-blocking downloads.
+
+**How backend selection works.** An explicit `backend="web" | "android"`
+wins over `NOTEBOOKLM_BACKEND`; otherwise Web is the default. Android selection
+installs Android adapters for all eleven typed namespaces together, and
+`client.backends` reports that immutable installed graph. The current Android
+namespace objects have no Web operation collaborators. `client.rpc_call(...)`
+is deprecated and not backend-neutral: `RPCMethod` values are batchexecute IDs,
+so Android preserves it through a lazy, no-keepalive Web sidecar only during the
+0.x warning window. Under the retained default 0.x policy,
+`NotebookLMClient.from_storage(backend="android")` still makes its homepage GET
+while the storage wrapper builds the client, so Web-cookie/network failures
+still occur before Android open; it does not poke/recover or persist the
+homepage cookie observation. The Android primary runtime then uses the sibling
+master token, while deprecated `rpc_call` uses the loaded Web cookies. A
+master-token-only profile can use typed Android methods and Android raw unary
+calls but cannot use that Web compatibility wrapper. New code uses the
+backend-selected typed namespaces or `client.raw` property:
+`raw.call(...)` on Web and `raw.unary(...)` / `unary_stream(...)` on Android.
+See the Android [entry point](android/README.md) and
+[architecture flow](architecture.md#android-grpc-path).
 
 **Naming conventions.** See [`docs/conventions.md`](./conventions.md) for the
 canonical tiebreakers on waiting/polling verbs (`poll_X` / `wait_for_X` /
@@ -206,36 +290,34 @@ from those catalogues rather than introducing parallel patterns.
 
 **New RPC Method:**
 1. Capture traffic (see [RPC Development Guide](rpc-development.md))
-2. Add to `rpc/types.py`: `NEW_METHOD = "AbCdEf"`
+2. Add to `rpc/_identifiers.py`: `NEW_METHOD = "AbCdEf"`
 3. Implement in appropriate `_*.py` API class
 4. Add dataclass to `types.py` if needed
 5. Add CLI command if user-facing
 
 **New API Class:**
-1. Create `_newfeature.py` with `NewFeatureAPI` class.
-2. Type each constructor parameter against the **narrowest shared
-   capability Protocol** it actually uses (`RpcCaller`, `LoopGuard`,
-   `Kernel` — see
-   [`docs/architecture.md`](./architecture.md) for the protocol
-   catalog). If the capability has only one consumer, define the
-   Protocol locally beside that consumer instead of promoting it to
-   `_runtime/contracts.py`. Pass each collaborator by keyword-only
-   argument; do not bundle them into a feature-local composite-runtime
-   Protocol unless a second production consumer materialises. **Do NOT
-   depend on a broad runtime facade for type annotations** — there is no
-   concrete `Session` class (the broad `Session` Protocol was deleted;
-   see ADR-0013).
-3. Add the wiring in `_client_assembly.py::_assemble_client(...)`, not
-   directly in `client.py`. The assembly seam is shared by
-   `NotebookLMClient.__init__` and the canonical test factory; set every
-   constructor-time attribute there and thread concrete collaborators
-   from `compose_client_internals(...)`.
-4. **Tests** should inject the narrow collaborator the feature actually
-   needs. `tests/_fixtures/fake_core.py:FakeSession` remains available
-   for legacy broad-fixture tests, but new direct feature tests should
-   prefer `MagicMock(spec=RpcCaller, rpc_call=AsyncMock(...))`-style
-   fakes or local protocol fakes.
-5. Export types from `__init__.py`.
+1. Define the backend-neutral abstract API or shared workflows in `_newfeature.py`
+   (e.g., `NewFeatureAPI` or `BaseNewFeatureAPI`).
+2. Implement backend-specific adapters:
+   - Web implementation under `_web/` (e.g. `_web/notes.py`) using narrow Web capability Protocols
+     (`RpcCaller` / `Kernel` from `_web/contracts.py`).
+   - Android implementation under `_android/` (e.g. `_android/notes.py`) using `AndroidSession` / codecs.
+   Type each constructor parameter against the **narrowest shared capability Protocol** it
+   actually uses (`LoopGuard` from `_runtime/contracts.py`, or web-only `RpcCaller` / `Kernel` from
+   `_web/contracts.py` — see [`docs/architecture.md`](./architecture.md) for the protocol catalog).
+   If a capability has only one consumer, define the Protocol locally beside that consumer. Pass
+   each collaborator by keyword-only argument. **Do NOT depend on a broad runtime facade for type
+   annotations** (the broad `Session` Protocol was deleted; see ADR-0013).
+3. Declare the namespace contract in `_client_contracts.py` (add to `_NAMESPACE_NAMES`
+   and the `FeatureNamespaces` dataclass).
+4. Wire concrete instances in `_web/assembly.py::assemble_web_backend(...)` and
+   `_android/assembly.py::assemble_android_backend(...)`.
+5. Install the namespace attribute on `NotebookLMClient` in
+   `_client_assembly.py::_install_client(...)` and declare it on `NotebookLMClient` in `client.py`.
+6. Export public types from `src/notebooklm/types.py` and public exports from
+   `src/notebooklm/__init__.py`.
+7. **Tests** should inject the narrow collaborator the feature actually needs (e.g.
+   `MagicMock(spec=RpcCaller, rpc_call=AsyncMock(...))` or local protocol fakes).
 
 ---
 
@@ -364,20 +446,32 @@ and retains late-bound bridges for legacy owner lookup, Android-ID generation,
 strict reload, and default verification. Session persistence finishes before
 token persistence; a missing-storage leader remains shielded to settlement
 before its bootstrap lock is released. At the extraction freeze the coordinator
-is 373 lines and the compatibility adapter is 463 lines.
+was 373 lines and the compatibility adapter was 463 lines. Those are historical
+split measurements, not current module-size claims.
 
-The current measured persistence boundary is 1,090 lines in `_auth/storage.py`, 602 in
+`MintService.mint_oauth()` is the single typed OAuth mint seam. New protocol
+adapters supply an immutable `OAuthClientSpec` and consume a repr-safe
+`MintedOAuthToken`; they do not import `gpsoauth` or invent a TTL when its
+optional `Expiry` is absent or malformed. Oversized decimal expiry values are
+rejected before integer conversion. Fixed mint failures retain no raw response,
+dependency exception, credential-bearing cause, or traceback local, while
+`MissingDependencyError` remains distinct. The web `mint()` path is pinned to
+the existing Chromecast/OAuthLogin arguments and cookie-mint wire sequence.
+
+The ownership-refactor completion snapshot measured 1,090 lines in `_auth/storage.py`, 602 in
 `_auth/profile_migration.py`, 876 in `_auth/profile_store.py`, 96 in
-`_auth/cookie_filter.py`, and 89 in `_auth/master_token_file.py` (2,753 total). `storage.py`
+`_auth/cookie_filter.py`, and 89 in `_auth/master_token_file.py` (2,753 total).
+Use the module-size guardrail for current measurements. `storage.py`
 remains the v0.x signature/result facade; the extracted owners do not create a second facade.
 
-`_auth/tokens.py` now owns the Phase 9 stored-auth composition: captured-inline/file sources,
+`_auth/tokens.py` now owns stored-auth composition: captured-inline/file sources,
 `LoadPolicy`, paired `SessionSeed`/`TokenAcquisition`, final-attempt `AccountRouteResolver`, the
 closed `LoadedAuth` result, and `StoredAuthLoader`. Its only structural test seam is
 `TokenAcquirer`; inject that seam for ladder-result tests, and patch the call-time
 `tokens._load_stored_auth` provider for `AuthTokens.from_storage`/client composition tests. Raw
 loads and PSIDTS heal, file-account resolution, and the initial `ProfileStore` merge remain worker
-offloads. `_auth/cookies.py` owns one-sample live/SameSite-preserving seed provenance.
+offloads. `_auth/cookie_types.py` owns one-sample live/SameSite-preserving seed provenance;
+`_auth/cookies.py` preserves the compatibility loader and conversion seams over that owner.
 `_auth/recovery.py` now owns the complete cold operation. A fresh, one-shot
 `ColdRecoveryCoordinator` spells L2.5 → L3 → L4 directly; its class-owned `_drive_cold` and
 `_coalesce_cold` methods are the sole ladder and flight bodies. `ColdRecoveryState` owns the
@@ -403,8 +497,10 @@ write/clear remain synchronous, only the frozen handled exception set becomes a 
 collaborators are scrubbed on every exit. Patch these services through constructor injection rather
 than adding module monkeypatch sites.
 
-PSIDTS load composition now receives the pure cookie loader as an explicit callable. Keep
-conversion in `CookieJar`, raw-row fidelity in `ProfileDocument`, and persistence in `ProfileStore`;
+PSIDTS load composition now receives the pure cookie loader as an explicit callable. Pure
+RFC 6265 routing and expiry helpers live in `cookie_types`; `psidts_recovery` retains thin
+endpoint-injecting compatibility wrappers over them. Keep conversion in `CookieJar`, raw-row
+fidelity in `ProfileDocument`, and persistence in `ProfileStore`;
 do not restore `psidts_recovery -> cookies` or `psidts_recovery -> storage`. Preserve the sentinel,
 contended-reread, acquired-full-reread, pre-POST observation, typed CAS, and post-save disk-live
 winner order. Its catches are intentionally narrow: cancellation, Unicode failures, and unlisted
@@ -423,13 +519,15 @@ cancellation: the caller is cancelled immediately, while an already-dispatched w
 and commit. File auth alone constructs the store; inline env auth logs the existing skip and does
 not persist. Patch the private typed helper/store method for these tests, not the retired private
 `refresh.save_cookies_to_storage` alias. The public saver/facade and client/runtime saver-injection
-seams remain exact. Phase 12C measures **40 modules / 15,237 lines / 128 unique edges (117 module +
-11 function-local)**. Module-only and all-scope SCC sets are both empty. The final touched production
-LOC is: account 252, account-repair 132, account-types 50, cookie-types 396, cookies 961, keepalive
-438, master-token 455, master-token-types 68, PSIDTS recovery 1,222, recovery 530, refresh 1,184,
-single-flight 268, and storage 1,127. These are ratchet evidence, not a budget to spend.
+seams remain exact. The current no-split auth graph measures
+**32 modules / 13,686 lines / 123 unique edges (111 module +
+12 function-local)**. Module-only and all-scope SCC sets are both empty. Current touched production
+LOC is: account 252, account-repair 132, account-types 50, cookie-types 672, cookies 833, keepalive
+438, master-token 469, master-token-types 70, profile-store 921, PSIDTS recovery 1,051, recovery 712,
+refresh 1,184, single-flight 268, and storage 1,089. These are ratchet evidence, not a budget to
+spend: the global module budget remains 1,500 lines, while PSIDTS recovery's shrink lock is 1,051.
 
-Phase 10 completes runtime ownership. `NotebookLMClient.from_storage` registers a
+Runtime ownership is complete. `NotebookLMClient.from_storage` registers a
 `FileLoadedAuth` result's exact `ProfileStore`/baseline pair with `CookiePersistence`, without a
 second disk read. A direct file client prepares its baseline once before transport construction;
 missing, malformed, or invalid input becomes a sticky typed failure for canonical saves. A
@@ -439,11 +537,16 @@ First-party `_from_store` persistence retains no `AuthTokens`. A missing saver r
 unconditionally through the private canonical merge. Only an explicit `cookie_saver=` routes
 through `_save_v0_callback`; it lazily initializes its own retryable adapter snapshot and suppresses
 the writer when the source is invalid.
-`ClientLifecycle` alone owns the client `AuthTokens` mirror and refreshes `cookie_snapshot` after
-open and accepted canonical or compatibility saves. Tests inject a saver on the client when they
+The former web-specific `ClientLifecycle` owned the client
+`AuthTokens` mirror and refreshed `cookie_snapshot` after open and accepted
+canonical or compatibility saves. The lifecycle split moved those responsibilities into
+`WebTransportLifecycle`; the current root `ClientLifecycle` owns only
+protocol-neutral lifecycle waves and state. Tests inject a saver on the client when they
 intend to exercise the callback contract; canonical tests target the private typed seam.
-Measured owners are 457 lines in `_cookie_persistence.py`, 618 in `_runtime/init.py`, 628 in
-`_runtime/lifecycle.py`, and 992 in `client.py`.
+At that closing snapshot the owners measured 457 lines in
+`_web/transport/cookie_persistence.py`, 618 in `_runtime/init.py`, 628 in
+`_runtime/lifecycle.py`, and 992 in `client.py`; these figures are retained as
+refactor evidence rather than a live inventory.
 
 - **In-process lock before OS lock.** `StorageLockManager` takes an in-process
   `threading.Lock` keyed by the exact raw lock-path spelling *before* the OS lock, so
@@ -488,7 +591,7 @@ lock sibling and the two invocations never contend.
    green run that never exercised the adapter surface. Add both extras
    (CI installs `--extra mcp --extra server --extra impersonate`) to run them.
 
-   CI runs the same lint gate with `uv run pre-commit run --all-files`, so local hook results should match the `quality` job.
+   CI runs the same lint gate with `uv run pre-commit run --all-files`, so local hook results should match the `quality` job. The ordinary suite then runs in a reduced 5-cell compatibility matrix on every PR: Python 3.10, 3.12, and 3.15 on Ubuntu, plus one Python 3.12 cell each on macOS and Windows. The separate **Nightly Code Checks** workflow (`nightly-checks.yml`) runs the full 18-cell matrix, coverage, and repository lint against one resolved commit. **Nightly E2E Tests** (`nightly.yml`) runs only authenticated live lanes: full Web on Ubuntu, full Android on macOS, and read-only Web on Windows. Each workflow has its own daily schedule and manual dispatch; an E2E rerun never starts ordinary tests.
 
 2. **Authenticate:**
    ```bash
@@ -496,7 +599,7 @@ lock sibling and the two invocations never contend.
    ```
 
 3. **Create read-only test notebook** (required for E2E tests):
-   - Create notebook at [NotebookLM](https://notebooklm.google.com)
+   - Create notebook at [NotebookLM](https://notebook.google.com)
    - Add multiple sources (text, URL, etc.)
    - Generate artifacts (audio, quiz, etc.)
    - Set env var: `export NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID="your-id"`
@@ -507,20 +610,25 @@ lock sibling and the two invocations never contend.
 # Unit + integration tests (no auth needed)
 uv run pytest
 
-# Same suite in parallel — the full suite is ~10.6k tests and runs single-process
+# Same suite in parallel — the full suite is ~22k+ tests and runs single-process
 # by default (slow). pytest-xdist (a dev dep) cuts wall-clock to ~1–2 min. CI runs
 # `-n auto --dist loadgroup`; loadgroup keeps @pytest.mark.xdist_group tests pinned
 # to one worker. Mirror it locally when running the whole suite.
 uv run pytest -n auto --dist loadgroup
 
-# Fast local loop — skip repo-wide audit / release-gate checks (~40s saved).
-# CI still runs these; the marker just lets you iterate quickly.
-uv run pytest tests/unit tests/integration -m "not repo_lint"
+# Fast local loop — skip repo-wide audits and exhaustive refactor qualification.
+# PR CI also skips the bulk repo_lint marker (of it, only node ids named in
+# the critical-guard step run). Manual and nightly qualification run both
+# slower markers; `make gates` still runs the complete repo_lint marker.
+uv run pytest tests/unit tests/integration -m "not repo_lint and not refactor_qualification"
+
+# Exhaustive lifecycle races and migration-only structural inventories.
+uv run pytest -m refactor_qualification --timeout=180 --no-cov
 
 # E2E tests (requires auth + test notebook)
 uv run pytest tests/e2e -m readonly        # Read-only tests only
 uv run pytest tests/e2e -m "not variants"  # Skip parameter variants
-uv run pytest tests/e2e --include-variants # All tests including variants
+uv run pytest tests/e2e --include-variants # Includes costly cinematic-video generation
 
 # Select a profile for E2E tests
 uv run pytest tests/e2e -m e2e --profile work
@@ -531,6 +639,12 @@ docstring/install-doc drift guards, version-sync, and CI-script audits.
 These are valuable release/CI guardrails but cost ~30–45s locally. See
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#fast-local-loop-skip-repo-wide-audit-checks)
 for the canonical fast-loop guidance.
+
+The `refactor_qualification` marker is narrower: it tags exhaustive concurrency
+wave matrices and exact migration inventories that are useful during architecture
+work and release qualification, but need not be multiplied across routine PR
+matrix cells. Compact public-surface, compatibility, and ownership-boundary tests
+remain in the required PR lane.
 
 ### Testing across boundaries and against reality
 
@@ -560,9 +674,9 @@ results:
 | `cli/services/playwright_login.py::ensure_chromium_installed` | The programmatic probe is checked against real Playwright, and a separate required Chromium launch smoke checks usability. |
 | Playwright launch/error classification | Synthetic classification tests remain valid; add a reality probe only when claiming a specific third-party message shape. |
 | `_auth/refresh.py` custom refresh command | Classification/security contract only; the command is operator-supplied, so there is no fixed third-party output contract. |
-| Auth refresh composition (`AuthRefreshCoordinator` → `NotebookLMClient.refresh_auth` → `_auth/session.py`) | `tests/unit/test_auth_refresh_seam.py` crosses the production assembly with a deterministic homepage response; the existing VCR test covers the stale-RPC → homepage-refresh → retry path. No live reality probe is used because it would require mutable authenticated external state and would not provide a stable CI contract. |
+| Auth refresh composition (`AuthRefreshCoordinator` → bound `WebSessionAuth.refresh_base` → `_web/transport/session_auth.py`) | `tests/unit/test_auth_refresh_seam.py` crosses the production assembly with a deterministic homepage response; the existing VCR test covers the stale-RPC → homepage-refresh → retry path. No live reality probe is used because it would require mutable authenticated external state and would not provide a stable CI contract. |
 | `_version_info.py` git lookup | Local-tool lookup with fallback behavior; synthetic and fallback tests are sufficient. |
-| `scripts/` subprocesses | Audited `audit_public_api_compat.py`, `regen_baselines.py`, and `audit_test_suite.py`: each invokes a local developer/CI tool, not a product boundary. Their wrappers are covered by `tests/unit/test_ci_audit_scripts.py` and related audit tests; no external-output reality probe is claimed. |
+| `scripts/` subprocesses | Audited `audit_public_api_compat.py`, `regen_baselines.py`, `audit_test_suite.py`, and `check_base_wheel.py`: each invokes a local developer/CI tool, not a product boundary. The wheel check creates isolated environments and exercises real package installation/import behavior; wrappers and workflow placement are covered by the CI audit tests. |
 
 The bounded MCP seam-matrix slice is
 [`tests/integration/mcp_vcr/test_notebooks.py::test_mcp_notebook_list_crosses_adapter_to_client_boundary`](../tests/integration/mcp_vcr/test_notebooks.py).
@@ -661,7 +775,7 @@ reports the actionable configuration error. A genuinely revoked token still
 reports the authentication failure. This distinction is pinned by
 [#2239](https://github.com/teng-lin/notebooklm-py/issues/2239).
 
-Similarly, without `cookies` (`rookiepy`) the browser discovery/login and
+Similarly, without `cookies` (`rookie-cookies`) the browser discovery/login and
 browser-refresh cells cannot run at all; use `--skip-browser` rather than
 reading their absence as a pass.
 
@@ -725,31 +839,139 @@ NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID=<work-nb-id> \
   uv run pytest tests/e2e -m e2e --profile work
 ```
 
+### Disposable E2E copy qualification
+
+Canonical live CI treats accounts as opaque slots (`A`, `B`, and `C`) and writable E2E notebooks
+as disposable copies. Before deploying the workflow cutover, complete the external operations gate
+in [issue #2331](https://github.com/teng-lin/notebooklm-py/issues/2331): configure the protected
+Environment, qualify the template under each enabled account/backend, and start the repository
+variable at `NOTEBOOKLM_CI_ACCOUNT_SLOTS=A`. Release verification must dispatch `rpc-health.yml`
+and `verify-package.yml` with `--ref main`; release and feature refs cannot reach their protected
+authenticated jobs.
+
+The canonical template describes only state the copy API promises to preserve and both backends
+can identify consistently: ready sources plus completed audio, video, infographic, and slide-deck
+artifacts. Legacy quiz and flashcard rows in this public notebook have no Web variant metadata;
+report, data-table, and interactive mind-map artifacts are absent. Those optional read-only checks
+skip when unavailable, while the full E2E lanes generate and exercise every family on disposable
+notebooks. Copying is asynchronous: provisioning dispatches every physical copy first, then polls
+copied sources until ready. Full lanes use a reference copy plus one clean mutable workspace
+shared by generation and multi-source tests. Clean
+workspaces wait for the required inherited artifact families to appear, delete them even when
+unfinished, then prove a stable empty inventory over the existing 90-second quiet window.
+Reference artifact completion is checked separately by
+`test_copied_reference_artifacts_become_ready`, with a ten-minute budget. Missing copied artifacts
+fail that test with the missing families listed while allowing the other E2E tests to run.
+Completed copies need not expose download payloads. Once the inventory is ready, the test reports
+each required family's completed count, list URL count, exact-read count, and payload availability.
+Android checks `GetArtifact` when `ListArtifacts` omits a URL. Missing URLs produce explicit
+warnings rather than another readiness wait; download tests report their own outcomes and skips.
+The checked-in template shape is
+`tests/fixtures/e2e_template_contract.json`. Notes and chat history are deliberately absent from
+that contract. Provisioning creates and validates those on the disposable `reference` copy using
+`tests/fixtures/e2e_prepared_role_contract.json`.
+
+Nightly logs show each preparation stage, per-test start/result lines, and a heartbeat every
+30 seconds while a test is running. Artifact verification reports pending families, producer
+tests, and copied download payload availability. The job summary retains preparation failures,
+E2E result counts, failed test names, failure phases and exception types, and a table of phase
+outcomes even after cleanup. Pytest logs retain tracebacks and skip/xfail reasons (`-ra`);
+live tests explicitly disable code coverage (`--no-cov`). Execution floors only detect when
+an entire required live-test family was skipped; they are separate from code coverage.
+These reports omit notebook handles, titles, parametrized resource values, and upstream response
+bodies. To enable the same test progress locally, set `CI_E2E_PROGRESS=1` when running pytest.
+For a short workflow smoke test, dispatch nightly with `e2e_lane=readonly`, a read-only pytest
+node in `test_filter`. The filter and retries still enforce the
+read-only marker selection.
+
+Web RPC health does not provision an E2E copy. After authentication, `check_rpc_health.py --full`
+creates its own temporary notebook and resources, probes the RPCs, then exercises deletion RPCs
+in its cleanup block. A failed notebook-creation probe remains a reported RPC failure; account
+checks that do not need a notebook still run. Both RPC lanes stream timestamped probe starts
+and outcomes while the complete report is captured. Web diagnostics identify the phase, method
+name and RPC ID, duration, and reason for an error or skip; the summary keeps a per-probe table
+and links the full report. An RPC-ID `OK` proves that the expected ID was observed, including
+when an operation was rejected; it does not prove feature behavior. Chat framing, customization
+enums, build-label age, and rebrand probes state their separate checks. Android diagnostics show
+the gRPC method path, ID round-trip/session checks, schema hashes, unknown-field counts, and
+baseline drift. No additional RPC requests are made just to produce progress output.
+The configured template is the public notebook titled
+`Make Your Writing More Powerful and Persuasive`. Its title cannot be changed; replacing the
+template requires updating the title contract and template-ID secret together.
+
+The lifecycle manager defaults to the public template
+`a109ad5c-834d-4f3d-82a0-fe41aa72318e` when the environment variable is unset. Set
+`NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID` only to qualify a replacement template. To qualify the
+default locally, use a dedicated profile:
+
+```bash
+export NOTEBOOKLM_PROFILE=agent-e2e-slot-A-web
+export GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1
+export GITHUB_REPOSITORY=teng-lin/notebooklm-py
+export RUNNER_TEMP="$(mktemp -d)"
+
+uv run python scripts/manage_ci_e2e_notebooks.py validate \
+  --backend web \
+  --contract tests/fixtures/e2e_template_contract.json
+
+uv run python scripts/manage_ci_e2e_notebooks.py provision \
+  --backend web \
+  --contract tests/fixtures/e2e_template_contract.json \
+  --mode full --lane nightly-web-ubuntu --account-slot A \
+  --manifest "$RUNNER_TEMP/notebooklm-e2e.json" \
+  --github-env "$RUNNER_TEMP/github-env"
+
+# Run pytest only after exporting the generated github-env entries.
+uv run python scripts/manage_ci_e2e_notebooks.py cleanup \
+  --backend web \
+  --manifest "$RUNNER_TEMP/notebooklm-e2e.json"
+```
+
+Cleanup is mandatory even when validation or pytest fails. Managed full mode publishes two
+physical IDs: a distinct `reference` ID and one mutable ID bound to both `generation` and
+`multi-source`; managed read-only mode publishes only `reference`. Both publish the activation flag
+last. With that flag present, pytest never
+consults profile cache files, creates a role notebook, cleans copied children on first use, or
+deletes a workflow-owned copy during teardown. `temp_notebook` and other function-level CRUD
+fixtures retain their existing lifecycle.
+
+Before workflow cutover, maintainers must create and validate the immutable template, grant every
+enabled account copy access, upload one independently revocable master-token secret per enabled
+slot, set `NOTEBOOKLM_CI_ACCOUNT_SLOTS=A`, and audit the real `protected-readonly` Environment so
+only `main` deployments are allowed. Add `B` and `C` only after each passes Web and Android
+qualification. Slot aliases, never account emails or token fields, are the only identity recorded
+in logs. Account-wide concurrency is designed to queue at most GitHub's documented 100 pending
+jobs per slot; check that queue before bulk manual dispatch.
+
 ### Test Structure
 
-```
+```text
 tests/
 ├── unit/                            # No network, fast, mock everything
-│   ├── app/                         # _app/ transport-neutral core
+│   ├── app/                         # _app/ transport-neutral core tests
 │   ├── cli/                         # CLI command tests
-│   └── mcp/                         # MCP adapter unit tests (importorskip fastmcp)
+│   ├── mcp/                         # MCP adapter unit tests (importorskip fastmcp)
+│   ├── android/                     # Android codec, session, and stub tests
+│   ├── test_artifacts_drift.py      # CREATE_ARTIFACT payload drift guard
+│   └── test_get_summary_drift.py    # GET_NOTEBOOK_SUMMARY drift guard
 ├── server/                          # REST adapter suite — FastAPI routes (importorskip fastapi)
 ├── _guardrails/                     # Architecture/invariant gates (custom AST + filesystem lint)
+├── _fault_server/                   # Local HTTP/gRPC fault injection test server (ADR-0038)
 ├── _baselines/                      # Regenerable-baseline registry (ADR-0022): derive/store/compare
 ├── fixtures/
-│   └── baselines/                   # Committed derived baselines (types_all.json, ungated_surface.json)
-├── integration/                     # Mocked HTTP responses + VCR cassettes
+│   └── baselines/                   # Committed derived baselines (types_all.json, ungated_surface.json, ...)
+├── integration/                     # Mocked HTTP responses + VCR cassettes + fault harness
+│   ├── faults/                      # Local socket fault-injection scenarios (R1–R14 contracts)
+│   ├── cli_vcr/                     # CLI → Client → RPC VCR tests
+│   ├── mcp_vcr/                     # MCP adapter VCR tier (replays CLI cassettes)
+│   ├── concurrency/                 # Cross-process / asyncio races
 │   ├── test_artifacts_integration.py # ArtifactsAPI integration
-│   ├── test_artifacts_drift.py      # CREATE_ARTIFACT payload drift guard
+│   ├── test_android_grpc_cassette.py # Android gRPC replay tests
 │   ├── test_auth_refresh_vcr.py     # Auth refresh token VCR test
 │   ├── test_auto_refresh.py         # Keepalive/refresh integration
 │   ├── test_chat_delete_conversation_vcr.py
 │   ├── test_chat_multi_source_vcr.py
-│   ├── test_chat_passage_resolver.py
-│   ├── test_cli_session_local.py
-│   ├── test_download_multi_artifact.py
 │   ├── test_error_paths_vcr.py      # Synthetic and VCR error paths
-│   ├── test_get_summary_drift.py    # GET_NOTEBOOK_SUMMARY drift guard
 │   ├── test_notebooks_integration.py # NotebooksAPI integration
 │   ├── test_notes_integration.py     # NotesAPI integration
 │   ├── test_notes_idempotency.py
@@ -759,21 +981,15 @@ tests/
 │   ├── test_save_chat_as_note_integration.py
 │   ├── test_session_integration.py  # Client init + RPC plumbing
 │   ├── test_settings_integration.py  # SettingsAPI integration
-│   ├── test_settings_vcr.py
 │   ├── test_sharing_integration.py   # SharingAPI integration
-│   ├── test_sharing_vcr.py
-│   ├── test_skill_packaging.py      # Packaging smoke (skills, entry-points)
 │   ├── test_sources_integration.py   # SourcesAPI integration
 │   ├── test_vcr_comprehensive.py    # End-to-end VCR walkthrough
 │   ├── test_vcr_example.py          # VCR pattern reference
-│   ├── test_vcr_real_api.py         # VCR against real-API cassettes
-│   ├── cli_vcr/                     # CLI → Client → RPC VCR tests
-│   ├── mcp_vcr/                     # MCP adapter VCR tier (replays CLI cassettes)
-│   └── concurrency/                 # Cross-process / asyncio races
+│   └── test_vcr_real_api.py         # VCR against real-API cassettes
 └── e2e/                             # Real API calls (requires auth; incl. test_mcp*.py, test_cli_live.py)
 ```
 
-The `*_drift.py` tests are payload-shape canaries: they decode a recorded
+The `*_drift.py` tests (under `tests/unit/`) are payload-shape canaries: they decode a recorded
 RPC response (or assemble a synthetic one) and assert the live decoder still
 produces the expected dataclass. They fail loudly when Google changes a
 payload field, so the failure shows up here before users hit it.
@@ -806,15 +1022,15 @@ A representative slice (run `ls tests/_guardrails/` for the full set):
 
 | Gate | Enforces |
 |---|---|
-| `test_no_raw_positional_rpc_indexing.py` | No chained positional indexing (`x[0][9][3]`) of `batchexecute` payloads outside the sanctioned `_row_adapters/` — the project's #1 fragility class |
-| `test_rpc_method_ids_only_in_types.py` | Obfuscated RPC IDs live only in `rpc/types.py` (the source of truth) |
+| `test_no_raw_positional_rpc_indexing.py` | No chained positional indexing (`x[0][9][3]`) of `batchexecute` payloads outside the sanctioned `_web/rows/` — the project's #1 fragility class |
+| `test_rpc_method_ids_only_in_types.py` | Obfuscated RPC IDs live only in `rpc/_identifiers.py` (the source of truth) |
 | `test_no_forbidden_monkeypatches.py` | The forbidden monkeypatch shapes under `tests/` (ADR-0007) |
 | `test_no_inline_deprecation_warnings.py` | No inline `warnings.warn(..., DeprecationWarning)` outside `_deprecation.py` (ADR-0018) |
 | `test_cli_rpc_envelope.py` | Every *RPC-touching* Click leaf command (call graph reaches `NotebookLMClient`) routes its errors into the JSON envelope |
 | `test_module_size_ratchet.py` | No module grows past the size budget (ADR-0008) — a burn-down ratchet |
-| `test_v080_release_gate.py` | The v0.8.0 breaking-change set flips in lockstep at the version bump |
+| `test_v100_release_gate.py` | The v1.0.0 breaking-change set flips in lockstep at the version bump |
 | `test_adr_reference_format.py` | ADR references are 4-digit and resolve to a real `docs/adr/NNNN-*.md` |
-| `test_cli_boundary.py` | CLI modules import only public `notebooklm` surface — no `notebooklm._*` / `notebooklm.rpc.*` / `_private` reach-in |
+| `test_cli_boundary.py` | CLI modules import only public `notebooklm` surface plus the single `_app` core exception — no direct `_browser`, other `notebooklm._*`, `notebooklm.rpc.*`, or `_private` reach-in |
 | `test_no_facade_reach_in.py` | Feature APIs and service modules don't reach into Session internals or runtime-import facade APIs |
 | `test_public_surface_manifest.py` | The documented public-import manifest + re-export identity pins for `notebooklm` / `auth` / `types` / shims stay intact |
 
@@ -865,8 +1081,8 @@ into `docs/`:
 
 | file | what it pins |
 |---|---|
-| `mobile/schema.proto` | 282 messages / 767 fields with real names and tag numbers |
-| `mobile/enums.txt` | 77 enums / ~1900 values with exact integers |
+| `android/schema.proto` | 326 messages / 879 fields with real names and tag numbers |
+| `android/enums.txt` | 104 library-scoped enum blocks (94 class names) / 2180 values with exact integers |
 
 Both come from the official Android app, which speaks the *same backend messages*
 over gRPC — where fields are tag-addressed rather than positional. The two line up
@@ -925,6 +1141,19 @@ surface change is a deliberate, diff-visible act. These **regenerable baselines*
 | `types_all` | `notebooklm.types.__all__` | `tests/fixtures/baselines/types_all.json` |
 | `ungated_surface` | collected `__all__` of each ungated public module | `tests/fixtures/baselines/ungated_surface.json` |
 | `cli_contract` | `build_cli_contract()` | `tests/fixtures/cli_contract_baseline.json` |
+| `auth_import_graph` | static direct imports under `notebooklm._auth` | `tests/fixtures/baselines/auth_import_graph.json` |
+| `auth_patch_sites` | auth test patch-site audit | `tests/fixtures/baselines/auth_patch_sites.json` |
+| `browser_import_graph` | package-aware imports under `notebooklm._browser` | `tests/fixtures/baselines/browser_import_graph.json` |
+| `browser_patch_sites` | browser test patch-site audit | `tests/fixtures/baselines/browser_patch_sites.json` |
+| `auth_facade_patch_sites` | public `notebooklm.auth` no-growth relocation sentinel | `tests/fixtures/baselines/auth_facade_patch_sites.json` |
+| `auth_family_patch_scorecard` | combined full-joint auth/browser/facade scorecard | `tests/fixtures/baselines/auth_family_patch_scorecard.json` |
+| `auth_shared_mutations` | class/singleton/process-default mutation audit | `tests/fixtures/baselines/auth_shared_mutations.json` |
+| `backend_boundary` | AST-derived boundary classification between Web and Android | `tests/fixtures/baselines/backend_boundary.json` |
+| `backend_runtime_coupling` | dynamic runtime cross-backend coupling audit | `tests/fixtures/baselines/backend_runtime_coupling.json` |
+| `backend_static_coupling` | static cross-backend import coupling audit | `tests/fixtures/baselines/backend_static_coupling.json` |
+| `module_size` | live over-budget and ADR-0033 shrink-locked LOC | `tests/fixtures/baselines/module_size.json` |
+| `storage_transaction_policy` | AST-derived lock-policy callers | `tests/fixtures/baselines/storage_transaction_policy.json` |
+| `guardrail_inline_literals` | grandfathered large guardrail literals | `tests/fixtures/baselines/guardrail_inline_literals.json` |
 
 The freeze test `test_baseline_matches_committed_file` (in
 `tests/_guardrails/test_public_surface_manifest.py`) asserts each committed file
@@ -935,6 +1164,49 @@ the committed files in the **same PR**:
 ```bash
 python scripts/regen_baselines.py
 git diff tests/fixtures/baselines tests/fixtures/cli_contract_baseline.json
+```
+
+Shrink-only baselines reject weakening changes during ordinary regeneration.
+After reviewing an intentional ceiling increase, new policy caller, or new large
+guardrail literal, acknowledge it explicitly:
+
+```bash
+python scripts/regen_baselines.py --allow-growth
+```
+
+Auth mutation projections are schema-v2 shrink-only ratchets. Review full
+package/target/path/lexical-owner rows and total counts alongside the
+private-name column; a non-underscore target is not necessarily public API.
+They intentionally implement a finite repository grammar, not general Python
+dataflow or pytest fixture discovery: use explicit family imports, direct
+mutation idioms, literal finite names/containers without unpacking, the
+suite-used syntactic `list(...)` wrapper, and direct local helpers with statically
+resolvable arguments. If a family-related target is reported as
+unresolved, simplify it until the audit can resolve it. Do not use unsupported
+control flow, dynamic registries, closure capture, or fixture/plugin discovery
+to justify a lower measurement; retain the prior row unless the coupling was
+removed in a supported, reviewable form. Proven-fresh or proven-non-family
+targets remain excluded.
+Authored scenario, lifecycle-cleanup, and coverage-allowance policies live in
+`tests/fixtures/policies/` and are never emitted by baseline regeneration.
+The separate **Auth Patch Audit** workflow runs on manual dispatch and is a
+required reusable gate in `publish.yml`, so it runs once for every release but
+not for ordinary pull requests. Manual runs compare the selected branch with
+its merge-base on `main` (or an explicit `base_ref`); releases compare the tag
+with the previous stable release tag. It uses isolated base/head workspaces, a
+bounded auth/browser unit-test coverage slice (never integration or server
+tests), pytest node/parameter/fixture-closure collection, and exact
+statement/branch preservation.
+The initial schema-v2 scorecard is `_auth` 244 (145 private-name), `_browser`
+66 (17 private-name), public facade 526, and shared-lifetime mutation 188. The
+private-package total is 310; the one-site increase over the legacy projection
+is a formerly invisible, statically resolvable constant-named `_auth` patch,
+not new test behavior.
+
+Run the complete AST/path/contract guard suite locally with:
+
+```bash
+make gates
 ```
 
 Review the diff — each changed line is the deliberate acknowledgement of the
@@ -1007,6 +1279,14 @@ The script is a manual maintainer helper — CI never runs it.
 # Re-record (or record-new) cassettes; sensitive data auto-scrubbed
 NOTEBOOKLM_VCR_RECORD=1 uv run pytest tests/integration/test_vcr_*.py -v
 ```
+
+Cassettes are stored per client tier. VCR's `cassette_library_dir` is
+`tests/cassettes/web/`, so recordings land there automatically and cassette
+names in test code stay tier-free (`use_cassette("notebooks_list.yaml")`).
+Android gRPC captures live alongside in `tests/cassettes/android/` and are
+replayed through a different seam. See
+[tests/cassettes/README.md](../tests/cassettes/README.md) for the full layout
+and naming convention.
 
 > **Recording reads your real `~/.notebooklm` profile.** Normally the suite
 > pins `NOTEBOOKLM_HOME` at a throwaway tmp dir (autouse `_isolate_notebooklm_home`
@@ -1128,7 +1408,7 @@ member of `RPCMethod` has **both**:
    (`RPCMethod.LIST_NOTEBOOKS`) OR by its raw RPC id string value
    (`"wXbhsf"`).
 2. **A cassette covering the RPC id** — at least one cassette YAML under
-   `tests/cassettes/` contains the RPC id string in its body.
+   `tests/cassettes/web/` contains the RPC id string in its body.
 
 The gate is a pure-text static check (no pytest, no network) and runs in the
 `quality` job of `test.yml`.
@@ -1168,10 +1448,17 @@ NotebookLM has undocumented rate limits. Generation tests may be skipped when ra
 
 ### Writing New Tests
 
+Use the [local fault-injection harness](fault-injection.md) for network,
+authentication, and lifecycle failures that need real socket behavior without
+a live account. Its deterministic scenarios also feed the concurrent stress
+runner.
+
 ```
 Need network?
 ├── No → tests/unit/
-├── Mocked → tests/integration/
+├── Mocked transport → tests/unit/
+├── Recorded upstream traffic → tests/integration/
+├── Local fault server → tests/integration/faults/
 └── Real API → tests/e2e/
     └── What notebook?
         ├── Read-only → read_only_notebook_id + @pytest.mark.readonly
@@ -1193,7 +1480,7 @@ Need network?
 
 ### Credential redaction
 
-The package handler installed by `configure_logging()` has a `RedactingFilter` attached. It runs for every record reaching the handler, including records originating in child loggers (`notebooklm._rpc_executor`, `notebooklm._transport_errors`, `notebooklm._chat`, etc.) via Python logging's default propagation. The filter scrubs:
+The package handler installed by `configure_logging()` has a `RedactingFilter` attached. It runs for every record reaching the handler, including records originating in child loggers (`notebooklm._rpc_executor`, `notebooklm._web.transport.errors`, `notebooklm._chat`, etc.) via Python logging's default propagation. The filter scrubs:
 
 - CSRF tokens (`at=...`)
 - Session IDs (`f.sid=...`)
@@ -1226,7 +1513,7 @@ Use `%`-style log calls, not f-strings:
 
 ```python
 logger.warning("Failed for %s in %.2fs", name, elapsed)  # OK
-logger.warning(f"Failed for {name} in {elapsed:.2f}s")    # BAD
+logger.warning(f"Failed for {name} in {elapsed:.2f}s")  # BAD
 ```
 
 f-string eager evaluation defeats lazy formatting and (although the filter would still scrub via `record.getMessage()`) makes profile-time cost unconditional.
@@ -1241,6 +1528,7 @@ If you also want those loggers to *emit* through notebooklm-py's default handler
 
 ```python
 from notebooklm.log import install_redaction
+
 install_redaction("httpx", "urllib3")
 ```
 
@@ -1268,74 +1556,229 @@ The `RedactingFilter` preserves `record.exc_info` (the live exception object) so
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `test.yml` | Push/PR | Unit tests, linting, type checking |
-| `nightly.yml` | Daily 6 AM UTC (`main`), manual dispatch for `release/*` | E2E tests with real API |
-| `rpc-health.yml` | Daily 7 AM UTC (`main`), manual dispatch for `release/*` | RPC method ID monitoring (see [stability.md](stability.md#automated-rpc-health-check)) |
+| `test.yml` | Push/PR | Reduced 5-cell compatibility matrix (Ubuntu × Python 3.10, 3.12, 3.15, plus macOS/Windows on 3.12), linting, type checking |
+| `fault-stress.yml` | PR, daily 5:45 AM UTC, manual dispatch | Local HTTP/gRPC fault workloads with synthetic credentials and diagnostic report artifacts |
+| `nightly-checks.yml` | Daily 6 AM UTC (`main`), manual dispatch with optional `custom_branch` | Full compatibility matrix, ordinary-test coverage, and repository lint; no live account credentials |
+| `nightly.yml` | Daily 6 AM UTC (`main`), manual dispatch on `main` | Managed-copy full Web/Ubuntu, full Android/macOS, and read-only Web/Windows E2E only; an owner may qualify an open same-repository PR at its pinned head SHA |
+| `rpc-health.yml` | Daily 7 AM UTC (`main`), manual dispatch on `main` | RPC monitoring on its own temporary notebook plus the template-read-only [Android gRPC canary](#android-grpc-canary); an owner may qualify an open same-repository PR at its pinned head SHA |
 | `testpypi-publish.yml` | Manual dispatch | Publish to TestPyPI |
-| `verify-package.yml` | Manual dispatch | Verify TestPyPI or PyPI install + E2E |
+| `verify-package.yml` | Manual dispatch on `main` | Verify TestPyPI or PyPI install plus managed-copy E2E; artifact inventory is advisory |
 | `publish.yml` | Tag push | Publish to PyPI |
 
-### Setting Up Nightly E2E Tests
+The test and both publish workflows build the wheel and run
+`scripts/check_base_wheel.py`. The smoke inspects wheel contents and metadata,
+then proves in clean environments that the base install imports and exposes CLI
+help without Playwright while installing the same wheel's `[browser]` extra does
+provide Playwright. `verify-package.yml` repeats the check against the exact
+wheel downloaded from the selected package index before installing the broader
+verification extras.
 
-1. Bootstrap a master token once: `notebooklm login --master-token --account <you@gmail.com>`
-   (needs the `[headless]` extra; see
-   [installation.md → master-token auth](installation.md#alternative-master-token-auth-no-cookie-file-to-ship-survives-expiry)).
-2. Add GitHub secrets:
-   - `NOTEBOOKLM_MASTER_TOKEN_JSON` (**required**): contents of
-     `~/.notebooklm/profiles/default/master_token.json`. The workflows exit `1`
-     when it is empty — it is the only credential they ship.
-   - `NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID`: Your test notebook ID
+#### Android gRPC canary
 
-   `NOTEBOOKLM_AUTH_JSON` is **no longer used by any workflow**. Any other
-   active client supersedes a cookie snapshot within ~10 minutes (the ~600 s
-   rotation cadence), and a *superseded* value has been observed failing
-   within roughly half an hour — so a snapshot exported on a workstation was
-   routinely dead before a scheduled run started (see
-   [auth-cookie-lifecycle.md §2.5](auth-cookie-lifecycle.md#25-four-timers-people-confuse)).
+`rpc-health.yml` also runs a second, lightweight job, `android-grpc-health`, on
+the same schedule and `workflow_dispatch`. It runs `scripts/android_grpc_canary.py`,
+a read-only probe of the private Android gRPC backend kept deliberately separate
+from the heavy Android E2E lane in `nightly.yml`. The script opens
+`NotebookLMClient.from_storage(backend="android")`, mints a bearer and forces one
+refresh (the generation must advance, and a re-mint that fails is the distinct
+`FAIL bearer refresh-mint …` verdict), calls unary `GetProject` and
+`ListChatSessions` through the public API, then re-issues both raw — `GetProject`
+decoded with the full recovered `GetProjectResponse`, as `sources.list` does —
+and prints per RPC a `SHAPE <rpc> <sha256>` fingerprint of the populated
+`(field_path, wire_type)` set (no values, ids, or text, so it is comparable
+across runs) and an `UNKNOWN <rpc> <n>` count of fields the recovered schema does
+not declare. A non-zero count is the steady state (the app protos are a subset of
+what the server sends; `GetProject` carries dozens), so drift is judged against a
+hand-authored baseline, not zero: the job passes
+`--baseline tests/fixtures/android/canary_baseline.json`
+(`{"<rpc>": {"shape": "<hex>", "unknown_fields": <n>}}`), and any RPC whose live
+shape or count differs prints `FAIL schema <rpc> … live=… baseline=…`. Until that
+file exists the job prints `WARN baseline missing …`, runs in diagnostic mode
+(green), and raises a `::warning::` annotation on the run so the inert drift
+check stays visible; author the file by hand from a reviewed run's
+`SHAPE`/`UNKNOWN` lines in the step summary. The bootstrap is bounded: the job
+passes `--missing-baseline-grace-until 2026-09-14`, after which a missing
+baseline is a `FAIL`, so the drift check cannot stay inert indefinitely. Transport or auth failures always
+`FAIL`. Every emitted line has the probed notebook id replaced with
+`<notebook-id>` and exception text scrubbed, so the summary carries no ids.
+`GenerateFreeFormStreamed` is the backend's only unary-stream RPC and it writes a
+chat turn, so the canary never calls it. Run it locally against your own profile:
 
-The live-E2E workflows (`verify-package.yml`, `nightly.yml`, `rpc-health.yml`,
-`verify-artifacts.yml`) ship no inline credential at all. Their "Materialize
-auth profile" step writes `master_token.json` to a real on-disk profile (mode
-`0600`) because the layer-4 re-mint only engages when the token sits beside the
-profile's `storage_state.json` — env-var auth bypasses it entirely. The step
-then runs `notebooklm login --master-token-refresh`, which **bootstraps**
-`storage_state.json` from the token, preserving a deterministic fresh-jar CI
-setup;
-ordinary file-backed cold loading now also reaches layer 4 after a confirmed
-login redirect, and layer 4 continues to cover mid-run expiry. So as long as
-the pre-mint succeeds, a cookie secret that Google has rotated no longer fails
-the run. The pre-mint is non-fatal: on failure (e.g. a revoked master
-token) the step logs a `::warning::` and falls back to the cookie snapshot,
-which then must still be live for the run to pass. Without the master-token
-secret, behavior degrades to the old cookie-only mode.
+```bash
+NOTEBOOKLM_PROFILE=<profile> NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID=<id> \
+  uv run python scripts/android_grpc_canary.py \
+    --baseline tests/fixtures/android/canary_baseline.json
+```
 
-Scheduled canaries target `main` only. Release canaries are manual: dispatch
-`nightly.yml` or `rpc-health.yml` with `custom_branch=release/vX.Y.Z`.
+It never writes the baseline, fixtures, cassettes, or the evidence ledger; a
+changed `SHAPE`/`UNKNOWN` value is a prompt to re-capture, review, and update the
+baseline by hand, not something the canary fixes.
 
-### Maintaining Secrets
+### Managed-copy live CI
 
-| Task | Frequency |
-|------|-----------|
-| Refresh credentials | Every 1-2 weeks (cookie-only); rarely needed once `NOTEBOOKLM_MASTER_TOKEN_JSON` is set — the master token survives cookie rotation until revoked |
-| Check nightly results | Daily |
+Canonical CI never points pytest or full RPC health at the immutable template.
+Each authenticated lane selects one opaque account slot and materializes only that
+slot's master token. E2E lanes create workload-isolated copies. Full lanes prepare a
+stable `reference` copy plus one mutable copy shared by `generation` and
+`multi-source`; Web RPC health creates and cleans up its own temporary notebook. The Android RPC
+canary is the only lane that reads the template directly, and it performs no
+notebook mutation.
+
+The contracts are checked in at `tests/fixtures/e2e_template_contract.json` and
+`tests/fixtures/e2e_prepared_role_contract.json`. Provisioning seeds the
+reference copy's note and persisted Q&A, removes inherited writable children
+from the mutable workspace, and publishes the managed fixture bindings only
+after both workspaces pass. Cleanup runs under `always()` after verification, while the next
+selected run also sweeps owned, reserved-prefix copies older than 24 hours.
+
+For a local managed-copy run, use an isolated profile and runner-style scratch
+directory. Never use the template ID as a pytest fixture binding:
+
+```bash
+export NOTEBOOKLM_PROFILE=agent-e2e-local
+export RUNNER_TEMP="$(mktemp -d)"
+export GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1
+export GITHUB_REPOSITORY=teng-lin/notebooklm-py
+uv run python scripts/manage_ci_e2e_notebooks.py provision \
+  --backend web \
+  --contract tests/fixtures/e2e_template_contract.json --mode full \
+  --lane verify-package --account-slot A \
+  --manifest "$RUNNER_TEMP/notebooklm-e2e.json" --github-env "$RUNNER_TEMP/e2e.env"
+set -a; source "$RUNNER_TEMP/e2e.env"; set +a
+NOTEBOOKLM_E2E_GENERATION_JOURNAL_MODE=off uv run pytest tests/e2e -m "not variants"
+uv run python scripts/manage_ci_e2e_notebooks.py cleanup \
+  --backend web \
+  --manifest "$RUNNER_TEMP/notebooklm-e2e.json"
+```
+
+Local runs without `NOTEBOOKLM_E2E_MANAGED_COPIES=1` retain the existing
+environment/profile-cache/auto-create behavior described above.
+
+#### Account pool setup
+
+The `protected-readonly` Environment contains one independent opaque token per
+enabled slot. It may also contain a template handle to override the checked-in public default:
+
+```text
+NOTEBOOKLM_MASTER_TOKEN_JSON_A
+NOTEBOOKLM_MASTER_TOKEN_JSON_B
+NOTEBOOKLM_MASTER_TOKEN_JSON_C
+NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID
+```
+
+Bootstrap each authorized account in a separate local profile and upload its
+token without printing it. To override the public template, upload the replacement ID through
+stdin as well:
+
+```bash
+NOTEBOOKLM_PROFILE=ci-bootstrap-a notebooklm login --master-token --account <account-a>
+gh secret set --repo teng-lin/notebooklm-py --env protected-readonly \
+  NOTEBOOKLM_MASTER_TOKEN_JSON_A \
+  < ~/.notebooklm/profiles/ci-bootstrap-a/master_token.json
+printf '%s' "$NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID" | \
+  gh secret set --repo teng-lin/notebooklm-py --env protected-readonly \
+  NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID
+gh variable set --repo teng-lin/notebooklm-py NOTEBOOKLM_CI_ACCOUNT_SLOTS --body A
+```
+
+Qualify A through Web/Ubuntu, Android/macOS, and read-only Web/Windows before adding B,
+then C. The ordered repository variable accepts only `A`, `B`, and `C`; start at `A`, then
+use `A,B` and finally `A,B,C` after the documented soak. Do not reorder it to
+prefer an account. Manual dispatch input `account_rotation_base` overrides the
+daily base, while stable lane offsets still shard matrix lanes.
+
+Every authenticated job uses `notebooklm-account-<slot>` concurrency with
+`queue: max` and no cancellation. This queue has GitHub's documented maximum of
+100 waiting jobs per group; check queued account jobs before a bulk manual
+dispatch. It is not an unbounded durable queue.
+
+The full Web/Ubuntu nightly producer uses one runner-temp append-only journal across the
+primary pytest process, the cooldown retry, and the in-lane verifier. Filtered
+nightly runs, the Android/macOS lane, the read-only Windows lane, and Verify Package
+explicitly set journal mode to `off`. The removed detached `verify-artifacts.yml` workflow and its persistent
+generation notebook are no longer part of CI.
+
+An unfiltered nightly run includes all three live lanes. A manual dispatch with
+`test_filter` runs the requested node only on the two full lanes and omits the Windows
+read-only lane, because an arbitrary node ID is not guaranteed to carry the `readonly` marker.
+The `e2e_lane` input can instead select only `web`, `android`, or `readonly`; `web` means the
+full Web/Ubuntu lane, while `all` preserves the scheduled matrix.
+
+To qualify code before merge, dispatch the workflow definition on `main` and pass the open PR
+number. Do **not** select the feature branch in the Actions ref picker. The resolver permits this
+mode only for actor `teng-lin`, verifies that the PR is open, targets `main`, and has a head branch
+inside `teng-lin/notebooklm-py`, then pins and verifies the returned 40-character head SHA. Fork
+PRs are deliberately ineligible because the candidate code runs with the protected live account.
+PR qualification reruns are rejected; use a fresh dispatch so a moved PR head is authorized again:
+
+```bash
+# Run both RPC backends against the PR head.
+gh workflow run rpc-health.yml --ref main \
+  -f qualification_pr=2353 -f account_rotation_base=auto
+
+# If RPC passes, run only the full Web E2E lane against the same PR.
+gh workflow run nightly.yml --ref main \
+  -f qualification_pr=2353 -f e2e_lane=web \
+  -f account_rotation_base=auto
+```
+
+Before merging, compare the run summary's resolved SHA with
+`gh pr view 2353 --json headRefOid`. Pushes to the PR after dispatch are not included; dispatch
+again to qualify the new head.
+
+The account planner and raw master-token consumer always execute from the immutable `main` SHA
+that supplied the workflow, not from the candidate checkout. This keeps slot-to-secret mapping and
+credential materialization outside PR control. Candidate code receives only the selected account's
+materialized profile, which is still a privileged credential: review the exact pinned diff before
+authorizing the dispatch.
+
+#### Operations runbooks
+
+- Disable a failing slot by removing it from `NOTEBOOKLM_CI_ACCOUNT_SLOTS`;
+  never rewrite the variable from a workflow. Re-bootstrap and replace only
+  that slot's Environment secret for authentication failures.
+- Rotate the template by creating a replacement, validating copies under every
+  enabled slot and both backends, then replacing the template secret. Keep the
+  previous template until one scheduled cycle succeeds; never mutate it in CI.
+- For cleanup alerts, account for the lane offset when choosing
+  `account_rotation_base`. In the ordered enabled-slot list, use the affected
+  slot for offset-0 lanes (`nightly-web-ubuntu` and `verify-package`), the
+  previous slot cyclically for `nightly-android-macos` (offset 1), two slots
+  before it for `nightly-readonly-windows` and `rpc-health-web` (offset 2), and
+  three slots before it for
+  `rpc-health-android` (offset 3). With only one enabled slot every base is that
+  slot. Confirm the intended slot in the workflow's account-plan summary before
+  its authenticated job starts. Inspect account-owned titles under the exact
+  `notebooklm-py-ci/` prefix in the UI for resources omitted by recent-project
+  listing; delete only after checking exact title and ownership.
+- For broad lifecycle failure, set the slot variable back to `A` or disable the
+  scheduled workflows. During the seven-day rollback window, revert the pool
+  cutover commit to restore the legacy workflows; legacy secrets remain stored
+  but unused until post-soak cleanup.
 
 ### Workflow secret gates
 
-Every workflow that consumes user-provided secrets (`secrets.NOTEBOOKLM_AUTH_JSON`,
-`secrets.NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID`, `secrets.CLAUDE_CODE_OAUTH_TOKEN`, …)
-is wrapped in at least one of three gates so that a non-maintainer cannot exfiltrate
-credentials by dispatching a workflow on a feature branch:
+Every generic workflow secret is protected by an approved Environment or an
+allowlisted actor/ref gate. Pool credentials are stricter: every live job must
+simultaneously bind literal `environment: protected-readonly`, test
+`github.repository == 'teng-lin/notebooklm-py'`, and consume
+`needs.resolve-target.outputs.is_standard == 'true'`. The resolver accepts a normal
+`refs/heads/main` run or an owner-authorized open same-repository PR requested from the trusted
+`main` workflow, publishes the immutable resolved SHA, and every planner and secret-bearing
+checkout uses that SHA.
 
 | Gate | Where | Mechanism |
 |------|-------|-----------|
 | `environment: protected-readonly` | Job-level | GitHub Environment hosting the canonical secret values. Bind it **unconditionally** (`environment: protected-readonly`) so every trigger — scheduled `cron` and `workflow_dispatch` alike — sees the same secret. **Note:** the earlier conditional form (`${{ github.event_name == 'workflow_dispatch' && 'protected-readonly' \|\| '' }}`) silently broke scheduled crons once the secrets stopped existing at repo level (issue #1009); the same env binding is now the single source of truth. If you want to block `workflow_dispatch` behind manual approval, add a **required reviewers** rule on the environment — but be aware scheduled runs will then queue at the same gate. |
-| `needs.<job>.outputs.is_standard == 'true'` | Job/step-level `if:` | Pin secret-using jobs or steps to standard branches (`main` / `release/*` / scheduled cron). Non-standard branches skip outright — no secret values land in the runner env. |
+| `needs.resolve-target.outputs.is_standard == 'true'` plus canonical repository equality | Job-level `if:` | Pool jobs accept normal `main`, or the exact head SHA of an open same-repository PR explicitly authorized by the owner through a `main` workflow dispatch. Direct release, tag, feature-ref, fork, and non-owner dispatches cannot reach the Environment job. |
 | `github.event.sender.login == 'teng-lin'` | Job-level `if:` | Pin webhook-triggered workflows (e.g. `claude.yml`) to a specific maintainer actor. Any other actor's trigger never reaches the secret-bearing steps. |
 
 `scripts/check_workflow_secret_gates.py` (wired into the `test.yml` quality job)
-asserts every workflow file in `.github/workflows/` satisfies at least one of
-the above gates for every `secrets.*` reference (except `secrets.GITHUB_TOKEN`,
-which is covered separately by `scripts/check_workflow_permissions.py`).
+asserts the generic gate for every `secrets.*` reference except
+`secrets.GITHUB_TOKEN`. For `NOTEBOOKLM_MASTER_TOKEN_JSON` and the template ID,
+it additionally requires both pool gates, step scope, dynamic secret detection,
+and no more than one selected master token per job. The checker rejects the
+legacy bundled token name and misspelled/dynamic Environment bindings.
 
 The checker also **rejects the conditional `environment:` shape** outright:
 
@@ -1351,31 +1794,30 @@ The empty-string fallback in the expression form means "no environment", so
 secrets that live only in environments resolve to empty under that branch.
 Binding the environment unconditionally is the single source of truth.
 
-Additionally, **every job that consumes `NOTEBOOKLM_AUTH_JSON` runs a
-fail-fast preflight** (`if [ -z "$NOTEBOOKLM_AUTH_JSON" ]; then exit 1`)
-before the test/script step — in the live-E2E workflows this lives at the top
-of the "Materialize auth profile" step. Without the preflight, an empty secret
-would let pytest skip every auth-requiring test silently and the job would land
-green with 0 tests run (issue #1009). The preflight surfaces an `::error::`
-annotation linked to the secret-config misconfig so the failure is visible
-in the GitHub UI rather than hidden behind "0 passed".
+The account selector constructs only an allowlisted
+`NOTEBOOKLM_MASTER_TOKEN_JSON_<slot>` name. GitHub resolves the dynamic
+`secrets[...]` expression only at the materializer step, so the runner never
+receives the other slot tokens. Token and template values never cross job
+outputs, matrices, caches, artifacts, or summaries.
 
 #### One-time GitHub Environment setup
 
 The `protected-readonly` environment must be configured in the GitHub repository
-settings before any workflow that references it can run **with an approval gate**.
+settings before any workflow that references it can safely use the pool. Its
+exact-`main` deployment policy is mandatory; required reviewers are optional
+because they also pause scheduled runs.
 
 > **Important — silent auto-creation**: GitHub Actions silently creates a
 > referenced environment that doesn't exist, with **no protection rules**, the
 > first time a workflow references it. A typo in the environment name (e.g.
 > `protectd-readonly`) or a never-configured environment would therefore
-> bypass maintainer approval at runtime even though the workflow YAML appears
-> to gate on it. The static checker `scripts/check_workflow_secret_gates.py`
+> bypass GitHub-side branch and reviewer policy even though the workflow YAML
+> appears to gate on it. The static checker `scripts/check_workflow_secret_gates.py`
 > pins the accepted environment names to an explicit allow-list
 > (`_APPROVED_ENVIRONMENTS`) to prevent typos from passing CI — but the
 > *runtime* gate still depends on the manual setup below being done correctly.
-> Verify by triggering a `workflow_dispatch` and confirming the run pauses at
-> "Waiting for review" before any secret is exposed.
+> Inventory the actual Environment rules and confirm its only allowed deployment
+> branch is `main` before enabling the pool.
 
 This is a manual UI/API step — Pull Requests cannot create environments on
 their own.
@@ -1385,21 +1827,18 @@ their own.
 2. Name the environment **`protected-readonly`** (exact spelling — the workflow
    YAML files match this string verbatim, and the checker enforces the same
    spelling).
-3. Under **Deployment protection rules**, enable **Required reviewers** and add
-   the maintainer GitHub account (e.g. `teng-lin`) to the reviewer list.
-4. Leave **Wait timer** at `0` minutes (manual approval is the gate; we don't
-   need a cool-down).
-5. Save. The environment is now ready; the next `workflow_dispatch` against
-   `verify-package.yml`, `verify-artifacts.yml`, `rpc-health.yml`, or
-   `nightly.yml` will pause at the maintainer-approval prompt before any
-   secret resolves.
-6. **Smoke-test the gate.** Dispatch one of the workflows above from a
-   non-maintainer account (or from the maintainer account if no second
-   account is available — the approval prompt should still fire) and
-   confirm the run pauses at "Waiting for review" instead of immediately
-   acquiring secrets. If the run does not pause, the environment was not
-   configured correctly; do not rely on the gate until this smoke-test
-   passes.
+3. Restrict deployment branches/tags to a custom rule matching exactly
+   `main`; do not use a `release/*` wildcard.
+4. Review whether Required reviewers is appropriate for scheduled runs (it
+   queues schedules too) and leave the wait timer at zero.
+5. Save. The environment is ready for `verify-package.yml`, `rpc-health.yml`,
+   and `nightly.yml`.
+6. **Smoke-test the gate.** Dispatch one of the workflows above on `main` and
+   verify the live job records a `protected-readonly` deployment. If required
+   reviewers are configured, also confirm it pauses at "Waiting for review".
+   Dispatching a feature/tag ref directly must stop in `resolve-target` before any Environment job
+   is created. The only feature-code exception is a valid `qualification_pr` supplied while
+   dispatching the trusted workflow on `main`. Do not enable the pool until both checks pass.
 
 For automation-driven setup (e.g. infrastructure-as-code), the same configuration
 can be applied via the GitHub REST API:
@@ -1407,9 +1846,13 @@ can be applied via the GitHub REST API:
 ```bash
 gh api -X PUT \
   /repos/teng-lin/notebooklm-py/environments/protected-readonly \
-  -f 'wait_timer=0' \
-  -f 'reviewers[][type]=User' \
-  -F 'reviewers[][id]=<github-user-id-for-teng-lin>'
+  -F wait_timer=0 \
+  -F prevent_self_review=false \
+  -F deployment_branch_policy[protected_branches]=false \
+  -F deployment_branch_policy[custom_branch_policies]=true
+gh api -X POST \
+  /repos/teng-lin/notebooklm-py/environments/protected-readonly/deployment-branch-policies \
+  -f name=main -f type=branch
 ```
 
 #### Adding a new secret-bearing workflow
@@ -1417,7 +1860,10 @@ gh api -X PUT \
 When introducing a workflow that touches `secrets.*`:
 
 1. Pick the gate shape that matches the trigger surface:
-   - `workflow_dispatch` only → job-level `environment: protected-readonly`.
+   - Pool authentication → literal Environment plus canonical repository and
+     exact-main `is_standard` job gates; resolve and checkout the SHA before
+     dynamically selecting one step-scoped token.
+   - Other `workflow_dispatch` only → job-level `environment: protected-readonly`.
    - `workflow_dispatch` + `schedule` → also job-level `environment: protected-readonly`
      (unconditional — issue #1009). Pair with an upstream `is_standard`
      gate so a non-maintainer's feature-branch dispatch can't reach the
@@ -1498,21 +1944,28 @@ the `notebooklm login --master-token` bootstrap and updating both secrets.
 
 #### Multiple accounts in CI/CD
 
-Use separate secrets and set `NOTEBOOKLM_AUTH_JSON` per job:
+Use the opaque slot pool described in [Managed-copy live CI](#managed-copy-live-ci).
+Do not bundle credentials or inject all accounts into one job. The selection
+matrix may carry only the slot alias and allowlisted secret name:
 
 ```yaml
 jobs:
-  account-1:
+  live:
+    environment: protected-readonly
+    concurrency:
+      group: notebooklm-account-${{ matrix.account_slot }}
+      queue: max
+      cancel-in-progress: false
     env:
-      NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_ACCOUNT1 }}
+      NOTEBOOKLM_PROFILE: ci-${{ matrix.account_slot }}-${{ matrix.lane }}
     steps:
-      - run: notebooklm list
-
-  account-2:
-    env:
-      NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_ACCOUNT2 }}
-    steps:
-      - run: notebooklm list
+      - name: Materialize selected account
+        env:
+          NOTEBOOKLM_MASTER_TOKEN_JSON: ${{ secrets[matrix.master_token_secret_name] }}
+        run: >-
+          python scripts/materialize_ci_auth.py
+          --account-slot "${{ matrix.account_slot }}"
+          --profile "$NOTEBOOKLM_PROFILE"
 ```
 
 #### Debugging CI/CD auth issues

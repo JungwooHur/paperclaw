@@ -6,6 +6,7 @@ Command structure:
   notebooklm status                   # Show current context
   notebooklm list                     # List notebooks
   notebooklm create <title>           # Create notebook
+  notebooklm copy <title>             # Copy current notebook
   notebooklm ask <question>           # Ask the current notebook a question
 
   notebooklm source <command>         # Source operations
@@ -44,9 +45,9 @@ from ._version_check import check_python_version as _check_python_version
 _check_python_version()
 del _check_python_version
 
-import asyncio
 import logging
 import os
+import warnings
 from pathlib import Path
 
 # =============================================================================
@@ -74,10 +75,9 @@ def _configure_windows_runtime() -> None:
     if sys.platform != "win32":
         return
 
-    # Fix #79: Windows asyncio ProactorEventLoop can hang indefinitely at IOCP layer
-    # (GetQueuedCompletionStatus) in certain environments like Sandboxie.
-    # SelectorEventLoop avoids this issue.
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # The event loop is no longer chosen here. Commands run on asyncio's default
+    # (Proactor) loop unless NOTEBOOKLM_WINDOWS_EVENT_LOOP opts into the selector
+    # loop (#79); see cli/runtime.py.
 
     # Fix #80/#318: changing PYTHONUTF8 after startup does not update the already
     # created stdout/stderr TextIOWrappers. Reconfigure the live streams so Rich's
@@ -114,8 +114,9 @@ from .cli import (
     share,
     skill,
     source,
+    usage,
 )
-from .cli.grouped import SectionedGroup
+from .cli.grouped import ConfigurationClickException, SectionedGroup
 
 # Public surface (ADR-0012). ``main`` is the ``[project.scripts]`` entry
 # point and ``src/notebooklm/__main__.py`` shim; ``cli`` is the root
@@ -146,6 +147,12 @@ __all__ = ["cli", "main"]
     help="Profile name (default: from config or 'default'). Use 'notebooklm profile list' to see profiles.",
 )
 @click.option(
+    "--backend",
+    type=click.Choice(("web", "android"), case_sensitive=True),
+    default=None,
+    help="Preferred API backend (default: $NOTEBOOKLM_BACKEND, else web).",
+)
+@click.option(
     "-v",
     "--verbose",
     count=True,
@@ -161,7 +168,7 @@ __all__ = ["cli", "main"]
     ),
 )
 @click.pass_context
-def cli(ctx, storage, profile, verbose, quiet):
+def cli(ctx, storage, profile, backend, verbose, quiet):
     """NotebookLM CLI.
 
     \b
@@ -196,6 +203,27 @@ def cli(ctx, storage, profile, verbose, quiet):
     elif verbose == 1:
         logging.getLogger("notebooklm").setLevel(logging.INFO)
 
+    # Reject a bad NOTEBOOKLM_WINDOWS_EVENT_LOOP before a command does work it
+    # would throw away (e.g. an interactive login whose result it never saves).
+    from .cli.runtime import windows_event_loop_choice
+    from .exceptions import ConfigurationError
+
+    try:
+        loop_choice = windows_event_loop_choice()
+    except ConfigurationError as e:
+        raise ConfigurationClickException(str(e)) from None
+    if sys.platform == "win32":
+        logging.getLogger(__name__).debug(
+            "Windows event loop: %s", loop_choice or "proactor (asyncio default)"
+        )
+    if loop_choice == "selector":
+        # Fix #2485: on CPython 3.12-3.14 the selector transport drops a chunk
+        # when a Windows send() would block, corrupting large uploads. Install
+        # the fix CPython 3.15 shipped; a no-op on interpreters without the bug.
+        from ._windows_asyncio import install_selector_write_fix
+
+        install_selector_write_fix()
+
     # Set up profile system
     from .paths import set_active_profile
 
@@ -226,6 +254,7 @@ def cli(ctx, storage, profile, verbose, quiet):
     # namespace (see :class:`notebooklm.cli.services.auth_source.AuthSource`).
     ctx.obj["storage_path"] = Path(storage).expanduser().resolve() if storage else None
     ctx.obj["profile"] = profile
+    ctx.obj["backend"] = backend
     # Mirror the root quiet flag for call sites that already read ctx.obj.
     # ``cli.runtime.is_quiet(ctx)`` remains the canonical reader.
     ctx.obj["quiet"] = bool(quiet)
@@ -261,6 +290,7 @@ cli.add_command(research)
 cli.add_command(language)
 cli.add_command(profile)
 cli.add_command(mcp)
+cli.add_command(usage)
 
 
 # =============================================================================
@@ -315,7 +345,25 @@ def completion_cmd(shell: str) -> None:
 # =============================================================================
 
 
+def _hide_curl_cffi_proactor_advice() -> None:
+    """Hide curl_cffi's Proactor warning in a Windows CLI process.
+
+    On the Proactor loop curl_cffi starts a helper selector thread and warns,
+    advising the selector policy this CLI no longer installs because of #2485.
+    The fallback works, so the advice only misleads. Installed from ``main()``
+    rather than at import, so applications importing this module keep their
+    own warning filters.
+    """
+    if sys.platform == "win32":
+        warnings.filterwarnings(
+            "ignore",
+            message=r"\s*Proactor event loop does not implement add_reader",
+            category=UserWarning,
+        )
+
+
 def main():
+    _hide_curl_cffi_proactor_advice()
     cli()
 
 

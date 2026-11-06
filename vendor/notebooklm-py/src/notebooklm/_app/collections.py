@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from ..exceptions import ValidationError
+from ..options import USE_DEFAULT
 from ..types import Collection
 from .resolve import near_miss_candidates, validate_id
 
@@ -26,32 +27,34 @@ if TYPE_CHECKING:
     from ..client import NotebookLMClient
 
 
+CollectionResolutionReason = Literal["ambiguous_id", "ambiguous_name", "not_found"]
+
+
+@dataclass(frozen=True)
+class CollectionResolutionMatch:
+    """Collection candidate carried by a semantic ambiguity."""
+
+    id: str
+    emoji: str | None
+    notebook_count: int
+
+
 class CollectionResolutionError(ValidationError):
-    """Typed collection-resolution error for command-layer rendering and exit policy.
-
-    Mirrors :class:`~notebooklm._app.labels.LabelResolutionError`: subclasses
-    :class:`~notebooklm.exceptions.ValidationError` so ``_app.errors.classify``
-    covers it uniformly, carries a human ``message``, an ADR-0015 ``code``
-    (``NOT_FOUND`` / ``AMBIGUOUS_ID`` / ``AMBIGUOUS_NAME`` / ``VALIDATION_ERROR``),
-    and an optional ``extra`` payload. The command layer catches it explicitly
-    and maps it through ``output_error`` so the typed ``--json`` envelope + its
-    ADR-0015 code are preserved.
-    """
-
-    #: Near-miss ``{"id", "title"}`` candidates for a failed name lookup
-    #: (mirrors :attr:`LabelResolutionError.candidates`).
-    candidates: Sequence[dict[str, str]] = ()
+    """Typed collection-resolution failure with adapter-neutral reason data."""
 
     def __init__(
         self,
-        message: str,
-        code: str,
-        extra: dict[str, Any] | None = None,
+        reason: CollectionResolutionReason,
+        *,
+        token: str,
+        matches: tuple[CollectionResolutionMatch, ...] = (),
+        candidates: Sequence[dict[str, str]] = (),
     ) -> None:
-        self.message = message
-        self.code = code
-        self.extra = extra
-        super().__init__(f"{message} (code={code})")
+        self.reason = reason
+        self.token = token
+        self.matches = matches
+        self.candidates = candidates
+        super().__init__(f"collection resolution {reason.replace('_', ' ')}: {token}")
 
 
 # ---------------------------------------------------------------------------
@@ -59,49 +62,23 @@ class CollectionResolutionError(ValidationError):
 # ---------------------------------------------------------------------------
 
 
-def _candidate_payload(matches: Sequence[Collection]) -> list[dict[str, Any]]:
-    """Build the structured candidate list (id + emoji + notebook count)."""
-    return [
-        {
-            "id": collection.id,
-            "emoji": collection.emoji,
-            "notebook_count": len(collection.notebook_ids),
-        }
+def _resolution_matches(
+    matches: Sequence[Collection],
+) -> tuple[CollectionResolutionMatch, ...]:
+    return tuple(
+        CollectionResolutionMatch(
+            collection.id,
+            collection.emoji,
+            len(collection.notebook_ids),
+        )
         for collection in matches
-    ]
-
-
-def _append_candidate_lines(lines: list[str], matches: Sequence[Collection]) -> None:
-    """Append the per-candidate ``id emoji (N notebooks)`` lines (capped at 5)."""
-    for collection in matches[:5]:
-        emoji = f"{collection.emoji} " if collection.emoji else ""
-        count = len(collection.notebook_ids)
-        lines.append(f"  {collection.id} {emoji}({count} notebook{'s' if count != 1 else ''})")
-    if len(matches) > 5:
-        lines.append(f"  ... and {len(matches) - 5} more")
-
-
-def _ambiguous_id_message(partial_id: str, matches: Sequence[Collection]) -> str:
-    """Build the ambiguous-prefix error listing each candidate."""
-    lines = [f"Ambiguous collection id '{partial_id}' matches {len(matches)} collections:"]
-    _append_candidate_lines(lines, matches)
-    lines.append("Specify more characters to disambiguate.")
-    return "\n".join(lines)
-
-
-def _ambiguous_name_message(name: str, matches: Sequence[Collection]) -> str:
-    """Build the ambiguous-name error listing each candidate."""
-    lines = [f"Name '{name}' matches {len(matches)} collections. Use a collection id instead:"]
-    _append_candidate_lines(lines, matches)
-    lines.append("Specify the collection id to disambiguate.")
-    return "\n".join(lines)
+    )
 
 
 async def resolve_collection_id(
     client: NotebookLMClient,
     token: str,
     *,
-    json_output: bool = False,
     collections: Sequence[Collection] | None = None,
 ) -> str:
     """Resolve a collection ``<id|name>`` token to a full collection id.
@@ -133,9 +110,9 @@ async def resolve_collection_id(
         return prefix_matches[0].id
     if len(prefix_matches) > 1:
         raise CollectionResolutionError(
-            _ambiguous_id_message(token, prefix_matches),
-            "AMBIGUOUS_ID",
-            {"id": token, "candidates": _candidate_payload(prefix_matches)},
+            "ambiguous_id",
+            token=token,
+            matches=_resolution_matches(prefix_matches),
         )
 
     # Pass 2: explicit exact-name match.
@@ -144,29 +121,19 @@ async def resolve_collection_id(
         return name_matches[0].id
     if len(name_matches) > 1:
         raise CollectionResolutionError(
-            _ambiguous_name_message(token, name_matches),
-            "AMBIGUOUS_NAME",
-            {"name": token, "candidates": _candidate_payload(name_matches)},
+            "ambiguous_name",
+            token=token,
+            matches=_resolution_matches(name_matches),
         )
 
     # Near-miss "did you mean" candidates (issue #1787 parity).
-    extra: dict[str, Any] = {"id": token}
     candidates = near_miss_candidates(
         token,
         collections,
         id_of=lambda collection: collection.id,
         title_of=lambda collection: collection.name,
     )
-    if candidates:
-        extra["candidates"] = candidates
-    error = CollectionResolutionError(
-        f"No collection found matching '{token}'. "
-        f"Run 'notebooklm collection list' to see available collections.",
-        "NOT_FOUND",
-        extra,
-    )
-    error.candidates = candidates
-    raise error
+    raise CollectionResolutionError("not_found", token=token, candidates=candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -176,17 +143,20 @@ async def resolve_collection_id(
 
 async def execute_collection_list(client: NotebookLMClient) -> list[Collection]:
     """List all collections in the account."""
-    return await client.collections.list()
+    async with client.operation(timeout=USE_DEFAULT):
+        return await client.collections.list()
 
 
 async def execute_collection_notebooks(client: NotebookLMClient, collection_id: str):
     """Expand a collection to its notebook objects (the ``collection notebooks`` body)."""
-    return await client.collections.notebooks(collection_id)
+    async with client.operation(timeout=USE_DEFAULT):
+        return await client.collections.notebooks(collection_id)
 
 
 async def execute_collection_create(client: NotebookLMClient, name: str) -> Collection:
     """Create an empty, named collection."""
-    return await client.collections.create(name)
+    async with client.operation(timeout=USE_DEFAULT):
+        return await client.collections.create(name)
 
 
 async def execute_collection_rename(
@@ -197,7 +167,8 @@ async def execute_collection_rename(
     ``return_object`` defaults to True, so the mutation returns a ``Collection``
     (or raises ``CollectionNotFoundError``) — never ``None`` here.
     """
-    return cast(Collection, await client.collections.rename(collection_id, new_name))
+    async with client.operation(timeout=USE_DEFAULT):
+        return cast(Collection, await client.collections.rename(collection_id, new_name))
 
 
 @dataclass(frozen=True)
@@ -212,30 +183,35 @@ async def execute_collection_add_notebooks(
     client: NotebookLMClient, collection_id: str, notebook_ids: Sequence[str]
 ) -> CollectionMembershipResult:
     """Add notebook(s) to a collection (append; existing members preserved)."""
-    ids = list(notebook_ids)
-    collection = cast(Collection, await client.collections.add_notebooks(collection_id, ids))
-    return CollectionMembershipResult(collection=collection, notebook_ids=ids)
+    async with client.operation(timeout=USE_DEFAULT):
+        ids = list(notebook_ids)
+        collection = cast(Collection, await client.collections.add_notebooks(collection_id, ids))
+        return CollectionMembershipResult(collection=collection, notebook_ids=ids)
 
 
 async def execute_collection_remove_notebooks(
     client: NotebookLMClient, collection_id: str, notebook_ids: Sequence[str]
 ) -> CollectionMembershipResult:
     """Un-assign notebook(s) from a collection (the inverse of ``add``)."""
-    ids = list(notebook_ids)
-    collection = cast(Collection, await client.collections.remove_notebooks(collection_id, ids))
-    return CollectionMembershipResult(collection=collection, notebook_ids=ids)
+    async with client.operation(timeout=USE_DEFAULT):
+        ids = list(notebook_ids)
+        collection = cast(Collection, await client.collections.remove_notebooks(collection_id, ids))
+        return CollectionMembershipResult(collection=collection, notebook_ids=ids)
 
 
 async def execute_collection_delete(
     client: NotebookLMClient, collection_ids: Sequence[str]
 ) -> None:
     """Delete one or more collections (the collection only, not its notebooks)."""
-    await client.collections.delete(list(collection_ids))
+    async with client.operation(timeout=USE_DEFAULT):
+        await client.collections.delete(list(collection_ids))
 
 
 __all__ = [
     "CollectionMembershipResult",
     "CollectionResolutionError",
+    "CollectionResolutionMatch",
+    "CollectionResolutionReason",
     "execute_collection_add_notebooks",
     "execute_collection_create",
     "execute_collection_delete",

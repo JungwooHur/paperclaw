@@ -40,6 +40,7 @@ from ....auth import (
     validate_with_recovery,
 )
 from ....client import NotebookLMClient
+from ....exceptions import AuthError
 from ....paths import get_storage_path
 from ...language_cmd import set_language
 from .browser_accounts import _enumerate_browser_accounts, _read_browser_cookies
@@ -266,7 +267,7 @@ def _login_all_accounts_from_browser(
     """Extract every signed-in Google account into its own profile.
 
     Args:
-        browser_cookies: rookiepy browser alias forwarded to
+        browser_cookies: rookie-cookies browser alias forwarded to
             :func:`_enumerate_browser_accounts`.
         update: When True and the natural profile name for an account
             (e.g. ``alice`` for ``alice@gmail.com``) already exists but has
@@ -406,11 +407,11 @@ def _login_with_browser_cookies(
     io: LoginIO | None = None,
     deps: RefreshDeps | None = None,
 ) -> None:
-    """Extract Google cookies from an installed browser via rookiepy.
+    """Extract Google cookies from an installed browser via rookie-cookies.
 
     Args:
         storage_path: Where to write storage_state.json.
-        browser_name: "auto" to use rookiepy.load(), or a specific browser name.
+        browser_name: "auto" to use automatic browser discovery, or a specific browser name.
         profile: Profile name (forwarded to verification step).
         authuser: Internal Google account index fallback for this profile.
         email: Optional account email to record for stable routing.
@@ -502,7 +503,7 @@ def _login_with_browser_cookies(
         io.run_async(deps.fetch_tokens_with_domains(storage_path, profile))
         logger.info("Cookies verified successfully")
         _emit(io, "[green]Cookies verified successfully.[/green]")
-    except ValueError as e:
+    except (ValueError, AuthError) as e:
         # Cookie validation failed - the extracted cookies are invalid
         logger.error("Extracted cookies are invalid: %s", e)
         _emit(
@@ -558,6 +559,9 @@ def _sync_server_language_to_config(
             kwargs["path"] = str(storage_path)
         if profile is not None:
             kwargs["profile"] = profile
+        from ...._app.client_config import adapter_client_config
+
+        kwargs["config"] = adapter_client_config()
         async with NotebookLMClient.from_storage(**kwargs) as client:
             return await client.settings.get_output_language()
 

@@ -3,7 +3,7 @@
 Contains the chromium multi-profile fan-out (``Default`` + ``Profile 1``
 + …) and the explicit ``chrome::<selector>`` reader. Imports from
 :mod:`.cookie_jar` (shared ``_enumerate_one_jar``),
-:mod:`.rookiepy_errors` (friendly rookiepy error messages), and
+:mod:`.rookie_cookies_errors` (friendly rookie-cookies error messages), and
 :mod:`.cookie_domains` (domain-list builder).
 """
 
@@ -17,20 +17,20 @@ from ...._app.login_cookie import Account, project_browser_account
 from .cookie_domains import _build_google_cookie_domains
 from .cookie_jar import _enumerate_one_jar
 from .outcomes import BrowserCookieOutcome, CookieValidationFailure, NetworkFailure
-from .rookiepy_errors import _handle_rookiepy_error
+from .rookie_cookies_errors import _handle_rookie_cookies_error
 
 if TYPE_CHECKING:
     from .io_seam import LoginIO
 
-# Shared rookiepy-not-installed message — kept identical to the single-jar
+# Shared rookie-cookies-not-installed message — kept identical to the single-jar
 # path (``browser_accounts._read_browser_cookies``) so the user sees the
 # same install hint regardless of which Chromium path raised it.
-_ROOKIEPY_NOT_INSTALLED_MESSAGE = (
-    "[red]rookiepy is not installed.[/red]\n"
+_ROOKIE_COOKIES_NOT_INSTALLED_MESSAGE = (
+    "[red]rookie-cookies is not installed.[/red]\n"
     "Install it with:\n"
     "  pip install 'notebooklm-py[cookies]'\n"
     "or directly:\n"
-    "  pip install rookiepy"
+    "  pip install rookie-cookies"
 )
 
 
@@ -101,12 +101,14 @@ def _read_chromium_profile_cookies_from_selector(
         cookies = chromium_profiles.read_chromium_profile_cookies(profile, domains=domains)
     except ImportError:
         return CookieValidationFailure(
-            code="ROOKIEPY_NOT_INSTALLED", message=_ROOKIEPY_NOT_INSTALLED_MESSAGE
+            code="ROOKIEPY_NOT_INSTALLED", message=_ROOKIE_COOKIES_NOT_INSTALLED_MESSAGE
         )
     except (OSError, RuntimeError) as e:
         return CookieValidationFailure(
             code="COOKIE_READ_FAILED",
-            message=_handle_rookiepy_error(e, f"{profile.browser} profile '{profile.human_name}'"),
+            message=_handle_rookie_cookies_error(
+                e, f"{profile.browser} profile '{profile.human_name}'"
+            ),
         )
 
     return profile, cookies
@@ -173,7 +175,7 @@ def _enumerate_chromium_profiles_fanout(
             except ImportError:
                 return CookieValidationFailure(
                     code="ROOKIEPY_NOT_INSTALLED",
-                    message=_ROOKIEPY_NOT_INSTALLED_MESSAGE,
+                    message=_ROOKIE_COOKIES_NOT_INSTALLED_MESSAGE,
                 )
             except (OSError, RuntimeError) as exc:
                 read_failures.append((profile.human_name, exc))

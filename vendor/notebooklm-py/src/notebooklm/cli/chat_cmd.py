@@ -14,6 +14,8 @@ import click
 from rich.table import Table
 
 from .._app.chat import (
+    ChatEvent,
+    ChatValidationError,
     ClearCacheResult,
     ConfigureResult,
     determine_conversation_id,
@@ -26,12 +28,11 @@ from .._app.chat import (
     save_answer_as_note,
     validate_ask_flags,
 )
-from .._app.events import ProgressEvent
 from .._app.views import ask_result_view
 from ..exceptions import ValidationError
 from .auth_runtime import resolve_client_factory, with_client
 from .context import get_current_conversation, get_current_notebook, set_current_conversation
-from .error_handler import _output_error, exit_with_code
+from .error_handler import _output_error, exception_json_fields, exit_with_code
 from .input import resolve_prompt
 from .options import _complete_sources, json_option, notebook_option, prompt_file_option
 from .rendering import (
@@ -105,8 +106,29 @@ def _history_json_payload(
     }
 
 
+def _render_chat_event(event: ChatEvent) -> str:
+    """Render one neutral chat event into the established CLI status prose."""
+    if event.kind == "NOTEBOOK_CHANGED":
+        return "[dim]Different notebook specified, starting new conversation...[/dim]"
+    if event.kind == "HISTORY_CONTINUING":
+        return f"[dim]Continuing conversation {(event.conversation_id or '')[:8]}...[/dim]"
+    if event.kind == "HISTORY_UNAVAILABLE":
+        return "[dim]Starting new conversation (history unavailable)[/dim]"
+    if event.kind == "NOTE_NO_ANSWER":
+        return "[yellow]Warning: No answer to save as note[/yellow]"
+    if event.kind == "NOTE_PLAIN_TEXT_FALLBACK":
+        return "[dim]No citations in answer; saving as plain-text note.[/dim]"
+    if event.kind == "NOTE_SAVED":
+        return (
+            f"\n[dim]Saved as note: {event.note_title or ''} ({(event.note_id or '')[:8]}...)[/dim]"
+        )
+    if event.kind == "NOTE_SAVE_FAILED":
+        return f"[yellow]Warning: Failed to save note: {event.detail or ''}[/yellow]"
+    raise AssertionError(f"Unhandled chat event: {event.kind}")
+
+
 class _CliPrintStatusSink:
-    """:class:`ProgressSink` routing neutral status events through ``cli_print``.
+    """Route neutral chat events through ``cli_print``.
 
     Used for the conversation-selection prose, which the historical command only
     emitted under ``not json_output`` — so the sink is constructed only on that
@@ -114,12 +136,12 @@ class _CliPrintStatusSink:
     Rich markup in the message is preserved.
     """
 
-    def emit(self, event: ProgressEvent) -> None:
-        cli_print(event.message)
+    def emit(self, event: ChatEvent) -> None:
+        cli_print(_render_chat_event(event))
 
 
 class _EmitStatusSink:
-    """:class:`ProgressSink` routing neutral status events through ``emit_status``.
+    """Route neutral chat events through ``emit_status``.
 
     Used for the ``ask --save-as-note`` status lines: routes to stderr under
     ``--json`` (keeping stdout JSON-pure) and to stdout otherwise, honoring root
@@ -129,11 +151,11 @@ class _EmitStatusSink:
     def __init__(self, *, json_output: bool) -> None:
         self._json_output = json_output
 
-    def emit(self, event: ProgressEvent) -> None:
+    def emit(self, event: ChatEvent) -> None:
         # Status forwarder for a secondary --save-as-note action: the neutral
         # workflow folds its own failures into the returned outcome (never
         # raised), so this emit is never on an error path.
-        emit_status(event.message, json_output=self._json_output)
+        emit_status(_render_chat_event(event), json_output=self._json_output)
 
 
 # Re-export the neutral note-content formatters under their historical
@@ -141,6 +163,33 @@ class _EmitStatusSink:
 # keeps resolving (the logic lives in ``_app.chat``).
 _format_single_qa = format_single_qa
 _format_history = format_history
+
+
+def _confirm_new_conversation_deletion(
+    conversation_id: str, *, assume_yes: bool, json_output: bool
+) -> None:
+    """Prompt for ``ask --new`` history deletion.
+
+    Sync and client-free so confirmation never sits inside a client
+    ``operation()`` scope. ``--json`` implies ``--yes`` so scripted callers
+    don't hang on stdin (which would also clobber JSON stdout purity). See
+    ``cli/artifact_cmd.py::artifact_delete`` for the same pattern.
+    """
+    if assume_yes or json_output:
+        return
+    if click.confirm(
+        f"This will permanently delete conversation "
+        f"{conversation_id[:8]}... and all its turns. Continue?",
+        default=False,
+    ):
+        return
+    # Exit 1 (BaseException-bypassing ``SystemExit``) so scripts can
+    # distinguish "user said no" from "ask succeeded" — the intended
+    # ``ask`` did not run. ``click.exceptions.Exit`` and ``ctx.exit``
+    # both raise ``RuntimeError`` subclasses that the ``handle_errors``
+    # catch-all (error_handler.py) would remap to exit 2.
+    console.print("[yellow]Aborted — no conversation deleted.[/yellow]")
+    exit_with_code(1)
 
 
 def _determine_conversation_id(
@@ -297,8 +346,12 @@ def register_chat_commands(cli):
         # maps it to the CLI's own ``VALIDATION_ERROR`` code / Click UsageError.
         try:
             validate_ask_flags(new_conversation=new_conversation, conversation_id=conversation_id)
-        except ValidationError as exc:
-            message = str(exc)
+        except ChatValidationError as exc:
+            message = (
+                "--new and --conversation-id are mutually exclusive: "
+                "--new starts a fresh conversation while --conversation-id "
+                "resumes a specific one."
+            )
             if json_output:
                 _output_error(message, "VALIDATION_ERROR", json_output, 1)
             raise click.UsageError(  # cli-input-validation: --new and --conversation-id are mutually exclusive
@@ -316,6 +369,7 @@ def register_chat_commands(cli):
         async def _run():
             async with resolve_client_factory(ctx)(client_auth, **client_kwargs) as client:
                 nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+                last_conv_id: str | None = None
                 if new_conversation:
                     # Dropping ``conversation_id`` alone extends the most-recent
                     # conversation (see ChatAPI.ask Note). Deleting it first
@@ -323,30 +377,6 @@ def register_chat_commands(cli):
                     # conversation is fine — skip both the prompt and the
                     # delete; ``ask`` then creates the notebook's first one.
                     last_conv_id = await client.chat.get_conversation_id(nb_id_resolved)
-                    if last_conv_id:
-                        # ``--json`` implies ``--yes`` so scripted callers don't
-                        # hang on stdin (which would also clobber JSON stdout
-                        # purity). See ``cli/artifact_cmd.py::artifact_delete``
-                        # for the same pattern.
-                        if (
-                            not assume_yes
-                            and not json_output
-                            and not click.confirm(
-                                f"This will permanently delete conversation "
-                                f"{last_conv_id[:8]}... and all its turns. Continue?",
-                                default=False,
-                            )
-                        ):
-                            # Exit 1 (BaseException-bypassing ``SystemExit``)
-                            # so scripts can distinguish "user said no" from
-                            # "ask succeeded" — the intended ``ask`` did not
-                            # run. ``click.exceptions.Exit`` and ``ctx.exit``
-                            # both raise ``RuntimeError`` subclasses that the
-                            # ``handle_errors`` catch-all (error_handler.py)
-                            # would remap to exit 2.
-                            console.print("[yellow]Aborted — no conversation deleted.[/yellow]")
-                            exit_with_code(1)
-                        await client.chat.delete_conversation(nb_id_resolved, last_conv_id)
                     effective_conv_id: str | None = None
                 else:
                     effective_conv_id = _determine_conversation_id(
@@ -365,9 +395,22 @@ def register_chat_commands(cli):
                     if effective_conv_id:
                         resumed_from_server = True
 
+                # ``--source`` resolution can still abort; finish it before any
+                # ``--new`` delete so a bad/ambiguous reference cannot destroy
+                # the current conversation. Confirm stays a sync prompt (no
+                # client ``operation()`` held across stdin).
                 sources = await resolve_source_ids(
-                    client, nb_id_resolved, source_ids, json_output=json_output
+                    client,
+                    nb_id_resolved,
+                    source_ids,
+                    json_output=json_output,
+                    require_existing=new_conversation,
                 )
+                if new_conversation and last_conv_id:
+                    _confirm_new_conversation_deletion(
+                        last_conv_id, assume_yes=assume_yes, json_output=json_output
+                    )
+                    await client.chat.delete_conversation(nb_id_resolved, last_conv_id)
                 result = await client.chat.ask(
                     nb_id_resolved,
                     question,
@@ -400,6 +443,7 @@ def register_chat_commands(cli):
 
                 note_save_result: dict[str, str] | None = None
                 note_save_error: str | None = None
+                note_save_failure: Exception | None = None
 
                 if save_as_note:
                     # The save-as-note workflow (citation-rich vs plain-text
@@ -407,7 +451,8 @@ def register_chat_commands(cli):
                     # ``_app.chat.save_answer_as_note``. Its Rich-markup status
                     # lines route through ``_EmitStatusSink`` (stderr under
                     # ``--json``, honoring root ``--quiet``); the outcome's note
-                    # / error are merged into the JSON envelope below.
+                    # / error / failure evidence are merged into the JSON
+                    # envelope below.
                     outcome = await save_answer_as_note(
                         client,
                         nb_id_resolved,
@@ -418,6 +463,7 @@ def register_chat_commands(cli):
                     )
                     note_save_result = outcome.note
                     note_save_error = outcome.error
+                    note_save_failure = outcome.failure
 
                 if json_output:
                     # Go through the shared projection rather than a local
@@ -429,11 +475,19 @@ def register_chat_commands(cli):
                     if save_as_note:
                         # Merge note-save outcome into the envelope so the
                         # caller can observe success/failure from stdout
-                        # alone without parsing stderr text.
+                        # alone without parsing stderr text. Keep save-as-note
+                        # non-fatal: the ask answer stays even when the
+                        # secondary write folded. Project ``failure`` through
+                        # the same JSON extra fields other CLI errors use
+                        # (commit state, recovery action, known ids) instead
+                        # of dropping ``operation_metadata`` on the redacted
+                        # ``note_save_error`` string.
                         if note_save_result is not None:
                             data["note"] = note_save_result
                         if note_save_error is not None:
                             data["note_save_error"] = note_save_error
+                        if note_save_failure is not None:
+                            data.update(exception_json_fields(note_save_failure))
                     json_output_response(data)
 
         return _run()
@@ -539,6 +593,64 @@ def register_chat_commands(cli):
                 for i, suggestion in enumerate(suggestions, 1):
                     console.print(f"\n[bold]{i}. {suggestion.title}[/bold]")
                     console.print(suggestion.prompt)
+
+        return _run()
+
+    @cli.command("suggest-next-steps")
+    @notebook_option
+    @click.option(
+        "--source",
+        "-s",
+        "source_ids",
+        multiple=True,
+        help="Limit to specific source IDs (can be repeated). Defaults to all sources.",
+        shell_complete=_complete_sources,
+    )
+    @json_option
+    @with_client
+    def suggest_next_steps_cmd(ctx, notebook_id, source_ids, json_output, client_auth):
+        """Get grounded follow-up questions for a notebook.
+
+        Returns the ready-to-ask questions NotebookLM shows beneath a chat
+        answer, without needing a prior conversation (``NextStepSuggestions``).
+        Unlike ``suggest-prompts`` these are questions grounded in the sources,
+        not steering prompts for a studio surface. Pass them straight to ``ask``.
+
+        \b
+        Example:
+          notebooklm suggest-next-steps
+          notebooklm suggest-next-steps -s src_001
+          notebooklm suggest-next-steps --json
+        """
+        nb_id = require_notebook(notebook_id)
+
+        async def _run():
+            async with resolve_client_factory(ctx)(client_auth) as client:
+                nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+                sources = await resolve_source_ids(
+                    client, nb_id_resolved, source_ids, json_output=json_output
+                )
+                suggestions = await client.notebooks.suggest_next_steps(
+                    nb_id_resolved, source_ids=sources
+                )
+                if json_output:
+                    json_output_response(
+                        {
+                            "notebook_id": nb_id_resolved,
+                            "suggestions": [
+                                {"question": s.question, "type_code": s.type_code}
+                                for s in suggestions
+                            ],
+                            "count": len(suggestions),
+                        }
+                    )
+                    return
+                if not suggestions:
+                    console.print("[yellow]No follow-up suggestions returned[/yellow]")
+                    return
+                console.print("[bold cyan]Suggested follow-up questions:[/bold cyan]")
+                for i, suggestion in enumerate(suggestions, 1):
+                    console.print(f"{i}. {suggestion.question}")
 
         return _run()
 

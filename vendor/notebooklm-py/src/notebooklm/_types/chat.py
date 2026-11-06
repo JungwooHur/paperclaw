@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from ..rpc.types import ChatGoal, ChatResponseLength, MagicArtifactType
 from .documents import StructuredDocument
+from .enums import ChatGoal, ChatResponseLength, MagicArtifactType
 
 
 class ChatMode(Enum):
@@ -26,6 +26,24 @@ class ConversationTurn:
     query: str
     answer: str
     turn_number: int
+
+
+@dataclass(frozen=True)
+class ChatSessionStatus:
+    """Whether a server-side chat generation is active for one session.
+
+    Returned by :meth:`ChatAPI.session_status`. ``token`` is Google's opaque
+    generation identifier and is populated only while :attr:`generating` is
+    true; callers should use it for correlation only, not as a cancellation
+    key. Cancellation is addressed by conversation ID.
+
+    Attributes:
+        generating: ``True`` while the session is producing an answer.
+        token: Opaque generation token while active, otherwise ``None``.
+    """
+
+    generating: bool
+    token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -238,7 +256,7 @@ class ChatReference:
             server omitted it.
 
             (The slot is ``Citation``'s protobuf tag 4, which the recovered
-            schema in ``docs/mobile/schema.proto`` does not name — the meaning
+            schema in ``docs/android/schema.proto`` does not name — the meaning
             is established by live capture, not by that file.)
         fragment_end_char: End of that source-side range (exclusive).
         answer_anchor_start: Start of the range **of the answer** this

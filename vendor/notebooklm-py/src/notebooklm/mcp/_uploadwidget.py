@@ -87,7 +87,7 @@ _WIDGET_HTML = """<!doctype html>
  const post=m=>{try{window.parent.postMessage(m,"*")}catch(e){}};
  const oai=window.openai;               // ChatGPT/Grok inject this; claude.ai does not
  const hasNative=!!(oai&&typeof oai.uploadFile==="function");  // OpenAI native upload (interop signal)
- let initialized=false, uploadUrls=null;  // a POOL of single-use tokens, one per file
+ let initialized=false, uploadUrls=null, frozen=0;  // keep uncertain outcomes across batch retries
  let confirmSpec=null;  // {tool,arg,values}: the auto-confirm contract fired after a successful upload
  let cfSeq=0;  // strictly-monotonic JSON-RPC id counter — unique per confirm even for same-ms completions
  const geturls=o=>o&&((Array.isArray(o.upload_urls)&&o.upload_urls.length&&o.upload_urls)||(o.upload_url&&[o.upload_url]))||null;
@@ -102,6 +102,7 @@ _WIDGET_HTML = """<!doctype html>
  const CONFIRM_TOOL="await_upload";
  function confirmUpload(link){ if(!confirmSpec||confirmSpec.tool!==CONFIRM_TOOL||!link)return;
    const args={}; args[confirmSpec.arg||"upload_link"]=link;
+   if(typeof confirmSpec.profile==="string")args.profile=confirmSpec.profile;
    try{
      if(oai&&typeof oai.callTool==="function"){oai.callTool(CONFIRM_TOOL,args).catch(()=>{});return;}
      post({jsonrpc:"2.0",id:"cf"+(++cfSeq),method:"tools/call",params:{name:CONFIRM_TOOL,arguments:args}});
@@ -160,7 +161,7 @@ _WIDGET_HTML = """<!doctype html>
    // change between clicks (a fresh batch = re-invoke the tool for a new token pool).
    btn.disabled=true; fi.disabled=true; let ok=0, failed=0, skipped=0;
    for(let i=0;i<n;i++){ const file=files[i], tok=uploadUrls[i];
-     if(!tok){skipped++;log("• "+file.name+": already added");continue;} // token consumed on a prior click
+     if(!tok){skipped++;log("• "+file.name+": upload link retired");continue;} // token consumed on a prior click
      if(file.size>200*1024*1024){log("❌ "+file.name+": exceeds 200 MB — skipped");failed++;continue;} // mirrors MAX_UPLOAD_BYTES
      log("uploading "+file.name+" ("+file.size+" B)…");
      try{
@@ -169,10 +170,15 @@ _WIDGET_HTML = """<!doctype html>
        const text=await res.text();
        log("["+res.status+"] "+file.name+": "+text.slice(0,160));
        if(res.ok){ok++;uploadUrls[i]=null;confirmUpload(tok);} // burn locally + auto-confirm the add (#1891)
-       else failed++;                                    // non-2xx: token uncommitted → still valid for retry
+       else if(res.headers.get("X-NotebookLM-Upload-Status")==="unconfirmed"){
+         frozen++;uploadUrls[i]=null;confirmUpload(tok);
+         log("Registration unconfirmed: check source_list before requesting a new upload link.");
+       }
+       else failed++;                                    // confirmed failure remains retryable
      }catch(e){log("❌ "+file.name+": upload failed (CSP/CORS/network): "+e);failed++;} // transient → retryable
    }
-   sub.textContent = failed ? ("✅ "+ok+" added · "+failed+" to retry — fix and click Upload again")
+   sub.textContent = frozen ? ("⚠ "+frozen+" unconfirmed — check source_list and request new links"+(failed ? " · "+failed+" other files can retry" : ""))
+     : failed ? ("✅ "+ok+" added · "+failed+" to retry — fix and click Upload again")
      : ok ? ("✅ "+ok+" added — you can close this and continue in chat")
      : "nothing to upload — already added";           // all files were skipped (tokens consumed): no misleading "0 added"
    btn.disabled = !failed;  // Upload stays enabled only when there's something to retry; fi stays frozen
@@ -231,7 +237,7 @@ def register_upload_widget(mcp: FastMCP, config: FileTransferConfig | None) -> N
             cfg = get_file_transfer(ctx)
             if cfg is None:
                 return {"error": "file transfer not configured"}
-            nb_id = await resolve_notebook(get_client(ctx), notebook)
+            nb_id = await resolve_notebook(await get_client(ctx), notebook, strict=True)
             # A POOL of independent single-use tokens — one per file the user may pick (each
             # cfg.upload_url() mints a fresh jti). The widget uploads file[i] to upload_urls[i], so
             # multi-file needs NO change to the /files/ul route or ADR-0024's single-use invariant;
@@ -263,5 +269,10 @@ def register_upload_widget(mcp: FastMCP, config: FileTransferConfig | None) -> N
                 # mirrors ``upload_urls`` (one link per file). Purely additive: a host that does not
                 # run the widget-initiated call just leaves the model on the manual await_upload /
                 # source_list path (the docstring's fallback).
-                "confirm": {"tool": "await_upload", "arg": "upload_link", "values": urls},
+                "confirm": {
+                    "tool": "await_upload",
+                    "arg": "upload_link",
+                    "values": urls,
+                    **({"profile": cfg.profile} if cfg.profile is not None else {}),
+                },
             }

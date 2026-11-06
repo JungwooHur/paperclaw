@@ -9,7 +9,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build wheel and run release smoke
+    name: Build candidate artifacts
     runs-on: ubuntu-latest
     # Smoke install pulls `[browser,dev,markdown]` extras (pytest, playwright,
     # mypy, ruff, markdownify, transitive deps). A compromised dep here is a
@@ -21,11 +21,16 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      candidate_sha: ${{ steps.candidate.outputs.sha }}
 
     steps:
     - uses: actions/checkout@v7
       with:
         persist-credentials: false
+
+    - name: Resolve candidate commit
+      id: candidate
+      run: echo "sha=$(git rev-parse "${GITHUB_SHA}^{commit}")" >> "$GITHUB_OUTPUT"
 
     - name: Set up Python 3.12
       uses: actions/setup-python@v7
@@ -66,32 +71,25 @@ jobs:
         # immediately. See issue #829 for the recovery trade-off.
         retention-days: 1
 
-    - name: Install built wheel + canonical contributor extras in a clean venv
-      # Canonical contributor extras (`[browser,dev,markdown]`, equivalent to
-      # `[all]`) match the install path documented in `docs/installation.md`,
-      # so the release smoke exercises the same surface area users will see.
-      # Plain `[dev]` skipped playwright + markdownify, masking packaging bugs
-      # in `[browser]`/`[markdown]` until users hit them post-release.
+    - name: Verify built base wheel without browser extra
+      shell: bash
       run: |
-        python -m venv smoke-venv
-        WHEEL=$(ls dist/notebooklm_py-*.whl)
-        smoke-venv/bin/pip install "${WHEEL}[browser,dev,markdown]"
-        smoke-venv/bin/python -c "import notebooklm; print(notebooklm.__version__)"
+        wheels=(dist/notebooklm_py-*.whl)
+        test "${#wheels[@]}" -eq 1
+        python scripts/check_base_wheel.py --wheel "${wheels[0]}"
 
-    - name: Install Playwright browser for smoke
-      # `[browser]` only installs the playwright Python package; the chromium
-      # binary + Linux system libs are needed for the unit-test smoke
-      # (tests/unit/test_windows_compatibility.py drives sync_playwright()).
-      run: |
-        smoke-venv/bin/playwright install chromium
-        smoke-venv/bin/playwright install-deps chromium
-
-    - name: Run unit tests against wheel
-      run: smoke-venv/bin/pytest tests/unit -q --no-cov -x
+  offline-qualification:
+    name: Qualify candidate wheel
+    needs: build-and-test
+    uses: ./.github/workflows/offline-qualification.yml
+    with:
+      candidate_sha: ${{ needs.build-and-test.outputs.candidate_sha }}
+      artifact_name: notebooklm-py-dist
+      tier: testpypi
 
   publish:
     name: Publish to TestPyPI
-    needs: build-and-test
+    needs: [build-and-test, offline-qualification]
     runs-on: ubuntu-latest
     environment: testpypi
     # Minimum-scope publish job: only the trusted PyPA action runs here. No
@@ -104,13 +102,13 @@ jobs:
 
     steps:
     - name: Download distribution artifacts
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # @ v8.0.1
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # @ v8.0.2
       with:
         name: notebooklm-py-dist
         path: dist/
 
     - name: Upload to TestPyPI
-      uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # @ v1.14.2
+      uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # @ v1.14.3
       with:
         repository-url: https://test.pypi.org/legacy/
         # PEP 740 attestations: pypa/gh-action-pypi-publish generates an

@@ -21,16 +21,19 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ..._app.artifacts import require_complete_artifact_listing
 from ..._app.resolve import (
     FULL_ID_PATTERN,
     AmbiguousIdError,
+    caseless_key,
+    match_title,
     resolve_ref,
     validate_id,
 )
 from ..._app.serialize import to_jsonable
 from ...exceptions import NotFoundError, ValidationError
 from ...types import ArtifactType
-from .._resolve import reject_non_canonical_id
+from .._resolve import ACCENT_ONLY_STEP, reject_non_canonical_id
 
 if TYPE_CHECKING:
     from ...client import NotebookLMClient
@@ -39,6 +42,7 @@ __all__ = [
     "StudioResolvedItem",
     "compact_studio_item",
     "hyphenated_type",
+    "partition_studio_refs",
     "resolve_studio_item",
     "studio_items",
     "summarize_studio_item",
@@ -106,6 +110,7 @@ async def studio_items(
     *,
     include_created_at: bool = False,
     include_artifact_meta: bool = False,
+    require_complete: bool = False,
 ) -> list[dict[str, Any]]:
     """Fetch + merge a notebook's text notes and studio artifacts into one list.
 
@@ -123,16 +128,26 @@ async def studio_items(
     default list paths stay byte-identical.
 
     When ``include_artifact_meta`` is set, each ARTIFACT item additionally carries
-    ``created_at`` and ``generation_prompt`` (both already decoded on the ``Artifact``)
-    — used by ``studio_list(detail="summary")`` to give artifacts the same richer
-    projection notes get. Notes are untouched by this flag. It defaults off so the
-    by-ref resolver and the default list paths stay byte-identical.
+    ``created_at``, ``generation_prompt``, ``duration_seconds``, ``slide_count``,
+    and ``source_count`` from the already-decoded ``Artifact``. Counts describe
+    populated decoded collections; empty collections yield ``None`` because the
+    model also uses them for absent wire fields. Used by summary and single-item
+    inspection. Notes are untouched by this flag. It defaults off for mutation
+    resolution and the full/compact list projections.
+
+    When ``require_complete`` is set, incomplete artifact reads raise before
+    resolution can mistake an unavailable backing for a missing item.
 
     Items are keyed by id (notes first) so a hypothetical future note∩artifact
     overlap can't double-list — this never fires today (``notes.list`` excludes
     mind maps, the only rows both listings could share).
     """
-    notes, artifacts = await asyncio.gather(client.notes.list(nb_id), client.artifacts.list(nb_id))
+    artifact_listing = (
+        require_complete_artifact_listing(client, nb_id)
+        if require_complete
+        else client.artifacts.list(nb_id)
+    )
+    notes, artifacts = await asyncio.gather(client.notes.list(nb_id), artifact_listing)
     items: dict[str, dict[str, Any]] = {}
     for note in notes:
         item: dict[str, Any] = {
@@ -169,6 +184,13 @@ async def studio_items(
             # (``getattr`` guards a minimal fake that predates it); ``None`` for a
             # note-backed mind map or a prompt-less type (#1925).
             art_item["generation_prompt"] = getattr(art, "generation_prompt", None)
+            art_item["duration_seconds"] = getattr(art, "duration_seconds", None)
+            # Empty tuples also represent absent metadata in the public model;
+            # do not invent a confirmed zero count for those rows (#1925).
+            slides = getattr(art, "slides", ())
+            source_ids = getattr(art, "source_ids", ())
+            art_item["slide_count"] = len(slides) if slides else None
+            art_item["source_count"] = len(source_ids) if source_ids else None
         items[art_id] = art_item
     return list(items.values())
 
@@ -219,17 +241,35 @@ def summarize_studio_item(item: dict[str, Any]) -> dict[str, Any]:
     return summarized
 
 
+def _ambiguous_studio_title(ref: str, how: str | None, titled: list[dict[str, Any]]) -> None:
+    """Raise :class:`AmbiguousIdError` listing the colliding Studio candidates."""
+    candidate_ids = [it["id"] for it in titled]
+    lines = [f"Ambiguous {how} '{ref}' matches {len(titled)} items:"]
+    for it in titled[:_MAX_AMBIGUOUS_CANDIDATES]:
+        lines.append(f"  {it['id'][:12]}... {it.get('title') or '(untitled)'}")
+    if len(titled) > _MAX_AMBIGUOUS_CANDIDATES:
+        lines.append(f"  ... and {len(titled) - _MAX_AMBIGUOUS_CANDIDATES} more")
+    lines.append("\nUse a more specific title or the id.")
+    raise AmbiguousIdError(ref, candidate_ids, "\n".join(lines))
+
+
 def _match_studio_ref(
-    items: list[dict[str, Any]], ref: str, kind: str | None
+    items: list[dict[str, Any]], ref: str, kind: str | None, *, exact_title_only: bool = False
 ) -> dict[str, Any] | None:
     """Match ``ref`` over the merged studio ``items``, honoring a ``kind`` scope.
 
     Matching order mirrors the single-type ``resolve_*`` helpers: full-UUID /
-    exact id / unique hex-prefix (via :func:`resolve_ref`), then exact
-    case-insensitive title (so an all-hex title stays reachable). Returns the
+    exact id / unique hex-prefix (via :func:`resolve_ref`), then the tiered title
+    match of :func:`match_title` (so an all-hex title stays reachable). Returns the
     matched item dict, or ``None`` on a miss (the caller decides whether a miss is
     NOT_FOUND or an idempotent no-op). Raises :class:`AmbiguousIdError` on an
-    ambiguous prefix or title.
+    ambiguous id prefix, title, or title prefix.
+
+    ``exact_title_only`` is for paths that rename or delete without a preview: the
+    title step accepts only a tier-1 exact title (:func:`caseless_key`), as before
+    tiered matching. A ref that only a title prefix or the accent-insensitive tier
+    would match raises :class:`ValidationError` naming the candidates, so a typo
+    can never mutate a different item; the caller can retry with the id.
     """
     scoped = [it for it in items if kind is None or it["type"] == kind]
     if _HEX_REF.match(ref):
@@ -246,7 +286,7 @@ def _match_studio_ref(
         except ValidationError:
             resolution = None
         if resolution is not None:
-            # ``resolve_ref``'s full-UUID fast-path returns the token verbatim
+            # ``resolve_ref``'s full-UUID fast-path returns the token (lowercased)
             # without a membership check; confirm membership case-insensitively
             # (also normalizes a prefix match to the list's canonical id).
             rid = resolution.id.casefold()
@@ -262,21 +302,67 @@ def _match_studio_ref(
         if FULL_ID_PATTERN.fullmatch(ref):
             return None
         # Fall through to the title path (id/prefix found nothing).
-    ref_folded = ref.casefold()
-    titled = [it for it in scoped if (it.get("title") or "").casefold() == ref_folded]
+    if exact_title_only:
+        ref_key = caseless_key(ref)
+        exact = [it for it in scoped if caseless_key(it.get("title") or "") == ref_key]
+        if len(exact) == 1:
+            (match,) = exact
+            return match
+        if len(exact) > 1:
+            _ambiguous_studio_title(ref, "title", exact)
+        # Say which looser step found the candidates: a tier-1 title prefix, or
+        # (only when tier 1 finds nothing) the accent-insensitive tier.
+        loose, _ = match_title(
+            ref, scoped, title_of=lambda it: it.get("title"), accent_insensitive=False
+        )
+        step = "by title prefix"
+        if not loose:
+            loose, _ = match_title(ref, scoped, title_of=lambda it: it.get("title"))
+            step = ACCENT_ONLY_STEP
+        if loose:
+            lines = [
+                f"'{ref}' matches only {step}, and renaming or deleting needs the "
+                "exact title or the id. Candidates:"
+            ]
+            for it in loose[:_MAX_AMBIGUOUS_CANDIDATES]:
+                lines.append(f"  {it['id']} {it.get('title') or '(untitled)'}")
+            raise ValidationError("\n".join(lines))
+        return None
+    titled, how = match_title(ref, scoped, title_of=lambda it: it.get("title"))
     if len(titled) == 1:
         (match,) = titled  # unpack (not titled[0]) — avoids the positional-index gate
         return match
     if len(titled) > 1:
-        candidate_ids = [it["id"] for it in titled]
-        lines = [f"Ambiguous title '{ref}' matches {len(titled)} items:"]
-        for it in titled[:_MAX_AMBIGUOUS_CANDIDATES]:
-            lines.append(f"  {it['id'][:12]}... {it.get('title') or '(untitled)'}")
-        if len(titled) > _MAX_AMBIGUOUS_CANDIDATES:
-            lines.append(f"  ... and {len(titled) - _MAX_AMBIGUOUS_CANDIDATES} more")
-        lines.append("\nUse a more specific title or the id.")
-        raise AmbiguousIdError(ref, candidate_ids, "\n".join(lines))
+        _ambiguous_studio_title(ref, how, titled)
     return None
+
+
+def partition_studio_refs(
+    refs: list[str], items: list[dict[str, Any]]
+) -> tuple[list[StudioResolvedItem], list[dict[str, str]]]:
+    """Resolve an explicit subset against one snapshot, retaining genuine misses.
+
+    Ambiguity aborts the whole plan before any deletion. UUIDs must be present
+    in the snapshot, and aliases of the same item resolve to one deletion.
+    """
+    resolved: list[StudioResolvedItem] = []
+    not_found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    seen_missing: set[str] = set()
+    for ref in refs:
+        match = _match_studio_ref(items, ref, None)
+        if match is None:
+            if ref.casefold() not in seen_missing:
+                seen_missing.add(ref.casefold())
+                not_found.append({"item_id": ref, "error": f"Studio item not found: {ref}"})
+        elif match["id"] not in seen:
+            seen.add(match["id"])
+            resolved.append(
+                StudioResolvedItem(
+                    item_id=match["id"], type=match["type"], title=match.get("title")
+                )
+            )
+    return resolved, not_found
 
 
 async def resolve_studio_item(
@@ -286,11 +372,12 @@ async def resolve_studio_item(
     kind: str | None = None,
     *,
     include_artifact_meta: bool = False,
+    mutating: bool = False,
 ) -> StudioResolvedItem:
     """Resolve a cross-type studio ref (note OR artifact) over the merged list.
 
     Builds :func:`studio_items` once and matches ``ref`` (full-UUID / hex-prefix /
-    exact title) within an optional ``kind`` scope. A miss raises
+    tiered title) within an optional ``kind`` scope. A miss raises
     :class:`~notebooklm.exceptions.NotFoundError` (NOT_FOUND category); an ambiguous
     ref raises :class:`AmbiguousIdError`.
 
@@ -299,13 +386,22 @@ async def resolve_studio_item(
     projection — used by ``studio_list(item=…)`` to surface the generation prompt of a
     single artifact. It defaults off so ``studio_delete`` / ``studio_rename`` (which
     only need the id + type) keep their byte-identical projection.
+
+    ``mutating`` (keyword-only) is set by paths that rename or delete without a
+    preview. A non-UUID ref then needs a complete listing (an incomplete artifact
+    read raises instead of letting a hidden item make a ref look unique), and the
+    title step accepts only an exact title (see :func:`_match_studio_ref`). A full
+    UUID skips both, so delete-by-id stays idempotent.
     """
     ref = validate_id(ref, "item")
     # Strict IDs-only mode rejects a title/prefix item ref before the list call,
     # matching the notebook/source/note/artifact resolvers (#1808).
     reject_non_canonical_id(ref, "studio item")
-    items = await studio_items(client, nb_id, include_artifact_meta=include_artifact_meta)
-    match = _match_studio_ref(items, ref, kind)
+    strict = mutating and not FULL_ID_PATTERN.fullmatch(ref)
+    items = await studio_items(
+        client, nb_id, include_artifact_meta=include_artifact_meta, require_complete=strict
+    )
+    match = _match_studio_ref(items, ref, kind, exact_title_only=strict)
     if match is None:
         raise NotFoundError(f"Studio item not found: {ref}")
     return StudioResolvedItem(

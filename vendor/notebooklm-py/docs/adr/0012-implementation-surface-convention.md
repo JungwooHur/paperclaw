@@ -1,12 +1,14 @@
 # ADR-0012: Implementation surface convention (underscore-prefix policy)
 
-> **Current state (2026-06-11).** The normative body and the illustrative tree
+> **Current state (2026-08-28).** The normative body and the illustrative tree
 > below were written when `_core.py`, `_session.py`, and the `_session_*.py`
 > seam modules still existed. **`_core.py` and `_session.py` (the concrete
 > `Session` orchestrator) have since been deleted**, and the former
-> `_session_*` / `_runtime_*` collaborators now live in the `_runtime/`
-> package (e.g. `_runtime/config.py`, `_runtime/contracts.py`,
-> `_runtime/lifecycle.py`, `_runtime/transport.py`) plus `_middleware/`.
+> `_session_*` / `_runtime_*` collaborators now live in the neutral `_runtime/`
+> package (for example `_runtime/config.py`, `_runtime/contracts.py`, and
+> `_runtime/lifecycle.py`) or, for the web transport, under `_web/transport/`
+> and `_web/contracts.py`. The former `_middleware/` package moved whole to
+> `_web/transport/middleware/`.
 > The underscore-prefix
 > *policy* this ADR establishes is unchanged and still in force; only the
 > example module names are stale. The current module map lives in
@@ -16,7 +18,8 @@
 ## Status
 
 Accepted (Tier 13 PR 13.9a). Amended by Tier 13 PR 13.8 to reflect
-the retirement of the lifted `_core_*` modules.
+the retirement of the lifted `_core_*` modules, and by Phase A to record the
+web transport relocation without changing the underscore-prefix policy.
 
 ## Context
 
@@ -28,7 +31,7 @@ the time of this ADR, `src/notebooklm/` contains 14 public-named modules
 seam modules and subpackages (`_runtime/`, `_middleware/`, `_kernel.py`,
 `_request_types.py`, `_transport_errors.py`, `_streaming_post.py`,
 `_rpc_executor.py`, `_artifacts.py`, `_artifact/`, `_chat/`,
-`_source/`, `_row_adapters/`, the `_auth/` subpackage, etc.).
+`_source/`, `_web/rows/`, the `_auth/` subpackage, etc.).
 The seam modules carry the bulk of the implementation; the
 public-named modules are mostly thin re-export facades or lifecycle
 entry points.
@@ -160,11 +163,14 @@ src/notebooklm/
 ├── _artifacts.py                # ArtifactsAPI implementation
 ├── _artifact/                   # per-concern artifact seams
 ├── _chat/                       # ChatAPI implementation + chat helpers
-├── _source/                     # per-concern source seams
+├── _source/                     # neutral source polling/Markdown + lazy shims
 ├── _label/                      # label payload builders
-├── _row_adapters/               # strict positional RPC row adapters
-├── _notebooks.py                # NotebooksAPI implementation
-├── _sources.py, _notes.py, ...  # other feature implementations
+├── _web/rows/                   # strict positional RPC row adapters
+├── _notebooks.py                # Backend-neutral abstract NotebooksAPI
+├── _web/notebooks.py            # WebNotebooksAPI implementation
+├── _sources.py                  # Backend-neutral abstract SourcesAPI
+├── _web/sources/                # WebSourcesAPI + concrete web source services
+├── _notes.py, ...               # other feature implementations
 ├── _env.py                      # env-var resolvers (NOTEBOOKLM_*)
 ├── _backoff.py, _atomic_io.py   # narrow utility seams
 └── _auth/                       # auth subpackage (entire tree internal)
@@ -304,8 +310,8 @@ collapses back.
   external-callsite imports from underscore-prefixed `notebooklm`
   submodules but cannot prevent them.
 - Some seams that *look* public-grade are not. For example,
-  `_runtime/contracts.py`, `_runtime/transport.py`, `_kernel.py`, and
-  `_middleware/chain_host.py` are load-bearing first-party internals,
+  `_runtime/contracts.py`, `_web/transport/runtime.py`, `_web/transport/kernel.py`, and
+  `_web/transport/middleware/chain_host.py` are load-bearing first-party internals,
   but downstream callers should still use the public facade or typed
   client API rather than importing those modules directly. If a seam-level
   name has legitimate downstream demand, promote a deliberate re-export
@@ -316,7 +322,7 @@ collapses back.
 **Drop the prefix convention and rely solely on `__all__`.** Rejected.
 `__all__` controls only `from foo import *` behaviour; named imports
 that reach directly into an underscore-prefixed seam (e.g. pulling
-`RuntimeTransport` out of `_runtime/transport.py` by name) bypass it entirely.
+`RuntimeTransport` out of `_web/transport/runtime.py` by name) bypass it entirely.
 Using `__all__` as the sole stability fence would force consumers to
 consult the docs for every name to learn whether it is stable, and
 reviewers would have no filename-level signal during code review. The
@@ -332,7 +338,7 @@ exceeds the benefit for a single-process library.
 
 **Put all seams under a single `notebooklm._internal` subpackage.**
 Rejected. The seams are already organised by domain
-(`_runtime/`, `_artifact/`, `_chat/`, `_source/`, `_middleware/`); collapsing
+(`_runtime/`, `_artifact/`, `_chat/`, `_source/`, `_web/transport/middleware/`); collapsing
 them under a single `_internal/` subpackage would either lose the
 domain grouping (one flat `_internal/` directory with 50 modules) or
 duplicate it (`_internal/core/`, `_internal/artifacts/`, ...) for no

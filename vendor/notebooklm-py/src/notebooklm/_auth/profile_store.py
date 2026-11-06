@@ -20,9 +20,16 @@ import notebooklm.paths as _notebooklm_paths
 from ..exceptions import LockUnavailableError
 from . import cookie_merge as _cookie_merge
 from . import cookie_policy as _cookie_policy
+from . import mint_service as _mint_service
 from .cookie_filter import filter_storage_state_cookies_by_domain_policy
 from .cookie_merge import RecoveryObservation
-from .cookie_types import CookieIdentity, CookieJar
+from .cookie_types import (
+    CookieIdentity,
+    CookieJar,
+    StorageStateValidationError,
+    _build_cookie_pair_from_storage_state,
+    _LoadedCookiePair,
+)
 from .credential_io import _commit_profile_json
 from .master_token_file import MasterTokenFile
 from .master_token_types import MasterToken
@@ -49,6 +56,23 @@ from .storage_lock import (
 logger = logging.getLogger("notebooklm.auth")
 
 T = TypeVar("T")
+
+
+def _is_cookie_pair_read_error(error: BaseException) -> bool:
+    """Classify the unchanged error taxonomy of ``read_cookie_pair``."""
+    return isinstance(
+        error,
+        (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            StorageStateValidationError,
+            _cookie_policy.RequiredCookieValidationError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ),
+    )
 
 
 class CookieMergeDisposition(Enum):
@@ -318,6 +342,27 @@ class ProfileStore:
                 include_domains=document.include_domains(),
                 include_optional=document.include_optional(),
             ),
+        )
+
+    def read_cookie_pair(self, *, require_routable: bool = False) -> _LoadedCookiePair:
+        """Read one raw sample into paired live and persistence projections."""
+        if not self._path.exists():
+            raise FileNotFoundError(
+                f"Storage file not found: {self._path}\n"
+                "Run 'notebooklm login' to authenticate first."
+            )
+        storage_state = json.loads(self._path.read_text(encoding="utf-8"))
+        if not isinstance(storage_state, dict) or not isinstance(
+            storage_state.get("cookies"), list
+        ):
+            raise StorageStateValidationError(
+                "Storage state must contain a 'cookies' list.\n"
+                'Expected format: {"cookies": [{"name": "SID", "value": "...", ...}]}'
+            )
+        return _build_cookie_pair_from_storage_state(
+            storage_state,
+            require_routable=require_routable,
+            rotate_url=_mint_service.KEEPALIVE_ROTATE_URL,
         )
 
     def replace_from_remint(self, request: RemintWriteRequest) -> ReplaceResult:

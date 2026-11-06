@@ -10,9 +10,8 @@ Thin adapters over the research surface:
   API directly.
 * ``research_status`` drives the neutral ``_app.research.poll_and_classify`` core
   (a single non-blocking poll classified into render fields).
-* ``research_import`` polls the notebook's completed research, then imports its
-  sources via the timeout-tolerant ``client.research.import_sources_with_verification``
-  (optionally narrowed by ``cited_only`` / bounded by ``max_sources``).
+* ``research_import`` drives ``_app.research.execute_research_import`` (poll →
+  optional cited/max filter → verified import under one ``client.operation``).
 * ``research_cancel`` preflights the run via ``poll_and_classify`` and sends the
   fire-and-forget cancel unless the run is already terminal (``completed`` /
   ``failed``); a transiently-absent just-started run (replication lag) is still
@@ -46,7 +45,6 @@ from ..._app import research as research_core
 from ..._app.serialize import to_jsonable
 from ..._deprecation import warn_deprecated
 from ...exceptions import ValidationError
-from ...research import select_cited_sources
 from ...types import ResearchTerminationReason
 from .._confirm import READ_ONLY
 from .._context import get_cancelled_research, get_client
@@ -126,13 +124,13 @@ def register(mcp: Any) -> None:
         ``source`` is ``web`` (default) or ``drive``. ``mode`` is ``fast``
         (default) or ``deep`` (deep is web-only).
         """
-        client = get_client(ctx)
         with mcp_errors():
             # ``deep`` mode is web-only — reject the invalid combination at the tool
             # boundary (the independent Literals can't express this cross-field rule).
             if source == "drive" and mode == "deep":
                 raise ValidationError("mode 'deep' is web-only; use source 'web' for deep research")
-            nb_id = await resolve_notebook(client, notebook)
+            client = await get_client(ctx)
+            nb_id = await resolve_notebook(client, notebook, strict=True)
             result = await client.research.start(nb_id, query, source, mode)
             # ``poll_task_id`` is the one id status/import/cancel drive off, chosen
             # by mode (NOT ``report_id or task_id`` — that would wrongly pick a
@@ -193,7 +191,6 @@ def register(mcp: Any) -> None:
         for a single task (ambiguous with two+). An unmatched pin reports
         ``not_found``. ``task_id`` is a deprecated alias (removed in v0.9.0).
         """
-        client = get_client(ctx)
         with mcp_errors():
             # Fold the deprecated ``task_id`` pin into ``poll_task_id`` (#1789).
             poll_task_id, deprecation = _resolve_poll_task_id(
@@ -218,6 +215,7 @@ def register(mcp: Any) -> None:
             # backend as a spurious mismatch.
             poll_task_id = poll_task_id.strip() if poll_task_id is not None else None
 
+            client = await get_client(ctx)
             nb_id = await resolve_notebook(client, notebook)
             result = await research_core.poll_and_classify(client, nb_id, poll_task_id)
 
@@ -348,7 +346,6 @@ def register(mcp: Any) -> None:
         ``no_research`` (replication lag) is cancelled too. Fire-and-forget; poll
         ``research_status`` afterward to confirm.
         """
-        client = get_client(ctx)
         with mcp_errors():
             # Fold the deprecated ``run_id`` alias into ``poll_task_id`` (#1789).
             poll_task_id, deprecation = _resolve_poll_task_id(
@@ -360,7 +357,8 @@ def register(mcp: Any) -> None:
             if not poll_task_id or not poll_task_id.strip():
                 raise ValidationError("poll_task_id is required to cancel a research run")
             poll_task_id = poll_task_id.strip()
-            nb_id = await resolve_notebook(client, notebook)
+            client = await get_client(ctx)
+            nb_id = await resolve_notebook(client, notebook, strict=True)
             # Preflight (``poll_task_id`` as the discriminator → typed NOT_FOUND
             # sentinel, never raises). Only an already-TERMINAL run
             # (``completed`` / ``failed``) is left alone — those states are stable,
@@ -429,7 +427,6 @@ def register(mcp: Any) -> None:
         ``cited_only`` imports only report-cited sources (all, if none resolve).
         ``max_sources`` caps the count.
         """
-        client = get_client(ctx)
         with mcp_errors():
             # Fold the deprecated ``task_id`` alias into ``poll_task_id`` (#1789).
             poll_task_id, deprecation = _resolve_poll_task_id(
@@ -445,52 +442,30 @@ def register(mcp: Any) -> None:
             if max_sources is not None and max_sources < 1:
                 raise ValidationError("max_sources must be >= 1 (omit it to import all)")
             poll_task_id = poll_task_id.strip()
-            nb_id = await resolve_notebook(client, notebook)
-            # Poll FOR THE REQUESTED task (via the shared importable-state guard,
-            # which forwards ``poll_task_id`` to ``poll`` as the discriminator) so
-            # the polled sources belong to it and every non-importable state
-            # (not_found / failed / non-completed / empty) is refused before we
-            # import — we never fall back to importing whatever the notebook's
-            # current task happens to be. The report is returned alongside the
-            # sources so cited-only selection can match citations without a second
-            # poll. The same guard backs the REST import route so it cannot drift.
-            sources, report = await research_core.poll_importable_research(
-                client, nb_id, poll_task_id
-            )
-            # Selection/bounding, in that order: narrow to report-cited sources
-            # first, then cap the count. Both are opt-in; without them every
-            # completed source is imported (unchanged default behavior).
-            # ``sources_to_import`` widens to ``ResearchSourceInput`` because
-            # ``select_cited_sources`` may hand back typed sources, not just dicts.
-            sources_to_import: list[Any] = list(sources)
-            cited_fallback = False
-            if cited_only:
-                selection = select_cited_sources(sources_to_import, report)
-                sources_to_import = list(selection.sources)
-                cited_fallback = selection.used_fallback
-            if max_sources is not None:
-                sources_to_import = sources_to_import[:max_sources]
-            # Import via the transport-neutral idempotent wrapper, which drives
-            # the timeout-tolerant variant (as the CLI does): the underlying
-            # IMPORT_RESEARCH RPC commonly runs >30 s on deep payloads and a
-            # one-shot call times out client-side even after the server
-            # committed. On timeout it probes sources.list and reconciles against
-            # what actually landed instead of raising as if nothing imported.
-            # The wrapper also pre-filters sources already present by URL (unless
-            # allow_duplicate) so re-importing the same task doesn't duplicate its
-            # sources (#1961), and reports the skipped set.
+            client = await get_client(ctx)
+            nb_id = await resolve_notebook(client, notebook, strict=True)
+            # Poll → optional cited/max filter → verified import share one
+            # ``client.operation`` so a configured aggregate deadline cannot
+            # restart between the read and the mutation. REST import drives the
+            # same helper on the oneshot path. Resolve/validation stay outside
+            # so a bad request never opens a scope.
             #
-            # TOCTOU note: the sources come from the poll snapshot above rather
-            # than an atomic re-fetch, so a concurrent/external change between poll
+            # TOCTOU note: the sources come from the poll snapshot rather than
+            # an atomic re-fetch, so a concurrent/external change between poll
             # and import could theoretically race. Acceptable: research tasks are
             # user-driven, and the pinned id prevents cross-task wiring.
-            outcome = await research_core.import_research_sources(
+            execution = await research_core.execute_research_import(
                 client,
                 nb_id,
                 poll_task_id,
-                sources_to_import,
+                cited_only=cited_only,
+                max_sources=max_sources,
                 allow_duplicate=allow_duplicate,
             )
+            outcome = execution.imported
+            sources = execution.sources_found
+            sources_to_import = execution.sources_selected
+            cited_fallback = execution.cited_fallback
             newly_imported = to_jsonable(outcome.newly_imported)
             already_present = to_jsonable(outcome.already_present)
             result: dict[str, Any] = {

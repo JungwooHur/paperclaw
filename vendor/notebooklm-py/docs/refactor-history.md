@@ -14,6 +14,21 @@
 > tables below are the **v0.5.0 as-shipped** names, not the current tree — see
 > [`docs/architecture.md`](architecture.md) for the current module map.
 
+> **2026-09-02 compatibility note:** Six deprecated private `_auth` consolidation shims were
+> removed in v0.8.x by explicit maintainer decision, earlier than their documented next-major
+> window. Replace `_auth._browser_cookie_filter` with `_auth.cookie_filter`,
+> `_auth.browser_cookie_recovery` with `_auth.psidts_recovery`, both
+> `_auth.browser_state_validation` and `_auth.login_wait_trace` with `_browser.browser_capture`,
+> `_auth.storage_transaction` with `_auth.profile_store`, and `_auth.storage_writer` with
+> `_auth.storage`. No transitional replacement shims were added.
+>
+> **2026-09-02 browser boundary note:** Playwright-backed acquisition now lives
+> in `_browser/`, while `_auth/recovery_rungs.py` owns the browser-neutral L3
+> registry. Interactive login is coordinated by `_app/login_browser.py`; CLI
+> code supplies preflight and rendering and reaches browser capabilities only
+> through lazy `notebooklm.auth` functions. This keeps the base import and CLI
+> help paths Playwright-free without splitting the work across multiple PRs.
+
 This document is the historical record of the Tier 12 / Tier 13 refactor arc.
 It exists for two audiences:
 
@@ -156,7 +171,7 @@ not change, only their home module did.
 | `notebooklm._core.ERROR_INJECT_ENV_VAR` | `notebooklm._error_injection.ERROR_INJECT_ENV_VAR` | |
 | `notebooklm._core._SyntheticErrorTransport` (class) | _Removed_ | Synthetic-error substitution moved into `notebooklm._middleware.error_injection.ErrorInjectionMiddleware`. The env-var resolver (`_get_error_injection_mode`) and startup guard (`_refuse_synthetic_error_outside_test_context`) survive in `notebooklm._error_injection`. |
 | `notebooklm._core.AuthRefreshCoordinator` | `notebooklm._runtime.auth.AuthRefreshCoordinator` | Class unchanged; only the home module moved. |
-| `notebooklm._core.TransportDrainTracker` | `notebooklm._transport_drain.TransportDrainTracker` | Same. |
+| `notebooklm._core.TransportDrainTracker` | _Removed_ | Transitional duplicate accounting was folded into `notebooklm._runtime.call_supervisor.CallSupervisor`. |
 | `notebooklm._core.ClientMetrics` | `notebooklm._client_metrics.ClientMetrics` | Same. |
 | `notebooklm._core.ReqidCounter` | `notebooklm._reqid_counter.ReqidCounter` | Same. |
 | `notebooklm._core.CookiePersistence` | `notebooklm._cookie_persistence.CookiePersistence` | Same. |
@@ -170,7 +185,7 @@ These modules did not exist before Tier 12 began:
 
 | Module | Purpose |
 |---|---|
-| `notebooklm._session_contracts` | Historical v0.5.0 home for `AuthMetadata`, `Kernel`, and the shared capability Protocols (`RpcCaller`, `LoopGuard`, `OperationScopeProvider`, `AsyncWorkRuntime`) added in the capability refactor (ADR-0013). Current home: `notebooklm._runtime.contracts`, exporting only `Kernel`, `RpcCaller`, and `LoopGuard`; `AuthMetadata` is local to `_source/upload.py`, `OperationScopeProvider` is local to `_artifact/polling.py`, and `AsyncWorkRuntime` was deleted. |
+| `notebooklm._session_contracts` | Historical v0.5.0 home for `AuthMetadata`, `Kernel`, and the shared capability Protocols (`RpcCaller`, `LoopGuard`, `OperationScopeProvider`, `AsyncWorkRuntime`) added in the capability refactor (ADR-0013). Current home: `notebooklm._runtime.contracts`, exporting only `Kernel`, `RpcCaller`, and `LoopGuard`; `AuthMetadata` is local to `_web/sources/upload.py`, `OperationScopeProvider` is local to `_artifact/polling.py`, and `AsyncWorkRuntime` was deleted. |
 | `notebooklm._kernel` | Concrete `Kernel` transport core (owns the `httpx.AsyncClient`, exposes `post` / `cookies` / `aclose`). Located at root (`src/notebooklm/_kernel.py`), not nested. |
 | `notebooklm._middleware` | Middleware chain primitives (`Middleware` Protocol, `NextCall` callable type, `RpcRequest` / `RpcResponse` envelope dataclasses, `build_chain` composer). |
 | `notebooklm._middleware_tracing` | Tier 12 PR 12.3 — request tracing middleware. |
@@ -271,7 +286,7 @@ class AsyncWorkRuntime(LoopGuard, OperationScopeProvider, Protocol):
 Current code has tightened that further: `_runtime/contracts.py`
 exports `Kernel`, `RpcCaller`, and `LoopGuard`; `OperationScopeProvider`
 is local to `_artifact/polling.py`; `AuthMetadata` is local to
-`_source/upload.py`; `AsyncWorkRuntime` was removed.
+`_web/sources/upload.py`; `AsyncWorkRuntime` was removed.
 
 The following were **not** globally promoted:
 
@@ -309,7 +324,7 @@ not on speculation.
 Those composite runtime Protocols were later removed. Current
 constructors take the direct collaborators they need by keyword:
 `ArtifactsAPI(rpc=..., drain=..., lifecycle=...)`,
-`ChatAPI(rpc=..., transport=..., reqid=..., loop_guard=...)`, and
+`WebChatAPI(rpc=..., transport=..., reqid=..., loop_guard=..., notebooks=...)`, and
 `SourceUploadPipeline(rpc=..., drain=..., lifecycle=..., kernel=...,
 auth=...)`.
 
@@ -342,6 +357,9 @@ These were factored apart:
   into `_chat/notes.py`, where `ChatAPI.save_answer_as_note(...)`
   owns the workflow. `NotesAPI.create_from_chat(...)` was a deprecated
   forwarder during the migration window and was removed in v0.7.0.
+  The later backend split kept citation preparation on the neutral
+  `ChatAPI` workflow and moved the positional encoder into
+  `_web/params/chat_note.py` with persistence in `WebChatAPI`.
 
 `NoteRowKind` stays private — it is an internal classification of
 rows returned by the undocumented `GET_NOTES_AND_MIND_MAPS` RPC, not
@@ -361,16 +379,16 @@ Feature APIs adopted consistent dependency-naming conventions:
 
 ```python
 SourcesAPI(rpc, *, uploader=source_uploader)
-NotebooksAPI(rpc, *, sources_api=sources)
-ChatAPI(rpc=rpc, transport=transport, reqid=reqid, loop_guard=lifecycle,
-        notebooks=notebooks)
+WebNotebooksAPI(rpc, *, sources_api=sources)
+WebChatAPI(rpc=rpc, transport=transport, reqid=reqid, loop_guard=lifecycle,
+           notebooks=notebooks)
 ArtifactsAPI(rpc=rpc, drain=drain, lifecycle=lifecycle,
              notebooks=notebooks, mind_maps=mind_maps,
              note_service=note_service)
 NotesAPI(*, notes=note_service, mind_maps=mind_maps)
 MindMapsAPI(rpc=rpc, mind_maps=mind_maps, artifacts=artifacts,
             notebooks=notebooks)
-LabelsAPI(rpc, list_sources=sources.list)
+WebLabelsAPI(rpc, list_sources=sources.list)
 ```
 
 Compatibility aliases and fallback constructors that read missing
