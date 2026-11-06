@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wrapper around the real NotebookLM CLI. Two jobs, both structural — they hold
+# Wrapper around the real NotebookLM CLI. Three jobs, all structural — they hold
 # regardless of what the agent remembers to do.
 #
 # 1) SERIALIZE every call.
@@ -16,7 +16,31 @@
 # Lock next to the ~/.notebooklm profile it guards (same container user -> same
 # HOME -> same lock, still serialized); avoids a /tmp file owned by another user.
 #
-# 2) Make `create` IDEMPOTENT and SELF-RECORDING.
+# 2) Give every call a CLEAN CONTEXT.
+# flock serializes single commands, not a subagent's sequence of commands, and every
+# call shares one context file (profiles/default/context.json: the notebook `use`
+# picked, the conversation the last `ask` left). `ask -n X` resumes the cached
+# conversation whenever X is the cached notebook, and another subagent's ask may
+# have replaced it with a conversation of ITS notebook — the ask is then answered
+# from the other paper's sources. A command with no -n acts on whichever notebook
+# another subagent selected last (a source added to an older paper's notebook). So
+# the context is deleted under the lock before every call: a command without -n now
+# fails loudly ("No notebook specified. Use 'notebooklm use <id>' ..." — that `use`
+# hint is refused here, pass --notebook instead), and `ask` resumes the named
+# notebook's own latest conversation from the server. `use` is refused, since it
+# only fills the file the next call deletes.
+#
+# Also refused: a second cookie jar (root -p/--profile/--storage, NOTEBOOKLM_PROFILE,
+# NOTEBOOKLM_HOME, an inline NOTEBOOKLM_AUTH_JSON, every `profile` command but
+# `list`). It would give a subagent a private context, but it needs a copy of
+# storage_state.json, and Google rotates the two copies' cookies independently:
+# whichever rotated last stays valid and the other is signed out. The shared jar
+# went first, and every later resume failed on auth. So never copy
+# storage_state.json; pass --notebook <id> to every command instead. A config.json
+# whose default_profile is not "default" (a `profile switch` on the host) is refused
+# too: every call would run in another jar, with a context this wrapper never clears.
+#
+# 3) Make `create` IDEMPOTENT and SELF-RECORDING.
 # Registering a new notebook in notebooks.json was a prose rule, and a missed
 # registration is expensive: the next question about that paper finds nothing,
 # creates ANOTHER notebook, re-uploads the PDF and waits for NotebookLM to index it
@@ -25,41 +49,107 @@
 # notebook is reused and a new one records itself, so the agent cannot forget.
 set -uo pipefail
 
-REAL=/usr/local/lib/notebooklm-real
+REAL=${NOTEBOOKLM_REAL_BIN:-/usr/local/lib/notebooklm-real}
 REGISTRY_PY=${NOTEBOOK_REGISTRY_PY:-/workspace/group/research-papers/notebook_registry.py}
+NLM_HOME=${NOTEBOOKLM_HOME:-${HOME:-/tmp}/.notebooklm}
+
+refuse() {
+  echo "notebooklm wrapper: $1; ${2:-pass --notebook <id> to every command}" >&2
+  exit 2
+}
+
+jar="a second cookie jar needs a copy of storage_state.json, and the two copies\
+ rotate apart until one is signed out"
+
+# Refuse before taking the lock, so a refused call never waits in the queue. The
+# CLI ignores an empty NOTEBOOKLM_PROFILE/NOTEBOOKLM_HOME and fails on an empty
+# NOTEBOOKLM_AUTH_JSON by itself, so only a non-empty one is refused.
+[ -n "${NOTEBOOKLM_PROFILE:-}" ] && refuse "NOTEBOOKLM_PROFILE is refused: $jar"
+[ -n "${NOTEBOOKLM_HOME:-}" ] && refuse "NOTEBOOKLM_HOME is refused: $jar"
+[ -n "${NOTEBOOKLM_AUTH_JSON:-}" ] && refuse "NOTEBOOKLM_AUTH_JSON is refused: $jar"
+
+# Root options are the tokens before the subcommand. Only -p/--profile and
+# --storage take a value, and both are refused, so the first other token not
+# starting with '-' is the subcommand. The root's only short options are -p and -v,
+# so a short cluster holding a 'p' (-p, -px, -vp) sets a profile. Options after the
+# subcommand are its own (`share add -p` is --permission) and are never checked.
+sub=""
+n=0
+for arg in "$@"; do
+  n=$((n + 1))
+  case "$arg" in
+    --) continue ;;
+    --profile | --profile=* | --storage | --storage=*) refuse "$arg is refused: $jar" ;;
+    --*) continue ;;
+    -*p*) refuse "-p (--profile) is refused: $jar" ;;
+    -*) continue ;;
+    *) sub=$arg; break ;;
+  esac
+done
+[ "$sub" = "use" ] && refuse "'use' is refused: the context it sets is shared by every\
+ parallel subagent and is cleared before each call"
+
+# `profile` takes no options of its own, so its first non-option token is the
+# action. Only `list` reads; create/switch/rename/delete make or move to another jar.
+if [ "$sub" = "profile" ]; then
+  action=""
+  for arg in "${@:n+1}"; do
+    case "$arg" in
+      -*) continue ;;
+      *) action=$arg; break ;;
+    esac
+  done
+  [ "$action" = "list" ] ||
+    refuse "'profile${action:+ $action}' is refused, only 'profile list' runs: $jar"
+fi
 
 exec 9>"${HOME:-/tmp}/notebooklm.lock"
 flock 9
 
+# config.json is shared with the host, where `notebooklm profile switch` is not
+# wrapped, so it is read under the lock: a switch made while this call queued still
+# counts. Read the way the CLI reads it — a non-empty string default_profile wins,
+# anything else (no file, bad JSON, no key, "") means "default".
+cfg=$NLM_HOME/config.json
+if [ -f "$cfg" ]; then
+  default_profile=$(python3 -I -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = json.load(f)
+except (OSError, ValueError):
+    sys.exit()
+value = data.get("default_profile") if isinstance(data, dict) else None
+print(value if isinstance(value, str) else "")
+' "$cfg" 2>/dev/null)
+  if [ -n "$default_profile" ] && [ "$default_profile" != "default" ]; then
+    refuse "$cfg sets default_profile '$default_profile': every call would run in\
+ another cookie jar, with a context this wrapper never clears" \
+      "run 'notebooklm profile switch default' on the host"
+  fi
+fi
+
+rm -f "$NLM_HOME/profiles/default/context.json" "$NLM_HOME/context.json"
+
+orig=("$@")
 if [ "${1:-}" = "create" ] && [ -n "${2:-}" ] && [ -f "$REGISTRY_PY" ]; then
   title=$2
   shift 2
-  json="" use=""
+  json=""
   for arg in "$@"; do
-    case "$arg" in
-      --json) json=--json ;;
-      --use|-u) use=1 ;;
-    esac
+    [ "$arg" = "--json" ] && json=--json
   done
   # The registry prints the same {"notebook": {...}} shape the real CLI does, so a
   # caller parsing `create --json` needs no change. On any failure fall through to
-  # the real CLI rather than blocking a create.
+  # the real CLI, with the original argv, rather than blocking a create. --use/-u is
+  # accepted and ignored here (and harmless in the real create's fall-through):
+  # the context it would set is deleted before the next call anyway, so the caller
+  # passes --notebook <id> from the printed id.
   if out=$(NOTEBOOKLM_REAL=$REAL python3 "$REGISTRY_PY" --get-or-create \
              --title "$title" $json 2>/dev/null) && [ -n "$out" ]; then
     printf '%s\n' "$out"
-    # --use asks for the notebook to become the active context; honour it for a
-    # reused notebook too, otherwise a later `source add` would target the wrong one.
-    if [ -n "$use" ]; then
-      nb_id=$(printf '%s' "$out" | python3 -c \
-        'import sys,json,re
-raw=sys.stdin.read()
-try: print((json.loads(raw).get("notebook") or {}).get("id",""))
-except Exception:
-    m=re.search(r"[0-9a-f-]{36}",raw); print(m.group(0) if m else "")' 2>/dev/null)
-      [ -n "$nb_id" ] && "$REAL" use "$nb_id" >/dev/null 2>&1
-    fi
     exit 0
   fi
 fi
 
-exec "$REAL" "$@"
+exec "$REAL" "${orig[@]}"
