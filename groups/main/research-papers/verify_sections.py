@@ -194,6 +194,7 @@ import heading_bloat  # noqa: E402  (threshold shared with the repair)
 import paragraph_headings  # noqa: E402  (same, for promoted titles)
 import list_markers  # noqa: E402  (predicate shared with the repair)
 import inline_emphasis  # noqa: E402  (same, for markdown emphasis)
+import latexml_math  # noqa: E402  (a formula read once, as the page stores it)
 
 
 def fetch_blocks(page_id: str) -> list:
@@ -383,6 +384,11 @@ ARXIV_CANDIDATES = ("https://arxiv.org/html/{id}",
 
 def _strip_html(html: str) -> str:
     html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
+    # Each formula once, as its TeX: the page stores a formula as TeX (an
+    # equation's expression), so a span measured with the rendered form beside
+    # its TeX and content-MathML copies read two or three times its length.
+    # Captions keep the rendered form (`ef._clean`); only this side compares.
+    html = latexml_math.drop_math_annotations(latexml_math.formulas_as_tex(html))
     # Keep block boundaries as newlines so the References tail-cut (which
     # anchors on a heading at line start) still works after tag stripping.
     html = re.sub(r"(?i)</(p|h[1-6]|section|div|li|figure|figcaption)>|<br\s*/?>",
@@ -596,11 +602,16 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
         # translation that was actually complete (one real section measured 5622
         # source chars against a true span of 2629).
         # Allow more skipped words between the label and the title words. A title
-        # carrying maths expands in the source — "VI The π₀.₇ Model…" is written
-        # "VI The π 0.7 \pi_{0.7} Model…", four tokens where the page shows one — so
-        # a 3-word allowance located neither VI nor VII. Their spans then merged into
-        # the previous section, whose ratio collapsed and reported a SUMMARIZED that
-        # was not real. Verified on that paper: 3 and 5 find nothing, 8 finds both.
+        # carrying maths spans several tokens in the source, which reads each
+        # formula as its TeX (`_strip_html`): "VI The ψ₀.₇ Model…" is "VI The
+        # \psi_{0.7} Model…" there: three tokens to skip for a heading written in
+        # Unicode, whose formula gives the needle no word, while a heading that
+        # keeps the TeX (`\psi_{0.7}`) finds its own words in it. When the source
+        # still carried the rendered form beside the TeX, a 3-word allowance
+        # located neither VI nor VII, and their spans merged into the previous
+        # section, which reported a SUMMARIZED that was not real (on that text 3
+        # and 5 found nothing, 8 found both). Longer formulas skip more, so the
+        # allowance stays at 8.
         gap = r"(?:\W+\w+){0,8}?\W+"
         needle = (re.escape(key.lower()) + r"\.?\s+"
                   + gap.join(re.escape(w.lower()) for w in words))

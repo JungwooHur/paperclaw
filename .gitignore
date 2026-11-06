@@ -65,6 +65,7 @@ groups/main/research-papers/*
 !groups/main/research-papers/resolve_paper.py
 !groups/main/research-papers/heal_verify.py
 !groups/main/research-papers/sweep_batch_queue.py
+!groups/main/research-papers/latexml_math.py
 !groups/main/research-papers/systemd/
 
 # Secrets & personal data (public repo — see scripts/check-sensitive.sh)
