@@ -1,11 +1,42 @@
 # Troubleshooting
 
 **Status:** Active
-**Last Updated:** 2026-08-04
+**Last Updated:** 2026-09-02
 
 Common issues, known limitations, and workarounds for `notebooklm-py`.
 
 ## Common Errors
+
+### Android backend
+
+The Android transport is opt-in. Install its runtime before selecting it:
+
+```bash
+pip install "notebooklm-py[android,browser]"
+notebooklm login --master-token --account you@example.com
+notebooklm --backend android list --json
+```
+
+`--backend android` must appear before the command. If the command reports a
+missing `grpcio`, `protobuf`, or `gpsoauth` module, install the `[android]`
+extra in the same environment as the `notebooklm` executable. Android uses the
+active profile's `master_token.json` to mint mobile bearer tokens; an ordinary
+browser-cookie login alone is not sufficient. Typed namespace operations stay
+on the Android transport; use them by default, or `client.raw.unary(...)` /
+`raw.unary_stream(...)` for advanced Android calls.
+
+The retained default v0.x compatibility policy still makes
+`NotebookLMClient.from_storage(backend="android")` send a homepage GET while
+the storage wrapper builds the client, before Android open. A stale/missing Web
+cookie, network failure, or homepage-token failure therefore still surfaces at
+that build step. The bootstrap does not run PSIDTS recovery or persist the
+homepage cookie observation. The deprecated root `client.rpc_call(...)` then
+crosses into a lazy Web sidecar and uses those Web cookies, not the Android
+master token. A master-token-only profile can run typed Android and raw unary
+operations but cannot use `rpc_call`; migrate that call instead of adding Web
+cookies solely for the compatibility path. See the
+[Android backend guide](android/README.md) for credential and protocol
+diagnostics.
 
 ### Authentication Errors
 
@@ -47,17 +78,27 @@ Google rotates `__Secure-1PSIDTS` (the freshness partner of `__Secure-1PSID`) on
 6. **Manual re-login** — `notebooklm login`; the legacy `notebooklm login --master-token-refresh` remains for an unconditional master-token re-mint.
 7. **External scheduler** — `notebooklm auth refresh` driven by cron / launchd / systemd / Task Scheduler / k8s CronJob, for idle profiles with no Python process running. Recommended cadence: 15–20 minutes.
 
-> **Master-token troubleshooting:** `MasterTokenError: ... re-bootstrap` means the master token was revoked (password change / Google security action) — re-run `notebooklm login --master-token`. `MissingDependencyError: ... needs gpsoauth` means the `[headless]` extra isn't installed (`pip install "notebooklm-py[headless]"`); recovery stops with that configuration error instead of misreporting rejected credentials. A minted jar "missing required cookies" indicates a MergeSession change — file an issue.
+The opt-in `NOTEBOOKLM_TRANSPORT=curl_cffi` transport also applies to the
+synchronous missing-`__Secure-1PSIDTS` recovery used when loading a saved session
+or importing browser cookies. It uses the same `NOTEBOOKLM_IMPERSONATE` setting
+as async requests; it does not silently fall back to HTTPX if the optional
+dependency is missing. This keeps transport selection consistent, but is not a
+guarantee against Google expiring or revoking a session.
+
+> **Master-token troubleshooting:** `MasterTokenError: ... re-bootstrap` means Google rejected the stored token or it was explicitly revoked; re-run `notebooklm login --master-token --account you@example.com`. A password change alone is not reliable revocation or containment for a leaked master token—remove its associated device/session in Google Account security. `MissingDependencyError: ... needs gpsoauth` means neither the `[headless]` nor `[android]` extra is installed; add the extra for your backend. Recovery stops with that configuration error instead of misreporting rejected credentials. A minted jar "missing required cookies" indicates a MergeSession change — file an issue.
 >
 > **"This browser or app may not be secure" during `--master-token` sign-in:** Google blocks sign-in inside the automated browser the auto-capture launches. The client drops the obvious automation flags, but Google may still block — use one of the reliable paths instead:
 > - **Attach to your own Chrome (recommended):** quit Chrome, relaunch it with `--remote-debugging-port=9222`, then `notebooklm login --master-token --account you@gmail.com --cdp-url http://127.0.0.1:9222`. It opens an EmbeddedSetup tab in your real (non-automated) browser, so Google allows sign-in, and scrapes the `oauth_token`.
 > - **Capture the token manually:** in a normal browser sign in at `accounts.google.com/EmbeddedSetup`, copy the `oauth_token` cookie (DevTools → Application → Cookies → accounts.google.com), then `notebooklm login --master-token --account you@gmail.com --oauth-token <value>`. The `oauth_token` is single-use and short-lived — use it immediately.
 
-Most users only need layer 1 — it's on by default and requires no configuration. For the full strategy (trade-offs between layers, including Python kwargs like `keepalive_min_interval` and environment variables like `NOTEBOOKLM_REFRESH_CMD_USE_SHELL`, and ready-to-paste launchd / systemd / cron / Task Scheduler / k8s CronJob recipes), see **[docs/auth-cookie-lifecycle.md#tldr](auth-cookie-lifecycle.md#tldr)** for a quick orientation, then [§4 The recovery ladder](auth-cookie-lifecycle.md#4--the-recovery-ladder) for the per-layer deep dive.
+Most users only need layer 1 — it is on by default and requires no configuration.
+For supported authentication methods and session-refresh commands, use the
+[installation guide](installation.md#d-headless-server-or-ci) and the examples
+in this section. Do not copy credentials into scheduler arguments or logs.
 
 #### macOS: `--browser-cookies` prompts for your password
 
-On macOS, Chrome (and Edge / Brave / Opera) encrypts its cookies file with a key stored in the **macOS Keychain** under the entry `Chrome Safe Storage`. By default that entry's ACL only allows `Google Chrome.app` itself to read the key without prompting; any other process — Python, Terminal, cron, an editor — gets a "wants to use the *Chrome Safe Storage* key" dialog. This is how macOS Keychain protects local data and applies to every cookie-extraction tool (`rookiepy`, `browser-cookie3`, `pycookiecheat`), not just `notebooklm-py`.
+On macOS, Chrome (and Edge / Brave / Opera) encrypts its cookies file with a key stored in the **macOS Keychain** under the entry `Chrome Safe Storage`. By default that entry's ACL only allows `Google Chrome.app` itself to read the key without prompting; any other process — Python, Terminal, cron, an editor — gets a "wants to use the *Chrome Safe Storage* key" dialog. This is how macOS Keychain protects local data and applies to every cookie-extraction tool (`rookie-cookies`, `browser-cookie3`, `pycookiecheat`), not just `notebooklm-py`.
 
 Workarounds, ordered by hassle:
 
@@ -103,9 +144,22 @@ Prints `OK` without prompting → keychain is unlocked and your user has access;
 On Windows, both credential paths can leave you without `__Secure-1PSIDTS` (the rotating freshness partner of `__Secure-1PSID` that every real RPC needs — see [Automatic Token Refresh](#automatic-token-refresh) above), so `notebooklm login` reports success but `notebooklm list` then fails with `Missing required cookies: __Secure-1PSIDTS` (issue [#1753](https://github.com/teng-lin/notebooklm-py/issues/1753)). Two distinct causes are in play:
 
 - **`notebooklm login --browser chrome` (Playwright flow).** The interactive browser completes Google sign-in, but Google may serve an automation-detected session *without* the token-binding cookie (and sometimes without the secondary-binding cookies `OSID` / `APISID` + `SAPISID` the automatic `RotateCookies` recovery needs to re-mint it). When that happens the saved `storage_state.json` is genuinely incomplete and re-running the same flow reproduces it.
-- **`notebooklm login --browser-cookies chrome` (or `edge`) → `Could not decrypt chrome cookies`.** Chrome 127+ (and current Edge) protect the cookie database with **App-Bound Encryption (ABE)**: the decryption key is bound to the browser process via a Windows service, so no external process can read it. This blocks every cookie-extraction library (`rookiepy`, `browser-cookie3`, `pycookiecheat`), not just `notebooklm-py`. There is no flag that bypasses ABE.
+- **`notebooklm login --browser-cookies chrome` (or `edge`) → `Could not decrypt chrome cookies`.** Chrome 127+ (and current Edge) protect the cookie database with **App-Bound Encryption (ABE)**: the decryption key is bound to the browser process via a Windows service, so no external process can read it. This blocks every cookie-extraction library (`rookie-cookies`, `browser-cookie3`, `pycookiecheat`), not just `notebooklm-py`. There is no flag that bypasses ABE.
 
-Note that `notebooklm doctor` may still say the auth check passed with an older client — the check historically only looked for `SID`. Current versions surface a **warn** row when `__Secure-1PSIDTS` is missing (`auth check --test` has always reported the real error). Trust `notebooklm auth check --test` / `notebooklm list` over a green `doctor` for "is this session actually usable".
+`notebooklm doctor` checks local auth material, not whether Google accepts the session.
+It reports a **warn** row when `__Secure-1PSIDTS` is missing, expired, empty, or
+cannot be sent to the configured NotebookLM URL. A usable local `SID` does not
+guarantee successful recovery or an accepted server session. Use
+`notebooklm auth check --test --passive` to test token fetching without refreshing
+or writing credentials when the required cookie names remain structurally usable.
+Absent, empty, malformed, or disallowed-domain PSIDTS stops the passive check
+locally before contacting Google. For incomplete file-backed auth, use
+`notebooklm auth check --test` for best-effort recovery; it may refresh, rotate,
+or update stored cookies. Incomplete inline auth needs a complete export, or
+unsetting `NOTEBOOKLM_AUTH_JSON` to use stored profile recovery.
+Keep the same `--profile` / `--storage` selector and inline auth environment as
+the failing command; doctor prints guidance for that source. On Windows, paste
+doctor's labeled commands into PowerShell so quoted selectors stay literal.
 
 Workarounds, most reliable first:
 
@@ -115,9 +169,9 @@ Workarounds, most reliable first:
    ```
    (If your Google session lives in a Multi-Account Containers tab, use the explicit `firefox::Container` / `firefox::none` syntax — see the [macOS section above](#macos---browser-cookies-prompts-for-your-password) for the container notes.) This is the simplest fix for the ABE case.
 
-2. **Set up a master token (best for unattended / long-lived use).** `notebooklm login --master-token` (needs the `[headless]` extra: `pip install "notebooklm-py[headless]"`) stores a durable `master_token.json` beside your profile. When cookies are missing or fully expired, the client re-mints a complete, fresh cookie jar — including `__Secure-1PSIDTS` — from the master token in-process, so it does not depend on what the browser login happened to hand back. If Google blocks sign-in inside the automated capture window ("This browser or app may not be secure"), use the CDP-attach or manual `oauth_token` variants described in the [master-token troubleshooting note](#cookie-freshness-for-long-running--unattended-use) above. See also [installation.md#d-headless-server-or-ci](installation.md#d-headless-server-or-ci).
+2. **Set up a master token (best for unattended / long-lived use).** `notebooklm login --master-token --account you@example.com` (needs `gpsoauth`, supplied by the `[headless]` or `[android]` extra) stores a durable `master_token.json` beside your profile. When cookies are missing or fully expired, the Web client re-mints a complete, fresh cookie jar — including `__Secure-1PSIDTS` — from the master token in-process, so it does not depend on what the browser login happened to hand back. If Google blocks sign-in inside the automated capture window ("This browser or app may not be secure"), use the CDP-attach or manual `oauth_token` variants described in the [master-token troubleshooting note](#cookie-freshness-for-long-running--unattended-use) above. See also [installation.md#d-headless-server-or-ci](installation.md#d-headless-server-or-ci).
 
-   > ⚠️ **The one-time bootstrap is not browser-free.** Plain `notebooklm login --master-token` launches a headed Playwright browser to capture the single-use `oauth_token`, so on a machine where the browser cannot start at all (see [`spawn UNKNOWN`](#windows-browser-fails-to-start-with-spawn-unknown) below) it fails the same way. Only the two manual variants avoid spawning a browser: `--master-token --oauth-token <value>` (paste the cookie yourself) and `--master-token --cdp-url <url>` (attach to a Chrome you started). What *is* browser-free is everything *after* bootstrap — the layer-4 re-mint from the stored `master_token.json`.
+   > ⚠️ **The one-time bootstrap is not browser-free.** Plain `notebooklm login --master-token --account you@example.com` launches a headed Playwright browser to capture the single-use `oauth_token`, so on a machine where the browser cannot start at all (see [`spawn UNKNOWN`](#windows-browser-fails-to-start-with-spawn-unknown) below) it fails the same way. Only the two manual variants avoid spawning a browser: `--master-token --account you@example.com --oauth-token <value>` (paste the cookie yourself) and `--master-token --account you@example.com --cdp-url <url>` (attach to a Chrome you started). What *is* browser-free is everything *after* bootstrap — the layer-4 re-mint from the stored `master_token.json`.
 
 3. **Retry the Playwright login on a fresh profile.** Sometimes a stale persistent profile is the culprit rather than automation detection:
    ```bash
@@ -191,7 +245,7 @@ Common causes:
 ```bash
 notebooklm login   # re-extract cookies with their original domains
 ```
-If it recurs, inspect `storage_state.json` and confirm each cookie kept its own `domain` field rather than being rewritten to one host. See [`docs/auth-cookie-lifecycle.md`](auth-cookie-lifecycle.md) for the cookie-domain model.
+If it recurs, inspect `storage_state.json` and confirm each cookie kept its own `domain` field rather than being rewritten to one host. The [installation guide](installation.md#d-headless-server-or-ci) covers the supported credential files.
 
 **Note:** These errors should rarely surface, since the client automatically retries with a fresh CSRF token on auth failures (see *Automatic Token Refresh* above). When one does reach you, the automatic refresh also failed.
 
@@ -204,13 +258,15 @@ Or re-run `notebooklm login` if session cookies are also expired. If the failure
 
 #### "NotebookLM redirected this request to its region / anti-abuse access gate"
 
-**Cause:** The request to the personal app host — `notebook.google.com` by default since #2067, or whichever host `NOTEBOOKLM_BASE_URL` selects — was redirected to **`notebooklm.google/?location=unsupported`** — Google's region / anti-abuse risk-control gate (the marketing/landing page, which has no CSRF token). This is **not** a library bug, expired login, or page-structure change, and **re-running `notebooklm login` will not fix it** (the cookies are fine). It is driven by the *access environment*, not just the account's country, and fires even for accounts in supported regions when Google sees:
+**Cause:** The request to the personal app host — `notebook.google.com` by default since #2067, or whichever host `NOTEBOOKLM_BASE_URL` selects — was redirected to **`notebooklm.google/?location=unsupported`** — Google's region / anti-abuse risk-control gate (the marketing/landing page, which has no CSRF token). The response is a landing page rather than the authenticated app, so it cannot supply app tokens. The redirect alone does not establish cookie validity or the underlying cause. The gate can depend on the *access environment*, not just the account's country, and can affect accounts in supported regions when Google sees:
 
 - a **VPN / proxy / datacenter / shared IP** (especially previously-abused ones),
 - an **IP ↔ timezone ↔ browser-language mismatch**, or
 - a **non-browser / automated access pattern** (a raw HTTP client without a real browser fingerprint).
 
-**Confirm:** open the same host the client is using (`https://notebook.google.com` unless you set `NOTEBOOKLM_BASE_URL`) in a normal browser, signed in to the same account, on the same network. If it also redirects to `notebooklm.google/?location=unsupported`, the gate is environmental. Test the host that actually failed — the two personal hosts are gated by the same risk-control system, but diagnosing against the host you are not using is how a working setup gets misread as broken.
+The rebranded landing page is **`https://notebook.google/`** (without `.com`); `notebooklm.google` now redirects there. It is a marketing site, not a new authenticated app endpoint. A redirect there alone does not establish that cookies expired or identify why Google declined app access. Do not set `NOTEBOOKLM_BASE_URL` to that landing host or copy cookies to it. Issue [#2441](https://github.com/teng-lin/notebooklm-py/issues/2441) exposed a missing landing-host alias in the redirect diagnostic; recognizing it improves the error but does not bypass Google's access gate or establish the cause of an RPC `PERMISSION_DENIED` response.
+
+**Confirm:** open the same host the client is using (`https://notebook.google.com` unless you set `NOTEBOOKLM_BASE_URL`) in a normal browser, signed in to the same account, on the same network. If it also redirects to `notebooklm.google/?location=unsupported` or `notebook.google/`, compare the result on another network to investigate the access environment. Test the host that actually failed — the two personal hosts are gated by the same risk-control system, but diagnosing against the host you are not using is how a working setup gets misread as broken.
 
 **Solution:** access from a **residential connection in a supported region**, keep your system **timezone/language consistent** with the IP's country, and avoid shared/datacenter VPN exit IPs. When the trigger is the **non-browser fingerprint** (a raw HTTP client) rather than the IP, the opt-in browser-TLS-impersonation transport can help: set `NOTEBOOKLM_TRANSPORT=curl_cffi` (requires the `curl_cffi` package) so requests carry a real browser's TLS fingerprint. (See issue [#1630](https://github.com/teng-lin/notebooklm-py/issues/1630).)
 
@@ -238,9 +294,9 @@ notebooklm login --browser chrome --storage <path>
 
 ### Configuration Errors
 
-#### `ValueError: NOTEBOOKLM_BASE_URL must use https and one of: ...` lists a host that is not documented
+#### `ValueError: NOTEBOOKLM_BASE_URL must use https and one of: ...`
 
-**Cause:** The error message enumerates every host the base-URL validator currently accepts. That list is not the same as the list of *supported* values in [configuration.md](configuration.md) — it now also names the Gemini Notebook rebrand host, `notebook.google.com`.
+**Cause:** `NOTEBOOKLM_BASE_URL` does not match an accepted HTTPS app origin. The error lists the supported hosts documented in [configuration.md](configuration.md): `notebook.google.com` (default), `notebooklm.google.com` (legacy personal), `notebook.cloud.google.com` (enterprise), and `notebooklm.cloud.google.com` (legacy enterprise). Non-root paths, query strings, credentials, and explicit ports are rejected. The marketing hosts `notebook.google` and `notebooklm.google` are not authenticated app endpoints.
 
 **Status:** `notebook.google.com` is **the default** since #2067. A live probe on 2026-08-04 reached `batchexecute` on **both** personal hosts, so the endpoint is dual-served, not rebrand-host-only or legacy-only. The cassettes in `tests/cassettes/` now record requests against the rebrand host. The pre-rebrand host `notebooklm.google.com` remains a valid, still-served value and is the documented rollback lever; switching back is normally just the variable, with the caveats described below. See [ADR-0028](adr/0028-gemini-notebook-rename.md).
 
@@ -253,7 +309,10 @@ export NOTEBOOKLM_BASE_URL=https://notebook.google.com
 # Personal, pre-rebrand host (still served; rollback lever)
 export NOTEBOOKLM_BASE_URL=https://notebooklm.google.com
 
-# Enterprise
+# Enterprise (origin only; project/region routing is not configured here)
+export NOTEBOOKLM_BASE_URL=https://notebook.cloud.google.com
+
+# Legacy enterprise
 export NOTEBOOKLM_BASE_URL=https://notebooklm.cloud.google.com
 ```
 
@@ -309,6 +368,7 @@ Or in Python:
 
 ```python
 import os
+
 os.environ["NOTEBOOKLM_RPC_OVERRIDES"] = '{"LIST_NOTEBOOKS": "newId123"}'
 
 from notebooklm import NotebookLMClient
@@ -320,9 +380,9 @@ from notebooklm import NotebookLMClient
 - The override is applied at BOTH the URL `rpcids=` query parameter AND the
   request body `f.req` payload, so the wire format stays consistent.
 - The override is gated on the configured base host being a known Google
-  NotebookLM endpoint (`notebook.google.com`, `notebooklm.google.com`, or
-  `notebooklm.cloud.google.com`). Overrides do NOT apply to non-Google
-  hosts, so this env var cannot be weaponised to leak custom RPC IDs to a
+  NotebookLM endpoint (`notebook.google.com`, `notebooklm.google.com`,
+  `notebook.cloud.google.com`, or `notebooklm.cloud.google.com`). Overrides do NOT
+  apply to non-Google hosts, so this env var cannot be weaponised to leak custom RPC IDs to a
   hostile endpoint.
 - Method names not listed in the override map continue to use the canonical
   IDs from `notebooklm.rpc.types.RPCMethod`.
@@ -337,7 +397,7 @@ the `Found RPC IDs in response: [...]` line tells you what the server is
 now returning. Cross-reference against the call site that failed.
 
 Please also report the rotated IDs in a GitHub issue so the canonical
-mapping in `src/notebooklm/rpc/types.py` can be updated for everyone.
+mapping in `src/notebooklm/rpc/_identifiers.py` can be updated for everyone.
 
 #### How to get the full response preview from an RPCError
 
@@ -353,6 +413,7 @@ Or in Python, set the env var before instantiating the client:
 
 ```python
 import os
+
 os.environ["NOTEBOOKLM_DEBUG"] = "1"
 
 from notebooklm import NotebookLMClient
@@ -626,6 +687,7 @@ status = await with_rate_limit_retry(
     max_retries=3,
 )
 
+
 # For non-artifact RPC calls, retry by passing a fresh callable each attempt
 async def retry_rpc_call(make_call, max_retries=3):
     for attempt in range(max_retries + 1):
@@ -635,6 +697,7 @@ async def retry_rpc_call(make_call, max_retries=3):
             if attempt >= max_retries:
                 raise
             await asyncio.sleep(2**attempt)
+
 
 notebook = await retry_rpc_call(lambda: client.notebooks.create("Research Notes"))
 ```
@@ -684,7 +747,10 @@ Some features have daily/hourly quotas:
 
 ### Download Requirements
 
-Artifact downloads (audio, video, images) use `httpx` with cookies from your storage state. **Playwright is NOT required for downloads**—only for the initial `notebooklm login`.
+Artifact downloads (audio, video, images) use `httpx` with cookies from your
+storage state. **Playwright is not required for downloads themselves**—it is
+used only by interactive `notebooklm login` or, when explicitly enabled, the
+optional layer-3 browser recovery path.
 
 If downloads fail with authentication errors:
 
@@ -727,7 +793,11 @@ playwright install-deps chromium
 
 **`playwright install chromium` fails with `TypeError: onExit is not a function`:**
 
-This is an environment-specific Playwright install failure that has been observed with some newer Playwright builds on Linux. `notebooklm-py` only needs a working browser install for `notebooklm login`; the workaround is to install a known-good Playwright version in a clean virtual environment.
+This is an environment-specific Playwright install failure that has been observed
+with some newer Playwright builds on Linux. `notebooklm-py` needs a working
+browser install for interactive `notebooklm login` and for explicitly enabled
+layer-3 browser recovery; the workaround is to install a known-good Playwright
+version in a clean virtual environment.
 
 **Workaround** (intentionally uses `pip` rather than the canonical `uv sync --frozen` flow from [installation.md#e-contributor](installation.md#e-contributor) — this workaround needs to *override* the `playwright>=1.40.0` constraint to a specific older version, which `uv sync --frozen` would refuse):
 ```bash
@@ -771,22 +841,41 @@ playwright install chromium
 
 **CLI hangs indefinitely (issue #75):**
 
-On certain Windows environments (particularly when running inside Sandboxie or similar sandboxing software), the CLI may hang indefinitely at startup. This is caused by the default `ProactorEventLoop` blocking at the IOCP (I/O Completion Ports) layer.
+The CLI runs on asyncio's default Windows event loop, `ProactorEventLoop`, like `notebooklm-mcp`, `notebooklm-server` and the Python API. One user running the CLI inside a Sandboxie-Plus box reported commands hanging at the IOCP (I/O Completion Ports) layer with that loop.
 
 **Symptoms:**
-- CLI starts but never responds
+- `notebooklm login` works, but `notebooklm list` and other network commands never return
 - Process appears frozen with no output
-- Happens consistently in sandboxed environments
+- Ctrl+C shows a traceback ending in `_overlapped.GetQueuedCompletionStatus`
 
-**Solution:** The library automatically sets `WindowsSelectorEventLoopPolicy` at CLI startup to avoid this issue. If you're using the Python API directly and encounter hanging, add this before any async code:
+**Solution:** Switch the CLI to the selector event loop:
+
+```powershell
+$env:NOTEBOOKLM_WINDOWS_EVENT_LOOP = "selector"   # PowerShell
+```
+
+```bat
+set NOTEBOOKLM_WINDOWS_EVENT_LOOP=selector
+```
+
+Only do this if the default loop hangs. On Python 3.12–3.14 asyncio's selector loop has a bug that drops data from large uploads ([#2485](https://github.com/teng-lin/notebooklm-py/issues/2485)). When this variable selects it, the CLI installs the fix from Python 3.15 for the run, so `source add` uploads are safe. Python 3.10, 3.11 and 3.15 do not have the bug.
+
+The variable accepts only `selector` or `proactor` (case-insensitive). Any other value makes every CLI command, even `status`, fail before it starts with `Unknown NOTEBOOKLM_WINDOWS_EVENT_LOOP=...` (`CONFIG_ERROR` with `--json`). If you set it persistently, for example in your user environment variables, fix or remove it there.
+
+Earlier releases forced the selector loop on every Windows machine (#79). If you added a workaround for #2485, such as a `.pth` hook that aliases `WindowsSelectorEventLoopPolicy` to the Proactor policy, you can remove it.
+
+For the Python API in such an environment, run your code on a selector loop. The library does not patch asyncio, so on Python 3.12–3.14 large uploads on that loop can fail with `NETWORK_ERROR … (upload_finalize)` after a flood of `AssertionError: Data should not be empty`; use Python 3.11 or 3.15 if you upload large files there:
 
 ```python
 import asyncio
-import sys
 
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)  # Python 3.12+
+
+with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:  # Python 3.11
+    runner.run(main())
 ```
+
+On Python 3.10, set `asyncio.WindowsSelectorEventLoopPolicy()` with `asyncio.set_event_loop_policy` before calling `asyncio.run`.
 
 **Unicode encoding errors on non-English Windows (issue #75, #80):**
 
@@ -927,6 +1016,28 @@ into `source_add(bytes_base64=…)` (and `studio_get_prompt` into
 `studio_list(item=…)`), the removed tool names failed with `Unknown tool`, but
 `source_add` with the new `bytes_base64` argument reached the upgraded server and
 worked without a reconnect.
+
+### MCP server `CONNECT_TIMEOUT` on connect ("connection timed out after 30000ms")
+
+**Cause (fixed in the version that shipped #2330):** the server used to open its
+`NotebookLMClient` — cookie rotation plus the CSRF fetch, and the cold-recovery
+ladder when those fail — *before* answering the MCP `initialize` handshake. That
+auth work has a larger budget (a 15 s `RotateCookies` poke plus a 30 s CSRF
+fetch, more on the recovery rungs) than the 30 s deadline hosts give the
+handshake, so a slow or rate-limited Google looked to the host like a dead
+server: `CONNECT_TIMEOUT`, with no way to tell "still working" from "stuck".
+Each retry spawned a fresh process that redid the same work, which is why it
+took several attempts (and, once cookies were warm, eventually succeeded).
+
+The client is now opened **lazily and in the background**: the handshake answers
+immediately, and the first tool call awaits the auth round-trip instead. An auth
+problem now arrives as a normal tool error (`AUTH: …`) naming the real cause, and
+the next call retries the open — so re-running `notebooklm login` recovers a
+running server without restarting it.
+
+**If you still see `CONNECT_TIMEOUT`:** you are on an older server. Upgrade, and
+check the host's MCP logs (the server logs to stderr) for the real error. It is
+not an auth problem in the client — the handshake never reaches auth.
 
 ## Getting Help
 

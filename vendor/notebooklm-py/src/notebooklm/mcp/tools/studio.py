@@ -3,12 +3,9 @@
 Thin adapters over the transport-neutral artifact cores:
 
 * ``studio_list`` reads ``client.artifacts.list`` directly (like ``source_list``).
-* ``studio_generate`` is a hybrid over the neutral ``generate`` core: it builds a
-  :class:`~notebooklm._app.generate.GenerationPlan` via ``build_generation_plan``
-  (which enum-maps + validates the per-kind options) and drives
-  ``execute_generation`` with **pass-through** notebook/source resolvers (MCP has
-  already resolved the notebook id and supplies full source ids). Each ``type``
-  routes to the matching ``client.artifacts.generate_*`` method.
+* ``studio_generate`` constructs one frozen per-kind generation request and drives
+  the neutral ``execute_generation`` core with already-resolved notebook/source
+  IDs. Each ``type`` routes to the matching ``client.artifacts.generate_*`` method.
 * ``studio_status`` is the **stateless** poll path (``_app.artifacts.poll_artifact``
   → ``client.artifacts.poll_status``) so an agent can poll a ``task_id`` across
   separate tool calls without holding server state.
@@ -23,8 +20,9 @@ from the canonical neutral ``_app.download_specs`` registry through
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from fastmcp import Context
 
@@ -32,6 +30,7 @@ from ..._app import artifacts as artifact_core
 from ..._app import download as download_core
 from ..._app import generate as generate_core
 from ..._app import notes as note_core
+from ..._app.generation_requests import UNSET, build_generation_request
 from ..._app.language import is_supported_language
 from ..._app.resolve import FULL_ID_PATTERN
 from ..._app.serialize import to_jsonable
@@ -46,9 +45,15 @@ from ...exceptions import (
     ServerError,
     ValidationError,
 )
-from ...rpc.types import GrpcStatusCode
+from ...types import ArtifactLookupStatus, GrpcStatusCode
 from .._coerce import coerce_list
-from .._confirm import DESTRUCTIVE, READ_ONLY, needs_confirmation
+from .._confirm import (
+    DESTRUCTIVE,
+    READ_ONLY,
+    confirmed_name_deprecation,
+    needs_confirmation,
+    with_confirmation_deprecation,
+)
 from .._context import get_client, get_file_transfer
 from .._errors import mcp_errors
 from .._paginate import DEFAULT_LIMIT, paginate
@@ -59,6 +64,7 @@ from .._resolve import (
     resolve_sources,
 )
 from ._passthrough import passthrough_child_id, passthrough_notebook_id
+from ._studio_delete import delete_studio_items, validate_delete_refs
 from ._studio_download import (
     _DOWNLOAD_SPECS,
     _INLINE_TEXT_TYPES,
@@ -82,108 +88,12 @@ from ._studio_payloads import _artifact_rename_payload, _generation_payload
 if TYPE_CHECKING:
     from ...client import NotebookLMClient
 
-#: Per-kind default option values mirroring the CLI ``generate`` Click ``Choice``
-#: defaults, so a bare ``studio_generate(notebook, type=…)`` succeeds without
-#: the agent restating every enum. The agent can override any of these by passing
-#: the matching keyword; ``build_generation_plan`` enum-maps + validates them.
-_KIND_DEFAULTS: dict[str, dict[str, Any]] = {
-    "audio": {"audio_format": "deep-dive", "audio_length": "default"},
-    "video": {"video_format": "explainer", "style": "auto"},
-    "cinematic-video": {},
-    "slide-deck": {"deck_format": "detailed", "deck_length": "default"},
-    "quiz": {"quantity": "standard", "difficulty": "medium"},
-    "flashcards": {"quantity": "standard", "difficulty": "medium"},
-    "infographic": {"orientation": "landscape", "detail": "standard", "style": "auto"},
-    "data-table": {},
-    "mind-map": {"map_kind": "interactive"},
-    "report": {"report_format": "briefing-doc"},
-}
-
-#: Per-kind agent-settable options → their accepted choices. ``None`` choices mean
-#: free text (only ``style_prompt``). This single table drives all three things the
-#: agent-facing override path needs:
-#:
-#: * **Choice validation** up front, so a bad value surfaces as a clean ``VALIDATION``
-#:   error rather than a raw ``KeyError`` from a generate-core display-name lookup that
-#:   runs before its own choice validation (the CLI never hits this — Click validates
-#:   the ``Choice`` first).
-#: * **The ``style`` collision** — ``video`` and ``infographic`` both take a ``style``
-#:   kwarg but with DIFFERENT choice sets (overlapping only on ``auto``/``anime``/
-#:   ``kawaii``); keying choices by ``artifact_type`` keeps them apart.
-#: * **Wrong-kind rejection** — an option valid for some other kind (e.g. ``orientation``
-#:   passed to ``quiz``) is rejected here, because the neutral core silently *ignores*
-#:   irrelevant extras (``build_generation_plan`` "picks the relevant subset"), which
-#:   would otherwise be a confusing silent no-op for an agent.
-#:
-#: The literal choice tuples are DUPLICATED from the neutral core's private ``_*_MAP``
-#: maps (MCP must not import them — the CLI/MCP boundary rule); a guardrail test pins
-#: these tuples equal to the core maps so they can't silently drift. ``map_kind`` has no
-#: core map (the core reads it raw and any non-``interactive`` value routes note-backed),
-#: so it is validated here ONLY.
-_KIND_OPTIONS: dict[str, dict[str, tuple[str, ...] | None]] = {
-    "audio": {
-        "audio_format": ("deep-dive", "brief", "critique", "debate"),
-        "audio_length": ("short", "default", "long"),
-    },
-    "video": {
-        "video_format": ("explainer", "brief", "cinematic", "short"),
-        "style": (
-            "auto",
-            "custom",
-            "classic",
-            "whiteboard",
-            "kawaii",
-            "anime",
-            "watercolor",
-            "retro-print",
-            "heritage",
-            "paper-craft",
-        ),
-        "style_prompt": None,
-    },
-    "cinematic-video": {},
-    "slide-deck": {
-        "deck_format": ("detailed", "presenter"),
-        "deck_length": ("default", "short"),
-    },
-    "quiz": {
-        "quantity": ("fewer", "standard", "more"),
-        "difficulty": ("easy", "medium", "hard"),
-    },
-    "flashcards": {
-        "quantity": ("fewer", "standard", "more"),
-        "difficulty": ("easy", "medium", "hard"),
-    },
-    "infographic": {
-        "orientation": ("landscape", "portrait", "square"),
-        "detail": ("concise", "standard", "detailed"),
-        "style": (
-            "auto",
-            "sketch-note",
-            "professional",
-            "bento-grid",
-            "editorial",
-            "instructional",
-            "bricks",
-            "clay",
-            "anime",
-            "kawaii",
-            "scientific",
-        ),
-    },
-    "data-table": {},
-    "mind-map": {"map_kind": ("interactive", "note-backed")},
-    "report": {"report_format": ("briefing-doc", "study-guide", "blog-post", "custom")},
-}
-
 
 async def _passthrough_sources(
     _client: NotebookLMClient,
     _notebook_id: str,
-    source_ids: Any,
-    *,
-    json_output: bool = False,
-) -> Any:
+    source_ids: tuple[str, ...],
+) -> list[str] | None:
     """Return the supplied (already-full) source ids, or ``None`` when none were
     given so the backend uses *every* source.
 
@@ -195,7 +105,7 @@ async def _passthrough_sources(
     returning a null id surfaced as ``… generation is unavailable``. The tool
     passes ``tuple(source_ids or ())``, so omitting ``source_ids`` arrives here
     as ``()`` and must become ``None``."""
-    return source_ids or None
+    return cast(list[str] | None, source_ids or None)
 
 
 def register(mcp: Any) -> None:
@@ -240,17 +150,16 @@ def register(mcp: Any) -> None:
 
         * ``detail`` ladder (NOTE bodies only; read a report/data-table body via
           ``studio_download``): ``summary`` (default) gives each note a bounded
-          ``content_preview`` + ``char_count`` (artifacts add ``created_at`` +
-          ``generation_prompt``, the free-text prompt the artifact was generated from,
-          ``null`` when it records none); ``full`` = whole ``content``; ``compact`` = a
+          ``content_preview`` + ``char_count``. Artifacts add ``created_at``,
+          ``generation_prompt``, ``duration_seconds``, ``slide_count``, ``source_count``
+          (unknown metadata/counts are ``null``). ``full`` = whole ``content``; ``compact`` = a
           ``id``/``title``/``type``/``status_label``/``created_at`` roster.
         * ``kind`` filters to one ``type``.
         * ``item`` (name or id) fetches just that item as a 1-element list with the
-          note's FULL ``content`` (an artifact also carries its ``generation_prompt``);
+          note's FULL ``content`` or the artifact's summary metadata;
           no match is NOT_FOUND. ``limit`` / ``offset`` / ``detail`` are ignored with
           ``item``; ``kind`` scopes resolution.
         """
-        client = get_client(ctx)
         with mcp_errors():
             # Validate pagination bounds unconditionally (inside ``mcp_errors`` so
             # the VALIDATION wire-contract applies) — ``studio_list(item=x,
@@ -262,6 +171,7 @@ def register(mcp: Any) -> None:
             # ``kind`` is a ``Literal`` — FastMCP/Pydantic rejects an unknown value at
             # the schema boundary, so no runtime membership check is needed (same as
             # ``studio_generate``'s ``artifact_type``).
+            client = await get_client(ctx)
             nb_id = await resolve_notebook(client, notebook)
             if item is not None:
                 # Single fetch by ref over the merged list; the resolved item's full
@@ -331,10 +241,8 @@ def register(mcp: Any) -> None:
         # Finite-choice per-kind options are typed as ``Literal`` so FastMCP/Pydantic
         # emits a JSON-schema ``enum`` (agents discover valid values from the schema,
         # not by trial-and-error) and rejects out-of-enum values at the boundary. The
-        # members are DUPLICATED from the neutral core's private ``_*_MAP`` maps via
-        # ``_KIND_OPTIONS`` (the CLI/MCP boundary forbids importing them); a guardrail
-        # test pins each ``enum`` equal to ``_KIND_OPTIONS`` (itself pinned to the core
-        # maps) so they can't drift. ``style_prompt``/``language`` stay free text.
+        # members mirror the neutral option contract; schema parity tests pin every
+        # ``enum`` to that authority. ``style_prompt``/``language`` stay free text.
         report_format: Literal["briefing-doc", "study-guide", "blog-post", "custom"] | None = None,
         audio_format: Literal["deep-dive", "brief", "critique", "debate"] | None = None,
         audio_length: Literal["short", "default", "long"] | None = None,
@@ -343,9 +251,8 @@ def register(mcp: Any) -> None:
         video_format: Literal["explainer", "brief", "cinematic", "short"] | None = None,
         # ``style`` is shared by ``video`` and ``infographic`` with DIFFERENT value
         # sets (overlap only auto/anime/kawaii). One param carries one Literal, so this
-        # is the UNION of both kinds' values; the runtime ``_KIND_OPTIONS`` loop narrows
-        # it per-kind (a video-only value on infographic, or vice versa, is rejected
-        # there with a clean VALIDATION error).
+        # is the UNION of both kinds' values; the neutral request builder narrows it
+        # per kind after schema parsing.
         style: Literal[
             # full video set (auto/kawaii/anime also valid for infographic)
             "auto",
@@ -418,7 +325,6 @@ def register(mcp: Any) -> None:
         (including ``mind-map``). ``language`` (optional) is a language code,
         e.g. ``en``/``ja``/``zh_Hans``.
         """
-        client = get_client(ctx)
         with mcp_errors():
             # Tolerate ``source_ids`` sent as a JSON-array string / comma string /
             # scalar (some MCP clients + LLM tool-callers do); normalize to a
@@ -434,79 +340,57 @@ def register(mcp: Any) -> None:
             if language is not None and not is_supported_language(language):
                 raise ValidationError(f"Unsupported language {language!r}")
 
-            # Validate caller-supplied per-kind overrides FIRST — before resolving the
-            # notebook — so a wrong-kind or invalid option fails fast without a wasted
-            # notebook-resolution round-trip. Each option is validated against the choice
-            # set for THIS ``artifact_type`` (see ``_KIND_OPTIONS``): an option not accepted
-            # by this kind is rejected (the core would otherwise silently ignore it), and a
-            # bad value surfaces a clean VALIDATION error. ``style_prompt`` (choices
-            # ``None``) is free text — the core enforces the ``style=custom`` ⇔
-            # ``style_prompt`` combination rules.
-            allowed = _KIND_OPTIONS[artifact_type]
-            overrides: dict[str, Any] = {}
-            for key, value in (
-                ("report_format", report_format),
-                ("audio_format", audio_format),
-                ("audio_length", audio_length),
-                ("quantity", quantity),
-                ("difficulty", difficulty),
-                ("video_format", video_format),
-                ("style", style),
-                ("style_prompt", style_prompt),
-                ("deck_format", deck_format),
-                ("deck_length", deck_length),
-                ("orientation", orientation),
-                ("detail", detail),
-                ("map_kind", map_kind),
-            ):
-                if value is None:
-                    continue
-                if key not in allowed:
-                    accepts = (
-                        f"this kind accepts {sorted(allowed)}"
-                        if allowed
-                        else "this kind accepts no per-kind options"
-                    )
-                    raise ValidationError(
-                        f"option {key!r} is not valid for artifact_type {artifact_type!r}; "
-                        f"{accepts}"
-                    )
-                choices = allowed[key]
-                if choices is not None and value not in choices:
-                    raise ValidationError(
-                        f"Invalid {key} {value!r}; expected one of {list(choices)}"
-                    )
-                overrides[key] = value
+            # Construct the typed request before name resolution so shared
+            # wrong-kind/value validation still fails before any remote lookup.
+            # The canonical IDs are installed immutably after resolution.
+            normalized_instructions = instructions or None
+            request = build_generation_request(
+                artifact_type,
+                notebook_id=notebook,
+                source_ids=UNSET,
+                language=language or "en",
+                instructions=normalized_instructions,
+                option_values={
+                    "report_format": report_format,
+                    "audio_format": audio_format,
+                    "audio_length": audio_length,
+                    "quantity": quantity,
+                    "difficulty": difficulty,
+                    "video_format": video_format,
+                    "style": style,
+                    "style_prompt": style_prompt,
+                    "deck_format": deck_format,
+                    "deck_length": deck_length,
+                    "orientation": orientation,
+                    "detail": detail,
+                    "map_kind": map_kind,
+                },
+                extra_instructions=None,
+            )
 
-            nb_id = await resolve_notebook(client, notebook)
+            client = await get_client(ctx)
+            nb_id = await resolve_notebook(client, notebook, strict=True)
             # Resolve each source ref the same way every other source-accepting tool
             # does (full-UUID fast-path, 12-char prefix, exact title) instead of
             # forwarding raw — so an agent that passed a prefix/title (the style that
             # works elsewhere) or an empty string gets it validated/resolved, not
             # forwarded to the backend. Omitted/empty stays None (= all sources, #1652).
             resolved_source_ids = (
-                await resolve_sources(client, nb_id, source_ids) if source_ids else None
+                await resolve_sources(client, nb_id, source_ids, strict=True)
+                if source_ids
+                else None
             )
-            raw_args: dict[str, Any] = dict(_KIND_DEFAULTS[artifact_type])
-            raw_args.update(
-                {
-                    "notebook_id": nb_id,
-                    "description": instructions or "",
-                    # ``mind-map`` reads ``raw_args["instructions"]`` (every other kind
-                    # reads ``description``); set it so mind-map instructions actually
-                    # reach the client — the extra key is ignored by the other builders.
-                    "instructions": instructions or None,
-                    "source_ids": tuple(resolved_source_ids or ()),
-                    "language": language,
-                    "wait": False,
-                    "json_output": True,
-                }
+            request = replace(
+                request,
+                notebook_id=nb_id,
+                source_ids=(
+                    UNSET  # type: ignore[arg-type]
+                    if resolved_source_ids is None
+                    else tuple(resolved_source_ids)
+                ),
             )
-            raw_args.update(overrides)
-
-            plan = generate_core.build_generation_plan(artifact_type, raw_args)
             result = await generate_core.execute_generation(
-                plan,
+                request,
                 client,
                 notebook_resolver=passthrough_notebook_id,
                 source_resolver=_passthrough_sources,
@@ -527,8 +411,8 @@ def register(mcp: Any) -> None:
         ``url`` / ``error`` / ``is_complete`` / ``media_ready``; poll until done. A
         pending ``url`` is provisional — trust it only if ``media_ready``.
         """
-        client = get_client(ctx)
         with mcp_errors():
+            client = await get_client(ctx)
             nb_id = await resolve_notebook(client, notebook)
             status = await artifact_core.poll_artifact(client, nb_id, task_id)
             view = artifact_core.status_view(status)
@@ -565,8 +449,8 @@ def register(mcp: Any) -> None:
         connector an explicit ``artifact_id`` (and ``output_format``) is validated up
         front — an unknown/ambiguous id fails immediately, not as a 400 when opened.
         """
-        client = get_client(ctx)
         with mcp_errors():
+            client = await get_client(ctx)
             nb_id = await resolve_notebook(client, notebook)
             # Title of the resolved target, when known cheaply (the ref path and the
             # explicit-id pre-validation both already list, so they capture it) —
@@ -698,12 +582,14 @@ def register(mcp: Any) -> None:
                 # resource_link still gets the content (#1907). Bounded to
                 # INLINE_TEXT_MAX_CHARS; the link remains the full file.
                 inline: tuple[str, int, bool] | None = None
+                size_bytes: int | None = None
                 if artifact_type in _INLINE_TEXT_TYPES:
                     read = await _read_inline_artifact_text(
                         client, nb_id, spec, output_format, artifact_id
                     )
                     if read is not None:
                         inline = (read.content, read.char_count, read.truncated)
+                        size_bytes = read.size_bytes
                         # Pin the signed link to the SAME artifact whose body we inlined
                         # — on the "latest" path (artifact_id was None) this stops the
                         # link from drifting to a newer artifact if one completes before
@@ -720,6 +606,7 @@ def register(mcp: Any) -> None:
                     artifact_id,
                     title=resolved_title,
                     inline=inline,
+                    size_bytes=size_bytes,
                 )
             # No file-transfer config. On the remote (http) connector the server
             # filesystem is unreachable REGARDLESS of `path`, so fail clearly here —
@@ -773,12 +660,12 @@ def register(mcp: Any) -> None:
         Returns ``item_id`` / ``type`` plus the applied ``new_title`` and
         ``is_mind_map``.
         """
-        client = get_client(ctx)
         with mcp_errors():
             item = item.strip()
-            nb_id = await resolve_notebook(client, notebook)
+            client = await get_client(ctx)
+            nb_id = await resolve_notebook(client, notebook, strict=True)
             try:
-                resolved = await resolve_studio_item(client, nb_id, item)
+                resolved = await resolve_studio_item(client, nb_id, item, mutating=True)
             except NotFoundError:
                 # Mirror studio_delete: an absent FULL UUID routes down the artifact
                 # rename path, whose core probes mind_maps.list — preserving
@@ -830,10 +717,10 @@ def register(mcp: Any) -> None:
         ``status``; poll ``studio_status(notebook, task_id)`` until complete. A
         synchronous refusal (rate limit / quota / not-retryable) surfaces as an error.
         """
-        client = get_client(ctx)
         with mcp_errors():
-            nb_id = await resolve_notebook(client, notebook)
-            art_id = await resolve_artifact(client, nb_id, artifact)
+            client = await get_client(ctx)
+            nb_id = await resolve_notebook(client, notebook, strict=True)
+            art_id = await resolve_artifact(client, nb_id, artifact, strict=True)
             try:
                 result = await artifact_core.retry_artifact(client, nb_id, art_id)
             except (AuthError, RateLimitError, ServerError, NetworkError, DecodingError):
@@ -870,13 +757,33 @@ def register(mcp: Any) -> None:
                 # with no status at all (``ArtifactFeatureUnavailableError``), or
                 # one the server tagged INVALID_ARGUMENT / FAILED_PRECONDITION.
                 # Anything else keeps its own error.
+                # A malformed success from a non-idempotent retry carries this
+                # marker. It is not a synchronous wrong-state refusal and must
+                # reach MCP unchanged; probing here could replace it with an
+                # unmarked read failure and encourage a duplicate retry.
+                if getattr(exc, "unconfirmed", False):
+                    raise
                 if not isinstance(exc, ArtifactFeatureUnavailableError) and exc.rpc_code not in (
                     GrpcStatusCode.INVALID_ARGUMENT,
                     GrpcStatusCode.FAILED_PRECONDITION,
                 ):
                     raise
-                art = await client.artifacts.get_or_none(nb_id, art_id)
-                if art is not None and not art.is_failed:
+                lookup = await client.artifacts.lookup(nb_id, art_id)
+                if lookup.status is ArtifactLookupStatus.UNKNOWN:
+                    components = (
+                        ", ".join(sorted({failure.component.value for failure in lookup.failures}))
+                        or "unspecified"
+                    )
+                    raise RPCError(
+                        f"Artifact lookup is incomplete; unavailable components: {components}",
+                        method_id="artifacts.lookup",
+                    ) from None
+                art = lookup.artifact
+                if (
+                    lookup.status is ArtifactLookupStatus.FOUND
+                    and art is not None
+                    and not art.is_failed
+                ):
                     raise ValidationError(
                         f"artifact is not failed (status: {art.status_str}); retry only "
                         "re-runs a failed artifact — use studio_generate for a new one."
@@ -891,28 +798,37 @@ def register(mcp: Any) -> None:
 
     @mcp.tool(annotations=DESTRUCTIVE)
     async def studio_delete(
-        ctx: Context, notebook: str, item: str, confirm: bool = False
+        ctx: Context,
+        notebook: str,
+        item: str | None = None,
+        confirm: bool = False,
+        items: list[str] | str | None = None,
     ) -> dict[str, Any]:
-        """Delete a Studio item (irreversible) — a text note OR an artifact.
+        """Delete notes/artifacts irreversibly: ``item`` XOR ``items`` (1–100 refs).
 
-        Accepts a notebook name or ID plus an ``item`` name-or-id ref resolved over
-        the merged notes+artifacts list. Routing is by resolved type: a ``note`` is
-        deleted via the note system; an artifact via the artifact delete RPC (which
-        itself *clears* a note-backed mind map through the note system rather than
-        hard-removing it — Google may garbage collect it later).
-
-        Two-step confirmation: with ``confirm=False`` (default) it returns a
-        ``needs_confirmation`` preview of the resolved item without deleting; call
-        again with ``confirm=True`` to perform the delete. Deleting an already-absent
-        full id is idempotent (no error) — it routes down the artifact path (a
-        present note would have been found in the list).
+        Names/IDs resolve over Studio. Preview first; confirm with canonical
+        ``notebook_id`` and item ID(s). Batch confirmation requires full IDs.
+        Text notes batch into one write; artifacts (including mind maps) route
+        individually by kind. Batch returns ``deleted`` / ``not_found`` arrays.
+        An absent single full ID is an idempotent success.
         """
-        client = get_client(ctx)
         with mcp_errors():
+            refs = validate_delete_refs(item, items, confirm=confirm)
+            client = await get_client(ctx)
+            nb_id = await resolve_notebook(client, notebook, strict=confirm)
+            if refs is not None:
+                payload = await delete_studio_items(client, nb_id, refs, confirm=confirm)
+                return with_confirmation_deprecation(
+                    payload,
+                    confirmed_name_deprecation(notebook) if confirm else None,
+                )
+            if item is None:  # pragma: no cover - validated above
+                raise ValidationError("Provide 'item' or 'items'")
             item = item.strip()
-            nb_id = await resolve_notebook(client, notebook)
             try:
-                resolved = await resolve_studio_item(client, nb_id, item)
+                # A confirmed call deletes with no preview, so it resolves strictly;
+                # the preview resolves loosely and returns the canonical item id.
+                resolved = await resolve_studio_item(client, nb_id, item, mutating=confirm)
             except NotFoundError:
                 # Idempotent-on-missing carve-out: an absent FULL UUID is safe to
                 # send down the artifact delete path (a present note would have been
@@ -936,13 +852,16 @@ def register(mcp: Any) -> None:
                         }
                     )
                 was_note_backed = await artifact_core.delete_artifact(client, nb_id, item)
-                return {
-                    "status": "deleted",
-                    "notebook_id": nb_id,
-                    "item_id": item,
-                    "type": "mind-map" if was_note_backed else "unknown",
-                    "was_note_backed": was_note_backed,
-                }
+                return with_confirmation_deprecation(
+                    {
+                        "status": "deleted",
+                        "notebook_id": nb_id,
+                        "item_id": item,
+                        "type": "mind-map" if was_note_backed else "unknown",
+                        "was_note_backed": was_note_backed,
+                    },
+                    confirmed_name_deprecation(notebook, item),
+                )
             if not confirm:
                 return needs_confirmation(
                     {
@@ -955,20 +874,26 @@ def register(mcp: Any) -> None:
                 )
             if resolved.type == "note":
                 await note_core.execute_note_delete(client, nb_id, resolved.item_id)
-                return {
+                return with_confirmation_deprecation(
+                    {
+                        "status": "deleted",
+                        "notebook_id": nb_id,
+                        "item_id": resolved.item_id,
+                        "type": "note",
+                        # Always present for a stable wire shape (a text note is never a
+                        # note-backed mind-map artifact).
+                        "was_note_backed": False,
+                    },
+                    confirmed_name_deprecation(notebook, item),
+                )
+            was_note_backed = await artifact_core.delete_artifact(client, nb_id, resolved.item_id)
+            return with_confirmation_deprecation(
+                {
                     "status": "deleted",
                     "notebook_id": nb_id,
                     "item_id": resolved.item_id,
-                    "type": "note",
-                    # Always present for a stable wire shape (a text note is never a
-                    # note-backed mind-map artifact).
-                    "was_note_backed": False,
-                }
-            was_note_backed = await artifact_core.delete_artifact(client, nb_id, resolved.item_id)
-            return {
-                "status": "deleted",
-                "notebook_id": nb_id,
-                "item_id": resolved.item_id,
-                "type": resolved.type,
-                "was_note_backed": was_note_backed,
-            }
+                    "type": resolved.type,
+                    "was_note_backed": was_note_backed,
+                },
+                confirmed_name_deprecation(notebook, item),
+            )

@@ -32,6 +32,7 @@ from .._app.research import (
     ResearchStatusResult,
     cancel_research,
     classify_importable_research,
+    discover_and_classify,
     poll_and_classify,
     validate_research_wait_flags,
 )
@@ -58,9 +59,11 @@ from .resolve import (
     resolve_notebook_id,
 )
 from .services.research import (
+    ResearchValidationError,
     ResearchWaitPlan,
     ResearchWaitResult,
     execute_research_wait,
+    research_validation_message,
 )
 
 # UI-only cap for the research summary preview shown in `research status` /
@@ -81,6 +84,7 @@ def research():
 
     \b
     Commands:
+      discover  Find web sources for a query synchronously (one call)
       status    Check research status (non-blocking)
       wait      Wait for research to complete (blocking)
       import    Import a completed run's sources (no wait for the run)
@@ -105,11 +109,61 @@ def research():
     pass
 
 
-@research.command("status")
+@research.command("discover")
+@click.argument("query", required=False, default="")
 @notebook_option
+@click.option(
+    "--mode",
+    type=click.Choice(["default", "raw", "curious", "curious_raw"], case_sensitive=False),
+    default="default",
+    show_default=True,
+    help=(
+        "Search mode. 'curious' and 'curious_raw' let the backend pick a topic "
+        "and accept an empty QUERY."
+    ),
+)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @with_client
-def research_status(ctx, notebook_id, json_output, client_auth):
+def research_discover(ctx, query, notebook_id, mode, json_output, client_auth):
+    """Discover web sources for QUERY in one synchronous call.
+
+    Unlike 'source add-research', this blocks for the single round trip
+    (about 8 seconds) and prints the ranked sources with the backend's overview.
+    The run is also recorded, so its run id works with 'research import'.
+
+    \b
+    Examples:
+      notebooklm research discover "history of the transistor"
+      notebooklm research discover --mode curious
+      notebooklm research discover "quantum error correction" --json
+    """
+    nb_id = require_notebook(notebook_id)
+
+    async def _run():
+        async with resolve_client_factory(ctx)(client_auth) as client:
+            nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
+            result = await discover_and_classify(client, nb_id_resolved, query, mode)
+            if json_output:
+                json_output_response(result.public_dict)
+                return
+            _render_status_result(result)
+            console.print(f"[dim]Run id: {result.task_id}[/dim]")
+
+    return _run()
+
+
+@research.command("status")
+@notebook_option
+@click.option(
+    "--run-id",
+    "--task-id",
+    "run_id",
+    default=None,
+    help="Poll one exact research run instead of the notebook's unfiltered history.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@with_client
+def research_status(ctx, notebook_id, run_id, json_output, client_auth):
     """Check research status for the current notebook.
 
     Shows whether research is in progress, completed, or not running.
@@ -117,6 +171,7 @@ def research_status(ctx, notebook_id, json_output, client_auth):
     \b
     Examples:
       notebooklm research status
+      notebooklm research status --run-id <run_id>
       notebooklm research status --json
     """
     nb_id = require_notebook(notebook_id)
@@ -124,7 +179,7 @@ def research_status(ctx, notebook_id, json_output, client_auth):
     async def _run():
         async with resolve_client_factory(ctx)(client_auth) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id, json_output=json_output)
-            result = await poll_and_classify(client, nb_id_resolved)
+            result = await poll_and_classify(client, nb_id_resolved, run_id)
 
             if json_output:
                 # The classified result carries the canonical
@@ -195,10 +250,9 @@ def _print_failure_reason(reason_message: str | None, hint: str | None) -> None:
     default=_DEFAULT_IMPORT_TIMEOUT,
     type=int,
     help=(
-        "Seconds budget for the import retry loop (default: 1800). The command "
-        "never waits for the RUN to finish, but IMPORT_RESEARCH itself commonly "
-        "outlives a single client timeout on deep payloads and is retried with "
-        "reconciliation; this bounds that. Matches 'research wait --timeout'."
+        "Seconds budget for read-only candidate inspection after an unknown import "
+        "outcome (default: 1800). IMPORT_RESEARCH is sent once. The command never "
+        "waits for the RUN to finish. Matches 'research wait --timeout'."
     ),
 )
 @click.option(
@@ -236,8 +290,8 @@ def research_import(
 
     \b
     The import RPC itself is not instant — IMPORT_RESEARCH commonly outlives a
-    single client timeout on deep payloads and is retried with reconciliation,
-    bounded by --timeout.
+    single client timeout on deep payloads. It is sent once; bounded read-only
+    inspection may attach candidates after an unknown outcome.
 
     \b
     Idempotent when the pre-import snapshot succeeds: a source whose URL is
@@ -449,6 +503,13 @@ def research_cancel(ctx, run_id, notebook_id, json_output, client_auth):
 @research.command("wait")
 @notebook_option
 @click.option(
+    "--run-id",
+    "--task-id",
+    "run_id",
+    default=None,
+    help="Wait for one exact research run instead of selecting from notebook history.",
+)
+@click.option(
     "--timeout",
     # 1800, matching ``source add-research`` (#2142). The legacy 5-minute cap sat
     # below every observed deep run: 374 s live, 358 s in
@@ -458,7 +519,8 @@ def research_cancel(ctx, run_id, notebook_id, json_output, client_auth):
     type=int,
     help=(
         "Per-phase seconds budget for (a) the research-completion poll loop "
-        "and (b) the --import-all retry loop (default: 1800). Each phase gets "
+        "and (b) read-only candidate inspection after an unknown --import-all "
+        "outcome (default: 1800). The import mutation is sent once. Each phase gets "
         "the full budget independently, so worst-case total wall time is up to "
         "2× this value. Matches 'source add-research --timeout' semantics."
     ),
@@ -477,7 +539,15 @@ def research_cancel(ctx, run_id, notebook_id, json_output, client_auth):
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @with_client
 def research_wait(
-    ctx, notebook_id, timeout, interval, import_all, cited_only, json_output, client_auth
+    ctx,
+    notebook_id,
+    run_id,
+    timeout,
+    interval,
+    import_all,
+    cited_only,
+    json_output,
+    client_auth,
 ):
     """Wait for research to complete.
 
@@ -487,13 +557,15 @@ def research_wait(
     \b
     Examples:
       notebooklm research wait
+      notebooklm research wait --run-id <run_id>
       notebooklm research wait --timeout 600 --import-all
       notebooklm research wait --import-all --cited-only
       notebooklm research wait --json
     """
     try:
         validate_research_wait_flags(import_all=import_all, cited_only=cited_only)
-    except ValidationError as exc:
+    except ResearchValidationError as exc:
+        message = research_validation_message(exc)
         # Per ADR-0015 §2: under --json this flag-combination conflict must
         # emit the typed JSON envelope and exit 1 (VALIDATION_ERROR), not
         # ride Click's parse-time UsageError path (exit 2, usage text on
@@ -501,9 +573,9 @@ def research_wait(
         # existing Click UX so interactive users still get the
         # ``Usage: ... / Error: ...`` formatting.
         if json_output:
-            _output_error(str(exc), "VALIDATION_ERROR", json_output, 1)
+            _output_error(message, "VALIDATION_ERROR", json_output, 1)
         raise click.UsageError(  # cli-input-validation: --cited-only requires --import-all
-            str(exc)
+            message
         ) from exc
 
     nb_id = require_notebook(notebook_id)
@@ -513,7 +585,7 @@ def research_wait(
         interval=interval,
         import_all=import_all,
         cited_only=cited_only,
-        json_output=json_output,
+        task_id=run_id,
     )
 
     async def _run():
@@ -523,23 +595,29 @@ def research_wait(
             # spinner emits the canonical "Cancelled. Resume with: ..."
             # envelope per :func:`emit_cancelled_and_exit`.
             def _wait_context():
+                resume_hint = "notebooklm research status"
+                if plan.task_id is not None:
+                    resume_hint += f" -n {plan.notebook_id} --run-id {plan.task_id}"
                 return status_with_elapsed(
                     "Waiting for research to complete...",
-                    json_output=plan.json_output,
-                    resume_hint="notebooklm research status",
+                    json_output=json_output,
+                    resume_hint=resume_hint,
                 )
 
             result = await execute_research_wait(
                 plan,
                 client=client,
                 wait_context=_wait_context,
+                json_output=json_output,
             )
-            _render_wait_result(plan, result)
+            _render_wait_result(plan, result, json_output=json_output)
 
     return _run()
 
 
-def _render_wait_result(plan: ResearchWaitPlan, result: ResearchWaitResult) -> None:
+def _render_wait_result(
+    plan: ResearchWaitPlan, result: ResearchWaitResult, *, json_output: bool
+) -> None:
     """Render a :class:`ResearchWaitResult` and exit on non-success outcomes.
 
     The handler owns all CLI I/O — text vs JSON, exit codes, "Imported N
@@ -547,14 +625,14 @@ def _render_wait_result(plan: ResearchWaitPlan, result: ResearchWaitResult) -> N
     a CliRunner).
     """
     if result.outcome == "no_research":
-        if plan.json_output:
+        if json_output:
             json_output_response({"status": "no_research", "error": "No research running"})
         else:
             console.print("[red]No research running[/red]")
         exit_with_code(1)
 
     if result.outcome == "timeout":
-        if plan.json_output:
+        if json_output:
             json_output_response(
                 {"status": "timeout", "error": f"Timed out after {result.timeout}s"}
             )
@@ -563,7 +641,7 @@ def _render_wait_result(plan: ResearchWaitPlan, result: ResearchWaitResult) -> N
         exit_with_code(1)
 
     if result.outcome == "failed":
-        if plan.json_output:
+        if json_output:
             failed_payload: dict[str, Any] = {"status": "failed", "error": "Research failed"}
             if result.query:
                 failed_payload["query"] = result.query
@@ -589,7 +667,7 @@ def _render_wait_result(plan: ResearchWaitPlan, result: ResearchWaitResult) -> N
         exit_with_code(1)
 
     # outcome == "completed"
-    if plan.json_output:
+    if json_output:
         # The CLI owns the ``--json`` envelope projection (``_app`` returns only
         # the typed result); ``_completed_wait_payload`` rebuilds the historical
         # completed payload (base keys + optional cited/imported keys) verbatim.

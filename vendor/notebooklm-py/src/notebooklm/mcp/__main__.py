@@ -14,8 +14,9 @@ Two transports are supported:
   claude.ai, served by :mod:`._oauth`). Both coexist via ``MultiAuth``. All secrets
   are **env-only** (never CLI flags, so they cannot leak via ``ps aux``).
 
-The auth profile is bound once at startup via ``--profile`` /
-``NOTEBOOKLM_PROFILE``. This module imports NO ``click`` / ``rich`` / ``cli``.
+The auth profile is bound at startup via ``--profile`` / ``NOTEBOOKLM_PROFILE``.
+Multi-profile mode (Web or Android) uses ``--profiles`` / ``NOTEBOOKLM_MCP_PROFILES``
+and requires explicit selection on every tool call. This module imports NO ``click`` / ``rich`` / ``cli``.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import os
 import secrets
 import sys
 
-from .._serving import check_bind_allowed, is_loopback
+from .._adapter_support import check_bind_allowed, is_loopback
 from ._auth import MCP_TOKEN_ENV, build_auth, get_configured_token
 from ._filelink import FileLinkSigner, FileTransferConfig
 from ._oauth import (
@@ -36,6 +37,7 @@ from ._oauth import (
     build_oauth_provider,
     get_oauth_config,
 )
+from ._profiles import PROFILES_ENV
 from ._urlcheck import _validate_bare_https_origin
 from .server import create_server
 
@@ -181,10 +183,25 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="notebooklm-mcp",
         description="Run the notebooklm-py MCP server.",
     )
-    parser.add_argument(
+    profile_group = parser.add_mutually_exclusive_group()
+    profile_group.add_argument(
         "--profile",
-        default=os.environ.get("NOTEBOOKLM_PROFILE"),
+        default=None,
         help="Auth profile to bind for this server process (default: active profile).",
+    )
+    profile_group.add_argument(
+        "--profiles",
+        default=None,
+        help=(
+            f"Comma-separated profiles (default: ${PROFILES_ENV}); with more than one, "
+            "every tool call requires a profile argument (Web or Android)."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("web", "android"),
+        default=None,
+        help="Preferred API backend (default: NOTEBOOKLM_BACKEND, else web).",
     )
     parser.add_argument(
         "--transport",
@@ -258,10 +275,31 @@ def _resolve_port(raw: str) -> int:
     return port
 
 
+def _create_server(**kwargs):
+    try:
+        return create_server(**kwargs)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+
+
 def main(argv: list[str] | None = None) -> None:
     """Parse args, enforce the bind guard, and run the server."""
     args = _build_parser().parse_args(argv)
     _configure_logging(args.log_level)
+    raw_profiles = args.profiles
+    if raw_profiles is None and args.profile is None:
+        raw_profiles = os.environ.get(PROFILES_ENV) or None
+    profile_kwargs = {}
+    if raw_profiles is not None:
+        profile_kwargs["profiles"] = [name.strip() for name in raw_profiles.split(",")]
+        args.profile = (
+            profile_kwargs["profiles"][0] if len(profile_kwargs["profiles"]) == 1 else None
+        )
+    else:
+        args.profile = args.profile or os.environ.get("NOTEBOOKLM_PROFILE")
+        profile_kwargs["profile"] = args.profile
+    if args.backend is not None:
+        profile_kwargs["backend"] = args.backend
 
     # argparse ``choices`` validates an explicit --transport, but NOT an
     # env-derived default; validate the resolved value so a bogus
@@ -292,11 +330,12 @@ def main(argv: list[str] | None = None) -> None:
         # Optional remote file transfer: built only here (http path), validated, and
         # absent (None) when no public URL is set — never a startup crash.
         file_transfer = _build_file_transfer()
-        server = create_server(
-            profile=args.profile,
-            auth=build_auth(token, oauth),
-            file_transfer=file_transfer,
-        )
+        server_kwargs = {
+            **profile_kwargs,
+            "auth": build_auth(token, oauth),
+            "file_transfer": file_transfer,
+        }
+        server = _create_server(**server_kwargs)
         # proxy_headers=False: Uvicorn defaults to rewriting the peer address from
         # X-Forwarded-For when the immediate client is a trusted host, which would let a
         # request forge its own source IP and defeat the OAuth login throttle's per-IP
@@ -336,7 +375,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         # show_banner=False keeps FastMCP's startup banner out of the host's logs
         # (and off stdout — stdio requires uncontaminated JSON-RPC).
-        server = create_server(profile=args.profile)
+        server = _create_server(**profile_kwargs)
         server.run(transport="stdio", show_banner=False)
 
 

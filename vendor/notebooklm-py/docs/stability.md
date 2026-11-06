@@ -1,7 +1,7 @@
 # API Stability and Versioning
 
 **Status:** Active
-**Last Updated:** 2026-08-14
+**Last Updated:** 2026-09-05
 
 This document describes the stability guarantees and versioning policy for `notebooklm-py`.
 
@@ -53,11 +53,12 @@ The following are considered **public API** and are subject to stability guarant
 
 ```python
 # Version
-__version__               # Package version string (read-only)
+__version__  # Package version string (read-only)
 
 # Client
 NotebookLMClient
 NotebookLMClient.from_storage()
+NotebookLMClient.backends
 NotebookLMClient.notebooks
 NotebookLMClient.sources
 NotebookLMClient.artifacts
@@ -69,11 +70,15 @@ NotebookLMClient.sharing
 NotebookLMClient.labels
 NotebookLMClient.mind_maps
 NotebookLMClient.collections
-NotebookLMClient.rpc_call()
+NotebookLMClient.raw
+WebRawAPI, AndroidRawAPI
+GrpcUnaryMethod, GrpcUnaryStreamMethod, ReplayPolicy
 
 # Types
 Notebook, Source, Artifact, Note, Label, MindMap, Collection
-GenerationState, GenerationStatus, AskResult   # incl. the .is_terminal predicate on both
+ArtifactListing, ArtifactListingComponent, ArtifactListingFailure
+ArtifactLookup, ArtifactLookupStatus
+GenerationState, GenerationStatus, AskResult  # incl. the .is_terminal predicate on both
 NotebookDescription, ConversationTurn, ChatSession, PremiumFeatureInfo
 ShareStatus, SharedUser, SourceFulltext, SourceGuide
 NotebookMetadata, SourceSummary
@@ -84,13 +89,14 @@ ResearchStart, ResearchStatus, ResearchTask, ResearchSource, ResearchTermination
 ClientMetricsSnapshot, ConnectionLimits, RpcTelemetryEvent
 
 # Exceptions (all inherit from NotebookLMError)
-NotebookLMError                    # Base exception
-NotFoundError                      # Cross-domain umbrella for *NotFoundError
-WaitTimeoutError                   # Cross-domain umbrella for wait/poll timeouts (also a built-in TimeoutError)
+NotebookLMError  # Base exception
+NotFoundError  # Cross-domain umbrella for *NotFoundError
+WaitTimeoutError  # Cross-domain umbrella for wait/poll timeouts (also a built-in TimeoutError)
+OperationTimeoutError  # Whole-workflow deadline; also WaitTimeoutError and TimeoutError
 RPCError, AuthError, RateLimitError, RPCTimeoutError, RPCResponseTooLargeError, ServerError
 NetworkError, DecodingError, UnknownRPCMethodError
 ClientError, ConfigurationError, ValidationError, MissingDependencyError
-NonIdempotentRetryError            # Raised by idempotent=True calls on a non-idempotent retry
+NonIdempotentRetryError  # Raised by idempotent=True calls on a non-idempotent retry
 # Domain-specific
 # Note: *NotFoundError classes mix in RPCError (catchable as either RPCError
 # or the domain base). v0.6.0 restored this symmetry across all three "not
@@ -108,9 +114,25 @@ SourceError, SourceAddError, SourceProcessingError, SourceTimeoutError, SourceNo
 # automatically. Read them with getattr(exc, "source_id", None) — they are absent
 # on every other failure. See docs/python-api.md#partial-file-uploads.
 NotebookError, NotebookNotFoundError
-ArtifactError, ArtifactDownloadError, ArtifactFeatureUnavailableError, ArtifactNotFoundError, ArtifactNotReadyError, ArtifactParseError
+(
+    ArtifactError,
+    ArtifactDownloadError,
+    ArtifactFeatureUnavailableError,
+    ArtifactNotFoundError,
+    ArtifactNotReadyError,
+    ArtifactParseError,
+)
+# Artifact download HTTP 401/403 responses raise AuthError directly so callers
+# can trigger reauthentication. Other download transport, policy, content, and
+# status failures continue to raise ArtifactDownloadError.
 ArtifactTimeoutError, ArtifactPendingTimeoutError, ArtifactInProgressTimeoutError
-ResearchError, ResearchTimeoutError, ResearchTaskMismatchError, AmbiguousResearchTaskError, ResearchStartUnavailableError
+(
+    ResearchError,
+    ResearchTimeoutError,
+    ResearchTaskMismatchError,
+    AmbiguousResearchTaskError,
+    ResearchStartUnavailableError,
+)
 # Note: notes.get/update/delete and mind_maps.get/rename/delete now raise
 # their domain *NotFoundError on a missing target; use get_or_none() for
 # warning-free None-on-miss lookups.
@@ -119,6 +141,11 @@ MindMapError, MindMapNotFoundError
 LabelError, LabelNotFoundError
 CollectionError, CollectionNotFoundError
 ChatError, ChatResponseParseError
+
+# Operation outcomes (imported from notebooklm.outcomes)
+CommitState, RecoveryAction, OperationMetadata
+BatchItemOutcome, BatchOutcome, SourceBatchItemOutcome
+ReconciliationCandidate, ReconciliationReport, LookupSuggestion
 
 # Enums
 AudioFormat, AudioLength
@@ -131,10 +158,10 @@ SourceType, ArtifactType, SourceStatus, DriveSourceStatus, DiscoveryMode
 ShareAccess, SharePermission, ShareViewLevel
 ChatGoal, ChatResponseLength, ChatMode, MagicArtifactType
 DriveMimeType, ExportType
-ArtifactStatus, artifact_status_to_str     # notebooklm.types.<X> only — NOT top-level (see below)
+ArtifactStatus, artifact_status_to_str  # notebooklm.types.<X> only — NOT top-level (see below)
 
 # Auth
-AuthTokens                # also re-exported as notebooklm.auth.AuthTokens
+AuthTokens  # also re-exported as notebooklm.auth.AuthTokens
 notebooklm.paths.get_storage_path()
 
 # Logging and Correlation
@@ -151,7 +178,7 @@ notebooklm.research.normalize_url
 notebooklm.research.extract_report_urls
 
 # Helpers (cookies extra) - imported from notebooklm.auth
-notebooklm.auth.convert_rookiepy_cookies_to_storage_state  # requires `pip install "notebooklm-py[cookies]"` — see docs/installation.md#optional-extras-matrix
+notebooklm.auth.convert_rookiepy_cookies_to_storage_state  # compatibility API name; requires the `rookie-cookies` package
 
 # Cookie-domain tiers - imported from notebooklm.auth
 notebooklm.auth.REQUIRED_COOKIE_DOMAINS
@@ -162,12 +189,56 @@ notebooklm.auth.OPTIONAL_COOKIE_DOMAINS_BY_LABEL
 notebooklm.auth.LockUnavailableError  # canonical home: notebooklm.exceptions; also an OSError via TimeoutError (ADR-0029)
 ```
 
+The raw Web-row factories on `Artifact`, `Collection`, `Label`, `Notebook`,
+`ShareStatus`, `SharedUser`, and `Source` are retained only for the v0.x
+compatibility window and are scheduled for removal in v1. Use the corresponding
+typed client namespace (`client.artifacts`, `collections`, `labels`, `notebooks`,
+`sharing`, or `sources`) instead; there is no supported public raw-row decoder.
+See [Deprecations](deprecations.md) for the exact nine methods and warning window.
+
+### Operation deadline and outcome stability
+
+`NotebookLMClient.operation(timeout=...)`,
+`RuntimeOptions.operation_timeout`, and `OperationTimeoutError` are public
+contracts. The operation scope remains task-, event-loop-, and client-epoch
+owned; nested scopes cannot extend a parent deadline; and external cancellation
+is not translated into `OperationTimeoutError`. Additional first-party phases
+may become covered by the aggregate budget in a backward-compatible release,
+but an existing phase will not silently gain a fresh independent budget inside
+a bounded operation.
+
+The symbols listed above from `notebooklm.outcomes` are public. Existing
+`CommitState` and `RecoveryAction` values keep their meanings. Treat both enums
+as open to additive members: callers should include a conservative fallback
+rather than exhaustively assuming the current member set is permanent.
+`UNKNOWN` never authorizes blind replay, and reconciliation candidates never
+constitute proof of a committed resource.
+
+`OperationMetadata` and `BatchOutcome` are additive evidence carriers. New
+optional evidence fields may be added in a minor release. Existing fields will
+not be reinterpreted to claim greater commit certainty. Batch member order and
+occurrence indexes are stable, including duplicate inputs and an escaping
+whole-request failure. Text, collections, and adapter projections are bounded
+and redacted; exact caps and private journal structures such as `SendIdentity`,
+`JournalEntry`, and `AttemptRecord` are implementation details and may change.
+
+See [Operation deadlines, ownership, and recovery
+contracts](architecture.md#operation-lifetime-deadlines-and-evidence) for the behavioral matrix and evidence map.
+
+Backend selection is also public: `backend="web"` (the default) or
+`backend="android"` on the client, and `--backend web|android` on the CLI.
+Android is opt-in; see the installation and Android guides for its dependency,
+credential, and undocumented-protocol requirements.
+
 > **`ArtifactStatus` / `artifact_status_to_str` import path.** Unlike every other
 > enum listed above, these two are **not** re-exported at top level — import them
 > as `from notebooklm.types import ArtifactStatus`, never `from notebooklm import
-> ArtifactStatus`. Their canonical module `notebooklm.rpc` is marked internal
-> below; the `notebooklm.types` spelling is the blessed public one (see
-> [deprecations.md](deprecations.md)).
+> ArtifactStatus`. Their definitions live in the private transport-neutral
+> `_types/enums.py` module; `notebooklm.rpc.types` remains a compatibility
+> re-export. The `notebooklm.types` spelling is the blessed public one (see
+> [deprecations.md](deprecations.md)). This implementation-home move preserves
+> object identity at both existing import paths, but newly created pickle data
+> records the private canonical module rather than the compatibility module.
 >
 > **Wire-value correction in the Unreleased line
 > ([#2127](https://github.com/teng-lin/notebooklm-py/issues/2127)).** `ArtifactStatus`
@@ -221,10 +292,10 @@ renamed, narrowed, or removed in a future minor release. Prefer the stable
 surface when possible.
 
 ```python
-CitedSourceSelection      # Chat citation payload — internal shape, exposed for typing
-AuthExtractionError       # Specialized AuthError raised by browser-based login
-NotebookLimitError        # Raised when account notebook quota is exhausted
-UnknownTypeWarning        # Warning category emitted when .kind falls back to UNKNOWN
+CitedSourceSelection  # Chat citation payload — internal shape, exposed for typing
+AuthExtractionError  # Specialized AuthError raised by browser-based login
+NotebookLimitError  # Raised when account notebook quota is exhausted
+UnknownTypeWarning  # Warning category emitted when .kind falls back to UNKNOWN
 ```
 
 ### Internal (May change without notice)
@@ -312,6 +383,7 @@ The following v0.3-era deprecations completed their removal cycle in v0.5.0:
 
 | Deprecated | Replacement | Notes |
 |------------|-------------|-------|
+| `NotebookLMClient.rpc_call(...)` | Web: `client.raw.call(...)`; Android: `client.raw.unary(...)` / `unary_stream(...)`, or a separate Web-selected client's `raw.call(...)` | Deprecated in v0.9.0; warns once per client; scheduled for v1.0 removal. Android compatibility lazily creates a Web sidecar during v0.x. |
 | `AuthTokens.from_storage(...)` | `async with NotebookLMClient.from_storage(...) as client:` and use `client.auth` | Deprecated in v0.8.1; emits `DeprecationWarning`; scheduled for v1.0 removal |
 | `AuthTokens(..., storage_path=..., cookie_jar=None)` synchronous storage fallback | Managed `NotebookLMClient.from_storage(...)`, or an explicit `cookie_jar=` | Deprecated in v0.8.1; only the implicit synchronous-I/O branch warns; scheduled for v1.0 removal |
 | Awaiting `NotebookLMClient.from_storage(...)` | `async with NotebookLMClient.from_storage(...) as client:` | Emits `DeprecationWarning`; scheduled for v1.0 removal |
@@ -332,7 +404,7 @@ aliases.
 Version 0.4.0 is backward compatible with v0.3.x. Notable additions:
 
 - **Multi-account profiles** - Existing single-account setups continue to work as the implicit default profile. Your existing `~/.notebooklm/storage_state.json` is auto-detected — no manual migration is required. New accounts can be added via `notebooklm profile create <name>`.
-- **`[cookies]` optional extra** - To reuse cookies from your existing browser, install with `pip install "notebooklm-py[cookies]"` (requires `rookiepy`; full extras matrix: [docs/installation.md#optional-extras-matrix](installation.md#optional-extras-matrix)).
+- **`[cookies]` optional extra** - To reuse cookies from your existing browser, install with `pip install "notebooklm-py[cookies]"` (installs `rookie-cookies`; full extras matrix: [docs/installation.md#optional-extras-matrix](installation.md#optional-extras-matrix)).
 - **Deprecation removal deferred** - The deprecated attributes originally scheduled for v0.4.0 (`Source.source_type`, `Artifact.artifact_type`, `Artifact.variant`, `SourceFulltext.source_type`, `StudioContentType`, `DEFAULT_STORAGE_PATH`) were deferred to v0.5.0. In v0.5.0 and later, use the replacements listed in [Removed in v0.5.0](#removed-in-v050).
 
 ### Migrating from v0.2.x to v0.3.0
@@ -427,16 +499,18 @@ if artifact.is_flashcards:
 When Google changes their internal APIs:
 
 1. **Detection**: Automated RPC health check runs nightly for `main`; release
-   branch checks run manually during release prep (see below)
+   candidates are checked by manually dispatching the workflow on protected
+   `main` after the release PR is merged (see below)
 2. **Investigation**: Identify changed method IDs using browser devtools
-3. **Fix**: Update `rpc/types.py` with new method IDs
+3. **Fix**: Update `rpc/_identifiers.py` with new method IDs
 4. **Release**: Push patch release as soon as possible
 
 ### Automated RPC Health Check
 
-A nightly GitHub Action (`rpc-health.yml`) monitors all 47 RPC methods for ID
-changes on `main`. Release branches use the same workflow through manual
-dispatch.
+A nightly GitHub Action (`rpc-health.yml`) monitors all 48 RPC methods for ID
+changes on `main`. Release candidates use the same workflow through a manual
+dispatch on protected `main` after their release PR is merged; non-`main` refs
+are intentionally rejected.
 
 **What it verifies:**
 - The RPC method ID we send matches the ID returned in the response envelope
@@ -450,13 +524,13 @@ dispatch.
 **Why this design:**
 - Google's breaking change pattern is silent ID changes, not schema changes
 - Error responses still contain the method ID, so we detect mismatches even on API errors
-- A mismatch means `rpc/types.py` needs updating, triggering a patch release
+- A mismatch means `rpc/_identifiers.py` needs updating, triggering a patch release
 
 **On mismatch detection:**
 - GitHub Issue auto-created with `bug`, `rpc-breakage`, and `automated` labels
 - Report shows expected vs actual IDs and which `RPCMethod` entries need updating
 
-**Manual trigger:** `gh workflow run rpc-health.yml -f custom_branch=release/vX.Y.Z`
+**Manual trigger:** `gh workflow run rpc-health.yml --ref main -f account_rotation_base=auto`
 
 ### How to Report API Breakage
 

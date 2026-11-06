@@ -1,6 +1,6 @@
 [project]
 name = "notebooklm-py"
-version = "0.8.1"
+version = "0.8.6"
 description = "Unofficial Python library for automating Google NotebookLM"
 dynamic = ["readme"]
 requires-python = ">=3.10"
@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 # Upper bounds protect downstream installs from a breaking new major
@@ -28,9 +29,11 @@ classifiers = [
 # bounds" for the policy.
 dependencies = [
     "httpx>=0.27.0,<0.29",
+    "idna>=3.6,<4",
     "click>=8.0.0,<9",
     "rich>=13.0.0,<16",
-    "filelock>=3.13,<4",
+    "filelock>=3.13,<5",
+    "typing_extensions>=4.4,<5",
 ]
 
 [project.urls]
@@ -42,23 +45,26 @@ Issues = "https://github.com/teng-lin/notebooklm-py/issues"
 [project.optional-dependencies]
 markdown = ["markdownify>=0.14.1,<2"]
 browser = ["playwright>=1.40.0,<2"]
-cookies = ["rookiepy>=0.1.0,<1"]
+cookies = ["rookie-cookies>=0.1.0,<1"]
 # EXPERIMENTAL / PoC: optional curl_cffi transport for browser TLS-JA3
 # impersonation (NOTEBOOKLM_TRANSPORT=curl_cffi). Native wheels, so excluded from
 # `all` like `cookies`. Opt in via pip install "notebooklm-py[impersonate]".
-impersonate = ["curl_cffi>=0.11,<1"]
+# >=0.15.0 supports discard_cookies and READFUNCTION streaming-upload callbacks.
+impersonate = ["curl_cffi>=0.15.0,<1"]
 # Headless master-token auth: mint web cookies from a durable Google master
 # token, no per-session browser (docs/installation.md#headless). gpsoauth is
 # pure-Python (no native wheels), so it is safe in `all`. >=1.1.0 for
 # exchange_token; no <2 cap so the 2.0.0 ServiceDisabled fix installs.
 headless = ["gpsoauth>=1.1.0"]
+# Android bearer-gRPC runtime. The protobuf runtime is pinned to the patched
+# 6.x release compatible with the checked-in Android generated stubs.
+android = ["grpcio==1.84.0", "protobuf==7.36.2", "gpsoauth>=1.1.0"]
 # >=3.0: the remote-transport bearer auth (FastMCP(auth=...) + TokenVerifier)
 # landed in fastmcp 3.0; 2.x lacks it and would ImportError in mcp/_auth.py.
-# Pinned ==3.4.2: fastmcp 3.4.3 broke the RFC 9728 protected-resource-metadata
-# route (/.well-known/oauth-protected-resource/mcp → 404), which dead-ends
-# claude.ai's remote-connector OAuth discovery ("Couldn't connect to the
-# server"). 3.4.2 is the last-good; lift the pin once a fixed release ships.
-mcp = ["fastmcp==3.4.2"]
+# Pinned ==4.1.0: fastmcp 3.x pulls beartype 0.22.x, which imports
+# typing.no_type_check_decorator (removed in Python 3.15), so ``import fastmcp``
+# fails on 3.15. 4.x resolves beartype to a 3.15-compatible release.
+mcp = ["fastmcp==4.1.0"]
 # Optional single-tenant REST server (the third _app adapter, after cli/ and
 # mcp/). EXPERIMENTAL: the /v1 surface may change in a minor release; it is
 # excluded from the public-API compatibility gate. python-multipart is REQUIRED
@@ -81,13 +87,21 @@ dev = [
     "python-dotenv>=1.0.0,<2",
     "mypy>=1.0.0,<3",
     "pre-commit>=4.5.1,<5",
-    "ruff==0.16.1",
+    "ruff==0.16.9",
     "tomli>=2.0.0,<3; python_version < '3.11'",  # for tests/unit/test_install_docs.py on Python 3.10 (tomllib is 3.11+)
     "vcrpy>=6.0.0,<9",
     "packaging>=23.0,<27",  # for tests/unit/test_version_gate.py (PEP 440 version parsing)
+    # Deterministic Android protobuf toolchain: grpcio-tools 1.84.0 embeds
+    # libprotoc 35.1; the generated code accepts the 7.36.2 runtime. 1.84.0 is
+    # the first grpcio release with CPython 3.15 wheels.
+    "grpcio==1.84.0",
+    "grpcio-tools==1.84.0",
+    "protobuf==7.36.2",
+    "gpsoauth>=1.1.0",
 ]
-# `all` deliberately excludes `cookies` — rookiepy has install issues on Python 3.13+
-# (see CHANGELOG [0.4.1]). Opt in explicitly via `pip install "notebooklm-py[cookies]"`.
+# `all` deliberately omits the `android`, `cookies`, and `impersonate` extra
+# names. Because `all` includes `dev`, it still resolves the pinned protobuf
+# compiler/runtime solely so CI can reproduce checked-in stubs.
 all = ["notebooklm-py[browser,dev,headless,markdown,mcp,server]"]
 
 [project.scripts]
@@ -134,6 +148,10 @@ replacement = '](https://github.com/teng-lin/notebooklm-py/blob/v$HFPR_VERSION/A
 pattern = '\]\(CONTRIBUTING\.md\)'
 replacement = '](https://github.com/teng-lin/notebooklm-py/blob/v$HFPR_VERSION/CONTRIBUTING.md)'
 
+[tool.hatch.build]
+# Keep repository-only assets out of both release distributions.
+exclude = ["/tests", "/examples", "/desktop-extension", "/deploy"]
+
 # Bakes the build commit into _commit.py (see hatch_build.py). Registered on both
 # targets so the commit survives `python -m build` (wheel is built from the sdist).
 [tool.hatch.build.targets.sdist.hooks.custom]
@@ -161,6 +179,12 @@ pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--ignore=tests/e2e"
+filterwarnings = [
+    "ignore:SelectableGroups dict interface is deprecated:DeprecationWarning",
+    "ignore:.*Using .httpx. with .starlette\\.testclient. is deprecated.*",
+    "ignore:ssl\\.SSLContext\\(\\) without protocol argument is deprecated\\.:DeprecationWarning:gpsoauth",
+    "ignore:ssl\\.PROTOCOL_TLS is deprecated:DeprecationWarning:gpsoauth",
+]
 # Global timeout prevents tests from hanging indefinitely (CI safety net)
 # Individual tests can override with @pytest.mark.timeout(seconds)
 timeout = 60
@@ -172,13 +196,15 @@ markers = [
     "readonly: read-only tests against user's test notebook",
     "impersonate_smoke: minimal live smoke run under NOTEBOOKLM_TRANSPORT=curl_cffi in the nightly (read/ask/upload/download — one per transport-critical op)",
     "vcr: tests using VCR.py recorded cassettes (run with NOTEBOOKLM_VCR_RECORD=1 to record)",
+    "grpc_cassette: tests replaying sanitized Android protobuf cassettes through the test-only gRPC channel seam",
     "no_keepalive_disable: opt a VCR test out of the global NOTEBOOKLM_DISABLE_KEEPALIVE_POKE=1 autouse fixture in tests/integration/conftest.py",
     "allow_no_vcr: opt a tests/integration/ test out of the integration-tree enforcement hook; use for mock-only tests that legitimately live under tests/integration/",
     "characterization: behavior-pinning unit tests that lock in current observable contracts and would be too synthetic to cassette-back",
+    "refactor_qualification: exhaustive migration inventories and concurrency characterizations; excluded from routine PR CI and run in manual, nightly, and release qualification",
     "reality: tests that validate assumptions about external tools or environments; required lanes must execute them",
     "requires_playwright: tests requiring the Playwright Python package",
     "requires_chromium: tests requiring a launchable Chromium browser",
-    "repo_lint: repo-wide audit/compat checks (cassette shapes, public surface, release gates, doc-sync, CI script audits). Slow; skip locally with `-m \"not repo_lint\"`. CI still runs them by default.",
+    "repo_lint: repo-wide audit/compat checks (cassette shapes, public surface, release gates, doc-sync, CI script audits). Run locally with `make gates`; PR CI keeps critical contracts and nightly runs the full set.",
 ]
 
 [tool.coverage.run]
@@ -215,7 +241,9 @@ disallow_untyped_defs = false
 check_untyped_defs = true
 ignore_missing_imports = true
 files = ["src/notebooklm"]
-exclude = ["tests/"]
+# Generated protobuf modules expose message attributes dynamically. Their
+# contract is checked by descriptor/regeneration tests rather than mypy.
+exclude = ["tests/", "src/notebooklm/_android/proto/"]
 
 # Public library modules and moved implementation modules that back exported
 # public types are checked more strictly before the package advertises PEP 561
@@ -232,6 +260,8 @@ module = [
     "notebooklm.io",
     "notebooklm.log",
     "notebooklm.migration",
+    "notebooklm.outcomes",
+    "notebooklm.options",
     "notebooklm.paths",
     "notebooklm.research",
     "notebooklm.types",
@@ -259,6 +289,9 @@ strict_optional = true
 target-version = "py310"
 line-length = 100
 src = ["src", "tests"]
+# Preserve protoc's byte-for-byte output. Generated modules are reviewed via
+# the descriptor contract and deterministic regeneration gate instead.
+extend-exclude = ["src/notebooklm/_android/proto/**"]
 
 [tool.ruff.lint]
 select = [

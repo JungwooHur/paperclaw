@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .._deprecation import warn_registered_deprecation
+
 
 @dataclass
 class Label:
@@ -35,14 +37,18 @@ class Label:
         notebook_id: str | None = None,
         method_id: str | None = None,
     ) -> Label:
-        """Parse one label 4-tuple ``[name, sources, label_id, emoji]``."""
-        from .._row_adapters.labels import LabelRow
+        """Parse one label 4-tuple ``[name, sources, label_id, emoji]``.
 
-        row = LabelRow.from_label_tuple(data, method_id=method_id)
-        return cls(
-            id=row.id,
-            name=row.name,
+        .. deprecated:: 0.9.0
+           Use ``client.labels`` typed APIs. Raw Web row decoding has no
+           supported public replacement.
+        """
+        warn_registered_deprecation("label_from_api_response")
+        from .._web.rows.labels import decode_label
+
+        return decode_label(
+            cls,
+            data,
             notebook_id=notebook_id,
-            emoji=row.emoji or None,
-            source_ids=list(row.source_ids),
+            method_id=method_id,
         )

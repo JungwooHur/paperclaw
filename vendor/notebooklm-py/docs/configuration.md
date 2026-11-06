@@ -1,7 +1,7 @@
 # Configuration
 
 **Status:** Active
-**Last Updated:** 2026-08-05
+**Last Updated:** 2026-09-29
 
 This guide covers storage locations, environment settings, and configuration options for `notebooklm-py`.
 
@@ -15,10 +15,12 @@ All data is stored under `~/.notebooklm/` by default, organized by profile:
 ├── profiles/
 │   ├── default/          # Default profile (auto-created)
 │   │   ├── storage_state.json    # Authentication cookies and session
+│   │   ├── master_token.json     # Durable headless/Android credential (optional)
 │   │   ├── context.json          # CLI context (active notebook, conversation)
 │   │   └── browser_profile/      # Persistent Chromium profile
 │   ├── work/             # Named profile example
 │   │   ├── storage_state.json
+│   │   ├── master_token.json
 │   │   ├── context.json
 │   │   └── browser_profile/
 │   └── personal/
@@ -71,7 +73,7 @@ Contains the authentication data extracted from your browser session:
 
 **Cookie requirements** (empirically validated via single-, pair-, and three-way ablation; see [auth-cookie-lifecycle.md](auth-cookie-lifecycle.md#33-empirical-cookie-requirements); enforced by `_validate_required_cookies()` in `_auth/cookie_policy.py`):
 
-- **Tier 1 — strictly required (raises on absence):** `SID` AND `__Secure-1PSIDTS`. `SID` is the only individually-required cookie (`__Secure-1PSIDTS` is removable on its own because Google can re-mint it via `RotateCookies`), but the pair-wise check uncovered that as soon as `__Secure-1PSIDTS` and any one other auth cookie are both missing, Google rejects with `Authentication expired or invalid`. The library therefore enforces both up-front. Authoritative value: `MINIMUM_REQUIRED_COOKIES` in `_auth/cookie_policy.py`.
+- **Tier 1 — strictly required (raises on absence):** both `SID` and `__Secure-1PSIDTS`. Recovery may be able to re-mint `__Secure-1PSIDTS` before validation, but an input that reaches normal validation without either cookie is rejected. Authoritative value: `MINIMUM_REQUIRED_COOKIES` in `_auth/cookie_policy.py`.
 - **Tier 2 — secondary binding (logs a warning if absent):** either `OSID` is present, or `APISID` and `SAPISID` are present **together with bare `LSID`** (the `LSID` conjunct is required — the pair alone fails, per the three-way ablation in #1977). Without this, even valid Tier 1 cookies can't authenticate the homepage GET. Logged rather than raised so unverified edge-case flows (e.g. Workspace SSO) aren't broken by a too-strict client check.
 
 In practice: extract the full cookie set via `notebooklm login` and don't try to subset it. Partial extractions (a known failure mode of browser-cookies tooling under Chrome 127+ App-Bound Encryption) are the leading suspect for "auth expires immediately" reports — see [#371](https://github.com/teng-lin/notebooklm-py/issues/371).
@@ -143,8 +145,9 @@ directory does not count as a reusable L3 browser session.
 
 ### Master Token (`master_token.json`)
 
-Written only by `notebooklm login --master-token` (the `[headless]` extra). Holds
-a durable Google master token (mode `0600`) that mints/refreshes the profile's
+Written only by `notebooklm login --master-token --account EMAIL`. It needs `gpsoauth`, supplied
+by either the `[headless]` or `[android]` extra. It holds a durable Google master
+token (mode `0600`) that mints/refreshes the profile's
 `storage_state.json` cookies with no per-session browser. When present beside a
 profile's `storage_state.json`, an expired session re-mints from it
 automatically. If storage is absent, `notebooklm auth refresh` mints it from the
@@ -157,20 +160,56 @@ remains an unconditional forced re-mint.
 
 > ⚠️ **Full-account, durable credential** — larger blast radius than
 > `storage_state.json`; dedicated/throwaway account only. See
-> [installation.md#alternative-master-token-auth-no-cookie-file-to-ship-survives-expiry](installation.md#d-headless-server-or-ci).
+> [installation.md#alternative-master-token-auth-no-cookie-file-to-ship-survives-expiry](installation.md#alternative-master-token-auth-no-cookie-file-to-ship-survives-expiry).
 
 ## Environment Variables
+
+### Backend preference
+
+The client accepts `backend="web"` or `backend="android"` as an optional,
+keyword-only construction argument. The same preference is available as the
+root CLI flag `notebooklm --backend ...`, the `notebooklm-mcp --backend ...`
+option, and the `notebooklm-server --backend ...` option. Resolution is always:
+
+1. explicit SDK or frontend option;
+2. `NOTEBOOKLM_BACKEND`;
+3. `web`.
+
+The preference is fixed when a client is constructed. `backend="android"`
+installs Android adapters for every public namespace; the read-only
+`client.backends` mapping consequently reports `android` for all eleven entries.
+`client.raw` is selected with the backend: Web exposes `raw.call(...)`, while
+Android exposes `raw.unary(...)` and `raw.unary_stream(...)`. The deprecated root
+`client.rpc_call(...)` wrapper still accepts Web `RPCMethod` identifiers through
+v0.x; on Android its first call creates a Web compatibility sidecar. That
+sidecar never starts a keepalive task. Neither `auto` nor `mobile` is accepted.
+
+Selecting Android does not read credentials during construction. At
+`client.open()` / async-context entry it requires both the `android` extra and
+a profile-backed `master_token.json`, from which it mints short-lived Android
+bearer credentials. Bootstrap that profile with
+`notebooklm login --master-token --account EMAIL`; a cookie-only storage file
+or `NOTEBOOKLM_AUTH_JSON` is not sufficient for Android. There is no public raw
+`master_token=` constructor argument. Android construction and normal open/close
+do not build the Web Kernel, run Web cookie recovery, persist Web cookies, or
+start Web keepalive. Android `from_storage(...)` uses a read-only, name-only
+cookie bootstrap: its homepage token observation stays in memory and it never
+pokes, heals, or merges profile cookies. Web-only constructor options (`cookie_saver`,
+`cookie_rotator`, `keepalive`, `keepalive_min_interval`, and `limits`) remain
+accepted for source compatibility but are ignored when Android is selected.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `NOTEBOOKLM_HOME` | Base directory for all files | `~/.notebooklm` |
 | `NOTEBOOKLM_PROFILE` | Active profile name | `default` |
+| `NOTEBOOKLM_BACKEND` | Preferred namespace backend: `web` or `android`. Explicit SDK/CLI/MCP/REST options take precedence. | `web` |
 | `NOTEBOOKLM_AUTH_JSON` | Inline authentication JSON (for CI/CD) | - |
 | `NOTEBOOKLM_NOTEBOOK` | Default notebook ID for commands without `-n/--notebook` | - |
 | `NOTEBOOKLM_HL` | Default interface/output language code (e.g. `en`, `ja`, `zh_Hans`) | `en` |
-| `NOTEBOOKLM_BASE_URL` | Gemini Notebook base URL. Constrained to `https://notebook.google.com` (default) or `https://notebooklm.google.com` (pre-rebrand personal, still served) or `https://notebooklm.cloud.google.com` (enterprise) | `https://notebook.google.com` |
+| `NOTEBOOKLM_BASE_URL` | Gemini Notebook base URL. Constrained to `https://notebook.google.com` (default) or `https://notebooklm.google.com` (pre-rebrand personal, still served) or `https://notebook.cloud.google.com` (enterprise) or `https://notebooklm.cloud.google.com` (legacy enterprise) | `https://notebook.google.com` |
 | `NOTEBOOKLM_BL` | `bl` (build label) URL parameter for the chat streaming endpoint; override when chasing a regression tied to a specific frontend build snapshot | built-in default in `_env.DEFAULT_BL` (drift-monitored nightly) |
 | `NOTEBOOKLM_TRANSPORT` | HTTP transport backend: `httpx` (default) or `curl_cffi` (opt-in browser-TLS impersonation; requires the `curl_cffi` package). Use `curl_cffi` where the default transport is TLS-fingerprint-blocked. | `httpx` |
+| `NOTEBOOKLM_WINDOWS_EVENT_LOOP` | Windows CLI only: the asyncio event loop CLI commands run on, `proactor` or `selector`. Set `selector` only if commands hang inside a sandbox such as Sandboxie-Plus ([troubleshooting](troubleshooting.md#windows)); on Python 3.12–3.14 the CLI then installs Python 3.15's fix for a selector-loop bug that loses data in large uploads (#2485). An unknown value makes every CLI command fail before it runs (exit 1; `CONFIG_ERROR` with `--json`). Ignored on other platforms and by `notebooklm-mcp`, `notebooklm-server` and the Python API. | `proactor` (asyncio's default) |
 | `NOTEBOOKLM_LOG_LEVEL` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` | `WARNING` |
 | `NOTEBOOKLM_DEBUG_RPC` | Legacy: Enable RPC debug logging (use `LOG_LEVEL=DEBUG` instead) | `false` |
 | `NOTEBOOKLM_DEBUG` | Show untruncated RPC response bodies in error messages instead of the default 80-char preview (verbose; intended for deep debugging) | `0` |
@@ -193,9 +232,16 @@ remains an unconditional forced re-mint.
 | `NOTEBOOKLM_MCP_OAUTH_PASSWORD` | Password gating the self-hosted OAuth authorization server that lets claude.ai connect to the remote MCP server (≥16 chars). Set together with `NOTEBOOKLM_MCP_OAUTH_BASE_URL`; both unset → bearer-only. | - |
 | `NOTEBOOKLM_MCP_OAUTH_BASE_URL` | Bare public HTTPS origin (no path) the self-hosted OAuth endpoints (`/authorize`, `/token`, `/.well-known/*`) mount under. Required with `NOTEBOOKLM_MCP_OAUTH_PASSWORD`; partial/weak/non-HTTPS config refuses to start. | - |
 | `NOTEBOOKLM_MCP_PUBLIC_URL` | Public base URL for the remote MCP file upload/download signed-URL side-channel (falls back to `NOTEBOOKLM_MCP_OAUTH_BASE_URL`). Unset → `source_add type=file` / `artifact_download` return a "not configured" error. | - |
+| `NOTEBOOKLM_MCP_ALLOWED_ROOTS` | OS-pathsep list of directories stdio `source_add(source_type="file", path=...)` may read. Unset/empty → host-path file-add is off. `$HOME`, `~/.notebooklm` / `NOTEBOOKLM_HOME`, and `/` are ignored even if listed. Credential filenames (`storage_state.json`, `master_token.json`) and Playwright profile dirs are refused even inside a listed root. Remote HTTP never opens a server-host `path`. | (empty / off) |
 | `NOTEBOOKLM_MCP_TRUST_PROXY` | Trust the proxy-set `CF-Connecting-IP` header as the self-hosted-OAuth login-throttle key. Only enable behind a trusted proxy (e.g. the Cloudflare tunnel); default off keys on the socket peer. | `0` |
 | `NOTEBOOKLM_MCP_STRICT_IDS` | Strict IDs-only mode for MCP tools: require a full canonical id for every `notebook`/`source`/`note`/`artifact` reference and reject names, titles, and short id prefixes (fail-fast, deterministic automation). | `0` |
+| `NOTEBOOKLM_MCP_CHAT_CONCURRENCY` | Concurrent detached `chat_start` generations; later accepted jobs queue FIFO. Clamped to 1–16. | `3` |
+| `NOTEBOOKLM_MCP_CHAT_JOB_TIMEOUT` | Optional aggregate seconds from detached-chat acceptance through queue and generation. Unset keeps jobs unbounded. | - |
 | `NOTEBOOKLM_SERVER_TOKEN` | Bearer token required by every REST `/v1` request. The REST server refuses to start without it. | - |
+| `NOTEBOOKLM_MCP_PROFILES` | Comma-separated MCP profiles. More than one (Web or Android) requires an explicit `profile` on every tool call; Web profiles must each own a distinct Web session. | - |
+| `NOTEBOOKLM_MCP_PROFILE_STARTUP_TIMEOUT` | Positive finite seconds for each multi-profile startup/recovery attempt. Waiting for another Web profile's open does not count. | `30` |
+| `NOTEBOOKLM_SERVER_PROFILES` | Comma-separated REST profiles. More than one (Web or Android) requires explicit `X-NotebookLM-Profile` routing; Web profiles must each own a distinct Web session. | - |
+| `NOTEBOOKLM_SERVER_PROFILE_STARTUP_TIMEOUT` | Complete startup/recovery timeout per multi-profile REST client, in positive finite seconds. Waiting for another Web profile's open does not count. | `30` |
 | `NOTEBOOKLM_SERVER_HOST` | REST server bind host; non-loopback refused unless `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND=1` | `127.0.0.1` |
 | `NOTEBOOKLM_SERVER_PORT` | REST server bind port | `8000` |
 | `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND` | Allow REST server to bind a non-loopback host. Use only behind a trusted proxy. | `0` |
@@ -208,6 +254,12 @@ remains an unconditional forced re-mint.
 | `NOTEBOOKLM_QUIET_DEPRECATIONS` | Suppress the project's public-API `DeprecationWarning`s (the one-off warnings routed through `warn_deprecated`, e.g. awaiting `from_storage(...)`). Set to a truthy value (`1` / `true` / `yes` / `on`, case-insensitive) to silence them; see `docs/deprecations.md`. | (warnings emitted) |
 | `NOTEBOOKLM_FUTURE_ERRORS` | **Retired (removed in v0.8.0; ignored).** It was the v0.7.0 forward-compat preview gate for the v0.8.0 error contract; now that every break it staged is the default, the flag is a no-op — setting it has no effect. See `docs/deprecations.md`. | (ignored) |
 | `NOTEBOOKLM_VCR_RECORD_ERRORS` | Synthetic-error injection mode for VCR test cassettes (`429`, `5xx`, `expired_csrf`) | - |
+
+### Enterprise host compatibility
+
+Google's [enterprise documentation](https://docs.cloud.google.com/gemini/enterprise/notebooklm-enterprise/docs/api-notebooks) names `notebook.cloud.google.com` for Google identities. Both that host and the legacy `notebooklm.cloud.google.com` are accepted by `NOTEBOOKLM_BASE_URL`; login recognizes redirects between the two enterprise hosts, and extracted cookies retain their original domain scope. Enterprise upload destinations remain pinned to the configured host.
+
+This is host-level compatibility, not verified end-to-end enterprise support. Google's browser URLs include a region path and `project` query parameter; `NOTEBOOKLM_BASE_URL` accepts only an origin, and this change does not add project/region routing. The separate `notebook.cloud.google` third-party identity flow is not supported by this cookie-authentication path and is not an accepted base URL.
 
 ### Public config API vs internal resolvers
 
@@ -222,7 +274,80 @@ re-exports only the supported endpoint/language helpers:
 from `notebooklm.config` remain supported; internal-only `_env` names should
 not be imported by downstream code.
 
+`ENTERPRISE_BASE_HOST` now resolves to `notebook.cloud.google.com`. Callers
+that use this public constant to construct URLs will select the current
+enterprise origin; the legacy origin remains available through an explicit
+`NOTEBOOKLM_BASE_URL=https://notebooklm.cloud.google.com` setting.
+
+### Bound Web request policy (additive preview)
+
+Python clients retain dynamic environment resolution in 0.x when
+`WebBackendConfig.request` is omitted or `None`. To bind request and recovery
+policy to one client, supply `WebRequestOptions`:
+
+```python
+from notebooklm import NotebookLMClient
+from notebooklm.options import ClientConfig, WebBackendConfig, WebRequestOptions
+
+config = ClientConfig(
+    backend=WebBackendConfig(
+        request=WebRequestOptions(
+            base_url="https://notebook.google.com",
+            language="en",
+            # build_label, transport, and impersonate may also be supplied explicitly.
+        )
+    )
+)
+pending = NotebookLMClient.from_storage(profile="work", config=config)
+# Defaults were captured at the call above, before deferred authentication I/O.
+async with pending as client:
+    notebooks = await client.notebooks.list()
+```
+
+Direct `NotebookLMClient(auth, config=config)` captures at construction. Creating
+an options object alone does not capture environment defaults. Explicit option
+fields win; omitted fields resolve from the environment and built-in defaults
+once. The same policy survives deferred loading, authentication refresh, and
+close/reopen. First-party CLI, MCP, and REST default factories explicitly select
+this bound preview; injected factories retain control of their configuration.
+
+The captured settings are `NOTEBOOKLM_BASE_URL`, `NOTEBOOKLM_HL`, `NOTEBOOKLM_BL`,
+`NOTEBOOKLM_TRANSPORT`, `NOTEBOOKLM_IMPERSONATE`, `NOTEBOOKLM_REFRESH_CMD`,
+`NOTEBOOKLM_REFRESH_CMD_USE_SHELL`, `NOTEBOOKLM_REFRESH_CMD_MIDSESSION`,
+`NOTEBOOKLM_HEADLESS_REAUTH`, and `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL`.
+The existing HTTPS host allowlist still applies. Request routing, output language
+defaults, Web notebook/share links, homepage acquisition, refresh, RPC, chat,
+uploads, and asset transfers use the client's policy. Operation-specific language
+arguments retain precedence. Drive import's guarded streaming download continues
+to use its fixed httpx implementation and redirect/byte-limit checks; it has no
+ambient transport selector.
+
+Cookies, CSRF/session tokens, and account routing remain live. Concurrent clients
+with different policies may share profile storage but cannot share incompatible
+recovery execution or successful-recovery markers. Recovery child processes get
+only selected policy overrides (including Web backend selection) over their
+current environment, plus the resolved storage/profile destination and recursion
+guard. Inline auth and serving secrets are scrubbed. Recovery commands stay in
+private redacted state, outside public option reprs and diagnostic keys.
+
+Operational controls remain dynamic: RPC-ID overrides, logging/deprecation
+controls, explicit refresh-output logging, the refresh recursion guard, keepalive
+poke disabling, and unrelated process settings such as `PATH` and proxies. This
+is not a snapshot of all process environment. Standalone config/URL helpers remain
+dynamic outside a bound client operation. Android configuration is independent;
+its display links and 0.x Web compatibility sidecar retain legacy dynamic policy.
+
+The eventual change to the omitted/default Web policy is a separate migration,
+C4-01, with **no shipped notice yet**. This additive preview does not switch the
+Python default or borrow another deprecation's release date. A stable preview or
+warning release and its own interval must precede that change; legacy behavior
+must survive a major release if its gate has not matured.
+
 ### Env vars and precedence
+
+The timing below describes standalone helpers and legacy dynamic Web clients.
+For explicitly bound Web clients, the settings listed above resolve at client
+construction instead of at request/spawn time.
 
 Every `NOTEBOOKLM_*` variable read by the library and CLI, in one place. CLI
 flags always win over env vars; env vars win over persisted profile config /
@@ -233,17 +358,17 @@ be audited from one location.
 | Variable | Purpose | Resolution order (highest → lowest) | Resolved by |
 |----------|---------|-------------------------------------|-------------|
 | `NOTEBOOKLM_PROFILE` | Active profile name. Selects which `~/.notebooklm/profiles/<name>/` directory backs storage and context. | `-p/--profile` flag → `NOTEBOOKLM_PROFILE` → `default_profile` from `~/.notebooklm/config.json` → `default` | `paths.resolve_profile` |
-| `NOTEBOOKLM_AUTH_JSON` | Inline `storage_state.json` payload for CI/CD; bypasses on-disk profile storage entirely. | `--storage` flag → `NOTEBOOKLM_AUTH_JSON` → profile-aware `storage_state.json` → legacy fallback | `auth.load_auth_from_storage` |
+| `NOTEBOOKLM_AUTH_JSON` | Inline `storage_state.json` payload for CI/CD; bypasses on-disk profile storage entirely. Its presence makes REST/MCP Web multi-profile serving refuse to start. | `--storage` flag → `NOTEBOOKLM_AUTH_JSON` → profile-aware `storage_state.json` → legacy fallback | `auth.load_auth_from_storage` |
 | `NOTEBOOKLM_HOME` | Base directory for all per-profile files. | `NOTEBOOKLM_HOME` → `~/.notebooklm` | `paths.get_home_dir` |
 | `NOTEBOOKLM_HL` | Default interface/output language for `generate <kind>` and the `hl` query parameter on every batchexecute RPC. | `--language` flag → `NOTEBOOKLM_HL` → `language` value from **global** `~/.notebooklm/config.json` (NOT per-profile) → `en` | `language.resolve_hl` |
 | `NOTEBOOKLM_LOG_LEVEL` | `DEBUG`/`INFO`/`WARNING`/`ERROR` floor for the `notebooklm` package logger. | `--quiet` flag (forces `ERROR`) → `-v/-vv` flags (force `INFO`/`DEBUG`) → `NOTEBOOKLM_DEBUG_RPC=1` (forces `DEBUG`) → `NOTEBOOKLM_LOG_LEVEL` → `WARNING` | `_logging.configure_logging` + `notebooklm_cli.cli` |
 | `NOTEBOOKLM_DEBUG_RPC` | Legacy alias that sets the package logger to `DEBUG`. Prefer `NOTEBOOKLM_LOG_LEVEL=DEBUG` for new code. | (See `NOTEBOOKLM_LOG_LEVEL`.) | `_logging.configure_logging` |
 | `NOTEBOOKLM_NOTEBOOK` | Default notebook ID when no `-n/--notebook` flag is passed. Composes with `notebooklm use <id>` so per-shell overrides do not clobber the persisted active-notebook context. | `-n/--notebook` flag → `NOTEBOOKLM_NOTEBOOK` → active context (from `notebooklm use`) → error | `cli.helpers.require_notebook` (Click also reads it natively via `cli/options.py:notebook_option`'s `envvar=`) |
-| `NOTEBOOKLM_RPC_OVERRIDES` | **JSON object** mapping `RPCMethod` enum names to RPC ID strings (e.g. `{"LIST_NOTEBOOKS": "AbC123"}`). Overrides runtime RPC IDs — community self-patch when Google rotates a method ID. Empty string / unset disables the mechanism; invalid JSON or non-object payloads emit a `WARNING` and are ignored. | Process env, evaluated per RPC resolve (cached on the raw env string). | `notebooklm.rpc.overrides._parse_rpc_overrides` |
+| `NOTEBOOKLM_RPC_OVERRIDES` | **JSON object** mapping `RPCMethod` enum names to RPC ID strings (e.g. `{"LIST_NOTEBOOKS": "AbC123"}`). Overrides runtime RPC IDs — community self-patch when Google rotates a method ID. Empty string / unset disables the mechanism; invalid JSON or non-object payloads emit a `WARNING` and are ignored. | Process env, evaluated per RPC resolve (cached on the raw env string). | `notebooklm._web.wire.overrides._parse_rpc_overrides` |
 | `NOTEBOOKLM_QUIET_DEPRECATIONS` | Suppress the project's public-API `DeprecationWarning`s — the one-off warnings routed through `src/notebooklm/_deprecation.py::warn_deprecated` (e.g. awaiting `from_storage(...)`). Set to a truthy value (`1` / `true` / `yes` / `on`) to silence them. See `docs/deprecations.md`. | (warnings emitted) | `_deprecation._deprecations_quiet` / `deprecations_quiet` |
 | `NOTEBOOKLM_FUTURE_ERRORS` | **Retired (removed in v0.8.0; ignored).** It was the v0.7.0 forward-compat preview gate for the v0.8.0 error contract (ADR-0019 / umbrella [#1346](https://github.com/teng-lin/notebooklm-py/issues/1346)). Now that every break it staged — `get()` raising `*NotFoundError`, the attribute-only typed returns, the removed `interval=` alias, the bool→`None` returns, the refusal-raises, and the mutate-existing fail-loud — is the default, the flag is a **no-op**: setting it has no effect. See `docs/deprecations.md`. | (ignored) | — |
 | `NOTEBOOKLM_STRICT_DECODE` | **Retired (ignored since v0.7.0).** Strict decoding is the only mode — `safe_index` always raises `UnknownRPCMethodError` on schema drift. The former `0` warn-and-fallback opt-out was removed; setting the variable has no effect. | (ignored) | — |
-| `NOTEBOOKLM_BASE_URL` | Gemini Notebook base URL. Constrained to `https://notebook.google.com` (default) or `https://notebooklm.google.com` (pre-rebrand personal host, still served — the documented rollback lever; if auth fails after switching, re-run `notebooklm login --fresh`) or `https://notebooklm.cloud.google.com` (enterprise); other schemes/hosts/paths raise `ValueError`. | Process env on every base-URL lookup. | `_env.get_base_url` |
+| `NOTEBOOKLM_BASE_URL` | Gemini Notebook base URL. Constrained to `https://notebook.google.com` (default) or `https://notebooklm.google.com` (pre-rebrand personal host, still served — the documented rollback lever; if auth fails after switching, re-run `notebooklm login --fresh`) or `https://notebook.cloud.google.com` (enterprise) or `https://notebooklm.cloud.google.com` (legacy enterprise); other schemes/hosts/paths raise `ValueError`. | Process env on every base-URL lookup. | `_env.get_base_url` |
 | `NOTEBOOKLM_BL` | `bl` (build label) URL parameter sent on the chat streaming endpoint (`ChatAPI.ask`). Pins the frontend build the request is attributed to. The built-in `_env.DEFAULT_BL` is watched by the nightly canary's [build-label lane](rpc-development.md#build-label-lane-bl--_envdefault_bl), which compares it against the label Google actually serves; an override here does not change that verdict. | Process env on every chat stream call; whitespace-only falls back to `_env.DEFAULT_BL`. | `_env.get_default_bl` |
 | `NOTEBOOKLM_DEBUG` | When `1`, RPC error messages include the **full** untruncated response body instead of the default 80-char preview. Verbose; intended for deep debugging only. | Process env on each error formatting call. | `exceptions._truncate_response_preview` |
 | `NOTEBOOKLM_REFRESH_CMD` | Optional command invoked when auth refresh is required. Must exit `0` after writing a refreshed `storage_state.json`; the parent reloads cookies from disk. Stdout/stderr are not parsed (only surfaced in the non-zero-exit error message). Parsing honors `NOTEBOOKLM_REFRESH_CMD_USE_SHELL`. | Process env on each refresh subprocess spawn. | `auth` refresh-spawn helper (constant `NOTEBOOKLM_REFRESH_CMD_ENV` in `notebooklm.auth`) |
@@ -254,15 +379,22 @@ be audited from one location.
 | `NOTEBOOKLM_REFRESH_STORAGE_PATH` | Child env var injected into `NOTEBOOKLM_REFRESH_CMD`; points to the `storage_state.json` file the command must rewrite before exiting `0`. Refresh scripts may read it, but setting it in the parent shell does not select storage. | Set by `auth` refresh-spawn helper from the explicit storage path or profile-aware storage path. | `auth._run_refresh_cmd` |
 | `NOTEBOOKLM_DISABLE_KEEPALIVE_POKE` | When `1`, disable the proactive `accounts.google.com/RotateCookies` poke that refreshes `__Secure-1PSIDTS` ahead of expiry. Useful when running behind a proxy that rejects the extra request, or in offline test fixtures. | Process env on every keepalive check. | `auth` keepalive guards (constant `NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV` in `notebooklm.auth`) |
 | `NOTEBOOKLM_PROMOTION_EXIT_TIMEOUT` | Seconds the process waits at exit for an in-flight one-time migration of a pre-`v0.x` `context.json` account into `storage_state.json`. A ceiling shared by all outstanding writers, not a delay — a finished migration exits immediately. `0` never waits. Unset, empty, or whitespace-only falls back to the default; non-numeric, negative, and non-finite (`inf`/`nan`) values are refused with a `WARNING` and the default is used; a finite value above `threading.TIMEOUT_MAX` is clamped. An incomplete wait is always reported at `WARNING` (so `--quiet`, which forces `ERROR`, suppresses it). | Process env, read once per process at exit → `30.0` | `_auth.profile_migration._promotion_exit_timeout` |
-| `NOTEBOOKLM_HEADLESS_REAUTH` | Opt in to layer-3 headless re-auth for cold construction and automatic refresh paths. Explicit Python/CLI `allow_headless` flags do not require the env var. | Literal `1` enables; all other values disabled. | `_auth.headless_reauth.headless_reauth_env_enabled` |
-| `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL` | Optional Chrome DevTools Protocol endpoint for layer-3 headless re-auth. Must be loopback (`127.0.0.1`, `::1`, or `localhost`); remote endpoints are ignored because CDP is account-equivalent. | Explicit function argument → env var → no CDP arm. | `_auth.headless_reauth.resolve_cdp_url` |
+| `NOTEBOOKLM_HEADLESS_REAUTH` | Opt in to layer-3 headless re-auth for cold construction and automatic refresh paths. Explicit Python/CLI `allow_headless` flags do not require the env var. | Literal `1` enables; all other values disabled. | `_browser.headless_reauth.headless_reauth_env_enabled` |
+| `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL` | Optional Chrome DevTools Protocol endpoint for layer-3 headless re-auth. Must be loopback (`127.0.0.1`, `::1`, or `localhost`); remote endpoints are ignored because CDP is account-equivalent. A non-blank value makes REST/MCP Web multi-profile serving refuse to start. | Explicit function argument → env var → no CDP arm. | `_browser.headless_reauth.resolve_cdp_url` |
 | `NOTEBOOKLM_MCP_TRANSPORT` | Default transport for `notebooklm-mcp`: `stdio` or `http`. CLI `--transport` wins. | `--transport` flag → env var → `stdio` | `mcp.__main__._build_parser` |
 | `NOTEBOOKLM_MCP_HOST` | HTTP bind host for `notebooklm-mcp --transport http`. Non-loopback refused unless `NOTEBOOKLM_MCP_ALLOW_EXTERNAL_BIND=1`. | `--host` flag → env var → `127.0.0.1` | `mcp.__main__._build_parser` / `_serving.check_bind_allowed` |
 | `NOTEBOOKLM_MCP_PORT` | HTTP bind port for `notebooklm-mcp --transport http`. | `--port` flag → env var → `9420` | `mcp.__main__._build_parser` / `_resolve_port` |
 | `NOTEBOOKLM_MCP_ALLOW_EXTERNAL_BIND` | Allow MCP HTTP transport to bind a non-loopback host. Use only behind a trusted proxy. | Literal `1` enables; all other values disabled. | `mcp.__main__._check_http_bind_allowed` → `_serving.check_bind_allowed` |
 | `NOTEBOOKLM_MCP_TRUST_PROXY` | Trust the proxy-set `CF-Connecting-IP` header as the self-hosted-OAuth login-throttle key. Enable only behind a trusted proxy (e.g. the Cloudflare tunnel); default off keys the throttle on the socket peer. | Literal `1` enables; all other values disabled. | `mcp._oauth.get_oauth_config` / `_client_ip` |
 | `NOTEBOOKLM_MCP_STRICT_IDS` | Strict IDs-only mode: MCP `notebook`/`source`/`note`/`artifact` references must be a full canonical id; names, titles, and short id prefixes are rejected before any list call (deterministic automation). Off by default → default name/prefix/title resolution is unchanged. | Literal `1` enables; all other values disabled. | `mcp._resolve._strict_ids_enabled` |
+| `NOTEBOOKLM_MCP_CHAT_CONCURRENCY` | Maximum concurrent detached chat generations; accepted excess work queues FIFO. | Env var → `3`, clamped to 1–16. | `mcp._chattasks._resolve_concurrency` |
+| `NOTEBOOKLM_MCP_CHAT_JOB_TIMEOUT` | Optional detached-chat aggregate deadline, anchored at registry acceptance and including queue time. | Positive finite seconds; unset/blank/invalid preserves unbounded behavior. | `mcp._chattasks._resolve_job_timeout` |
+| `NOTEBOOKLM_MCP_ALLOWED_ROOTS` | Directories stdio `source_add(source_type="file", path=...)` may read. OS pathsep-separated. Unset/empty disables host-path file-add. `$HOME`, NotebookLM home, and the filesystem root are dropped. Credential filenames and Playwright profile dirs are refused even inside a listed root. Remote HTTP never opens a server-host `path`. | Process env on each stdio host-path file-add → empty (off). | `mcp.tools._fileupload._spool_stdio_upload` / `_app.source_add.validate_upload_path` |
 | `NOTEBOOKLM_SERVER_TOKEN` | Bearer token required by every REST `/v1` request. The server refuses to start when unset/empty. | `--token` flag → env var → startup failure | `server.__main__._check_token_configured` / `server._auth.require_auth` |
+| `NOTEBOOKLM_MCP_PROFILES` | Static MCP profiles (Web or Android). Web mode refuses copied `storage_state.json` sessions per profile and refuses inline auth or a shared CDP re-auth browser at startup. | `--profiles` → env; explicit `--profile` selects single mode. | `mcp.__main__.main` / `_app.profiles.configured_profiles` / `_app.web_profiles.WebProfileSet` |
+| `NOTEBOOKLM_MCP_PROFILE_STARTUP_TIMEOUT` | Per-profile startup/recovery deadline. | Positive finite seconds; default `30`. | `_app.profiles.profile_startup_timeout` |
+| `NOTEBOOKLM_SERVER_PROFILES` | Static REST profiles (Web or Android). Web mode refuses copied `storage_state.json` sessions per profile and refuses inline auth or a shared CDP re-auth browser at startup. | `--profiles` → env; explicit `--profile` selects single mode. | `server.__main__.main` / `server._profiles.configured_profiles` / `_app.web_profiles.WebProfileSet` |
+| `NOTEBOOKLM_SERVER_PROFILE_STARTUP_TIMEOUT` | Complete construction timeout for each multi-profile REST client, including credential inspection and readiness. Also applies to recovery attempts. Web profiles open one at a time; the wait for a turn is excluded. | Env var → `30` seconds; blank uses default; invalid/nonpositive/nonfinite values fail configuration. Single-profile mode ignores it. | `server._profiles.profile_startup_timeout` |
 | `NOTEBOOKLM_SERVER_HOST` | REST server bind host. Non-loopback refused unless `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND=1`. | `--host` flag → env var → `127.0.0.1` | `server.__main__._build_parser` / `_serving.check_bind_allowed` |
 | `NOTEBOOKLM_SERVER_PORT` | REST server bind port. | `--port` flag → env var → `8000` | `server.__main__._build_parser` / `_resolve_port` |
 | `NOTEBOOKLM_SERVER_ALLOW_EXTERNAL_BIND` | Allow REST server to bind a non-loopback host. Use only behind a trusted proxy. | Literal `1` enables; all other values disabled. | `server.__main__._check_bind_allowed` → `_serving.check_bind_allowed` |
@@ -347,6 +479,8 @@ notebooklm list  # Works without any file on disk
 5. `~/.notebooklm/storage_state.json` (legacy fallback)
 
 **Note:** Cannot run `notebooklm login` when `NOTEBOOKLM_AUTH_JSON` is set.
+REST and MCP Web multi-profile serving refuses to start while it is set (even
+empty), because inline auth would bypass every profile's own storage.
 
 ### `NOTEBOOKLM_REFRESH_CMD`
 
@@ -454,6 +588,21 @@ effect.** Remove it from your environment / CI config. See
 
 ### Timeouts
 
+For Python construction, prefer the owner-grouped `ClientConfig` facade in
+`notebooklm.options`. `WebTransportOptions` owns independent read/write/pool
+timeouts (connect remains an internal fixed default), `AndroidBackendConfig`
+owns the aggregate logical-RPC timeout, and `TransferOptions` owns resumable
+start/finalize plus Drive HTTP phases. Legacy `timeout=` still maps to all three
+Web components or the Android RPC budget; legacy `upload_timeout=` maps to Web
+start/finalize and to all three Android transfer phases. These flat tuning
+keywords remain functional in v0.x but non-default uses warn for their v1
+removal.
+
+`TransferOptions.drive_timeout` affects only Drive metadata/media/staging HTTP
+legs. It never changes registration or readiness RPC budgets. A whole-field
+`None` preserves backend phase defaults; `TimeoutOptions(None, None, None,
+None)` explicitly disables local HTTP component timers.
+
 Most batchexecute RPCs issued by the client (whether through `NotebookLMClient`
 or any of the CLI commands) use a **30-second** HTTP request timeout by default,
 with a tighter **10-second** connection-establishment timeout. The shorter
@@ -508,19 +657,11 @@ compose. Both kwargs read identically:
 A non-positive or non-finite value for either raises `ValueError` at
 construction rather than silently producing a window that times out instantly.
 
-Independently, an IMPORT_RESEARCH attempt made by
-`import_sources_with_verification` is clamped to whatever is left of that call's
-own `max_elapsed` retry budget, so a late retry cannot be *granted* a window
-larger than the budget it has left. Note what that does and does not promise:
-every timeout here is an `httpx` slot, and the read slot is an inactivity limit
-between socket reads — so `max_elapsed` bounds when a new attempt may *start*,
-not the wall-clock duration of one already in flight. Enforcing the latter would
-mean cancelling an in-flight non-idempotent POST, which risks duplicated sources
-the client can no longer see. When less than 10 seconds of that budget remains — too little for an
-attempt to outlast connection establishment — the loop stops instead of sending
-one: `IMPORT_RESEARCH` is non-idempotent, so an attempt whose result the client
-cannot observe can still commit sources server-side and duplicate them. The
-first attempt is exempt, so `max_elapsed=0` still means "try once".
+`import_sources_with_verification` sends `IMPORT_RESEARCH` once. Its
+`max_elapsed` value bounds only the optional read-only inspection performed
+after an unknown outcome; it never grants a second import attempt. Every timeout
+here remains an `httpx` slot, and the read slot is an inactivity limit between
+socket reads rather than a hard wall-clock cancellation deadline.
 
 ### Decoder strictness
 
@@ -828,6 +969,9 @@ Browser login opens in the Windows host browser. The storage file is saved in th
 
 ### Headless Servers & Containers
 
-**Playwright is only required for the `notebooklm login` command.** All other operations use standard HTTP requests via `httpx`.
+**Playwright is required only for interactive `notebooklm login` and the optional,
+explicitly enabled layer-3 browser recovery path.** Ordinary RPC operations use
+standard HTTP requests via `httpx`; a base install with supplied storage state
+does not import Playwright.
 
 For the install + auth-bootstrap recipe (run `notebooklm login` on a workstation, copy `storage_state.json` to the server, set `NOTEBOOKLM_AUTH_JSON`), see the canonical Persona D guide: [docs/installation.md#d-headless-server-or-ci](installation.md#d-headless-server-or-ci).

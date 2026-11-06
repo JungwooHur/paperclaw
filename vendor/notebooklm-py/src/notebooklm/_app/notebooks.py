@@ -1,11 +1,11 @@
 """Transport-neutral notebook business logic.
 
 This is the Click-free core of ``cli/notebook_cmd.py``: it owns the
-``create`` / ``delete`` / ``rename`` / ``describe`` (summary) / ``metadata``
-workflows and returns typed result dataclasses instead of an adapter-shaped
-envelope dict. Every transport adapter (the Click CLI today, the FastMCP
-server / future HTTP later) drives this core and renders the typed result into
-its own surface + exit-code policy.
+``create`` / ``copy`` / ``delete`` / ``rename`` / ``describe`` (summary) /
+``metadata`` workflows and returns typed result dataclasses instead of an
+adapter-shaped envelope dict. Every transport adapter (the Click CLI today,
+the FastMCP server / future HTTP later) drives this core and renders the typed
+result into its own surface + exit-code policy.
 
 Two boundary-imposed seams are worth calling out:
 
@@ -30,6 +30,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+
+from ..options import USE_DEFAULT
 
 if TYPE_CHECKING:
     from ..client import NotebookLMClient
@@ -103,9 +105,10 @@ async def execute_notebook_create(
     and the MCP ``notebook_create`` tool — surfaces populated timestamps on
     creation rather than ``null`` (#1705, lifting the MCP-only fix from #1699).
     """
-    notebook = await client.notebooks.create(title)
-    await _backfill_create_timestamps(client, notebook)
-    return NotebookCreateResult(notebook=notebook)
+    async with client.operation(timeout=USE_DEFAULT):
+        notebook = await client.notebooks.create(title)
+        await _backfill_create_timestamps(client, notebook)
+        return NotebookCreateResult(notebook=notebook)
 
 
 async def _backfill_create_timestamps(
@@ -155,6 +158,39 @@ async def _backfill_create_timestamps(
 
 
 # ---------------------------------------------------------------------------
+# notebook copy
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NotebookCopyResult:
+    """Outcome of ``notebook copy``."""
+
+    source_notebook_id: str
+    notebook: Notebook
+
+
+async def execute_notebook_copy(
+    client: NotebookLMClient,
+    notebook_id: str,
+    title: str,
+    *,
+    resolve_notebook_id: ResolveNotebookIdFn,
+) -> NotebookCopyResult:
+    """Resolve + copy a notebook, including its sources and Studio artifacts.
+
+    ``notebooks.copy`` deliberately does not retry an ambiguous transport
+    failure because the server may already have committed the copy. That
+    policy lives in the backend implementation; this workflow preserves it by
+    issuing exactly one copy call after resolution.
+    """
+    async with client.operation(timeout=USE_DEFAULT):
+        resolved_id = await resolve_notebook_id(client, notebook_id)
+        notebook = await client.notebooks.copy(resolved_id, title)
+        return NotebookCopyResult(source_notebook_id=resolved_id, notebook=notebook)
+
+
+# ---------------------------------------------------------------------------
 # notebook delete
 # ---------------------------------------------------------------------------
 
@@ -190,16 +226,16 @@ async def execute_notebook_rename(
     new_title: str,
     *,
     resolve_notebook_id: ResolveNotebookIdFn,
-    json_output: bool = False,
 ) -> NotebookRenameResult:
     """Resolve + rename a notebook.
 
     ``resolve_notebook_id`` is injected so this core stays free of the
     ``rich``-coupled resolver and the CLI's ``monkeypatch`` seam keeps landing.
     """
-    resolved_id = await resolve_notebook_id(client, notebook_id, json_output=json_output)
-    await client.notebooks.rename(resolved_id, new_title)
-    return NotebookRenameResult(notebook_id=resolved_id, new_title=new_title)
+    async with client.operation(timeout=USE_DEFAULT):
+        resolved_id = await resolve_notebook_id(client, notebook_id)
+        await client.notebooks.rename(resolved_id, new_title)
+        return NotebookRenameResult(notebook_id=resolved_id, new_title=new_title)
 
 
 # ---------------------------------------------------------------------------
@@ -224,12 +260,12 @@ async def execute_notebook_describe(
     notebook_id: str,
     *,
     resolve_notebook_id: ResolveNotebookIdFn,
-    json_output: bool = False,
 ) -> NotebookDescribeResult:
     """Resolve + fetch a notebook's AI-generated description."""
-    resolved_id = await resolve_notebook_id(client, notebook_id, json_output=json_output)
-    description = await client.notebooks.get_description(resolved_id)
-    return NotebookDescribeResult(notebook_id=resolved_id, description=description)
+    async with client.operation(timeout=USE_DEFAULT):
+        resolved_id = await resolve_notebook_id(client, notebook_id)
+        description = await client.notebooks.get_description(resolved_id)
+        return NotebookDescribeResult(notebook_id=resolved_id, description=description)
 
 
 # ---------------------------------------------------------------------------
@@ -254,15 +290,16 @@ async def execute_notebook_metadata(
     notebook_id: str,
     *,
     resolve_notebook_id: ResolveNotebookIdFn,
-    json_output: bool = False,
 ) -> NotebookMetadataResult:
     """Resolve + fetch a notebook's metadata (details + sources list)."""
-    resolved_id = await resolve_notebook_id(client, notebook_id, json_output=json_output)
-    metadata = await client.notebooks.get_metadata(resolved_id)
-    return NotebookMetadataResult(notebook_id=resolved_id, metadata=metadata)
+    async with client.operation(timeout=USE_DEFAULT):
+        resolved_id = await resolve_notebook_id(client, notebook_id)
+        metadata = await client.notebooks.get_metadata(resolved_id)
+        return NotebookMetadataResult(notebook_id=resolved_id, metadata=metadata)
 
 
 __all__ = [
+    "NotebookCopyResult",
     "NotebookCreateResult",
     "NotebookDescribeResult",
     "NotebookMetadataResult",
@@ -270,6 +307,7 @@ __all__ = [
     "ResolveNotebookIdFn",
     "SUGGEST_SURFACE_MAP",
     "SuggestSurface",
+    "execute_notebook_copy",
     "execute_notebook_create",
     "execute_notebook_delete",
     "execute_notebook_describe",

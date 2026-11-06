@@ -261,7 +261,7 @@ def _render_logout_outcome(outcome: LogoutOutcome, *, json_output: bool = False)
         console.print("[yellow]No active session found.[/yellow] Already logged out.")
 
 
-def _render_auth_check_result(result: AuthCheckResult) -> None:
+def _render_auth_check_result(result: AuthCheckResult, *, json_output: bool) -> None:
     """Render an :class:`AuthCheckResult` (table or JSON) and exit on failure.
 
     The presentation + exit-code policy lives here in the command layer
@@ -273,7 +273,15 @@ def _render_auth_check_result(result: AuthCheckResult) -> None:
     checks = result.checks
     details = result.details
 
-    if plan.json_output:
+    def render_guidance(code: str) -> str:
+        if code == "master_token_psidts":
+            return (
+                "Run 'notebooklm auth check --test' to mint and verify, or re-run "
+                "'notebooklm login --master-token'."
+            )
+        raise AssertionError(f"Unhandled auth guidance code: {code}")
+
+    if json_output:
         # Promote the identity/location facts to top-level keys for CI gates
         # (the same values the Rich table shows — sourced from one ``details``
         # so the two surfaces can't disagree, issue #1640). ``notebook_count`` is
@@ -291,6 +299,8 @@ def _render_auth_check_result(result: AuthCheckResult) -> None:
         }
         if plan.test_fetch:
             payload["notebook_count"] = details.get("notebook_count")
+        if result.guidance:
+            payload["guidance"] = [render_guidance(code) for code in result.guidance]
         json_output_response(payload)
         if not all_passed:
             exit_with_code(1)
@@ -403,6 +413,8 @@ def _render_auth_check_result(result: AuthCheckResult) -> None:
 
     if details.get("error"):
         console.print(f"\n[red]Error:[/red] {details['error']}")
+    for guidance in result.guidance:
+        console.print(f"[yellow]{render_guidance(guidance)}[/yellow]")
 
     if all_passed:
         console.print("\n[green]Authentication is valid.[/green]")

@@ -11,14 +11,19 @@ of endpoint/language helpers from here.
 
 from __future__ import annotations
 
-import os
 import re
 from datetime import date, datetime
 from urllib.parse import urlparse
 
+from ._request_context import policy_env
+
 DEFAULT_BASE_URL = "https://notebook.google.com"
 PERSONAL_BASE_HOST = "notebook.google.com"
-ENTERPRISE_BASE_HOST = "notebooklm.cloud.google.com"
+# Google-identity enterprise UI hosts. Third-party identity uses a separate
+# non-.com origin and authentication flow; it is not an accepted base URL.
+ENTERPRISE_BASE_HOST = "notebook.cloud.google.com"
+ENTERPRISE_LEGACY_HOST = "notebooklm.cloud.google.com"
+ENTERPRISE_APP_HOSTS = frozenset({ENTERPRISE_BASE_HOST, ENTERPRISE_LEGACY_HOST})
 
 # The pre-rebrand personal host. Still served, still selectable via
 # ``NOTEBOOKLM_BASE_URL``, and documented as the rollback lever for the #2067
@@ -55,7 +60,7 @@ if len(PERSONAL_APP_HOSTS) != 2:  # pragma: no cover - import-time invariant
         "a one-element PERSONAL_APP_HOSTS silently breaks the login accept-set"
     )
 
-_ALLOWED_BASE_HOSTS = PERSONAL_APP_HOSTS | {ENTERPRISE_BASE_HOST}
+_ALLOWED_BASE_HOSTS = PERSONAL_APP_HOSTS | ENTERPRISE_APP_HOSTS
 
 
 def get_base_url() -> str:
@@ -64,7 +69,11 @@ def get_base_url() -> str:
     ``NOTEBOOKLM_BASE_URL`` is constrained to known Google-owned NotebookLM hosts
     because the value is used for authenticated requests.
     """
-    configured = os.environ.get("NOTEBOOKLM_BASE_URL")
+    return validate_base_url(policy_env("NOTEBOOKLM_BASE_URL"))
+
+
+def validate_base_url(configured: str | None) -> str:
+    """Validate an explicit host using the same authenticated-endpoint allowlist."""
     raw = (configured.strip() if configured is not None else DEFAULT_BASE_URL).rstrip("/")
     if not raw:
         raw = DEFAULT_BASE_URL
@@ -201,7 +210,7 @@ def get_default_bl() -> str:
     always compares the *committed* :data:`DEFAULT_BL` against what the app shell
     serves, because that constant is what ships to every user.
     """
-    raw = os.environ.get("NOTEBOOKLM_BL", "") or ""
+    raw = policy_env("NOTEBOOKLM_BL", "") or ""
     return raw.strip() or DEFAULT_BL
 
 
@@ -215,11 +224,11 @@ def get_default_language() -> str:
 
     * The ``hl`` URL query parameter on every batchexecute RPC call
       (``RpcExecutor.build_url`` and
-      ``_chat.wire.build_streaming_chat_request``).
+      ``_web.params.chat_stream.build_streaming_chat_request``).
     * Language-aware ``ArtifactsAPI.generate_*`` calls when callers pass
       ``language=None`` to opt in to environment/default resolution. Omitting
       ``language`` in the public Python API keeps the historical ``"en"``
       artifact-language default.
     """
-    raw = os.environ.get("NOTEBOOKLM_HL", "") or ""
+    raw = policy_env("NOTEBOOKLM_HL", "") or ""
     return raw.strip() or "en"

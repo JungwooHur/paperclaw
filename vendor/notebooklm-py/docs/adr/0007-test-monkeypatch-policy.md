@@ -4,6 +4,28 @@
 
 Accepted.
 
+**Amended 2026-09-03 (auth/browser package-family ratchet).** The generally
+sanctioned public-attribute ``patch.object`` form is not an unbounded exception
+inside ``notebooklm._auth`` or ``notebooklm._browser``. Schema-v2 patch
+projections freeze the full package/target/test-path/lexical-owner row, a
+separate 526-site ``notebooklm.auth`` projection prevents relocation to the
+public facade, and the companion shared-owner audit prevents moving mutation to
+classes, singletons, process-default owners, or mutating helpers. During the
+ordered migration the private-package population is shrink-only; the final
+survivor policy classifies each remaining site as a compatibility adapter,
+sealed fault, runtime gateway, or minimum composition probe. Public-facade
+substitution remains an operation-boundary technique, but its exact projection
+cannot grow.
+
+The auth/browser collectors enforce a finite repository grammar rather than
+attempting to interpret arbitrary Python or pytest behavior. Explicit imports,
+direct mutation idioms, literal finite target names/containers without unpacking,
+the suite-used syntactic `list(...)` wrapper, and direct local helper calls with
+statically resolvable arguments are supported. A family
+target that is unresolved within those forms fails closed; syntax outside them
+must not be used to claim that an existing projected site disappeared. See
+ADR-0033's measurement boundary for the complete review rule.
+
 This ADR shipped in the `arch-d1-fixtures-scaffolding` PR (D1 PR-1). It defines the *forbidden* test patterns going forward. The migration of the existing offenders to constructor seams is **complete**: the meta-lint's file-level allowlist has been **drained to zero** (issue #1376), so the per-file gate is now a global invariant and `tests/_guardrails/test_no_forbidden_monkeypatches.py` asserts `_ALLOWLIST == frozenset()` as a hardening guard against re-growth. The policy and lint stay in force indefinitely; only the *migration* is finished.
 
 **Shim-retirement milestone complete (issue #1367).** All three named production shims this ADR set out to remove are now gone: `_AuthFacadeModule` (retired by ADR-0014), the `_core.py` property-bridge zoo (retired in the session-shrink arc per ADR-0001), and — as of #1367 ([PR #1374](https://github.com/teng-lin/notebooklm-py/pull/1374)) — the last one, the `cli/session_cmd` patch-surface bridge (`_resolve_paths_helper` precedence chain plus its dual fixture and the pure re-export surface). The earlier "only the `cli/session_cmd` block remains / two of three retired" status is superseded by this entry. With the shims retired *and* the allowlist drained to zero (issue #1376), both halves of the policy — shim retirement and offender migration — are complete, so this ADR is now plain "Accepted".
@@ -46,9 +68,10 @@ Going forward, every test that needs to substitute a collaborator on `Session` o
 ```python
 from tests._fixtures import make_fake_core
 
+
 async def test_notebooks_list_returns_payload() -> None:
     fake = make_fake_core(rpc_call=AsyncMock(return_value=[fake_payload]))
-    api = NotebooksAPI(fake.rpc_executor)
+    api = WebNotebooksAPI(fake.rpc_executor)
     result = await api.list()
     fake.rpc_executor.rpc_call.assert_awaited_once()
 ```
@@ -75,7 +98,7 @@ The meta-lint (`tests/_guardrails/test_no_forbidden_monkeypatches.py`) runs in `
 **Wanted:**
 
 - New tests cannot rebuild the gravity well. The meta-lint blocks the patterns at PR review.
-- Sub-clients become testable in isolation. `NotebooksAPI(core=fake)` exercises the sub-client without standing up a real `Session`, without import-string resolution, and without after-construction mutation.
+- Sub-clients become testable in isolation. `WebNotebooksAPI(fake.rpc_executor)` exercises the web sub-client without standing up a real `Session`, without import-string resolution, and without after-construction mutation.
 - The `_AuthFacadeModule` shim, the `_core.py` property bridges, and the `cli/session_cmd.py` proxy block were always intended as *removable* artifacts. They kept existing tests passing until those tests migrated; **all three have now been deleted with no remaining test churn** (D2 cutover and D1 PR-2/PR-3 removed the first two; #1367 / [PR #1374](https://github.com/teng-lin/notebooklm-py/pull/1374) removed the `cli/session_cmd` bridge). The file-level allowlist drain is **complete — the allowlist drained to zero** (issue #1376).
 - Test diffs become smaller and more readable. A test that overrides one collaborator now shows one keyword argument instead of one `monkeypatch.setattr` line per substituted symbol.
 

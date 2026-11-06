@@ -117,8 +117,8 @@ Appendix-A2 races) is a symptom of that duplication. So the destination is:
 
 ```python
 @dataclass(frozen=True)
-class AuthTokens:                    # a BOOTSTRAP credential, not a live-state bag
-    initial_cookies: CookieJar       # immutable seed — read ONCE to open the client, never re-read
+class AuthTokens:  # a BOOTSTRAP credential, not a live-state bag
+    initial_cookies: CookieJar  # immutable seed — read ONCE to open the client, never re-read
     csrf_token: str
     session_id: str
     authuser: int
@@ -132,12 +132,13 @@ live-cookie authority**. The Phase-A audit is equality-pinned by
 
 | Owner | Shadow access | Role |
 |---|---|---|
-| `_kernel.py:Kernel._bootstrap_cookies` | reads `cookie_jar`, falling back to `cookies` | the one bootstrap hand-off; copied into kernel ownership during client composition |
+| `_web/transport/kernel.py:Kernel._bootstrap_cookies` | reads `cookie_jar`, falling back to `cookies` | the one bootstrap hand-off; copied into kernel ownership during client composition |
 | `_auth/tokens.py:AuthTokens.__post_init__` | reads/writes `cookies` and `cookie_jar` | public construction compatibility and normalization |
-| `_auth/tokens.py:AuthTokens.replace_cookie_jar` | writes `cookies` and `cookie_jar` | public v0.x sync-back only |
-| `_auth/tokens.py:AuthTokens._replace_profile_session` | calls `replace_cookie_jar` | syncs public shadows after an atomic stored-profile install |
-| `_auth/session.py:_try_storage_cookie_reload` | calls `replace_cookie_jar` in `finally` | syncs public shadows even when cancellation interrupts baseline adoption |
-| `_runtime/auth.py:AuthRefreshCoordinator.update_auth_headers` | calls `replace_cookie_jar` | syncs public shadows after refresh |
+| `_auth/tokens.py:AuthTokens._sync_cookie_jar` | writes `cookies` and `cookie_jar` | warning-free internal v0.x sync-back owner |
+| `_auth/tokens.py:AuthTokens.replace_cookie_jar` | calls `_sync_cookie_jar` after a caller-attributed warning | deprecated public v0.x compatibility boundary only |
+| `_auth/tokens.py:AuthTokens._replace_profile_session` | calls `_sync_cookie_jar` | syncs public shadows after an atomic stored-profile install |
+| `_auth/session.py:_try_storage_cookie_reload` | calls `_sync_cookie_jar` in `finally` | syncs public shadows even when cancellation interrupts baseline adoption |
+| `_web/transport/auth.py:AuthRefreshCoordinator.update_auth_headers` | calls `_sync_cookie_jar` | syncs public shadows after refresh |
 | `_auth/tokens.py:AuthTokens.__repr__` | reads both fields | redacted public representation only |
 | `_auth/tokens.py:AuthTokens.jar` | reads `cookie_jar` | public question/bootstrap migration projection only |
 | `_auth/tokens.py:AuthTokens._flat_cookie_projection` | reads `cookies` | warning-free implementation shared by lossy public compatibility projections |
@@ -145,12 +146,12 @@ live-cookie authority**. The Phase-A audit is equality-pinned by
 | `_auth/tokens.py:AuthTokens.cookie_header` | calls the private projection without warning | distinct domain-blind public compatibility projection only |
 | `_auth/tokens.py:AuthTokens.cookie_header_for` | reads `cookie_jar` | public compatibility query; no first-party request path calls it |
 
-The three `replace_cookie_jar` callsites above write only to keep the two public shadows coherent;
-none reads a shadow to select recovery or persistence behavior. Persistence reads `kernel.cookies`;
-account-email routing now reads the kernel jar before open, while open, and after close. No
-first-party post-bootstrap transport, routing, recovery, or persistence decision reads a cookie
-shadow. The kernel retains the exact transport jar across close/reopen—it does not construct a
-detached generation snapshot.
+The three first-party `_sync_cookie_jar` callsites above write only to keep the two public shadows
+coherent; the fourth call is the deprecated public compatibility wrapper. None reads a shadow to
+select recovery or persistence behavior. Persistence reads `kernel.cookies`; account-email routing
+now reads the kernel jar before open, while open, and after close. No first-party post-bootstrap
+transport, routing, recovery, or persistence decision reads a cookie shadow. The kernel retains the
+exact transport jar across close/reopen—it does not construct a detached generation snapshot.
 
 - **Phase A — now, non-breaking (no public change).** Repoint post-bootstrap readers to
   `kernel.cookies`; `.jar` remains a public projection whose migration role is the future
@@ -158,12 +159,15 @@ detached generation snapshot.
   `AuthTokens` is *behaviorally* the frozen bootstrap credential above, wearing a mutable-dataclass
   costume for the public surface.
 - **Next minor — deprecate, non-breaking.** Runtime `DeprecationWarning` on `flat_cookies` (a plain
-  property, safe to warn — the early-warning canary). `cookies` / `cookie_jar` get **docs-only**
-  deprecation: they cannot carry a runtime warning because `dataclasses.replace` / `__eq__` /
-  `__repr__` read them, so a warning would fire from library internals.
-- **Phase B — next major, breaking.** Delete `cookie_jar`, `cookies`, the sync-back, `flat_cookies`,
-  and `cookie_header*`; freeze `AuthTokens` to the shape above. Phase A makes this a clean field
-  deletion, not a logic migration, because by then nothing internal depends on the fields.
+  property, safe to warn — the early-warning canary) and on the public `replace_cookie_jar`
+  operation after first-party sync-back moves to `_sync_cookie_jar`. `cookies` / `cookie_jar` and
+  `cookie_snapshot` get **docs-only** deprecation: they cannot carry a runtime warning because
+  `dataclasses.replace` / `__eq__` / `__repr__` read them, so a warning would fire from library
+  internals.
+- **Phase B — next major, breaking.** Delete `cookie_jar`, `cookies`, `cookie_snapshot`, public
+  `replace_cookie_jar`, the internal sync-back, `flat_cookies`, and `cookie_header*`; freeze
+  `AuthTokens` to the shape above. Phase A makes this a clean field deletion, not a logic migration,
+  because by then nothing internal depends on the fields.
 
 The earlier framing — "`cookies` becomes a property derived from `cookie_jar`" — is rejected as the
 destination: it keeps the shadow and computes it, so it does not remove the bug class. The goal is to

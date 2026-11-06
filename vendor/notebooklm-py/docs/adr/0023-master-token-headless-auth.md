@@ -156,3 +156,53 @@ v0.x boundary: public signatures and facade identities are unchanged, and its
 call-time bridges retain legacy account lookup, strict-loader, Android-ID, and
 default-verifier monkeypatch timing without importing runtime/client code into
 the coordinator.
+
+## Amendment (Phase B0c): typed OAuth mint boundary
+
+`MintService` now exposes the protocol-neutral `mint_oauth(master_token, spec)`
+seam. `OAuthClientSpec(service, app, client_sig)` is immutable, and the returned
+`MintedOAuthToken` excludes its token from `repr`. A valid server-supplied
+one-to-ten-digit decimal `Expiry` is projected to Unix seconds; an absent,
+non-decimal, or oversized value is `None`, with no fallback lifetime invented
+by the client. OAuth failures use fixed sanitized messages and discard raw
+dependency exceptions, responses, and credential-bearing traceback locals;
+`MissingDependencyError` retains its distinct type.
+
+The existing web cookie mint supplies the frozen Chromecast/OAuthLogin spec and
+then performs OAuthLogin, MergeSession, and RotateCookies exactly as before.
+`gpsoauth` remains lazily imported, its logger mutation remains serialized, and
+the sole production `perform_oauth` call remains inside `_auth/mint_service.py`
+under `asyncio.to_thread`. Protocol adapters may consume the typed seam but may
+not import `gpsoauth`, duplicate the exchange, or persist the minted bearer.
+
+## Amendment (2026-09-02): browser OAuth acquisition boundary
+
+The visible EmbeddedSetup capture implementation moved to
+`_browser/oauth_token.py`. The CLI still decides when a human-driven capture is
+appropriate and injects its small `capture_oauth_token` adapter into the neutral
+master-token bootstrap. That adapter calls the coarse
+`auth.capture_browser_oauth_token` facade operation; no browser plan/result type
+crosses the facade. Both wrapper frames delete the browser choice, CDP endpoint,
+and timeout locals on failure so a retained traceback cannot retain an
+account-equivalent endpoint. See ADR-0036.
+
+## Amendment (2026-09-29): re-minted sessions are independent
+
+The original Consequences section called master-token re-minting
+"single-consumer per account", on the reasoning that concurrent re-mints could
+invalidate each other's `SID`. That was a design-time caution, not a measured
+result. Live testing for
+[#1901](https://github.com/teng-lin/notebooklm-py/issues/1901) ran two
+processes, each holding a copy of one `master_token.json` and minting its own
+Web session, with production keepalive enabled. Neither process invalidated the
+other's session, including when extra mints were made during the run.
+
+What must not happen is two consumers actively using one cookie session at the
+same time: copies of one `storage_state.json` in concurrent use can sign each
+other out, so each concurrent consumer needs its own minted or logged-in
+session. Moving a profile's `storage_state.json` to another machine remains
+fine once the original copy is no longer used. A re-mint replaces its profile's
+stored session, so direct or manual re-mints against one profile path should
+still be serialized. Workers on one account continue to share that account's
+usage limits. This amendment supersedes the "Single-consumer per account"
+consequence above, which is kept as originally accepted.

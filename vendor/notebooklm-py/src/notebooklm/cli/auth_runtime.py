@@ -297,11 +297,26 @@ def resolve_client_factory(
         injected = ctx.obj.get("client_factory")
         if injected is not None:
             return injected
-    if default is not None:
-        return default
-    from ..client import NotebookLMClient
+    if default is None:
+        from ..client import NotebookLMClient
 
-    return NotebookLMClient
+        default = NotebookLMClient
+
+    backend = ctx.obj.get("backend") if ctx is not None and isinstance(ctx.obj, dict) else None
+
+    def selected_factory(*args: Any, **kwargs: Any) -> AbstractAsyncContextManager[Any]:
+        from .._app.client_config import adapter_client_config
+        from ..options import AUTO
+
+        if "config" not in kwargs:
+            kwargs["config"] = adapter_client_config(
+                backend=kwargs.pop("backend", backend),
+                timeout=kwargs.pop("timeout", 30.0),
+                chat_timeout=kwargs.pop("chat_timeout", AUTO),
+            )
+        return default(*args, **kwargs)
+
+    return selected_factory
 
 
 def auth_check_notebook_count(ctx: click.Context) -> int | None:

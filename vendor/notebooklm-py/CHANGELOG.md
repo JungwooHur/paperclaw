@@ -7,6 +7,572 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-10-28
+
+### Added
+
+- **Deferred audio generation (#2506).** Queue audio overviews with `later=True`
+  in Python or `--later` in the CLI on Web and Android.
+
+- **Deferred Studio generation (#2519).** Queue videos, reports (including study
+  guides), quizzes, flashcards, infographics and slide decks with `later=True`
+  in Python or `--later` in the CLI on Web and Android. Scheduled jobs return
+  `scheduled`; combining `--later` with `--wait` is rejected. Cinematic video
+  remains unsupported for deferred generation.
+
+- **Experimental Android Live Voice (#2509).** Android clients can open
+  notebook-bound `client.live.connect(...)` sessions with audio input/output,
+  transcripts, interruption events and bounded lifecycle cleanup. Recording,
+  playback and codecs remain application-owned; automatic reconnection is not enabled.
+
+### Changed
+
+- **The Windows CLI runs on asyncio's default event loop (#2485).** The
+  `notebooklm` CLI no longer installs `WindowsSelectorEventLoopPolicy` at
+  startup (#79). On CPython 3.12–3.14 that loop could drop chunks of large file
+  uploads (`AssertionError: Data should not be empty`, then `NETWORK_ERROR …
+  (upload_finalize)`), and it had already broken Playwright login (#89, #2011).
+  Commands now use the Proactor loop, like `notebooklm-mcp`,
+  `notebooklm-server` and the Python API. If commands hang inside a sandbox
+  such as Sandboxie-Plus (#75), set `NOTEBOOKLM_WINDOWS_EVENT_LOOP=selector`;
+  an unknown value fails before the command starts. On Python 3.11+ the CLI no
+  longer uses the event-loop policy API that Python 3.16 removes,
+  `login --master-token` now runs through the same loop selection, and the CLI
+  hides curl_cffi's Proactor warning, whose advice to install the selector
+  policy no longer applies.
+
+### Fixed
+
+- **Android owned notebooks can be removed from recent views without an error.**
+  Google now returns `INVALID_ARGUMENT` for this no-op. The client verifies
+  explicit ownership before accepting that response; failures for shared,
+  missing, or unreadable notebooks still raise an error.
+
+- **Fresh installs include `typing_extensions` (#2500).** Declare the runtime
+  dependency used by public type exports.
+- **Synchronous cookie recovery honors the selected transport (#2504).**
+  Curl-backed recovery uses the supported curl_cffi runtime.
+- Updated locked dependencies to address reported vulnerabilities (#2513).
+
+- **An uppercase full UUID now reaches the right notebook, source, note or
+  artifact.** The CLI and MCP resolvers passed a full UUID through in the case
+  it was typed, but Google matches ids case-sensitively and its ids are always
+  lowercase. Reads by an uppercase id failed with a misleading `NOT_FOUND`, and
+  `notebook_delete` by one reported `deleted` while the notebook stayed. The
+  resolvers now lowercase a full UUID before any backend call. The REST server,
+  which takes ids as given in the path, is unchanged.
+
+- **Windows CLI uploads on the selector loop no longer lose data (#2485).** On
+  Python 3.12–3.14, asyncio's selector loop drops a chunk of the request body
+  when a Windows socket send would block, so multi-megabyte uploads failed
+  with a flood of `AssertionError: Data should not be empty` and left the
+  source stuck in `preparing`. When `NOTEBOOKLM_WINDOWS_EVENT_LOOP=selector`
+  selects that loop, the CLI now installs the fix from Python 3.15, only on
+  interpreters that have the bug. The default Proactor loop, the Python API,
+  `notebooklm-mcp` and `notebooklm-server` leave asyncio unpatched.
+- **Android audio and video downloads no longer crawl at playback speed.** The
+  media host, `googlevideo.com`, throttles a whole-file download to about
+  32 KiB/s, so a 23-minute audio overview took roughly 12 minutes and often
+  failed with `Android transfer failed (code=transport …)`. The Android backend
+  now fetches that host in contiguous 8 MiB ranges, which arrive at full
+  speed: the same 22.8 MB file downloads in about a second. Each range is
+  checked against the previous one and the declared total, and a server that
+  ignores the range is still read in full.
+- **Title lookups now find `İstanbul` from `istanbul` (#2476).** MCP name
+  resolution (notebooks, sources, notes, artifacts and Studio items) matches
+  in tiers. Tier 1 is Unicode canonical caseless matching, so composed and
+  decomposed spellings now agree. Only when tier 1 finds nothing does an
+  accent-insensitive tier 2 run, and it raises an ambiguity error rather than
+  pick between several titles. The near-miss hints and the download `--name`
+  filter use the accent-insensitive key directly. Studio item refs gain the
+  title-prefix matching the other resolvers already had for lookups and
+  previews; `studio_rename` and a confirmed single-item `studio_delete` still
+  need an exact title or an id, and a complete Studio listing for a title. Dotless `ı` still
+  never matches `i`. The confirmation previews of `share_set_access`,
+  `share_set_user` and `share_remove_user` now include the resolved notebook
+  `title`, as `notebook_delete` already did, so a tier-2 match is visible
+  before anything changes; if the notebook list cannot be read, the preview
+  shows `title: null` instead of failing. These previews, and those of
+  `notebook_delete` and a single-source `source_delete`, reuse the list read
+  to resolve a name instead of listing again; the two delete previews also
+  show `title: null` when a full-id preview cannot read the list (with a
+  name, resolution fails first). Preview titles are now also found when the
+  ref is a full id in uppercase. Tools that change data (renames,
+  saves, adds, generation, research, chat settings, sharing changes, and
+  confirmed deletes) use tier 1 only: a ref that only the accent-insensitive
+  tier would match returns a `VALIDATION` error naming the candidates, where
+  it was `NOT_FOUND` with a "Did you mean" hint before. Read-only tools and
+  confirmation previews keep both tiers.
+
+## [0.8.5] - 2026-10-12
+
+### Added
+
+- **Python 3.15 support (#2480).** Add Python 3.15 classifier, documentation,
+  and testing across CI matrices.
+
+### Fixed
+
+- **Expired cold-start authentication (#2461, #2464).** Exhausted login-redirect
+  recovery raises `AuthError`, so Python callers can catch it, CLI commands
+  return `AUTH_ERROR` with exit 1, and MCP tools preserve the re-login hint.
+  Read-only Android auth loading reports the same error without running Web
+  recovery or persisting cookies.
+
+- **Signed-out sessions misreported as a page-structure change (#2479, #2481).**
+  The app host now answers a signed-out request with a token-less landing page
+  instead of a sign-in redirect. When the CSRF token is missing, token loading
+  now asks the app's `/login` endpoint whether the session is signed in. A
+  stale session reports `Authentication expired` and enters the existing login
+  recovery, instead of `CSRF token not found ... page structure has changed`.
+
+- **Headless and CDP re-auth no longer capture a signed-out browser session
+  (#2482, #2483).** An app-host landing with a `SID` cookie is no longer enough: the
+  capture first asks the app's `/login`, through the browser context's own
+  cookies, whether the session is signed in. A signed-out session is refused
+  with `HeadlessLoginRequiredError` and the saved authentication is kept,
+  instead of being overwritten with another expired set. If the check cannot
+  be answered, capture proceeds as before.
+
+- **Browser session capture validation and auth doctor (#2472).** Validate
+  captured browser storage cookies across SPA navigation, refuse anonymous
+  captures, and clarify diagnostic warnings in `notebooklm doctor`.
+
+- **Tokenless Web auth recovery and generation journal (#2465).** Recover
+  tokenless Web authentication and journal generation at submission time.
+
+- **Release archives packaging (#2463).** Exclude internal repository assets
+  from release distribution archives.
+
+- **CI resilience and recovery (#2458, #2460, #2462, #2473, #2475).** Install
+  impersonate extra for package verification, recover tagged publishes with
+  release-scoped auth allowances, allow scheduler delays in upload and
+  download fault scenarios, and reconcile auth repository lint guardrails.
+
+- **MCP test isolation (#2459).** Isolate MCP backend flag tests from ambient
+  user profiles.
+
+### Changed
+
+- **FastMCP 4.1.0 and MCP 2.x upgrade (#2480).** Bump FastMCP to 4.1.0 and adapt
+  MCP tool annotations and tool result handling for Python 3.15 compatibility.
+- **Android protobuf toolchain upgrade (#2480).** Upgrade pinned toolchain to
+  grpcio 1.84.0 and protobuf 7.36.2 for Python 3.15 wheel support.
+- **Dependency updates.** Bump pyjwt to 2.15.0 (#2456), beartype to 0.23.1 (#2480),
+  and librt (#2480).
+
+## [0.8.4] - 2026-10-01
+
+### Added
+
+- **Android multi-profile REST and MCP serving (#1901).** Serve several Android
+  accounts with `--profiles`, route each request by profile, and isolate profile
+  startup failures and recovery.
+
+- **Web multi-profile REST and MCP serving (#1901).** `notebooklm-server --profiles
+  work,personal` and `notebooklm-mcp --profiles work,personal` now serve several
+  profiles on the default Web backend, with the same `X-NotebookLM-Profile` /
+  per-tool `profile` routing, per-profile isolation, `503 profile_unavailable`
+  degradation, and recovery cooldown as Android multi-profile mode. Each profile
+  opens its own `storage_state.json` by explicit path; a profile with only a
+  `master_token.json` mints its own session first. A profile that shares either
+  session cookie (`__Secure-1PSID` or `SID`) with another configured profile, such
+  as a copied `storage_state.json`, is refused while siblings keep serving;
+  diagnostics report `session_conflict`. Web profile opens
+  take turns, and waiting for a turn does not count against the startup timeout. Web
+  multi-profile mode refuses `NOTEBOOKLM_AUTH_JSON` and a non-blank
+  `NOTEBOOKLM_HEADLESS_REAUTH_CDP_URL`. Copies made after both profiles are serving
+  are detected only when one reopens. Single-profile and Android behavior are
+  unchanged.
+- **MCP inspection and retry metadata (#1925).** Studio summary and single-item
+  responses include decoded media duration, slide count, and source count;
+  unavailable metadata stays `null`. MCP errors preserve known retry delays as
+  `retry_after_seconds` in both structured results and tool-error messages.
+- **Opt-in URL recovery (#2110).** CLI `source add --fallback-fetch` and
+  MCP/REST `fallback_fetch` can import eligible failed web pages as static text,
+  using a bounded, public-address-only browser-impersonating fetch. Results and
+  content preserve provenance. Optional `cleanup_on_failure` removes only an
+  attributable ERROR stub after replacement readiness; ambiguous rows remain.
+  Requires the `impersonate` and `markdown` extras. Android URL commit failures
+  with code 9 retain their original `ClientError`/`RPCError` type and carry the
+  correlated tentative `source_id` as operation metadata for recovery.
+
+- **Bulk note deletion (#1999).** `notes.delete(notebook_id, note_ids)` accepts a
+  list and sends one delete request on Web and Android. MCP `studio_delete(items=...)`
+  previews an explicit subset, batches text notes, routes artifacts and mind maps
+  by kind, and reports `deleted` / `not_found` results. Confirmed batches require
+  the canonical IDs from the preview.
+- **Bulk MCP sharing (#2000).** `share_set_user(grants=[...])` accepts 1–100 mixed
+  editor/viewer grants through the existing `sharing.set_users()` batch API.
+  Confirmation previews include every grantee; notification and welcome-message
+  settings apply to the whole batch. Together with the existing
+  `sources.add_urls_batch()` / `source_add(urls=...)` support (#1998), these expose
+  the verified batch-capable operations without adding MCP tools.
+
+### Fixed
+
+- **Authentication across rebranded hosts (#2443, #2444).** Recognize
+  `notebook.google` landing redirects and enterprise hosts, and report access
+  gates without misclassifying them as expired sessions.
+- **Mutation rejection handling (#2446).** Note deletion and sharing reject
+  explicit backend failures instead of reporting success.
+
+- **Android RPC health baseline.** Add the missing reviewed schema baseline,
+  using matching fingerprints from three consecutive protected-main runs, so
+  the canary can enforce drift checks after its bootstrap grace period.
+
+### Changed
+
+- Allow FileLock 4.x (#2450). Keep FastMCP pinned to the validated 3.4.2 release;
+  the 4.0.9 upgrade (#2451) is deferred because it breaks MCP imports and types.
+
+### Security
+
+- Update locked urllib3 to 2.8.0 and virtualenv to 21.7.13, resolving the
+  advisories reported by the release dependency audit.
+
+### Documentation
+
+- **Master-token re-mint guidance (#1901).** The auth cookie lifecycle guide no
+  longer calls Web re-minting "single-consumer per account", and ADR-0023 gains
+  an amendment recording why. Live testing found that sessions minted from copies
+  of one master token stay independent. The guidance now warns against two
+  consumers actively using the same cookie session at once instead.
+
+## [0.8.3] - 2026-09-25
+
+### Added
+
+- **Web vs Android public-behavior inventory.**
+  [`docs/web-android-public-behavior.md`](docs/web-android-public-behavior.md)
+  classifies remaining public backend splits (notes tombstone projection, raw
+  escape-hatch types, deliberate research-import policy, tracked default flips
+  gated by C3-02/C5A-01, and the [#2384](https://github.com/teng-lin/notebooklm-py/issues/2384)
+  `get_history` contract fix) so callers
+  do not treat every difference as a defect.
+- **Owner-grouped client configuration.** `notebooklm.options` adds frozen
+  `ClientConfig` groups for runtime capacity, retries, selected backend,
+  transfer phases, feature read windows, and Web session hooks. Both direct
+  construction and `from_storage` accept keyword-only `config=` while retaining
+  flat 0.x arguments through one compatibility normalizer.
+- **Public mutation-outcome evidence.** `notebooklm.outcomes` now exposes
+  `CommitState`, `RecoveryAction`, frozen `OperationMetadata`, typed reconciliation reports,
+  and ordered batch outcomes. These let callers
+  distinguish a request proven not sent, a decoded rejection, an unknown
+  commit outcome, and a caller-correlated confirmation. Unknown-outcome errors
+  retain the compatibility `unconfirmed` marker and may expose bounded
+  reconciliation candidates for manual inspection. Legacy `unconfirmed`, `source_id`, and
+  `stage` attributes remain projections; because they are now declared on `NotebookLMError`,
+  callers should test `source_id is None` rather than `hasattr(error, "source_id")`.
+- **Aggregate operation deadlines and journals.** Public
+  `client.operation(timeout=...)` and `RuntimeOptions.operation_timeout` apply
+  one monotonic budget across queueing, authentication, retries, transport,
+  polling, reconciliation, and transfers. Owned expiry raises
+  `OperationTimeoutError`; partial failures and cancellation retain the
+  operation's ordered mutation evidence.
+- **Adapter-neutral preparation and execution.** CLI, MCP, and REST workflows
+  now share presentation-free `_app` request preparation and execution cores.
+  Generation uses typed requests and outcomes, while source batches preserve a
+  typed result for every input occurrence. MCP confirmation previews return
+  canonical resource IDs; during v0.9, a successful confirmed mutation that
+  still uses a name or partial ID emits a registered compatibility warning.
+- **Pre-merge live CI qualification.** The repository owner can dispatch RPC health or nightly
+  E2E from the trusted `main` workflow against the immutable head SHA of an open, same-repository
+  PR targeting `main`. Forks, non-owner dispatches, and direct feature-ref dispatches remain
+  blocked from protected credentials, while account selection and raw-token materialization remain
+  pinned to trusted `main` code and a trusted lockfile-built environment before candidate
+  dependencies execute. Nightly dispatches can also select only the full Web, Android, or read-only
+  live lane.
+
+### Fixed
+
+- **Research import no longer hangs on unclosed Markdown links (#2434).**
+  Citation URL extraction no longer triggers catastrophic regex backtracking
+  on long URLs in malformed Markdown links or images. Cited-only research
+  imports can process these reports without blocking the MCP event loop,
+  which previously caused connector and OAuth requests to time out.
+
+- **Artifact polling preserves unresolved absence (#2432).** Repeated listing
+  misses no longer produce a terminal `REMOVED` or fabricated quota error.
+  Waiters keep the original ID until completion, explicit failure, or timeout;
+  a completed sibling never substitutes for the requested artifact. Web listing
+  errors carried by null RPC responses now propagate, with bounded retries for
+  transient polling reads. The public `max_not_found` and
+  `min_not_found_window` arguments are deprecated and ignored; non-default
+  values warn. Permanently missing IDs now reach the caller's timeout. The
+  `REMOVED` enum remains available for compatibility.
+
+- **MCP stdio `source_add` host-path file-add is default-deny.**
+  `source_add(source_type="file", path=...)` over stdio now requires
+  `NOTEBOOKLM_MCP_ALLOWED_ROOTS` (OS-pathsep directories; `$HOME` and
+  `~/.notebooklm` are rejected as roots). Known credential filenames
+  (`storage_state.json`, `master_token.json`) and Playwright profile dirs
+  are refused even inside an allowed root. Remote HTTP still never opens a
+  server-host `path`.
+- **Fuzzy artifact resolution refuses incomplete listings.** CLI
+  `resolve_artifact_id` and MCP `resolve_artifact` now require
+  `list_with_status().is_complete` before title/prefix matching. A notes
+  outage (or other secondary backing failure) no longer turns an ambiguous
+  title/prefix into a unique hit or a partial miss into not-found; both
+  surfaces raise the existing `artifacts.lookup` incomplete-read `RPCError`.
+  Canonical UUID refs still fast-path without listing ([#2380](https://github.com/teng-lin/notebooklm-py/issues/2380)).
+- **REST/MCP research import shares one operation budget.** Poll, optional
+  cited/max filtering, and import now run under one `client.operation` so a
+  configured aggregate deadline cannot restart between the read and the
+  mutation (`Fixes #2382`).
+- **CLI `ask --save-as-note --json` keeps save-failure commit evidence.** Optional
+  note-save remains non-fatal, but JSON now projects `SaveNoteOutcome.failure`
+  through the same commit-state / recovery-action / known-id fields as other CLI
+  errors instead of dropping them on a redacted `note_save_error` string (#2383).
+- **Retry-unsafe writes no longer replay after transmission.** Notebook and
+  source creates, file registration, research imports, collection creates, and
+  chat POSTs now require explicit commit evidence before any outer replay.
+  Because neither backend's full-set response nor a matching list row proves
+  which collection belongs to the caller, Web and Android
+  `client.collections.create()` send once and then raise `CollectionError` with
+  bounded candidate IDs for manual identification. Staged Drive cleanup
+  deletes only rows proven to belong to the current operation.
+- **Web chat preserves ambiguous post-send outcomes.** A transmitted turn is
+  never blindly replayed after an HTTP 429, 5xx, write/read/protocol failure, or
+  auth-shaped 400/401/403. Stale credentials are refreshed once for later
+  calls, but the current ask surfaces unknown commit evidence with
+  conversation-history inspection guidance. Positively pre-send connection
+  failures retain bounded retry.
+- **Decoded refusals stay distinct from transport throttles.** Artifact
+  rate-limit retry now follows commit evidence rather than exception type: a
+  decoded service refusal with `REJECTED` evidence may consume the explicit
+  retry budget, while a bare transport 429 or other unknown post-dispatch
+  outcome surfaces without replay.
+- **Nightly E2E and RPC health template validation.** The disposable-copy contract now matches
+  the immutable public template title and its cross-backend copied artifact inventory, allowing
+  provisioning to proceed in the scheduled Web and Android lanes. Legacy quiz/flashcard rows that
+  Web cannot classify and absent optional artifact families no longer block provisioning; full E2E
+  still generates those families on disposable notebooks. Reference copies are polled for up to
+  ten minutes while inherited sources and artifacts finish processing; clean-role copies wait only
+  for ready sources before removing inherited artifacts. The lifecycle manager also uses the
+  public notebook as its default when no template override is configured. A close-time transport
+  failure after a one-shot lifecycle command has completed is now reported as a warning instead of
+  reversing the command's successful result. Read-only download checks now distinguish completed
+  artifact inventory from an actually downloadable asset, since public copies omit asset URLs.
+- **MCP server: `CONNECT_TIMEOUT` on connect.** The FastMCP lifespan opened the
+  `NotebookLMClient` — cookie rotation, the CSRF fetch, and the cold-recovery
+  ladder when those fail — *before* answering the MCP `initialize` handshake.
+  That auth work's budget (a 15 s `RotateCookies` poke plus a 30 s CSRF fetch,
+  more on the recovery rungs) exceeds the 30 s deadline hosts give the handshake,
+  so a slow or rate-limited Google surfaced to the host as a dead server
+  (`MCP server notebooklm connection timed out after 30000ms`) rather than an
+  auth error, and every retry spawned a fresh process that redid the same work.
+  The client is now opened lazily behind a `ClientProvider` that the lifespan
+  warms in the background: the handshake answers immediately, the first tool call
+  awaits the open, an auth failure arrives as a normal categorized tool error,
+  and a failed open is retried by the next call — so a mid-session
+  `notebooklm login` recovers a running server without a restart ([#2330]).
+
+### Changed
+
+- **`chat.get_history` raises on turn-fetch failures.** Web previously logged
+  `ChatError`/`NetworkError` from the conversation-turns RPC and returned `[]`,
+  so a failed fetch looked like an empty conversation. Android already raised.
+  Both backends now raise; for a positive `limit`, `[]` means no conversation
+  or no turns. Android also returns `[]` for non-positive limits
+  ([#2384](https://github.com/teng-lin/notebooklm-py/issues/2384)).
+- **Legacy client tuning has a v1 runway.** A construction using non-default
+  flat tuning keywords now emits one caller-attributed `DeprecationWarning`
+  naming all arguments to migrate to `config=ClientConfig(...)`. Explicit old
+  defaults remain silent. Web read/write/pool timers and start/finalize/Drive
+  transfer timers now reach their owning transports independently without
+  changing legacy defaults.
+- **Create and research-import recovery is diagnostic, not success-producing.**
+  The former probe-and-retry helper and `PROBE_THEN_CREATE` policy are retired.
+  Ambiguous mutations are sent once and surfaced unchanged.
+  `research.import_sources_with_verification()` never reissues an import after
+  response loss; its bounded read-only inspection can attach candidates and
+  unresolved inputs before re-raising, but cannot claim that a row belongs to
+  the failed call.
+- **Artifact poll followers declare their v1 behavior.** During v0.x the first
+  waiter still owns the shared leader's polling options, so differing follower
+  values are ignored with a deprecation warning. A follower
+  `on_status_change` callback still receives only the final status and emits a
+  separate warning; v1.0 will make options per-waiter and deliver every
+  observed status to each callback.
+- **Artifact download authentication failures now raise `AuthError`.** Public
+  artifact download methods surface HTTP 401/403 responses from guarded asset
+  transfers as `AuthError` instead of wrapping them in `ArtifactDownloadError`.
+  Callers that previously caught only `ArtifactDownloadError` for expired
+  credentials should also catch `AuthError`; other asset-transfer failures
+  continue to use `ArtifactDownloadError`. This aligns the Web and Android
+  backends and lets CLI/MCP adapters return their structured authentication
+  error and login guidance.
+- **Backend-conditional client assembly and backend-selected raw access.** An
+  Android-selected client now constructs and owns only the shared and Android
+  runtimes during normal use: it no longer creates a Web Kernel, performs Web
+  cookie recovery/persistence, or starts Web keepalive. Use `client.raw.call(...)`
+  on Web and `client.raw.unary(...)` / `unary_stream(...)` on Android. The root
+  `client.rpc_call(...)` wrapper is deprecated in v0.9.0 for removal in v1.0;
+  during v0.x its first Android use lazily opens a no-keepalive Web compatibility
+  sidecar so mixed profiles keep their historical behavior.
+- Pull requests run a reduced 7-cell compatibility matrix again (Python
+  3.10–3.14 on Ubuntu plus Python 3.12 on macOS and Windows). The full 15-cell
+  Ubuntu/macOS/Windows × Python 3.10–3.14 matrix now runs only in the nightly
+  workflow, and manual nightly dispatches include it by default.
+
+### Documentation
+
+- **MCP/REST hosting threat model (`SECURITY.md`).** Operator-facing security
+  docs no longer claim the CLI has "no long-lived API keys or OAuth tokens".
+  They now document that `master_token.json` is account-equivalent, MCP OAuth
+  refresh tokens are long-lived (rotating `NOTEBOOKLM_MCP_OAUTH_PASSWORD` does
+  not revoke them), stdio `source_add(path)` reads server-host files, `/files/dl`
+  and `/files/ul` are HMAC-URL auth only, open OAuth DCR does not bypass the
+  login password, MCP loopback HTTP may be tokenless while REST always requires
+  `NOTEBOOKLM_SERVER_TOKEN`, `GET /healthz` is liveness not readiness, and
+  `pip-audit` in CI still exports `browser+dev+markdown` by default.
+  ([#2387](https://github.com/teng-lin/notebooklm-py/issues/2387))
+
+### Removed
+
+- Removed six deprecated private `_auth` compatibility modules earlier than their documented
+  next-major removal window. Private importers must use `_auth.cookie_filter` instead of
+  `_auth._browser_cookie_filter`, `_auth.psidts_recovery` instead of
+  `_auth.browser_cookie_recovery`, `_browser.browser_capture` instead of
+  `_auth.browser_state_validation` or `_auth.login_wait_trace`, `_auth.profile_store` for
+  transaction primitives instead of `_auth.storage_transaction`, and `_auth.storage` instead of
+  `_auth.storage_writer`.
+
+## [0.8.2] - 2026-09-02
+
+The headline of this release is the new **Android backend**. The Python SDK, CLI,
+MCP server, and REST server can now use NotebookLM's native mobile API as an
+alternative to the Web backend. Install the `android` extra and select it with
+`backend="android"`, `--backend android`, or `NOTEBOOKLM_BACKEND=android`.
+The Web backend remains the default. All eleven public API namespaces are
+available, and Android operations no longer fall back to the Web transport. See
+the [installation](docs/installation.md#optional-extras-matrix) and
+[configuration](docs/configuration.md#backend-preference) guides
+([#2269], [#2281]).
+
+Why choose it? The Android transport talks directly to NotebookLM's native gRPC
+service, using short-lived OAuth bearer tokens minted on demand from a stored
+master token. This avoids the Web backend's expiring browser-cookie sessions,
+frontend build labels, obfuscated RPC IDs, and positional `batchexecute`
+responses. It can therefore be a better fit for unattended CI, containers, and
+long-running services, while also providing an independent route when a Web UI
+change disrupts automation. The tradeoff is that a durable master token is a
+more powerful credential than a cookie snapshot; use a dedicated account and
+protect it carefully. Both backends rely on undocumented Google APIs and may
+change without notice.
+
+### Added
+
+- Added chat generation status and cancellation on both backends.
+  `client.chat.session_status()` reports the active session state, while
+  `client.chat.cancel()` idempotently stops the selected or latest session.
+  MCP users can cancel a detached chat task with `chat_cancel` and inspect live
+  session state through `chat_status` ([#2306]).
+- Added `notebooklm copy <title>` as a CLI entry point for copying a notebook
+  with its sources and Studio artifacts on either backend. It accepts a partial
+  or active notebook ID, `--use` selects the new copy, and `--json` returns
+  structured output ([#2308]).
+- Added ranked passage search on both backends through
+  `sources.search(notebook_id, query, source_ids=..., limit=...)` and
+  `notebooklm source search`. Results include the source, text, rank, and
+  source-relative span, and can be filtered to selected sources
+  ([#2305], [#2307]).
+- Added Google Play Books sources on both backends. Use
+  `sources.list_play_books()` and `sources.add_play_book()`,
+  `notebooklm source books` / `source add-book`, or the corresponding MCP
+  tools to add eligible books from your library. Availability follows
+  NotebookLM's account and region restrictions ([#2300], [#2304]).
+- Added `research.discover()` and `notebooklm research discover` on both
+  backends for a single-call "Discover sources" workflow. It returns ranked
+  sources and an overview immediately, while preserving a task ID for later
+  import ([#2299]).
+- Added source and artifact workflow helpers on both backends: non-blocking URL
+  batches, appending text to a source, copying sources or artifacts, fetching
+  Studio customization choices, and requesting grounded next-step suggestions.
+  These are also available through the corresponding CLI commands ([#2291]).
+- Added `chat_start` and `chat_status` MCP tools for chat generations that
+  may outlast a remote connector's request timeout. Requests queue when the
+  configurable concurrency limit is reached, and `chat_status` can poll
+  multiple task IDs at once ([#2286]).
+- Added source-type recognition for Gemini chats, Excel, Gmail, AI Mode chats,
+  Google Play Books, and general Google Drive files ([#2282], [#2300]).
+
+### Changed
+
+- Release and nightly compatibility testing now runs the complete 15-cell
+  matrix: Ubuntu, macOS, and Windows across Python 3.10 through 3.14. Browser,
+  coverage, repository-lint, and live-E2E work remains in dedicated lanes.
+- **Compatibility note:** backend source type code `14` now reports
+  `SourceType.GOOGLE_DRIVE` instead of `GOOGLE_SPREADSHEET`. Native Google
+  Sheets continue to report `SourceType.GOOGLE_SPREADSHEET` through code `7`
+  ([#2281]).
+- The `cookies` extra now uses the maintained `rookie-cookies` package instead
+  of `rookiepy`. This supports Python 3.13+ as well as extracting cookies on
+  Windows for Chrome, Edge, Brave, and other Chromium-based browsers ([#2162]).
+
+### Fixed
+
+- Android gRPC `PERMISSION_DENIED` responses now surface as client request
+  failures rather than authentication failures, matching the Web backend and
+  avoiding misleading re-authentication guidance for operation-level refusals.
+- Web chat now identifies payload-free terminal streams as quota exhaustion,
+  matching the Android backend's explicit `RESOURCE_EXHAUSTED` result for the
+  same account state. CLI, MCP, and REST callers now receive a retriable
+  rate-limit error instead of a non-retriable generic chat failure.
+- The public API compatibility audit now treats a previously uninspectable
+  baseline signature as unknown rather than a breaking change. This prevents
+  false release failures on Python 3.14 while still rejecting regressions that
+  make a previously inspectable signature unavailable.
+- Credential redaction now recognizes current `AQ.`-prefixed Google
+  authorization keys in runtime logs, exception previews, and cassette
+  fixtures, alongside legacy `AIza` keys ([#2254]).
+- The RPC health canary no longer treats an account-dependent omission of the
+  dedicated Cinematic row from Studio customization choices as removal of
+  `VideoFormat.CINEMATIC`. Wire format 3 remains supported, while unknown codes
+  and missing ordinary format choices still report drift ([#2313]).
+- Write operations no longer report success when NotebookLM actually rejected
+  the request. This covers source refresh and rename, notebook and chat
+  updates, sharing changes, note, label, and collection mutations, and artifact
+  rename, export, and mind-map generation ([#2296]).
+- Android `sources.get_guide()` now accepts the server's valid unlabelled
+  response on repeated reads. Missing or not-yet-summarized sources also match
+  Web behavior for `get_guide()` and `check_freshness()` instead of raising a
+  false not-found error ([#2277], [#2280]).
+- Android file uploads now always perform one status check before timing out
+  when given a positive wait timeout, so a ready or failed source is not
+  misreported as an indeterminate timeout ([#2294]).
+- Interactive login now tolerates interrupted navigation during Google's
+  sign-in flow and gives actionable fallback guidance after repeated failures.
+  Browser-cookie import also handles millisecond or microsecond expiry values
+  and Firefox session cookies correctly ([#2260], [#2252]).
+- Fixed evaluation of public method annotations on Python 3.14 when a class
+  method shadows a builtin type name ([#2268]).
+
+[#2162]: https://github.com/teng-lin/notebooklm-py/pull/2162
+[#2252]: https://github.com/teng-lin/notebooklm-py/pull/2252
+[#2254]: https://github.com/teng-lin/notebooklm-py/pull/2254
+[#2260]: https://github.com/teng-lin/notebooklm-py/pull/2260
+[#2268]: https://github.com/teng-lin/notebooklm-py/pull/2268
+[#2269]: https://github.com/teng-lin/notebooklm-py/pull/2269
+[#2277]: https://github.com/teng-lin/notebooklm-py/pull/2277
+[#2280]: https://github.com/teng-lin/notebooklm-py/pull/2280
+[#2281]: https://github.com/teng-lin/notebooklm-py/pull/2281
+[#2282]: https://github.com/teng-lin/notebooklm-py/pull/2282
+[#2286]: https://github.com/teng-lin/notebooklm-py/pull/2286
+[#2291]: https://github.com/teng-lin/notebooklm-py/pull/2291
+[#2294]: https://github.com/teng-lin/notebooklm-py/pull/2294
+[#2296]: https://github.com/teng-lin/notebooklm-py/pull/2296
+[#2299]: https://github.com/teng-lin/notebooklm-py/pull/2299
+[#2300]: https://github.com/teng-lin/notebooklm-py/pull/2300
+[#2304]: https://github.com/teng-lin/notebooklm-py/pull/2304
+[#2305]: https://github.com/teng-lin/notebooklm-py/pull/2305
+[#2306]: https://github.com/teng-lin/notebooklm-py/pull/2306
+[#2307]: https://github.com/teng-lin/notebooklm-py/pull/2307
+[#2308]: https://github.com/teng-lin/notebooklm-py/pull/2308
+[#2313]: https://github.com/teng-lin/notebooklm-py/issues/2313
+[#2330]: https://github.com/teng-lin/notebooklm-py/issues/2330
+
 ## [0.8.1] - 2026-08-14
 
 ### Added
@@ -1574,7 +2140,7 @@ Maintenance patch on the 0.7.x line. Backports two fixes from `main`
   from notebooklm import ResearchStatus
 
   result = await client.research.poll(nb_id)
-  if result.status == ResearchStatus.COMPLETED:   # also == "completed"
+  if result.status == ResearchStatus.COMPLETED:  # also == "completed"
       for source in result.sources:
           print(source.title, source.url)
 
@@ -1600,11 +2166,12 @@ Maintenance patch on the 0.7.x line. Backports two fixes from `main`
   `except TimeoutError` clauses keep catching every wait timeout unchanged.
   ```python
   from notebooklm import WaitTimeoutError
+
   try:
       await client.sources.wait_until_ready(nb_id, src_id)
       await client.artifacts.wait_for_completion(nb_id, task_id)
       await client.research.wait_for_completion(nb_id, research_task_id)
-  except WaitTimeoutError:   # was three separate / inconsistent timeout types
+  except WaitTimeoutError:  # was three separate / inconsistent timeout types
       ...
   ```
 - **`ResearchError` / `ResearchTimeoutError`.** The research domain gained a
@@ -2212,10 +2779,10 @@ Items that need attention when upgrading from 0.4.x. Full migration prose lives 
 - **`.kind` property** - Unified type access across `Source`, `Artifact`, and `SourceFulltext`:
   ```python
   # Works with both enum and string comparison
-  source.kind == SourceType.PDF        # True
-  source.kind == "pdf"                 # Also True
+  source.kind == SourceType.PDF  # True
+  source.kind == "pdf"  # Also True
   artifact.kind == ArtifactType.AUDIO  # True
-  artifact.kind == "audio"             # Also True
+  artifact.kind == "audio"  # Also True
   ```
 - **`UnknownTypeWarning`** - Warning (deduplicated) when API returns unknown type codes
 - **`SourceStatus.PREPARING`** - New status (5) for sources in upload/preparation phase
@@ -2436,7 +3003,12 @@ This is the initial public release of `notebooklm-py`. While core functionality 
 - **Authentication expiry**: CSRF tokens expire after some time. Re-run `notebooklm login` if you encounter auth errors.
 - **Large file uploads**: Files over 50MB may fail or timeout. Split large documents if needed.
 
-[Unreleased]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.4...v0.8.5
+[0.8.4]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.3...v0.8.4
+[0.8.3]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/teng-lin/notebooklm-py/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/teng-lin/notebooklm-py/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/teng-lin/notebooklm-py/compare/v0.7.2...v0.7.3

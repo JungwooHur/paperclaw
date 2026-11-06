@@ -3,11 +3,11 @@
 Sibling to ``scripts/check_claude_md_freshness.py`` (which guards the
 ``### Repository Structure`` map in ``docs/architecture.md``). This gate turns
 the repo's "enforce, don't document" principle onto the *rest* of the docs:
-after the #1328 refactor promoted flat ``_*.py`` modules into subpackages
-(``_chat.py`` -> ``_chat/api.py``, ``_runtime_lifecycle.py`` ->
-``_runtime/lifecycle.py``, ...), ~25 stale flat references survived across the
-live docs because a hand audit and a scoped doc-sync PR both missed them. A gate
-is the only thing that makes that class of drift un-recurrable.
+after the #1328 refactor relocated flat ``_*.py`` modules into subpackages
+(``_runtime_lifecycle.py`` -> ``_runtime/lifecycle.py``, ...), ~25 stale flat
+references survived across the live docs because a hand audit and a scoped
+doc-sync PR both missed them. A gate is the only thing that makes that class of
+drift un-recurrable.
 
 Two checks, both read the docs and resolve targets against the repo:
 
@@ -50,6 +50,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+if __package__:
+    from scripts._tracked_files import tracked_files
+else:  # pragma: no cover - exercised by the script entry-point subprocess tests
+    from _tracked_files import tracked_files
+
 # The package every reference resolves against.
 _PACKAGE_RELDIR = "src/notebooklm"
 
@@ -65,7 +70,7 @@ _PACKAGE_RELDIR = "src/notebooklm"
 # ``test_test_and_script_refs_are_not_module_shaped`` pins this scope.
 _MODULE_REF_RE = re.compile(
     r"^(_[a-z0-9_]+|client|auth|exceptions|config|io|log|migration|paths|research"
-    r"|types|urls|utils|artifacts|notebooklm_cli|rpc|cli)([/][a-z0-9_]+)*\.py$"
+    r"|types|urls|utils|artifacts|raw|notebooklm_cli|rpc|cli)([/][a-z0-9_]+)*\.py$"
 )
 
 # Inline code spans: ``\`...\```. Non-greedy so adjacent spans on one line are
@@ -206,11 +211,12 @@ def _iter_docs(repo_root: Path):
     :func:`_is_historical_prose`) so the inline check skips them while the link
     check still applies.
     """
-    docs_dir = repo_root / "docs"
-    md_paths: list[Path] = []
-    if docs_dir.is_dir():
-        md_paths.extend(sorted(docs_dir.rglob("*.md")))
-    md_paths.extend(sorted(repo_root.glob("*.md")))
+    md_paths = [
+        path
+        for path in tracked_files(repo_root, fallback_globs=("docs/**/*.md", "*.md"))
+        if path.suffix == ".md"
+        and (path.parent == repo_root or path.is_relative_to(repo_root / "docs"))
+    ]
 
     for path in md_paths:
         rel = path.relative_to(repo_root).as_posix()

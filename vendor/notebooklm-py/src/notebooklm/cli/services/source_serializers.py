@@ -8,12 +8,23 @@ from ..._app.serialize import source_summary
 from ...types import drive_source_status_to_str, source_status_to_str
 
 if TYPE_CHECKING:
-    from ...types import Source, SourceFulltext, SourceType
+    from ...types import RelevantChunk, Source, SourceFulltext, SourceType
 
 
 def source_kind_value(kind: SourceType | None) -> str | None:
     """Return the public JSON value for a source kind."""
     return kind.value if kind is not None else None
+
+
+def relevant_chunk_payload(chunk: RelevantChunk) -> dict[str, Any]:
+    """Return the stable JSON shape for one ranked source-search result."""
+    return {
+        "source_id": chunk.source_id,
+        "text": chunk.text,
+        "rank": chunk.rank,
+        "start": chunk.start,
+        "end": chunk.end,
+    }
 
 
 def source_summary_payload(src: Source) -> dict[str, Any]:
@@ -53,7 +64,7 @@ def source_row_payload(src: Source) -> dict[str, Any]:
       total bijection over :class:`~notebooklm.types.DriveSourceStatus`, and the
       one case where a raw code would earn its keep — a code this client cannot
       map — is precisely the case where
-      :attr:`notebooklm._row_adapters.sources.SourceRow.drive_status` has
+      :attr:`notebooklm._web.rows.sources.SourceRow.drive_status` has
       already replaced the wire value with the ``UNKNOWN`` (-1) client sentinel
       and sent the original to a log warning. It never reaches this row.
     * The code spaces collide adversarially. ``status_id`` 2 is ``ready`` and 3

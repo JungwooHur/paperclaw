@@ -1,6 +1,6 @@
 """Route-group concurrency limiters for the REST server.
 
-The server is single-tenant but can receive many simultaneous local requests.
+The server can receive many simultaneous local requests across configured profiles.
 These semaphores bound expensive route groups without putting cheap reads or
 ``/healthz`` behind a process-wide lock.
 
@@ -16,8 +16,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Literal
 
+from .._adapter_support import LoopBoundPrimitive
 from .._loop_affinity import assert_bound_loop
-from .._loop_bound import LoopBoundPrimitive
 
 __all__ = [
     "DEFAULT_CHAT_CONCURRENCY",

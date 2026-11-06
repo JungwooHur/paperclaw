@@ -1,10 +1,15 @@
 """Per-request access to the lifespan-bound client.
 
-The server binds exactly one :class:`~notebooklm.client.NotebookLMClient` for the
+By default the server binds one :class:`~notebooklm.client.NotebookLMClient` for the
 process lifetime via the FastMCP lifespan (one client, bound to the server's
-event loop, satisfying the ADR-0004 loop-affinity contract). Tools reach it
-through the request context. Keeping this in one place means the tool modules
-never touch FastMCP internals directly.
+event loop, satisfying the ADR-0004 loop-affinity contract). It is opened
+**lazily** behind a :class:`~notebooklm.mcp._clientprovider.ClientProvider` so
+the MCP handshake is not gated on Google's auth round-trip (#2330) — which makes
+:func:`get_client` a coroutine: the first tool call to reach it awaits the open
+(or joins the lifespan's background warm-up) and any auth failure surfaces there
+as a categorized tool error. Tools reach it through the request context. Keeping
+this in one place means the tool modules never touch FastMCP internals directly.
+In multi-profile mode a request-local selection routes to an isolated AppState.
 
 This module imports NO ``click`` / ``rich`` / ``cli``.
 """
@@ -12,14 +17,20 @@ This module imports NO ``click`` / ``rich`` / ``cli``.
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from fastmcp import Context
 
+from ._chattasks import ChatTaskRegistry
+from ._clientprovider import ClientProvider
+
 if TYPE_CHECKING:
     from starlette.requests import Request
 
+    from .._app.web_profiles import WebProfileSet
     from ..client import NotebookLMClient
     from ._filelink import FileTransferConfig
 
@@ -27,6 +38,7 @@ __all__ = [
     "AppState",
     "CancelledResearchTracker",
     "get_cancelled_research",
+    "get_chat_tasks",
     "get_client",
     "get_client_from_app",
     "get_file_transfer",
@@ -88,11 +100,60 @@ class AppState:
     ``cancelled_research`` is the bounded cancel-intent tracker for issue #1922
     (F9) — see :class:`CancelledResearchTracker`. Process-scoped in-memory state
     (no persistence, consistent with the loop-bound lifespan client).
+
+    ``chat_tasks`` is the bounded registry of detached chat asks backing
+    ``chat_start`` / ``chat_status`` / ``chat_cancel`` — see
+    :class:`~notebooklm.mcp._chattasks.ChatTaskRegistry`. Same process-scoped
+    in-memory contract; the lifespan cancels its running tasks (``aclose``)
+    before the client closes.
+
+    ``client_provider`` owns the lazily-opened client (#2330); read it through
+    :func:`get_client`, never by touching the provider from a tool.
+
+    ``backend`` names the multi-profile backend (``"web"`` / ``"android"``); it
+    stays ``None`` in single-profile mode, where the client factory resolves it.
+    ``web_profiles`` is set only for Web multi-profile states and serves their
+    file-only diagnostics.
     """
 
-    client: NotebookLMClient
+    client_provider: ClientProvider
     file_transfer: FileTransferConfig | None = None
     cancelled_research: CancelledResearchTracker = field(default_factory=CancelledResearchTracker)
+    chat_tasks: ChatTaskRegistry = field(default_factory=ChatTaskRegistry)
+    profile: str | None = None
+    storage_path: Path | None = None
+    backend: str | None = None
+    web_profiles: WebProfileSet | None = None
+
+
+@dataclass
+class ProfileRegistry:
+    """Isolated MCP state for every configured Web or Android profile."""
+
+    profiles: dict[str, AppState]
+
+
+selected_profile: ContextVar[str | None] = ContextVar("mcp_selected_profile", default=None)
+
+
+def select_state(state: AppState | ProfileRegistry, profile: str | None) -> AppState:
+    """Require explicit routing; never fall back to another account."""
+    from ..exceptions import ValidationError
+
+    if isinstance(state, ProfileRegistry):
+        if not profile:
+            raise ValidationError("profile is required")
+        if profile not in state.profiles:
+            raise ValidationError("Unknown profile")
+        return state.profiles[profile]
+    if profile is not None and profile != state.profile:
+        raise ValidationError("Signed profile does not match the server profile")
+    return state
+
+
+def get_profile_state(ctx: Context) -> AppState:
+    """Expose the selected profile's diagnostics without opening a client."""
+    return _app_state(ctx)
 
 
 def _app_state(ctx: Context) -> AppState:
@@ -105,17 +166,27 @@ def _app_state(ctx: Context) -> AppState:
     request_context = ctx.request_context
     if request_context is None:  # pragma: no cover - always set during a tool call
         raise RuntimeError("no active MCP request context")
-    return cast("AppState", request_context.lifespan_context)
+    return select_state(
+        cast("AppState | ProfileRegistry", request_context.lifespan_context), selected_profile.get()
+    )
 
 
-def get_client(ctx: Context) -> NotebookLMClient:
-    """Return the lifespan-bound client for the current tool call.
+async def get_client(ctx: Context) -> NotebookLMClient:
+    """Return the lifespan-bound client for the current tool call, opening it first.
+
+    A coroutine because the client is opened lazily (#2330): the first caller
+    awaits the auth round-trip (or joins the lifespan's background warm-up)
+    instead of the MCP handshake blocking on it. A failed open is re-tried by the
+    next call rather than poisoning the server for its lifetime.
 
     Raises:
         RuntimeError: If called outside an active MCP request context (the
-            lifespan binding is always present during a real tool invocation).
+            lifespan binding is always present during a real tool invocation),
+            or if the server is shutting down.
+        Exception: Whatever the open path raised (auth, network) — tool bodies run
+            inside ``mcp_errors``, which projects it onto a structured MCP error.
     """
-    return _app_state(ctx).client
+    return await _app_state(ctx).client_provider.get()
 
 
 def get_cancelled_research(ctx: Context) -> CancelledResearchTracker:
@@ -131,6 +202,18 @@ def get_cancelled_research(ctx: Context) -> CancelledResearchTracker:
     return _app_state(ctx).cancelled_research
 
 
+def get_chat_tasks(ctx: Context) -> ChatTaskRegistry:
+    """Return the detached-chat-task registry for the current tool call.
+
+    The live :class:`~notebooklm.mcp._chattasks.ChatTaskRegistry` backing
+    ``chat_start`` / ``chat_status`` / ``chat_cancel``: the start tool claims a
+    slot and spawns the server-owned ask here; the status and cancel tools inspect
+    or stop it. Returns the live registry so callers mutate it in place. Mirrors
+    :func:`get_client`.
+    """
+    return _app_state(ctx).chat_tasks
+
+
 def get_file_transfer(ctx: Context) -> FileTransferConfig | None:
     """Return the file-transfer config bound at lifespan, or ``None`` if unset.
 
@@ -141,7 +224,7 @@ def get_file_transfer(ctx: Context) -> FileTransferConfig | None:
     return _app_state(ctx).file_transfer
 
 
-def get_client_from_app(request: Request) -> NotebookLMClient:
+async def get_client_from_app(request: Request, *, profile: str | None = None) -> NotebookLMClient:
     """Return the lifespan-bound client from a bare Starlette ``Request``.
 
     The ``/files/*`` custom routes receive a Starlette :class:`Request`, not an
@@ -152,12 +235,16 @@ def get_client_from_app(request: Request) -> NotebookLMClient:
     regression test pins this access path so a FastMCP upgrade that changes either
     fails loudly.
 
+    Awaits the lazy open exactly like :func:`get_client` does, so a ``/files/*``
+    request that lands before the background warm-up finished still gets a live
+    client instead of a 500.
+
     Raises:
-        RuntimeError: the lifespan has not bound the client yet (the route then
-            returns 500 rather than crashing).
+        RuntimeError: the lifespan has not bound the provider yet (the route then
+            returns 500 rather than crashing), or the server is shutting down.
     """
     server = request.app.state.fastmcp_server
     if not getattr(server, "_lifespan_result_set", False):
         raise RuntimeError("MCP lifespan client is not bound")
-    state = cast("AppState", server._lifespan_result)
-    return state.client
+    state = select_state(cast("AppState | ProfileRegistry", server._lifespan_result), profile)
+    return await state.client_provider.get()

@@ -76,9 +76,30 @@ _SPEC_TABLE = "DEPRECATION_SPECS"
 _SPEC_FIELDS = ("key", "message", "category", "replacement", "since", "removal", "stacklevel")
 _REGISTERED_SPEC_KEYS = frozenset(
     {
+        "artifact_ambiguous_absence",
+        "artifact_raw_download_prefetch",
+        "mind_map_legacy_terminal_hydration",
         "auth_tokens_flat_cookies",
         "auth_tokens_from_storage",
+        "auth_tokens_replace_cookie_jar",
         "auth_tokens_sync_storage_construction",
+        "artifact_from_api_response",
+        "artifact_from_mind_map",
+        "artifact_poll_absence_thresholds",
+        "artifact_poll_follower_callback",
+        "artifact_poll_follower_options",
+        "client_rpc_call_android",
+        "client_rpc_call_web",
+        "client_legacy_constructor_options",
+        "client_legacy_from_storage_options",
+        "collection_from_api_response",
+        "label_from_api_response",
+        "mcp_confirmed_name_references",
+        "notebook_from_api_response",
+        "share_status_from_api_response",
+        "shared_user_from_api_response",
+        "source_from_api_response",
+        "source_from_row",
     }
 )
 _SEMVER = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
@@ -212,6 +233,222 @@ def _spec_arguments(node: ast.Call, problems: list[str]) -> dict[str, ast.AST]:
     return values
 
 
+def _statement_binds_name(statement: ast.stmt, name: str) -> bool:
+    """Conservatively detect an effective or conditional module-name binding."""
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return statement.name == name
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        return any((alias.asname or alias.name.split(".")[0]) == name for alias in statement.names)
+    return any(
+        isinstance(node, ast.Name)
+        and node.id == name
+        and isinstance(getattr(node, "ctx", None), (ast.Store, ast.Del))
+        for node in ast.walk(statement)
+    )
+
+
+def _effective_top_level_binding(module: ast.Module, name: str) -> ast.stmt | None:
+    binding = None
+    for statement in module.body:
+        if _statement_binds_name(statement, name):
+            binding = statement
+    return binding
+
+
+def _eager_statement_references_name(statement: ast.stmt, name: str) -> bool:
+    """Check module-executed parts while excluding deferred function bodies."""
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        eager_nodes: list[ast.AST] = [*statement.decorator_list, *statement.args.defaults]
+        eager_nodes.extend(default for default in statement.args.kw_defaults if default is not None)
+        eager_nodes.extend(
+            annotation
+            for argument in [
+                *statement.args.posonlyargs,
+                *statement.args.args,
+                *statement.args.kwonlyargs,
+            ]
+            if (annotation := argument.annotation) is not None
+        )
+        if statement.args.vararg is not None and statement.args.vararg.annotation is not None:
+            eager_nodes.append(statement.args.vararg.annotation)
+        if statement.args.kwarg is not None and statement.args.kwarg.annotation is not None:
+            eager_nodes.append(statement.args.kwarg.annotation)
+        if statement.returns is not None:
+            eager_nodes.append(statement.returns)
+        eager_nodes.extend(getattr(statement, "type_params", ()))
+        return any(
+            isinstance(node, ast.Name) and node.id == name
+            for eager in eager_nodes
+            for node in ast.walk(eager)
+        )
+    return any(isinstance(node, ast.Name) and node.id == name for node in ast.walk(statement))
+
+
+def _canonical_lazy_export_map(module: ast.Module) -> str | None:
+    """Return the literal map used by the canonical module ``__getattr__`` shape."""
+    hook = _effective_top_level_binding(module, "__getattr__")
+    if not isinstance(hook, ast.FunctionDef) or hook.decorator_list:
+        return None
+    args = hook.args
+    positional = [*args.posonlyargs, *args.args]
+    if (
+        len(positional) != 1
+        or args.vararg is not None
+        or args.kwarg is not None
+        or args.kwonlyargs
+        or args.defaults
+    ):
+        return None
+    body = hook.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if len(body) != 4:
+        return None
+
+    lookup, missing_guard, unpack, returned = body
+    if (
+        not isinstance(lookup, ast.Assign)
+        or len(lookup.targets) != 1
+        or not isinstance(lookup.targets[0], ast.Name)
+        or not isinstance(lookup.value, ast.Call)
+        or not isinstance(lookup.value.func, ast.Attribute)
+        or lookup.value.func.attr != "get"
+        or not isinstance(lookup.value.func.value, ast.Name)
+        or len(lookup.value.args) != 1
+        or not isinstance(lookup.value.args[0], ast.Name)
+        or lookup.value.args[0].id != positional[0].arg
+        or lookup.value.keywords
+    ):
+        return None
+    value_name = lookup.targets[0].id
+    map_name = lookup.value.func.value.id
+    if not map_name.startswith("_LAZY") or not map_name.endswith("EXPORTS"):
+        return None
+    if (
+        not isinstance(missing_guard, ast.If)
+        or missing_guard.orelse
+        or len(missing_guard.body) != 1
+        or not isinstance(missing_guard.body[0], ast.Raise)
+        or not isinstance(missing_guard.test, ast.Compare)
+        or not isinstance(missing_guard.test.left, ast.Name)
+        or missing_guard.test.left.id != value_name
+        or len(missing_guard.test.ops) != 1
+        or not isinstance(missing_guard.test.ops[0], ast.Is)
+        or len(missing_guard.test.comparators) != 1
+        or not isinstance(missing_guard.test.comparators[0], ast.Constant)
+        or missing_guard.test.comparators[0].value is not None
+    ):
+        return None
+    if (
+        not isinstance(unpack, ast.Assign)
+        or len(unpack.targets) != 1
+        or not isinstance(unpack.targets[0], (ast.Tuple, ast.List))
+        or len(unpack.targets[0].elts) != 2
+        or not all(isinstance(item, ast.Name) for item in unpack.targets[0].elts)
+        or not isinstance(unpack.value, ast.Name)
+        or unpack.value.id != value_name
+    ):
+        return None
+    module_var, attribute_var = (item.id for item in unpack.targets[0].elts)
+    local_names = {positional[0].arg, value_name, module_var, attribute_var}
+    if len(local_names) != 4 or local_names & {map_name, "importlib", "getattr"}:
+        return None
+    if not isinstance(returned, ast.Return) or not isinstance(returned.value, ast.Call):
+        return None
+    outer = returned.value
+    if (
+        not isinstance(outer.func, ast.Name)
+        or outer.func.id != "getattr"
+        or len(outer.args) != 2
+        or outer.keywords
+        or not isinstance(outer.args[0], ast.Call)
+        or not isinstance(outer.args[1], ast.Name)
+        or outer.args[1].id != attribute_var
+    ):
+        return None
+    importer = outer.args[0]
+    if (
+        not isinstance(importer.func, ast.Attribute)
+        or not isinstance(importer.func.value, ast.Name)
+        or importer.func.value.id != "importlib"
+        or importer.func.attr != "import_module"
+        or len(importer.args) != 1
+        or not isinstance(importer.args[0], ast.Name)
+        or importer.args[0].id != module_var
+        or importer.keywords
+    ):
+        return None
+    importlib_binding = _effective_top_level_binding(module, "importlib")
+    if not (
+        isinstance(importlib_binding, ast.Import)
+        and len(importlib_binding.names) == 1
+        and importlib_binding.names[0].name == "importlib"
+        and importlib_binding.names[0].asname is None
+    ):
+        return None
+    if _effective_top_level_binding(module, "getattr") is not None:
+        return None
+    return map_name
+
+
+def _literal_lazy_exports(module: ast.Module, map_name: str) -> dict[str, tuple[str, str]] | None:
+    binding = _effective_top_level_binding(module, map_name)
+    if (
+        not isinstance(binding, ast.Assign)
+        or len(binding.targets) != 1
+        or not isinstance(binding.targets[0], ast.Name)
+        or binding.targets[0].id != map_name
+        or not isinstance(binding.value, ast.Call)
+        or not isinstance(binding.value.func, ast.Name)
+        or binding.value.func.id != "MappingProxyType"
+        or len(binding.value.args) != 1
+        or binding.value.keywords
+        or not isinstance(binding.value.args[0], ast.Dict)
+    ):
+        return None
+    proxy_binding = _effective_top_level_binding(module, "MappingProxyType")
+    if not (
+        isinstance(proxy_binding, ast.ImportFrom)
+        and proxy_binding.level == 0
+        and proxy_binding.module == "types"
+        and len(proxy_binding.names) == 1
+        and proxy_binding.names[0].name == "MappingProxyType"
+        and proxy_binding.names[0].asname is None
+    ):
+        return None
+    binding_index = module.body.index(binding)
+    if module.body.index(proxy_binding) > binding_index:
+        return None
+    literal = binding.value.args[0]
+    if len(literal.keys) != len(literal.values):
+        return None
+    for statement in module.body[binding_index + 1 :]:
+        if _eager_statement_references_name(statement, map_name):
+            return None
+    exports: dict[str, tuple[str, str]] = {}
+    for key, value in zip(literal.keys, literal.values, strict=False):
+        if (
+            not isinstance(key, ast.Constant)
+            or not isinstance(key.value, str)
+            or key.value in exports
+            or not isinstance(value, ast.Tuple)
+            or len(value.elts) != 2
+            or not all(
+                isinstance(item, ast.Constant) and isinstance(item.value, str)
+                for item in value.elts
+            )
+        ):
+            return None
+        module_name, attribute = (item.value for item in value.elts)
+        exports[key.value] = (module_name, attribute)
+    return exports
+
+
 def _find_public_symbol(
     module: ast.Module, name: str
 ) -> ast.AST | tuple[int, str | None, str] | None:
@@ -223,7 +460,12 @@ def _find_public_symbol(
             for alias in statement.names:
                 if (alias.asname or alias.name) == name:
                     return statement.level, statement.module, alias.name
-    return None
+    map_name = _canonical_lazy_export_map(module)
+    exports = _literal_lazy_exports(module, map_name) if map_name is not None else None
+    if exports is None or name not in exports:
+        return None
+    module_name, attribute = exports[name]
+    return 0, module_name, attribute
 
 
 def _module_source(module_parts: tuple[str, ...]) -> tuple[Path, bool] | None:
@@ -268,8 +510,19 @@ def _replacement_resolves(replacement: str) -> bool:
     if len(parts) < 2 or parts[0] != "notebooklm" or any(not part for part in parts):
         return False
 
+    # Prefer the longest concrete public module prefix.  Most historical
+    # replacements start from a symbol re-exported by ``notebooklm.__init__``;
+    # backend-selected raw replacements intentionally start from the public
+    # ``notebooklm.raw`` module instead.
     module_parts: tuple[str, ...] = ()
-    symbol_name = parts[1]
+    symbol_index = 1
+    for index in range(len(parts) - 1, 1, -1):
+        candidate = tuple(parts[1:index])
+        if _module_source(candidate) is not None:
+            module_parts = candidate
+            symbol_index = index
+            break
+    symbol_name = parts[symbol_index]
     visited_reexports: set[tuple[tuple[str, ...], str]] = set()
     while True:
         visit = (module_parts, symbol_name)
@@ -298,15 +551,22 @@ def _replacement_resolves(replacement: str) -> bool:
             return False
         module_parts = resolved_parts
 
-    for attribute in parts[2:]:
+    for attribute in parts[symbol_index + 1 :]:
         if not isinstance(target, ast.ClassDef):
             return False
         target = next(
             (
                 statement
                 for statement in target.body
-                if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-                and statement.name == attribute
+                if (
+                    isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                    and statement.name == attribute
+                )
+                or (
+                    isinstance(statement, ast.AnnAssign)
+                    and isinstance(statement.target, ast.Name)
+                    and statement.target.id == attribute
+                )
             ),
             None,
         )
@@ -337,8 +597,16 @@ def _registered_deprecation_problems(version: str) -> list[str]:
             if _call_name(node.func).rsplit(".", 1)[-1] != _REGISTERED_EMITTER:
                 continue
             rel = path.relative_to(REPO_ROOT).as_posix()
-            if len(node.args) != 1 or node.keywords:
-                problems.append(f"{rel}:{node.lineno}: registered call must have one literal key")
+            detail_keywords = [keyword for keyword in node.keywords if keyword.arg == "detail"]
+            if (
+                len(node.args) != 1
+                or len(detail_keywords) != len(node.keywords)
+                or len(detail_keywords) > 1
+            ):
+                problems.append(
+                    f"{rel}:{node.lineno}: registered call must have one literal key and "
+                    "at most one detail= keyword"
+                )
                 continue
             key = _literal(node.args[0], "registered deprecation key", problems)
             if not isinstance(key, str):

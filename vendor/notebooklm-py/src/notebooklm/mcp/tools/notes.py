@@ -51,9 +51,9 @@ def register(mcp: Any) -> None:
           replaces the body). A ref that doesn't resolve is a not-found error, NEVER
           a stray create. Returns ``status="updated"``.
         """
-        client = get_client(ctx)
         with mcp_errors():
-            nb_id = await resolve_notebook(client, notebook)
+            client = await get_client(ctx)
+            nb_id = await resolve_notebook(client, notebook, strict=True)
             if note is None:
                 if not title or not content:
                     raise ValidationError(
@@ -78,7 +78,7 @@ def register(mcp: Any) -> None:
             # update
             if title is None and content is None:
                 raise ValidationError("provide 'title' and/or 'content' to update a note.")
-            note_id = await resolve_note(client, nb_id, note)
+            note_id = await resolve_note(client, nb_id, note, strict=True)
             saved = await core.execute_note_save(
                 client,
                 nb_id,

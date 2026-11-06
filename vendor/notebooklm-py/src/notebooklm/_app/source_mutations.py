@@ -22,17 +22,9 @@ Two boundary-imposed seams are worth calling out:
   Reading the resolver off the wrapper at call time also preserves the
   historical ``monkeypatch.setattr(source_mutations, "resolve_source_id", ...)``
   test seam.
-* **``SourceMutationError`` carries Rich markup in ``status_message``.** The
-  field is a plain ``str``; the markup→plain conversion and the exit-code
-  policy live in the CLI renderer (``_handle_source_mutation_error``), so this
-  module stays presentation-neutral while still carrying the hint string.
-
-The confirm → execute flow for the destructive ``delete`` paths is inlined here
-(rather than importing the CLI-services ``confirming_mutation`` pipeline, which
-``_app`` cannot reach) so the resolvers + the JSON-mode confirmation gate stay
-together. The ``confirmer`` is injected by the adapter (``click.confirm`` for
-the CLI). The ``--json`` payloads themselves are built by the CLI render layer
-(``cli/_source_render.py``) from the typed-fields-only result dataclasses (§11).
+Destructive flows are split at an immutable resolved target. Adapters preview
+and authorize that target, then pass it to the executor; confirmation wording
+and output-mode policy never enter this module.
 
 This module is transport-neutral — no ``click`` / ``rich`` / ``cli`` /
 ``fastmcp`` imports (enforced by ``tests/_guardrails/test_app_boundary.py``).
@@ -42,9 +34,10 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from ..exceptions import NotebookLMError, ValidationError
+from ..options import USE_DEFAULT
 from ..types import DriveMimeType, Source, SourceType
 from .resolve import FULL_ID_PATTERN
 from .resolve import validate_id as _neutral_validate_id
@@ -65,48 +58,45 @@ ValidateIdFn = Callable[[str, str], str]
 ResolveSourceIdFn = Callable[..., Awaitable[str]]
 
 
-class SourceMutationError(NotebookLMError):
-    """Typed source-mutation error for command-layer rendering and exit policy.
+SourceMutationReason = Literal[
+    "ambiguous_id",
+    "title_used_as_id",
+    "id_not_found",
+    "ambiguous_title",
+    "title_not_found",
+]
 
-    Subclasses :class:`~notebooklm.exceptions.NotebookLMError` (was bare
-    ``Exception``) so ``_app.errors.classify`` covers it — it classifies as
-    :attr:`~notebooklm._app.errors.ErrorCategory.SOURCE_MUTATION`, the
-    class-sensitive category that lets adapters recover its carried ``.code``
-    vocabulary. The CLI renderer (``_handle_source_mutation_error``) still reads
-    its ``.code`` / ``.message`` / ``.extra`` / ``.status_message`` attributes to
-    emit the historical per-error ``--json`` codes (``AMBIGUOUS_ID`` /
-    ``NOT_FOUND`` / ``CONFIRM_REQUIRED`` / …) + exit codes unchanged.
-    """
+
+@dataclass(frozen=True)
+class SourceMutationMatch:
+    """Candidate source carried by a semantic resolution failure."""
+
+    id: str
+    title: str
+
+
+class SourceMutationError(NotebookLMError):
+    """Typed source-mutation failure with adapter-neutral reason data."""
 
     def __init__(
         self,
-        message: str,
-        code: str,
-        extra: dict[str, Any] | None = None,
-        status_message: str | None = None,
+        reason: SourceMutationReason,
+        *,
+        token: str,
+        matches: tuple[SourceMutationMatch, ...] = (),
     ) -> None:
-        self.message = message
-        self.code = code
-        self.extra = extra
-        self.status_message = status_message
-        metadata = f" (code={code}, extra={extra})" if extra else f" (code={code})"
-        super().__init__(f"{message}{metadata}")
+        self.reason = reason
+        self.token = token
+        self.matches = matches
+        super().__init__(f"source resolution {reason.replace('_', ' ')}: {token}")
 
 
 @dataclass(frozen=True)
 class SourceIdResolution:
-    """Resolved source-id data plus optional status prose for the command layer.
-
-    ``status_message`` is the "Matched: ..." hint for a partial-id expansion. It
-    currently carries CLI Rich markup (``[dim]...[/dim]``) — a known
-    transport-neutrality wrinkle: a non-CLI adapter (MCP/HTTP) must strip the
-    markup. The markup will move into the CLI render layer
-    (``cli/_source_render.py``) when the MCP adapter lands (the deferred MCP
-    rebase), leaving this field plain text.
-    """
+    """Resolved source-id data used for adapter-owned match diagnostics."""
 
     source_id: str
-    status_message: str | None = None
+    matched_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,7 +111,7 @@ class SourceDeleteResult:
     notebook_id: str
     success: bool
     status: Literal["completed", "cancelled"]
-    status_message: str | None = None
+    matched_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -137,7 +127,6 @@ class SourceDeleteByTitleResult:
     notebook_id: str
     success: bool
     status: Literal["completed", "cancelled"]
-    status_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -185,16 +174,9 @@ class SourceAddDriveResult:
 # ---------------------------------------------------------------------------
 
 
-def build_id_ambiguity_error(source_id: str, matches: list[Source]) -> str:
-    """Build a consistent ambiguity error for source ID prefix matches."""
-    lines = [f"Ambiguous ID '{source_id}' matches {len(matches)} sources:"]
-    for item in matches[:5]:
-        title = item.title or "(untitled)"
-        lines.append(f"  {item.id[:12]}... {title}")
-    if len(matches) > 5:
-        lines.append(f"  ... and {len(matches) - 5} more")
-    lines.append("Specify more characters to narrow down.")
-    return "\n".join(lines)
+def _source_matches(matches: list[Source]) -> tuple[SourceMutationMatch, ...]:
+    """Project source objects onto transport-neutral resolution candidates."""
+    return tuple(SourceMutationMatch(item.id, item.title or "") for item in matches)
 
 
 def looks_like_full_source_id(source_id: str) -> bool:
@@ -231,7 +213,7 @@ async def resolve_source_for_delete(
     # short-but-complete id that is also a strict prefix of another source's id
     # (e.g. ``abc`` vs ``abcdef``) would be reported as AMBIGUOUS_ID here while
     # the other verbs resolve it (issue #1522). An exact match is not a partial
-    # expansion, so no "Matched:" status prose is emitted.
+    # expansion, so there is no match metadata for an adapter to render.
     source_id_lower = source_id.lower()
     matches = []
     for item in sources:
@@ -242,34 +224,29 @@ async def resolve_source_for_delete(
             matches.append(item)
 
     if len(matches) == 1:
-        status_message = None
+        matched_title = None
         if matches[0].id != source_id:
-            title = matches[0].title or "(untitled)"
-            status_message = f"[dim]Matched: {matches[0].id[:12]}... ({title})[/dim]"
-        return SourceIdResolution(source_id=matches[0].id, status_message=status_message)
+            matched_title = matches[0].title or "(untitled)"
+        return SourceIdResolution(source_id=matches[0].id, matched_title=matched_title)
 
     if len(matches) > 1:
         raise SourceMutationError(
-            build_id_ambiguity_error(source_id, matches),
-            "AMBIGUOUS_ID",
+            "ambiguous_id",
+            token=source_id,
+            matches=_source_matches(matches),
         )
 
     title_matches = [item for item in sources if item.title == source_id]
     if title_matches:
-        lines = [
-            f"'{source_id}' matches {len(title_matches)} source title(s), not source IDs.",
-            f"Use 'notebooklm source delete-by-title \"{source_id}\"' or delete by ID:",
-        ]
-        for item in title_matches[:5]:
-            lines.append(f"  {item.id[:12]}... {item.title}")
-        if len(title_matches) > 5:
-            lines.append(f"  ... and {len(title_matches) - 5} more")
-        raise SourceMutationError("\n".join(lines), "VALIDATION_ERROR")
+        raise SourceMutationError(
+            "title_used_as_id",
+            token=source_id,
+            matches=_source_matches(title_matches),
+        )
 
     raise SourceMutationError(
-        f"No source found starting with '{source_id}'. "
-        "Run 'notebooklm source list' to see available sources.",
-        "NOT_FOUND",
+        "id_not_found",
+        token=source_id,
     )
 
 
@@ -289,41 +266,15 @@ async def resolve_source_by_exact_title(
         return matches[0]
 
     if len(matches) > 1:
-        lines = [f"Title '{title}' matches {len(matches)} sources. Delete by ID instead:"]
-        for item in matches[:5]:
-            lines.append(f"  {item.id[:12]}... {item.title}")
-        if len(matches) > 5:
-            lines.append(f"  ... and {len(matches) - 5} more")
-        raise SourceMutationError("\n".join(lines), "AMBIGUOUS_TITLE")
+        raise SourceMutationError(
+            "ambiguous_title",
+            token=title,
+            matches=_source_matches(matches),
+        )
 
     raise SourceMutationError(
-        f"No source found with title '{title}'. "
-        "Run 'notebooklm source list' to see available sources.",
-        "NOT_FOUND",
-    )
-
-
-def require_yes_in_json(
-    *,
-    action: str,
-    extra: dict[str, Any] | None = None,
-    status_message: str | None = None,
-) -> NoReturn:
-    """Raise a typed ``CONFIRM_REQUIRED`` error for command-layer handling.
-
-    Centralises the JSON-mode confirmation gate used by destructive
-    commands (``source delete``, ``source delete-by-title``, ``source
-    clean``). Calling this helper always raises a typed error for the
-    command layer; it never returns normally.
-    """
-    payload: dict[str, Any] = {"action": action}
-    if extra:
-        payload.update(extra)
-    raise SourceMutationError(
-        "Pass --yes to confirm destructive operation in --json mode",
-        "CONFIRM_REQUIRED",
-        payload,
-        status_message,
+        "title_not_found",
+        token=title,
     )
 
 
@@ -337,61 +288,23 @@ class SourceDeletePlan:
     """Prepared inputs for ``execute_source_delete``."""
 
     notebook_id: str
-    source_id: str
-    yes: bool
-    json_output: bool
+    target: SourceIdResolution
 
 
 async def execute_source_delete(
     client: NotebookLMClient,
     plan: SourceDeletePlan,
-    *,
-    confirmer: Callable[[str], bool],
-    validate_id: ValidateIdFn = _neutral_validate_id,
 ) -> SourceDeleteResult:
-    """Resolve + confirm + delete a single source by id or partial id."""
-    resolution = await resolve_source_for_delete(
-        client,
-        plan.notebook_id,
-        plan.source_id,
-        validate_id=validate_id,
-    )
-    # In --json mode, never prompt — automation cannot answer an interactive
-    # confirmation. Require --yes and emit a structured JSON error otherwise.
-    if plan.json_output and not plan.yes:
-        require_yes_in_json(
-            action="delete",
-            extra={
-                "source_id": resolution.source_id,
-                "notebook_id": plan.notebook_id,
-            },
-            status_message=resolution.status_message,
-        )
-
-    # Confirm (interactive text mode only); --yes and --json skip the prompt.
-    if (
-        not plan.yes
-        and not plan.json_output
-        and not confirmer(f"Delete source {resolution.source_id}?")
-    ):
+    """Delete the exact immutable target an adapter already authorized."""
+    async with client.operation(timeout=USE_DEFAULT):
+        await client.sources.delete(plan.notebook_id, plan.target.source_id)
         return SourceDeleteResult(
-            source_id=resolution.source_id,
+            source_id=plan.target.source_id,
             notebook_id=plan.notebook_id,
-            success=False,
-            status="cancelled",
-            status_message=resolution.status_message,
+            success=True,
+            status="completed",
+            matched_title=plan.target.matched_title,
         )
-
-    # delete() now returns None and raises on real failure (issue #1211);
-    # reaching here without an exception means success.
-    await client.sources.delete(plan.notebook_id, resolution.source_id)
-    return SourceDeleteResult(
-        source_id=resolution.source_id,
-        notebook_id=plan.notebook_id,
-        success=True,
-        status="completed",
-        status_message=resolution.status_message,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -404,59 +317,24 @@ class SourceDeleteByTitlePlan:
     """Prepared inputs for ``execute_source_delete_by_title``."""
 
     notebook_id: str
+    source_id: str
     title: str
-    yes: bool
-    json_output: bool
 
 
 async def execute_source_delete_by_title(
     client: NotebookLMClient,
     plan: SourceDeleteByTitlePlan,
-    *,
-    confirmer: Callable[[str], bool],
-    validate_id: ValidateIdFn = _neutral_validate_id,
 ) -> SourceDeleteByTitleResult:
-    """Resolve + confirm + delete a source by exact title."""
-    source = await resolve_source_by_exact_title(
-        client,
-        plan.notebook_id,
-        plan.title,
-        validate_id=validate_id,
-    )
-    # Same JSON-mode confirmation contract as ``source delete``.
-    if plan.json_output and not plan.yes:
-        require_yes_in_json(
-            action="delete-by-title",
-            extra={
-                "source_id": source.id,
-                "title": source.title,
-                "notebook_id": plan.notebook_id,
-            },
-        )
-
-    if (
-        not plan.yes
-        and not plan.json_output
-        and not confirmer(f"Delete source '{source.title}' ({source.id})?")
-    ):
+    """Delete the exact title-resolved target an adapter already authorized."""
+    async with client.operation(timeout=USE_DEFAULT):
+        await client.sources.delete(plan.notebook_id, plan.source_id)
         return SourceDeleteByTitleResult(
-            source_id=source.id,
-            title=cast(str, source.title),
+            source_id=plan.source_id,
+            title=plan.title,
             notebook_id=plan.notebook_id,
-            success=False,
-            status="cancelled",
+            success=True,
+            status="completed",
         )
-
-    # delete() now returns None and raises on real failure (issue #1211);
-    # reaching here without an exception means success.
-    await client.sources.delete(plan.notebook_id, source.id)
-    return SourceDeleteByTitleResult(
-        source_id=source.id,
-        title=cast(str, source.title),
-        notebook_id=plan.notebook_id,
-        success=True,
-        status="completed",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +349,6 @@ class SourceRenamePlan:
     notebook_id: str
     source_id: str
     new_title: str
-    json_output: bool
 
 
 async def execute_source_rename(
@@ -486,18 +363,17 @@ async def execute_source_rename(
     ``cli.resolve.resolve_source_id``) so this core stays free of the
     ``rich``-coupled resolver and the CLI's monkeypatch seam keeps landing.
     """
-    resolved_id = await resolve_source_id(
-        client, plan.notebook_id, plan.source_id, json_output=plan.json_output
-    )
-    # return_object defaults to True, so rename returns a Source (or raises
-    # SourceNotFoundError on a missing target) — never None on this path. Use
-    # cast (not assert, which -O strips) to narrow Source | None for the
-    # rename-result dataclass.
-    src = cast(
-        Source,
-        await client.sources.rename(plan.notebook_id, resolved_id, plan.new_title),
-    )
-    return SourceRenameResult(source=src, notebook_id=plan.notebook_id)
+    async with client.operation(timeout=USE_DEFAULT):
+        resolved_id = await resolve_source_id(client, plan.notebook_id, plan.source_id)
+        # return_object defaults to True, so rename returns a Source (or raises
+        # SourceNotFoundError on a missing target) — never None on this path. Use
+        # cast (not assert, which -O strips) to narrow Source | None for the
+        # rename-result dataclass.
+        src = cast(
+            Source,
+            await client.sources.rename(plan.notebook_id, resolved_id, plan.new_title),
+        )
+        return SourceRenameResult(source=src, notebook_id=plan.notebook_id)
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +387,6 @@ class SourceRefreshPlan:
 
     notebook_id: str
     source_id: str
-    json_output: bool
 
 
 async def execute_source_refresh(
@@ -524,14 +399,13 @@ async def execute_source_refresh(
 
     ``resolve_source_id`` is injected (see :func:`execute_source_rename`).
     """
-    resolved_id = await resolve_source_id(
-        client, plan.notebook_id, plan.source_id, json_output=plan.json_output
-    )
+    async with client.operation(timeout=USE_DEFAULT):
+        resolved_id = await resolve_source_id(client, plan.notebook_id, plan.source_id)
 
-    # ``sources.refresh`` returns ``None`` on success (#1290); any failure
-    # raises before reaching here.
-    await client.sources.refresh(plan.notebook_id, resolved_id)
-    return SourceRefreshResult(source_id=resolved_id, notebook_id=plan.notebook_id, result=None)
+        # ``sources.refresh`` returns ``None`` on success (#1290); any failure
+        # raises before reaching here.
+        await client.sources.refresh(plan.notebook_id, resolved_id)
+        return SourceRefreshResult(source_id=resolved_id, notebook_id=plan.notebook_id, result=None)
 
 
 # ---------------------------------------------------------------------------
@@ -549,10 +423,10 @@ _DRIVE_MIME_MAP: dict[DriveMimeChoice, str] = {
 #: The declared Drive MIME choice → the :class:`~notebooklm.types.SourceType` that
 #: labels the imported file.
 #:
-#: The NotebookLM backend returns an ambiguous type code for Drive imports: a
-#: Drive-hosted PDF comes back as code ``14``, which the client otherwise maps to
-#: :attr:`~notebooklm.types.SourceType.GOOGLE_SPREADSHEET`, mislabeling PDFs as
-#: spreadsheets (#1828). On the Drive add path the caller's declared ``mime_type``
+#: The NotebookLM backend returns a catch-all type code for most Drive imports:
+#: everything but a Doc or a PDF comes back as code ``14``
+#: (:attr:`~notebooklm.types.SourceType.GOOGLE_DRIVE`), so a Drive-hosted PDF or
+#: Sheet would lose its format (#1828). On the Drive add path the caller's declared ``mime_type``
 #: is authoritative for the imported file, so we stamp the corresponding type code
 #: onto the returned source rather than exposing the raw (ambiguous) backend code.
 _DRIVE_MIME_SOURCE_TYPE: dict[DriveMimeChoice, SourceType] = {
@@ -571,7 +445,7 @@ _SOURCE_TYPE_TO_CODE: dict[SourceType, int] = {
     SourceType.GOOGLE_DOCS: 1,
     SourceType.GOOGLE_SLIDES: 2,
     SourceType.PDF: 3,
-    SourceType.GOOGLE_SPREADSHEET: 14,
+    SourceType.GOOGLE_SPREADSHEET: 7,
 }
 
 
@@ -603,29 +477,30 @@ async def execute_source_add_drive(
             (MCP/HTTP) gets a clean ``VALIDATION`` rather than a leaked
             ``KeyError`` (ADR-0021).
     """
-    if plan.mime_type not in _DRIVE_MIME_MAP:
-        raise ValidationError(
-            f"Invalid mime_type {plan.mime_type!r}; expected one of {sorted(_DRIVE_MIME_MAP)}. "
-            "NotebookLM's Drive import only ingests Google-native Docs/Slides/Sheets + PDF; "
-            "an upload-only Drive file (e.g. epub/docx/txt/md/rtf/odt/csv) must be "
-            "downloaded and added as a `file` source instead."
-        )
-    mime = _DRIVE_MIME_MAP[plan.mime_type]
+    async with client.operation(timeout=USE_DEFAULT):
+        if plan.mime_type not in _DRIVE_MIME_MAP:
+            raise ValidationError(
+                f"Invalid mime_type {plan.mime_type!r}; expected one of {sorted(_DRIVE_MIME_MAP)}. "
+                "NotebookLM's Drive import only ingests Google-native Docs/Slides/Sheets + PDF; "
+                "an upload-only Drive file (e.g. epub/docx/txt/md/rtf/odt/csv) must be "
+                "downloaded and added as a `file` source instead."
+            )
+        mime = _DRIVE_MIME_MAP[plan.mime_type]
 
-    src = await client.sources.add_drive(plan.notebook_id, plan.file_id, plan.title, mime)
-    # Stamp the declared type onto the returned source. The backend returns an
-    # ambiguous type code for Drive imports (a Drive-hosted PDF comes back as
-    # ``14`` → GOOGLE_SPREADSHEET), so the caller's declared ``mime_type`` — not the
-    # raw backend code — is authoritative for how the source is labeled (#1828). The
-    # freshly returned ``Source`` is ours to finalize; ``kind`` derives from
-    # ``_type_code``, so overwriting it is the whole fix.
-    src._type_code = drive_mime_type_code(plan.mime_type)
-    return SourceAddDriveResult(
-        source=src,
-        notebook_id=plan.notebook_id,
-        file_id=plan.file_id,
-        mime_type=plan.mime_type,
-    )
+        src = await client.sources.add_drive(plan.notebook_id, plan.file_id, plan.title, mime)
+        # Stamp the declared type onto the returned source. The backend returns an
+        # ambiguous type code for Drive imports (a Drive-hosted PDF comes back as
+        # ``14`` → GOOGLE_SPREADSHEET), so the caller's declared ``mime_type`` — not the
+        # raw backend code — is authoritative for how the source is labeled (#1828). The
+        # freshly returned ``Source`` is ours to finalize; ``kind`` derives from
+        # ``_type_code``, so overwriting it is the whole fix.
+        src._type_code = drive_mime_type_code(plan.mime_type)
+        return SourceAddDriveResult(
+            source=src,
+            notebook_id=plan.notebook_id,
+            file_id=plan.file_id,
+            mime_type=plan.mime_type,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -670,18 +545,19 @@ async def execute_source_add_drive_file(
     type, or expired Drive auth surface as :class:`ValidationError` from the
     client, which the surface adapters render.
     """
-    src = await client.sources.add_drive_file(
-        plan.notebook_id,
-        plan.document_id,
-        title=plan.title,
-        wait=plan.wait,
-        wait_timeout=plan.wait_timeout,
-    )
-    return SourceAddDriveFileResult(
-        source=src,
-        notebook_id=plan.notebook_id,
-        document_id=plan.document_id,
-    )
+    async with client.operation(timeout=USE_DEFAULT):
+        src = await client.sources.add_drive_file(
+            plan.notebook_id,
+            plan.document_id,
+            title=plan.title,
+            wait=plan.wait,
+            wait_timeout=plan.wait_timeout,
+        )
+        return SourceAddDriveFileResult(
+            source=src,
+            notebook_id=plan.notebook_id,
+            document_id=plan.document_id,
+        )
 
 
 __all__ = [
@@ -699,7 +575,8 @@ __all__ = [
     "SourceRefreshResult",
     "SourceRenamePlan",
     "SourceRenameResult",
-    "build_id_ambiguity_error",
+    "SourceMutationMatch",
+    "SourceMutationReason",
     "drive_mime_type_code",
     "execute_source_add_drive",
     "execute_source_add_drive_file",
@@ -708,7 +585,6 @@ __all__ = [
     "execute_source_refresh",
     "execute_source_rename",
     "looks_like_full_source_id",
-    "require_yes_in_json",
     "resolve_source_by_exact_title",
     "resolve_source_for_delete",
 ]

@@ -9,10 +9,10 @@ few wrappers remain explicit test patch points.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
-from rich.markup import render as render_markup
+from rich.markup import escape as escape_markup
 from rich.table import Table
 
 from .._app import source_add as source_add_service
@@ -43,6 +43,7 @@ from .rendering import (
     json_output_response,
 )
 from .services.source_mutations import (
+    CliSourceMutationError,
     SourceAddDriveFileResult,
     SourceAddDriveResult,
     SourceDeleteByTitleResult,
@@ -50,17 +51,53 @@ from .services.source_mutations import (
     SourceMutationError,
     SourceRefreshResult,
     SourceRenameResult,
+    source_mutation_error_details,
 )
 from .services.source_research import SourceAddResearchResult
 from .services.source_serializers import (
+    relevant_chunk_payload,
     source_fulltext_payload,
     source_kind_value,
     source_row_payload,
     source_summary_payload,
 )
 
+if TYPE_CHECKING:
+    from ..types import RelevantChunk
+
 # Compatibility wrappers — tests patch these names on this module. Each
 # one is a one-liner forwarder to the canonical service-layer home.
+
+
+def _render_source_search_result(
+    chunks: list[RelevantChunk],
+    *,
+    json_output: bool,
+    ctx: click.Context,
+) -> None:
+    """Render ranked passage search results as JSON or a readable table."""
+    if json_output:
+        json_output_response([relevant_chunk_payload(chunk) for chunk in chunks])
+        return
+
+    if not chunks:
+        cli_print("No relevant passages found.", ctx=ctx)
+        return
+
+    table = Table(title=f"{len(chunks)} relevant passage(s)")
+    table.add_column("Rank", justify="right", no_wrap=True)
+    table.add_column("Source ID", style="cyan", overflow="fold")
+    table.add_column("Span", no_wrap=True)
+    table.add_column("Text", overflow="fold")
+    for chunk in chunks:
+        span = f"{chunk.start}:{chunk.end}" if chunk.start is not None else "-"
+        table.add_row(
+            str(chunk.rank),
+            escape_markup(chunk.source_id),
+            span,
+            escape_markup(chunk.text),
+        )
+    console.print(table)
 
 
 def _looks_like_path(content: str) -> bool:
@@ -68,12 +105,56 @@ def _looks_like_path(content: str) -> bool:
     return source_add_service.looks_like_path(content)
 
 
+def _source_add_validation_message(exc: source_add_service.SourceAddValidationError) -> str:
+    """Render a neutral source-add reason using the established CLI wording."""
+    if exc.reason == "invalid_url":
+        return f"Invalid URL: {exc.url} ({exc.detail})"
+    if exc.reason == "unsupported_url_scheme":
+        return (
+            f"URL scheme {exc.scheme!r} is not allowed; only http and https URLs "
+            f"are accepted as sources. Got: {exc.url}"
+        )
+    if exc.reason == "url_missing_host":
+        return f"URL has no host component: {exc.url}"
+    if exc.reason == "local_host_disallowed":
+        return (
+            f"URL targets the local host {exc.host!r}; pass --allow-internal "
+            f"to override. Got: {exc.url}"
+        )
+    if exc.reason == "internal_ip_disallowed":
+        return (
+            f"URL targets an internal IP address {exc.host}; pass --allow-internal "
+            f"to override. Got: {exc.url}"
+        )
+    if exc.reason == "symlink_disallowed":
+        return (
+            "Path is a symlink; pass --follow-symlinks to follow it explicitly. "
+            f"Refusing to upload: {exc.path}"
+        )
+    if exc.reason == "not_regular_file":
+        return f"Not a regular file: {exc.path}"
+    if exc.reason == "missing_upload_path":
+        return "upload_path must be set when detected_type == 'file'"
+    if exc.reason == "upload_root_not_configured":
+        return "No upload allowed roots are configured; refusing local file add."
+    if exc.reason == "path_outside_allowed_root":
+        return f"Path is outside the allowed upload roots: {exc.path}"
+    if exc.reason == "credential_path_disallowed":
+        return f"Refusing to upload a credential or Playwright profile path: {exc.path}"
+    raise AssertionError(f"Unhandled source-add validation reason: {exc.reason}")
+
+
 def _validate_upload_path(content: str, follow_symlinks: bool) -> Path:
     """Compatibility wrapper for tests patching source-add upload validation."""
     try:
         return source_add_service.validate_upload_path(content, follow_symlinks)
     except source_add_service.SourceAddValidationError as exc:
-        _output_error(f"Error: {exc}", "VALIDATION_ERROR", current_json_output(), 1)
+        _output_error(
+            f"Error: {_source_add_validation_message(exc)}",
+            "VALIDATION_ERROR",
+            current_json_output(),
+            1,
+        )
         raise AssertionError("unreachable") from None  # pragma: no cover
 
 
@@ -136,7 +217,7 @@ def _print_drive_lines(src: Source) -> None:
     The two lines are gated **independently**, and that is load-bearing rather
     than defensive: the id and the status decode from structurally unrelated
     wire slots, and the only Drive row this project has captured
-    (``tests/cassettes/sources_add_drive.yaml``) carries an id with **no**
+    (``tests/cassettes/web/sources_add_drive.yaml``) carries an id with **no**
     health slot at all. Gating the id on the status would blank #2113's whole
     reason for existing on the most common real shape.
     """
@@ -424,24 +505,17 @@ def _render_source_stale_result(
         exit_with_code(0)
 
 
-def _handle_source_mutation_error(exc: SourceMutationError, *, json_output: bool) -> NoReturn:
+def _handle_source_mutation_error(
+    exc: SourceMutationError | CliSourceMutationError, *, json_output: bool
+) -> NoReturn:
     """Render a typed source-mutation error through the CLI error contract."""
-    extra = dict(exc.extra) if exc.extra else None
-    hint = None
-    if exc.status_message:
-        plain_status = render_markup(exc.status_message).plain
-        if json_output:
-            extra = extra or {}
-            extra["status_message"] = plain_status
-        else:
-            hint = plain_status
+    message, code, extra = source_mutation_error_details(exc)
     _output_error(
-        exc.message,
-        code=exc.code,
+        message,
+        code=code,
         json_output=json_output,
         exit_code=1,
-        extra=extra,
-        hint=hint,
+        extra=dict(extra) if extra else None,
     )
     raise AssertionError("unreachable")  # pragma: no cover
 
@@ -514,8 +588,11 @@ def _render_source_delete_result(
     json_output: bool,
     ctx: click.Context,
 ) -> None:
-    if result.status_message:
-        emit_status(result.status_message, json_output=json_output)
+    if isinstance(result, SourceDeleteResult) and result.matched_title is not None:
+        emit_status(
+            f"[dim]Matched: {result.source_id[:12]}... ({result.matched_title})[/dim]",
+            json_output=json_output,
+        )
 
     if json_output:
         payload = (
@@ -575,7 +652,83 @@ def source_add_payload(result: SourceAddResult) -> dict[str, Any]:
     the neutral ``source_summary_payload`` shape. Built in the CLI render layer
     (§11) so the ``_app`` result dataclass stays typed-fields-only.
     """
-    return {"source": source_summary_payload(result.source)}
+    from .._app.serialize import to_jsonable
+
+    payload = {"source": source_summary_payload(result.source)}
+    fallback = getattr(result, "fallback", None)
+    if fallback is not None:
+        payload["fallback"] = to_jsonable(fallback)
+    return payload
+
+
+def _render_play_books_result(
+    books: list[Any],
+    *,
+    json_output: bool,
+    ctx: click.Context,
+) -> None:
+    """Render ``source books`` — the account's Play Books library (#2292)."""
+    from .._app.serialize import play_book_summary
+
+    if json_output:
+        json_output_response(
+            {
+                "play_books": [play_book_summary(b) for b in books],
+                "count": len(books),
+            }
+        )
+        return
+
+    if not books:
+        cli_print("No Google Play Books available to add as sources.", ctx=ctx)
+        return
+
+    table = Table(title=f"{len(books)} Play Book(s)")
+    table.add_column("Content ID", no_wrap=True)
+    table.add_column("Title")
+    table.add_column("Authors")
+    table.add_column("Add?")
+    for book in books:
+        add_cell = (
+            "[green]yes[/green]"
+            if not book.export_disabled
+            else f"[red]no[/red] ({escape_markup(book.reason.value)})"
+            if book.reason is not None
+            else "[red]no[/red]"
+        )
+        # Escape library-supplied strings so a title/author containing
+        # ``[...]`` is not parsed as Rich console markup.
+        table.add_row(
+            escape_markup(book.content_id),
+            escape_markup(book.title or "-"),
+            escape_markup(", ".join(book.authors) or "-"),
+            add_cell,
+        )
+    console.print(table)
+
+
+def _render_source_add_play_book_result(
+    result: Any,
+    *,
+    json_output: bool,
+    ctx: click.Context,
+) -> None:
+    """Render ``source add-book`` (#2292)."""
+    if json_output:
+        json_output_response(
+            {
+                "action": "add-book",
+                "source": source_summary_payload(result.source),
+                "content_id": result.content_id,
+                "notebook_id": result.notebook_id,
+            }
+        )
+        return
+
+    # Escape the library-supplied title so a value containing ``[...]`` is not
+    # parsed as Rich console markup.
+    cli_print(f"[green]Added Play Book source:[/green] {result.source.id}", ctx=ctx)
+    cli_print(f"[bold]Title:[/bold] {escape_markup(result.source.title or '-')}", ctx=ctx)
 
 
 def _render_source_add_drive_result(

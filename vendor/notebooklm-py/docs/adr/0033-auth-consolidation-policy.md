@@ -6,6 +6,47 @@ Accepted (#2156). Amended by
 [ADR-0034](0034-auth-storage-object-model.md), which preserves this record's consolidation safety
 boundary while extracting independently owned state and lifecycles from the consolidated facade.
 
+**Amended 2026-09-03 (test-patch coupling).** The old patch-site totals were an
+aggregate diagnostic, not a migration-safe invariant. The registered schema-v2
+auth/browser/facade projections now retain package, target, test path, lexical
+owner, owner kind, idiom, and count. A combined scorecard and shared-lifetime
+mutation projection reject package relocation, helper hiding, direct/item/bulk
+namespace mutation, and displacement to classes or process-default owners.
+Non-underscore is a lexical spelling classification, not a statement that the
+target is supported API; reviewers must read total and private-name counts
+together.
+
+The PR-1 schema-v2 measurement is 244 `_auth` sites (145 private-name, 99
+non-underscore), 66 `_browser` sites (17/49), and 526 public-facade sites
+(0/526): 836 family sites total, 162 private-name, 97 distinct package/target
+identities, 96 files, 714 lexical owners, and 6 direct assignments. This is one
+site above the legacy `_auth` projection because the old collector silently
+ignored a real patch whose attribute was a module-level string constant; the
+fail-closed collector expands that constant. The shared-lifetime companion
+projection starts at 188 operations (32 private-name, 46 in fixture/helper
+bodies, zero direct assignments).
+
+**Measurement boundary.** These projections are repository-specific ratchets,
+not general Python dataflow or pytest-fixture analyzers. Their supported grammar
+is deliberately finite: explicit family imports and lexical aliases; direct
+attribute, item, namespace, and bulk mutation; literal mutation names and finite
+literal loops/containers without unpacking; the suite-used syntactic `list(...)`
+wrapper; and direct local helper forwarding whose explicit arguments resolve to a
+finite target set. The three outcomes inside that grammar
+are: count a resolved family/shared target, exclude a proven-fresh or
+proven-non-family target, or reject an unresolved family-related target. The
+last outcome is opaque debt with a baseline of zero, not an invitation to
+approximate more of Python.
+
+Consequently, arbitrary control flow, closure capture, runtime registries,
+descriptor behavior, and pytest plugin/fixture discovery are known limits. A
+rewrite using such a form cannot be offered as proof that coupling decreased:
+it must be rewritten into the supported grammar or retain the prior projected
+row. Review findings about unsupported semantics are blocking only when they
+reproduce current repository behavior or demonstrate a simple laundering
+rewrite within the supported grammar. Dynamic names or keys against an
+already-resolved family/shared owner always fail closed.
+
 **Amended 2026-08-12 (module-size budget raise):** `MODULE_SIZE_BUDGET` moved 1000 → 1500 under
 ADR-0008. This ADR's sanctioned-merge machinery is unaffected in substance, but one mechanical
 consequence needed handling: the shrink-lock guarantee below was carried by
@@ -13,10 +54,33 @@ consequence needed handling: the shrink-lock guarantee below was carried by
 all four sanctioned `_auth` pins fell under it, so dropping them — as the raise's first draft did
 — would have silently repealed this ADR's "shrink-locked at its pin" rule and handed 275–410 lines
 of unratcheted growth back to already-consolidated modules. The locks therefore moved to a
-dedicated `SHRINK_LOCKED_CEILINGS` map in `tests/_guardrails/test_module_size_ratchet.py`, which
+dedicated `SHRINK_LOCKED_CEILINGS` view loaded by
+`tests/_guardrails/test_module_size_ratchet.py` from the regenerable
+`tests/fixtures/baselines/module_size.json`, which
 carries the same grow/tighten semantics but is deliberately exempt from the
 budget-below-every-ceiling invariant. **The guarantee in this ADR is unchanged; only its
 enforcement site moved.**
+
+**Amended 2026-09-02 (early compatibility-shim removal):** the six private compatibility shims
+created by this consolidation were removed in v0.8.x by explicit maintainer decision, before their
+documented next-major removal window. This is an intentional compatibility-policy override for
+out-of-tree private importers; no replacement shims were added. The canonical replacements are:
+
+| removed private module | canonical replacement |
+|---|---|
+| `_auth._browser_cookie_filter` | `_auth.cookie_filter` |
+| `_auth.browser_cookie_recovery` | `_auth.psidts_recovery` |
+| `_auth.browser_state_validation` | `_browser.browser_capture` |
+| `_auth.login_wait_trace` | `_browser.browser_capture` |
+| `_auth.storage_transaction` | `_auth.profile_store` |
+| `_auth.storage_writer` | `_auth.storage` |
+
+**Amended 2026-09-02 (browser-package relocation):** the browser-acquisition
+implementation moved from `_auth` to `_browser` under ADR-0036. The exact
+`browser_capture.py` shrink lock moved with the file into the separate browser
+module-size projection; it was not dropped or granted headroom. `_auth` now has
+no `_browser`/Playwright edge and reaches L3 through the neutral installed-rung
+contract in `_auth/recovery_rungs.py`.
 
 **Amended during PR 1.2 (2026-08-08):** decision 1 gains a **third** sanctioned class, *template
 adoption*. The effort's plan assumed PR 1.2 would shrink `storage.py`; it does not — converting a
@@ -35,7 +99,7 @@ granularity without weakening its guarantee. Supersedes-by-deferral
 
 Before #2156, `_auth` was 27 modules / 12,730 lines (measured 2026-08-07; regenerate with
 `python -c "from pathlib import Path; ps=sorted(Path('src/notebooklm/_auth').rglob('*.py')); print(len(ps), sum(len(p.read_text(encoding='utf-8').splitlines()) for p in ps))"`
-— the snippet in `tests/_guardrails/test_module_size_ratchet.py` lists per-module counts over the
+— the `module_size.json` baseline lists per-module counts over the
 budget, which is a different figure). The 2026-08-07 architecture review found the
 residual friction has one dominant cause: **ADR-0008's 1000-line cap has been acting as the module
 boundary inside `_auth` instead of the seams.** The evidence is in the code's own comments, which
@@ -101,19 +165,21 @@ consolidation under `src/notebooklm/_auth/`** may register its merged module at 
 line count, annotated `# sanctioned merge (ADR-0033)` with a one-line note naming the absorbed
 modules and the PR.
 
-**Which map to register in** (since the 2026-08-12 amendment there are two, and the choice is
-mechanical — compare the measured LOC against `MODULE_SIZE_BUDGET`):
+**Which authored policy set to register in** (the baseline derives the measured maps from these
+sets, and the choice is mechanical — compare the measured LOC against `MODULE_SIZE_BUDGET`):
 
-| measured LOC | map | enforced by |
-|---|---|---|
-| **over** budget | `ALLOWLISTED_CEILINGS` | `test_allowlisted_modules_do_not_exceed_their_ceiling`, `test_allowlisted_ceilings_ratchet_down`, `test_budget_is_below_every_allowlisted_ceiling` |
-| **at or under** budget | `SHRINK_LOCKED_CEILINGS` | `test_shrink_locked_modules_do_not_exceed_their_pin`, `test_shrink_locked_ceilings_ratchet_down` |
+| measured LOC | authored policy | derived baseline view | enforced by |
+|---|---|---|---|
+| **over** budget | `OVER_BUDGET_EXEMPTIONS` with a durable reason | `ALLOWLISTED_CEILINGS` | `test_allowlisted_modules_do_not_exceed_their_ceiling`, `test_allowlisted_ceilings_ratchet_down`, `test_budget_is_below_every_allowlisted_ceiling` |
+| **at or under** budget | `SHRINK_LOCKED_MODULES` | `SHRINK_LOCKED_CEILINGS` | `test_shrink_locked_modules_do_not_exceed_their_pin`, `test_shrink_locked_ceilings_ratchet_down` |
 
 Both carry identical grow/tighten semantics, so the shrink-lock guarantee below is the same either
 way. They differ only in the budget invariant: an `ALLOWLISTED_CEILINGS` entry must sit strictly
 *above* the budget (a redundant entry is a sign the budget was raised without re-baselining), while
 a `SHRINK_LOCKED_CEILINGS` entry sits *below* it by design. A module belongs to exactly one map —
-`test_shrink_locked_entries_are_disjoint_and_not_stale` fails if it is in both.
+`test_ceiling_sets_are_disjoint_and_not_stale` fails if it is in both. These maps are measured JSON
+projections, not policy authoring surfaces; edit the authored sets in
+`tests/_baselines/module_size.py`, then regenerate the baseline.
 
 This is the **one** exception to the ratchet's "the allowlist only shrinks and ceilings only
 tighten" convention, and it covers three cases:
@@ -252,8 +318,9 @@ Line count alone is never the trigger; any of the above is.
 
 - The plan's merges become legal as pure structural PRs: each merge PR moves file contents wholesale
   and records one annotated ceiling, with no gate-code change required for the ratchet itself
-  (mechanism (b): the ceiling maps carry the exception — `ALLOWLISTED_CEILINGS` when the merged
-  module lands over budget, `SHRINK_LOCKED_CEILINGS` when it lands under; see decision 1).
+  (mechanism (b): the authored policy sets carry the exception — `OVER_BUDGET_EXEMPTIONS` with a
+  reason when the merged module lands over budget, `SHRINK_LOCKED_MODULES` when it lands under;
+  regeneration records the corresponding measured ceiling; see decision 1).
 - Re-accretion protection is preserved everywhere it still applies. The modules the plan does *not*
   merge keep the plain budget; the modules it does merge are shrink-locked at their measured pin.
 - ADR-0029's boundary stays by-construction, but its assertion is now a name list that must be

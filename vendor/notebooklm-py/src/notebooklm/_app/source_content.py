@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ..exceptions import MissingDependencyError, SourceNotFoundError, ValidationError
+from ..options import USE_DEFAULT
 
 if TYPE_CHECKING:
     from ..client import NotebookLMClient
@@ -190,49 +191,50 @@ async def execute_source_read(client: NotebookLMClient, plan: SourceReadPlan) ->
       :class:`~notebooklm.exceptions.MissingDependencyError` so adapters surface
       an *install the extra* hint (#1959); the text path re-raises — a genuine bug.
     """
-    if plan.max_chars is not None and plan.max_chars < 0:
-        raise ValidationError(f"max_chars must be >= 0; got {plan.max_chars}")
-    if plan.offset < 0:
-        raise ValidationError(f"offset must be >= 0; got {plan.offset}")
+    async with client.operation(timeout=USE_DEFAULT):
+        if plan.max_chars is not None and plan.max_chars < 0:
+            raise ValidationError(f"max_chars must be >= 0; got {plan.max_chars}")
+        if plan.offset < 0:
+            raise ValidationError(f"offset must be >= 0; got {plan.offset}")
 
-    get_result = await execute_source_get(
-        client, SourceGetPlan(notebook_id=plan.notebook_id, source_id=plan.source_id)
-    )
-    if get_result.source is None:
-        raise SourceNotFoundError(plan.source_id)
-    source = get_result.source
+        get_result = await execute_source_get(
+            client, SourceGetPlan(notebook_id=plan.notebook_id, source_id=plan.source_id)
+        )
+        if get_result.source is None:
+            raise SourceNotFoundError(plan.source_id)
+        source = get_result.source
 
-    content: str | None = None
-    char_count = 0
-    if source.is_ready:
-        try:
-            fulltext_result = await execute_source_fulltext(
-                client,
-                SourceFulltextPlan(
-                    notebook_id=plan.notebook_id,
-                    source_id=plan.source_id,
-                    output_format=plan.output_format,
-                ),
-            )
-        except ImportError as exc:
-            if plan.output_format != "markdown":
-                raise
-            raise MissingDependencyError(str(exc)) from exc
-        content = fulltext_result.fulltext.content or None
-        char_count = fulltext_result.fulltext.char_count
+        content: str | None = None
+        char_count = 0
+        if source.is_ready:
+            try:
+                fulltext_result = await execute_source_fulltext(
+                    client,
+                    SourceFulltextPlan(
+                        notebook_id=plan.notebook_id,
+                        source_id=plan.source_id,
+                        output_format=plan.output_format,
+                    ),
+                )
+            except ImportError as exc:
+                if plan.output_format != "markdown":
+                    raise
+                raise MissingDependencyError(str(exc)) from exc
+            content = fulltext_result.fulltext.content or None
+            char_count = fulltext_result.fulltext.char_count
 
-    truncated = False
-    if content is not None:
-        effective_max = DEFAULT_CONTENT_CHARS if plan.max_chars is None else plan.max_chars
-        windowed = content[plan.offset : plan.offset + effective_max]
-        truncated = len(windowed) < (len(content) - plan.offset)
-        # Normalize an empty slice (e.g. offset past the end) to None, matching the
-        # fetch-path contract (content is null when there's nothing to show).
-        content = windowed or None
+        truncated = False
+        if content is not None:
+            effective_max = DEFAULT_CONTENT_CHARS if plan.max_chars is None else plan.max_chars
+            windowed = content[plan.offset : plan.offset + effective_max]
+            truncated = len(windowed) < (len(content) - plan.offset)
+            # Normalize an empty slice (e.g. offset past the end) to None, matching the
+            # fetch-path contract (content is null when there's nothing to show).
+            content = windowed or None
 
-    return SourceReadResult(
-        source=source, content=content, char_count=char_count, truncated=truncated
-    )
+        return SourceReadResult(
+            source=source, content=content, char_count=char_count, truncated=truncated
+        )
 
 
 # ---------------------------------------------------------------------------

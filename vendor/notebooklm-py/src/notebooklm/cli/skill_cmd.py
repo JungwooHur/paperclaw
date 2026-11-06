@@ -30,6 +30,7 @@ from .._app.skill import (
     get_installed_content,
     get_package_version,
     get_scope_root,
+    get_skill_content_mismatch,
     get_skill_path,
     get_skill_version,
     iter_targets,
@@ -58,6 +59,7 @@ __all__ = [
     "get_installed_content",
     "get_package_version",
     "get_scope_root",
+    "get_skill_content_mismatch",
     "get_skill_path",
     "get_skill_source_content",
     "get_skill_version",
@@ -143,6 +145,14 @@ def _frontmatter_description(content: str) -> str | None:
         return None
     match = re.search(r"^description:\s*(.*)$", parts[1], flags=re.MULTILINE)
     return match.group(1).strip() if match else None
+
+
+def _skill_repair_command(scope: str, target: str) -> str:
+    """Return the command that repairs one reported skill target."""
+    command = f"notebooklm skill install --scope {scope} --target {target}"
+    if scope == "project":
+        command += " --force"
+    return command
 
 
 @click.group()
@@ -336,14 +346,25 @@ def install(scope: str, target_name: str, dry_run: bool, no_clobber: bool, force
 )
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 def status(scope: str, target_name: str, json_output: bool):
-    """Check installed skill targets and version info."""
+    """Check installed skill targets, versions, and content integrity."""
     cli_version = get_package_version()
+    try:
+        source_content = get_skill_source_content()
+    except (OSError, UnicodeError):
+        source_content = None
+    canonical_content = (
+        add_version_comment(source_content, cli_version) if source_content is not None else None
+    )
     selected_targets = iter_targets(target_name)
     target_rows = []
     for target in selected_targets:
         skill_path = get_skill_path(target, scope)
         skill_version = get_skill_version(skill_path)
-        installed = skill_path.exists()
+        try:
+            installed = skill_path.exists()
+        except OSError:
+            installed = False
+        content_mismatch = get_skill_content_mismatch(skill_path, canonical_content)
         target_rows.append(
             {
                 "target": target,
@@ -354,6 +375,7 @@ def status(scope: str, target_name: str, json_output: bool):
                 "version_mismatch": bool(
                     installed and skill_version and skill_version != cli_version
                 ),
+                "content_mismatch": content_mismatch,
             }
         )
     any_installed = any(row["installed"] for row in target_rows)
@@ -372,10 +394,23 @@ def status(scope: str, target_name: str, json_output: bool):
         console.print(f"  {row['label']}: {status_label}")
         console.print(f"    Path: {row['path']}")
         if row["installed"]:
+            repair_command = _skill_repair_command(scope, str(row["target"]))
+            repair_note = " (overwrites the differing project skill)" if scope == "project" else ""
             console.print(f"    Skill version: {row['skill_version'] or 'unknown'}")
             if row["version_mismatch"]:
                 console.print(
-                    "    [yellow]Version mismatch[/yellow] - run [cyan]notebooklm skill install[/cyan]"
+                    "    [yellow]Version mismatch[/yellow] - run "
+                    f"[cyan]{repair_command}[/cyan]{repair_note}"
+                )
+            if row["content_mismatch"] is None:
+                console.print(
+                    "    [yellow]Content comparison unavailable[/yellow] - canonical or "
+                    "installed skill could not be read"
+                )
+            elif row["content_mismatch"] and not row["version_mismatch"]:
+                console.print(
+                    "    [yellow]Content drift[/yellow] - installed skill differs from this "
+                    f"package; run [cyan]{repair_command}[/cyan]{repair_note}"
                 )
 
     if not any_installed:

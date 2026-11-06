@@ -6,10 +6,10 @@ import asyncio
 import builtins
 import logging
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import Any
+from typing import Any, Protocol, TypeVar
 
 from .._deadline import RuntimeDeadline
-from ..rpc.types import SourceStatus
+from .._types.enums import SourceStatus
 from ..types import Source, SourceNotFoundError, SourceProcessingError, SourceTimeoutError
 
 # Source type codes where status=3 (ERROR) is transient rather than terminal.
@@ -93,6 +93,17 @@ def _expiry_error(
 GetSource = Callable[[str, str], Awaitable[Source | None]]
 ListSources = Callable[[str], Awaitable[builtins.list[Source]]]
 WaitUntilReady = Callable[..., Coroutine[Any, Any, Source]]
+_ChildResult = TypeVar("_ChildResult")
+
+
+class SpawnSourceChild(Protocol):
+    """Admit an exclusive child with the parent's deadline and evidence journal."""
+
+    async def __call__(
+        self, label: str, factory: Callable[[], Awaitable[_ChildResult]]
+    ) -> asyncio.Task[_ChildResult]: ...
+
+
 Sleep = Callable[[float], Awaitable[Any]]
 Monotonic = Callable[[], float]
 
@@ -119,13 +130,16 @@ class SourcePoller:
         max_interval: float = 10.0,
         backoff_factor: float = 1.5,
         transient_error_types: tuple[int | None, ...] | None = None,
+        look_first: bool = False,
+        missing_is_pending: bool = False,
+        deadline: RuntimeDeadline | None = None,
         get_source: GetSource,
         sleep: Sleep,
         monotonic: Monotonic,
         logger: logging.Logger,
     ) -> Source:
         """Wait for a source to become ready."""
-        deadline = RuntimeDeadline.start(timeout, monotonic=monotonic)
+        deadline = deadline or RuntimeDeadline.start(timeout, monotonic=monotonic)
         interval = initial_interval
         last_status: int | None = None
         # Consecutive ERROR observations ending at the current tick. Reset by any
@@ -135,31 +149,37 @@ class SourcePoller:
         transient_errors = (
             _TRANSIENT_ERROR_TYPES if transient_error_types is None else transient_error_types
         )
+        first_look = True
+        if deadline.timeout <= 0.0:
+            raise _expiry_error(source_id, timeout, last_status)
 
         while True:
             # Check timeout before each poll.
-            if deadline.expired():
+            if not (look_first and first_look) and deadline.expired():
                 raise _expiry_error(source_id, timeout, last_status, error_streak=error_streak)
 
             source = await get_source(notebook_id, source_id)
+            first_look = False
 
             if source is None:
-                raise SourceNotFoundError(source_id)
+                if not missing_is_pending:
+                    raise SourceNotFoundError(source_id)
+                error_streak = 0
+            else:
+                last_status = source.status
+                error_streak = error_streak + 1 if source.is_error else 0
 
-            last_status = source.status
-            error_streak = error_streak + 1 if source.is_error else 0
+                if source.is_ready:
+                    return source
 
-            if source.is_ready:
-                return source
-
-            if source.is_error:
-                if source._type_code not in transient_errors:
-                    raise SourceProcessingError(source_id, source.status)
-                logger.debug(
-                    "Source %s reported transient ERROR status for type %s; continuing poll",
-                    source_id,
-                    source._type_code,
-                )
+                if source.is_error:
+                    if source._type_code not in transient_errors:
+                        raise SourceProcessingError(source_id, source.status)
+                    logger.debug(
+                        "Source %s reported transient ERROR status for type %s; continuing poll",
+                        source_id,
+                        source._type_code,
+                    )
 
             # Don't sleep longer than remaining time.
             if deadline.expired():
@@ -179,13 +199,16 @@ class SourcePoller:
         max_interval: float = 5.0,
         backoff_factor: float = 1.5,
         transient_error_types: tuple[int | None, ...] | None = None,
+        look_first: bool = False,
+        accept: Callable[[Source], bool] | None = None,
+        deadline: RuntimeDeadline | None = None,
         get_source: GetSource,
         sleep: Sleep,
         monotonic: Monotonic,
         logger: logging.Logger,
     ) -> Source:
         """Wait for a source to be registered server-side."""
-        deadline = RuntimeDeadline.start(timeout, monotonic=monotonic)
+        deadline = deadline or RuntimeDeadline.start(timeout, monotonic=monotonic)
         interval = initial_interval
         last_status: int | None = None
         # Consecutive ERROR observations ending at the current tick. Reset by any
@@ -195,12 +218,16 @@ class SourcePoller:
         transient_errors = (
             _TRANSIENT_ERROR_TYPES if transient_error_types is None else transient_error_types
         )
+        first_look = True
+        if deadline.timeout <= 0.0:
+            raise _expiry_error(source_id, timeout, last_status)
 
         while True:
-            if deadline.expired():
+            if not (look_first and first_look) and deadline.expired():
                 raise _expiry_error(source_id, timeout, last_status, error_streak=error_streak)
 
             source = await get_source(notebook_id, source_id)
+            first_look = False
 
             if source is not None:
                 last_status = source.status
@@ -215,9 +242,10 @@ class SourcePoller:
                         source_id,
                         source._type_code,
                     )
-                else:
-                    # Any non-error status (PROCESSING, READY, PREPARING)
-                    # means the source is registered server-side.
+                elif accept is None or accept(source):
+                    # By default any non-error status means the source is
+                    # registered. Backends can narrow that without duplicating
+                    # the polling and timeout machinery.
                     return source
 
             if deadline.expired():
@@ -360,6 +388,7 @@ class SourcePoller:
         *,
         timeout: float = 120.0,
         wait_until_ready: WaitUntilReady,
+        spawn_child: SpawnSourceChild,
         logger: logging.Logger,
         **kwargs: Any,
     ) -> builtins.list[Source]:
@@ -369,11 +398,27 @@ class SourcePoller:
         # cleanup, and it does not cancel still-running siblings for us.
         # Drive the fan-out as explicit tasks so any failure cancels and
         # drains every pending sibling before re-raising.
-        tasks: builtins.list[asyncio.Task[Source]] = [
-            asyncio.create_task(wait_until_ready(notebook_id, sid, timeout=timeout, **kwargs))
-            for sid in source_ids
-        ]
+        tasks: builtins.list[asyncio.Task[Source]] = []
+
+        def _wait_factory(source_id: str) -> Callable[[], Awaitable[Source]]:
+            async def _wait() -> Source:
+                return await wait_until_ready(
+                    notebook_id,
+                    source_id,
+                    timeout=timeout,
+                    **kwargs,
+                )
+
+            return _wait
+
         try:
+            for sid in source_ids:
+                tasks.append(
+                    await spawn_child(
+                        f"source-wait-{notebook_id}-{sid}",
+                        _wait_factory(sid),
+                    )
+                )
             return list(await asyncio.gather(*tasks))
         except BaseException:
             logger.debug("wait_for_sources: cancelling sibling source pollers", exc_info=True)
@@ -388,4 +433,4 @@ class SourcePoller:
             raise
 
 
-__all__ = ["SourcePoller", "SourceWaitResult"]
+__all__ = ["SourcePoller", "SourceWaitResult", "SpawnSourceChild"]

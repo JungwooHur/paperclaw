@@ -15,10 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..exceptions import UnknownRPCMethodError
-from ..rpc import safe_index
-
-_SRC = "_types.collections"
+from .._deprecation import warn_registered_deprecation
 
 
 @dataclass
@@ -42,48 +39,18 @@ class Collection:
     def from_api_response(cls, data: list[Any], *, method_id: str | None = None) -> Collection:
         """Parse one collection 4-tuple ``[name, notebook_ids, collection_id, emoji]``.
 
+        .. deprecated:: 0.9.0
+           Use ``client.collections`` typed APIs. Raw Web row decoding has no
+           supported public replacement.
+
         Decoded positionally rather than via :class:`LabelRow` because the
         member slot's shape differs from a label's once populated: bare
         notebook-id strings, not ``[[source_id], ...]`` wrapped singletons.
-        Strict per ADR-0019/0011 — ``safe_index`` raises on descent failure,
-        and any type drift (non-string name/id, a member that isn't a string,
-        a non-string emoji) raises too; there is no degrade-to-sentinel path.
+        Strict per ADR-0019/0011 — checked row descent raises on failure, and
+        any type drift (non-string name/id, a member that isn't a string, a
+        non-string emoji) raises too; there is no degrade-to-sentinel path.
         """
-        name = safe_index(data, 0, method_id=method_id, source=_SRC)
-        members = safe_index(data, 1, method_id=method_id, source=_SRC)  # list OR None
-        collection_id = safe_index(data, 2, method_id=method_id, source=_SRC)
-        emoji = safe_index(data, 3, method_id=method_id, source=_SRC)
-        if not isinstance(name, str) or not isinstance(collection_id, str):
-            raise UnknownRPCMethodError(
-                message="collection tuple name/id not strings",
-                method_id=method_id,
-                source=_SRC,
-            )
-        if members is None:
-            notebook_ids: list[str] = []  # legitimate empty collection
-        elif isinstance(members, list):
-            if not all(isinstance(m, str) for m in members):
-                raise UnknownRPCMethodError(
-                    message="malformed collection member row",
-                    method_id=method_id,
-                    source=_SRC,
-                )
-            notebook_ids = list(members)
-        else:
-            raise UnknownRPCMethodError(
-                message="collection notebook_ids slot is neither None nor list",
-                method_id=method_id,
-                source=_SRC,
-            )
-        if not isinstance(emoji, str):
-            raise UnknownRPCMethodError(
-                message="collection emoji slot is not a string",
-                method_id=method_id,
-                source=_SRC,
-            )
-        return cls(
-            id=collection_id,
-            name=name,
-            emoji=emoji or None,
-            notebook_ids=notebook_ids,
-        )
+        warn_registered_deprecation("collection_from_api_response")
+        from .._web.rows.collections import decode_collection
+
+        return decode_collection(cls, data, method_id=method_id)

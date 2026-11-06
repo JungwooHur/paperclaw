@@ -31,13 +31,13 @@ This module is transport-neutral — no ``click`` / ``rich`` / ``cli`` /
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
-from ..exceptions import ValidationError
-
-if TYPE_CHECKING:
-    from ..client import NotebookLMClient
+from ..options import USE_DEFAULT, UseDefault
+from ..types import CitedSourceSelection, ResearchStart, ResearchTask
+from .research import ResearchValidationError
 
 SearchSource = Literal["web", "drive"]
 SearchMode = Literal["fast", "deep"]
@@ -73,13 +73,38 @@ class ResearchImportOutcome(Protocol):
     def sources(self) -> list[dict[str, Any]]: ...
 
     @property
-    def cited_selection(self) -> Any: ...
+    def cited_selection(self) -> CitedSourceSelection | None: ...
 
 
-#: Signature of the injected source importer (the CLI passes
-#: ``cli.research_import.import_research_sources``). Keyword arguments
-#: (``report`` / ``cited_only`` / ``max_elapsed`` / ``json_output``) are
-#: forwarded verbatim, so this stays ``Callable[..., Awaitable[...]]``.
+class _ResearchNamespace(Protocol):
+    async def start(
+        self, notebook_id: str, query: str, source: str = "web", mode: str = "fast"
+    ) -> ResearchStart: ...
+
+    async def wait_for_completion(
+        self,
+        notebook_id: str,
+        task_id: str | None = None,
+        *,
+        timeout: float = 1800,
+        initial_interval: float = 2.0,
+    ) -> ResearchTask: ...
+
+
+class SourceResearchClient(Protocol):
+    """Public client capabilities consumed by source-research orchestration."""
+
+    def operation(
+        self, timeout: float | None | UseDefault = None
+    ) -> AbstractAsyncContextManager[object]: ...
+
+    @property
+    def research(self) -> _ResearchNamespace: ...
+
+
+#: Signature of the injected source importer. Neutral execution forwards only
+#: report/selection/deadline data; adapters may pre-bind their own presentation
+#: options before supplying the callable.
 ImportSourcesFn = Callable[..., Awaitable[ResearchImportOutcome]]
 
 
@@ -95,7 +120,6 @@ class SourceAddResearchPlan:
     cited_only: bool
     no_wait: bool
     timeout: int
-    json_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +146,7 @@ class SourceAddResearchResult:
     # termination reason.
     reason_message: str | None = None
     hint: str | None = None
+    failure: TimeoutError | None = field(default=None, repr=False, compare=False)
 
 
 def validate_add_research_flags(*, import_all: bool, cited_only: bool, no_wait: bool) -> None:
@@ -143,21 +168,17 @@ def validate_add_research_flags(*, import_all: bool, cited_only: bool, no_wait: 
     re-raises the Click-shaped error per ADR-0015.
     """
     if cited_only and not import_all:
-        raise ValidationError("--cited-only requires --import-all")
+        raise ResearchValidationError("cited_requires_import")
     if no_wait and import_all:
         # Both follow-ups are named because they differ in kind, not just in
         # spelling: ``research wait --import-all`` blocks until the run lands,
         # ``research import`` refuses a run that has not (#2206). Pointing only
         # at the blocking one left ``--no-wait`` with no non-blocking route.
-        raise ValidationError(
-            "--import-all requires --wait (the default), or after --no-wait a "
-            "separate 'research wait --import-all' (blocks) or 'research import' "
-            "(imports an already-completed run, never blocks)."
-        )
+        raise ResearchValidationError("import_requires_wait")
 
 
 async def execute_source_add_research(
-    client: NotebookLMClient,
+    client: SourceResearchClient,
     plan: SourceAddResearchPlan,
     *,
     import_sources: ImportSourcesFn,
@@ -198,106 +219,106 @@ async def execute_source_add_research(
     Deep research uses the returned ``report_id`` for polling/import because
     ``START_DEEP_RESEARCH`` slot 0 is not stable for those follow-up RPCs.
     """
-    result = await client.research.start(
-        plan.notebook_id, plan.query, plan.search_source, plan.mode
-    )
-    if not result:
-        return SourceAddResearchResult(outcome="start_failed", plan=plan)
-
-    start_task_id = result.task_id
-    # Deep research polls under the report id returned in slot 1 of the
-    # START_DEEP_RESEARCH response; the first slot is not stable for
-    # POLL_RESEARCH / IMPORT_RESEARCH.
-    task_id = result.report_id if plan.mode == "deep" else start_task_id
-    task_id = task_id or start_task_id
-
-    # Non-blocking mode: return immediately. Research will keep running
-    # server-side; until something fires IMPORT_RESEARCH the NotebookLM
-    # web UI will show an "Add sources?" modal (issue #315).
-    if plan.no_wait:
-        return SourceAddResearchResult(
-            outcome="started_no_wait",
-            plan=plan,
-            start_task_id=start_task_id,
-            poll_task_id=task_id,
+    async with client.operation(timeout=USE_DEFAULT):
+        result = await client.research.start(
+            plan.notebook_id, plan.query, plan.search_source, plan.mode
         )
+        if not result:
+            return SourceAddResearchResult(outcome="start_failed", plan=plan)
 
-    try:
-        status = await client.research.wait_for_completion(
-            plan.notebook_id,
-            task_id=task_id,
-            timeout=float(plan.timeout),
-            initial_interval=float(_POLL_INTERVAL_S),
-        )
-    except TimeoutError:
-        return SourceAddResearchResult(
-            outcome="timeout",
-            plan=plan,
-            start_task_id=start_task_id,
-            poll_task_id=task_id,
-        )
+        start_task_id = result.task_id
+        # Deep research polls under the report id returned in slot 1 of the
+        # START_DEEP_RESEARCH response; the first slot is not stable for
+        # POLL_RESEARCH / IMPORT_RESEARCH.
+        task_id = result.report_id if plan.mode == "deep" else start_task_id
+        task_id = task_id or start_task_id
 
-    status_val = status.status.value
-    # ``import_sources`` / ``SourceAddResearchResult`` consume the legacy
-    # ``list[dict]`` source shape, so serialize the typed sources here.
-    sources = [src.to_public_dict() for src in status.sources]
-    report = status.report or ""
+        # Non-blocking mode: return immediately. Research will keep running
+        # server-side; until something fires IMPORT_RESEARCH the NotebookLM
+        # web UI will show an "Add sources?" modal (issue #315).
+        if plan.no_wait:
+            return SourceAddResearchResult(
+                outcome="started_no_wait",
+                plan=plan,
+                start_task_id=start_task_id,
+                poll_task_id=task_id,
+            )
 
-    if status_val == "completed":
-        import_result: ResearchImportOutcome | None = None
-        if plan.import_all and sources and task_id:
-            import_kwargs: dict[str, Any] = {
-                "report": report,
-                "cited_only": plan.cited_only,
-                "max_elapsed": plan.timeout,
-            }
-            if plan.json_output:
-                import_kwargs["json_output"] = True
-            import_result = await import_sources(
-                client,
+        try:
+            status = await client.research.wait_for_completion(
                 plan.notebook_id,
-                task_id,
-                sources,
-                **import_kwargs,
+                task_id=task_id,
+                timeout=float(plan.timeout),
+                initial_interval=float(_POLL_INTERVAL_S),
+            )
+        except TimeoutError as error:
+            return SourceAddResearchResult(
+                outcome="timeout",
+                plan=plan,
+                start_task_id=start_task_id,
+                poll_task_id=task_id,
+                failure=error,
+            )
+
+        status_val = status.status.value
+        # ``import_sources`` / ``SourceAddResearchResult`` consume the legacy
+        # ``list[dict]`` source shape, so serialize the typed sources here.
+        sources = [src.to_public_dict() for src in status.sources]
+        report = status.report or ""
+
+        if status_val == "completed":
+            import_result: ResearchImportOutcome | None = None
+            if plan.import_all and sources and task_id:
+                import_kwargs: dict[str, Any] = {
+                    "report": report,
+                    "cited_only": plan.cited_only,
+                    "max_elapsed": plan.timeout,
+                }
+                import_result = await import_sources(
+                    client,
+                    plan.notebook_id,
+                    task_id,
+                    sources,
+                    **import_kwargs,
+                )
+            return SourceAddResearchResult(
+                outcome="completed",
+                plan=plan,
+                start_task_id=start_task_id,
+                poll_task_id=task_id,
+                sources=sources,
+                report=report,
+                import_result=import_result,
+            )
+        if status_val == "no_research":
+            return SourceAddResearchResult(
+                outcome="no_research",
+                plan=plan,
+                start_task_id=start_task_id,
+                poll_task_id=task_id,
+            )
+        if status_val in ("failed", "timeout"):
+            return SourceAddResearchResult(
+                outcome="failed" if status_val == "failed" else "timeout",
+                plan=plan,
+                start_task_id=start_task_id,
+                poll_task_id=task_id,
+                sources=sources,
+                report=report,
+                reason_message=status.reason_message,
+                hint=status.hint,
             )
         return SourceAddResearchResult(
-            outcome="completed",
+            outcome="unknown_status",
             plan=plan,
             start_task_id=start_task_id,
             poll_task_id=task_id,
             sources=sources,
             report=report,
-            import_result=import_result,
-        )
-    if status_val == "no_research":
-        return SourceAddResearchResult(
-            outcome="no_research",
-            plan=plan,
-            start_task_id=start_task_id,
-            poll_task_id=task_id,
-        )
-    if status_val in ("failed", "timeout"):
-        return SourceAddResearchResult(
-            outcome="failed" if status_val == "failed" else "timeout",
-            plan=plan,
-            start_task_id=start_task_id,
-            poll_task_id=task_id,
-            sources=sources,
-            report=report,
+            status=status_val,
             reason_message=status.reason_message,
             hint=status.hint,
         )
-    return SourceAddResearchResult(
-        outcome="unknown_status",
-        plan=plan,
-        start_task_id=start_task_id,
-        poll_task_id=task_id,
-        sources=sources,
-        report=report,
-        status=status_val,
-        reason_message=status.reason_message,
-        hint=status.hint,
-    )
 
 
 __all__ = [
@@ -305,6 +326,7 @@ __all__ = [
     "ResearchImportOutcome",
     "SearchMode",
     "SearchSource",
+    "SourceResearchClient",
     "SourceAddResearchOutcome",
     "SourceAddResearchPlan",
     "SourceAddResearchResult",

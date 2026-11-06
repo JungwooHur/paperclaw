@@ -14,6 +14,7 @@ import httpx
 from .._deprecation import warn_registered_deprecation
 from . import account as _auth_account
 from . import cookies as _auth_cookies
+from . import extraction as _auth_extraction
 from . import psidts_recovery as _auth_psidts_recovery
 from . import refresh as _auth_refresh
 from . import storage as _auth_storage
@@ -76,10 +77,17 @@ class SessionSeed:
 @dataclass(frozen=True, slots=True)
 class LoadPolicy:
     allow_headless: bool = False
+    # False is the Android NAME_ONLY contract: load stored cookie names and
+    # permit the read-only homepage token acquisition needed to populate the
+    # compatibility AuthTokens object, but never enter the Web recovery/poke
+    # ladder or merge that acquisition's cookie observation back to disk.
+    heal_psidts: bool = True
 
     def __post_init__(self) -> None:
         if type(self.allow_headless) is not bool:
             raise TypeError("allow_headless must be a boolean")
+        if type(self.heal_psidts) is not bool:
+            raise TypeError("heal_psidts must be a boolean")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -144,7 +152,9 @@ class AuthTokens:
         cookie_snapshot: Internal save baseline used when a pre-client token
             fetch mutates cookies but persistence fails or CAS-rejects. This
             lets the eventual client retry the unpersisted delta instead
-            of snapshotting the already-mutated jar as clean state.
+            of snapshotting the already-mutated jar as clean state. Docs-only
+            deprecated since v0.9.0 for removal in v1; field access cannot warn
+            without making generated dataclass operations noisy.
     """
 
     # Secret fields are excluded from the dataclass-generated ``__repr__`` via
@@ -184,21 +194,33 @@ class AuthTokens:
                 storage_path=self.storage_path,
             )
 
-    def replace_cookie_jar(self, cookie_jar: httpx.Cookies) -> None:
-        """Rebind both public compatibility shadows together.
+    def _sync_cookie_jar(self, cookie_jar: httpx.Cookies) -> None:
+        """Synchronize both public compatibility shadows without warning.
 
         ``cookies`` and ``cookie_jar`` hold the same information in two shapes,
         initialized together at bootstrap. The kernel owns the live jar after
-        composition; this method is the ADR-0032 Phase-A sync-back for public
-        callers that still inspect the old fields. Rebinding only one shadow
-        would expose two different sessions through the public object even
-        though no first-party runtime decision consults either field.
+        composition; this internal operation is the ADR-0032 Phase-A sync-back
+        for public callers that still inspect the old fields. Rebinding only
+        one shadow would expose two different sessions through the public
+        object even though no first-party runtime decision consults either
+        field.
 
         Every rebind goes through here so the two cannot diverge. Enforced by
         ``tests/_guardrails/test_authtokens_jar_sync.py``.
         """
         self.cookie_jar = cookie_jar
         self.cookies = _auth_cookies._cookie_map_from_jar(cookie_jar)
+
+    def replace_cookie_jar(self, cookie_jar: httpx.Cookies) -> None:
+        """Rebind both public compatibility shadows together.
+
+        .. deprecated:: 0.9.0
+           Use managed :class:`~notebooklm.NotebookLMClient` request APIs.
+           Managed cookie-jar replacement is internal and this public sync-back
+           method will be removed in v1.
+        """
+        warn_registered_deprecation("auth_tokens_replace_cookie_jar")
+        self._sync_cookie_jar(cookie_jar)
 
     def _replace_profile_session(
         self,
@@ -232,7 +254,7 @@ class AuthTokens:
             return None
         route_before = (self.authuser, self.account_email)
         _auth_cookies._replace_cookie_jar(target_cookie_jar, source_cookie_jar)
-        self.replace_cookie_jar(target_cookie_jar)
+        self._sync_cookie_jar(target_cookie_jar)
         self.authuser = authuser
         self.account_email = account_email
         self._profile_session_generation += 1
@@ -456,6 +478,7 @@ class AuthTokens:
 
         Raises:
             FileNotFoundError: If storage file doesn't exist
+            AuthError: If authentication is expired and recovery is exhausted
             ValueError: If required cookies are missing or tokens can't be extracted
             httpx.HTTPError: If token fetch request fails
 
@@ -519,8 +542,22 @@ class SessionSeedLoader:
             raise TypeError("policy must be a LoadPolicy")
 
         def load_sync() -> _auth_cookies._LoadedCookiePair:
+            heal_policy = (
+                _auth_psidts_recovery.HealPolicy.HEAL_THEN_NAME_ONLY
+                if policy.heal_psidts
+                else _auth_psidts_recovery.HealPolicy.NAME_ONLY
+            )
             if isinstance(source, FileAuthSource):
-                return _auth_cookies._build_cookie_pair_from_storage(source.store.path)
+                if heal_policy is _auth_psidts_recovery.HealPolicy.NAME_ONLY:
+                    return _auth_cookies._load_cookie_pair_pure(
+                        source.store.path,
+                        require_routable=False,
+                    )
+                return _auth_psidts_recovery.load_with_recovery(
+                    source.store.path,
+                    heal_policy,
+                    load=_auth_cookies._load_cookie_pair_pure,
+                )
 
             def load_captured(
                 _path: Path | None,
@@ -539,9 +576,11 @@ class SessionSeedLoader:
                 )
                 return False
 
+            if heal_policy is _auth_psidts_recovery.HealPolicy.NAME_ONLY:
+                return load_captured(None, require_routable=False)
             return _auth_psidts_recovery.load_with_recovery(
                 None,
-                _auth_psidts_recovery.HealPolicy.HEAL_THEN_NAME_ONLY,
+                heal_policy,
                 load=load_captured,
                 heal=decline_inline,
             )
@@ -638,6 +677,28 @@ class _ProductionTokenAcquirer:
 
         storage_path = source.store.path if isinstance(source, FileAuthSource) else None
         profile = source.profile if isinstance(source, FileAuthSource) else None
+        if not policy.heal_psidts:
+            # Android only needs its master-token/bearer route.  Keep the
+            # historical AuthTokens bootstrap available for the deprecated
+            # lazy Web sidecar, but make that bootstrap strictly read-only:
+            # no PSIDTS poke, refresh command, headless/master-token cookie
+            # recovery, or cookie-store merge.  Set-Cookie observations remain
+            # in ``seed.live`` and become persistable only if the Web sidecar is
+            # later materialised and assumes lifecycle ownership.
+            with _auth_extraction._auth_error_boundary():
+                csrf, session_id = await _auth_refresh._fetch_tokens_with_jar(
+                    seed.live,
+                    storage_path,
+                    poke=False,
+                    **await resolve_route(storage_path),
+                )
+            return TokenAcquisition(
+                csrf,
+                session_id,
+                seed.live,
+                seed.baseline,
+                final_account,
+            )
         csrf, session_id, baseline = await _auth_refresh._fetch_tokens_with_exact_baseline(
             seed.live,
             storage_path,
@@ -721,7 +782,7 @@ class StoredAuthLoader:
             policy=policy,
         )
         selected_baseline = acquired.baseline_before_fetch_mutations
-        if isinstance(source, FileAuthSource):
+        if isinstance(source, FileAuthSource) and policy.heal_psidts:
             store: ProfileStore = source.store
             observation = CookieJar.from_httpx(acquired.live)
             merge = await asyncio.to_thread(
