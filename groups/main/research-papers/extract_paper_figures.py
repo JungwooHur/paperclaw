@@ -35,6 +35,7 @@ from urllib.parse import urljoin
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import latexml_math  # noqa: E402
 import reference_section  # noqa: E402
 
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
@@ -49,6 +50,16 @@ TEXT_TYPES = ("paragraph", "heading_1", "heading_2", "heading_3", "quote",
 
 
 def _clean(s: str) -> str:
+    """LaTeXML markup as the text a reader sees: each formula once, in its
+    rendered form (`latexml_math`), tags dropped, entities decoded."""
+    return _legacy_clean(latexml_math.drop_math_annotations(s))
+
+
+def _legacy_clean(s: str) -> str:
+    """What `_clean` read before `latexml_math`: tags dropped and nothing else,
+    so each formula's TeX (and content MathML) follows its rendered form
+    (`5×55\\times 5`). Every caption placed before then carries this text, so
+    telling which float such an image shows needs this reading of the source."""
     return re.sub(r"\s+", " ", _html.unescape(_TAG.sub("", s))).strip()
 
 
@@ -1162,6 +1173,9 @@ def recaption_page(page_id: str, arxiv_id: str = None, apply: bool = False) -> d
     every figure, which is destructive on a page somebody has arranged by hand.
     This edits captions only: it finds the source figure whose markup CONTAINS the
     panel caption now on the page, and writes that figure's own caption instead.
+    The markup is read both ways: as today, and as it was read before
+    `latexml_math` (`_legacy_clean`), since a panel caption placed then carries
+    each formula followed by its TeX.
     """
     import time
     import verify_sections as vs
@@ -1187,7 +1201,8 @@ def recaption_page(page_id: str, arxiv_id: str = None, apply: bool = False) -> d
             continue                     # already carries a real caption
         probe = _clean(cap)[:40]
         owner = next((fid for fid, body in bodies.items()
-                      if probe and probe in _clean(body)), None)
+                      if probe and (probe in _clean(body)
+                                    or probe in _legacy_clean(body))), None)
         if not owner or not good.get(owner):
             rep["unmatched"].append(cap[:40])
             continue

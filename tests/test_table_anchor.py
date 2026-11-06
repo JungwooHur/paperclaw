@@ -1219,8 +1219,9 @@ class TestTheRendererPicturesEachPart:
 
 class TestACaptionThatAlreadyNamesItsTable:
     """A caption is rewritten only when it is not the table's: bare, cut short,
-    or another table's. The source's own text can be noisier than what the
-    page shows — the current render prints a formula and its TeX twice."""
+    or another table's. The render's markup carries a formula and its TeX; the
+    parser reads it once (`latexml_math`), so the page's clean caption is the
+    table's own."""
 
     TEX = ('Table 1: Accuracy of every model on the held-out split, averaged over '
            'five seeds and three prompts; models reach <math alttext="75\\%"><semantics>'

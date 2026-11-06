@@ -149,23 +149,43 @@ def _source_key(table: dict) -> str:
 
 
 def _legacy_keys(tables: list) -> dict:
-    """{caption key: table} for the captions the pre-fix parser wrote.
+    """{caption key: table} for the captions the pre-fix parsers wrote.
 
-    Only a key that names ONE table and is no table's caption today: the old
-    parser gave a table without a caption of its own the NEXT table's, and that
-    key is the next table's now — matching it would take that table's image.
-    The tables `parse_tables` splits out of one id count as one: the old parser
-    read one caption for the id, and its image is the id's.
+    Two of them: the window parser's (`legacy_caption`), and the table's own
+    caption as read before `latexml_math`, each formula followed by its TeX
+    (`doubled_caption`). Only a key that names ONE table and is no table's
+    caption today: the old parser gave a table without a caption of its own the
+    NEXT table's, and that key is the next table's now — matching it would take
+    that table's image. Nor a window key that is another table's
+    `doubled_caption` key: the window parser read every formula doubled, so the
+    caption it borrowed is that table's own as read before `latexml_math`, which
+    its images placed then carry; the key names that table, as it did while it
+    was the table's caption. The tables `parse_tables` splits out of one id
+    count as one: the old parser read one caption for the id, and its image is
+    the id's.
     """
+    def owner(t):
+        return t.get("container") or t["id"]
+
+    def key_of(t, field):
+        return _cap_key(placed_caption(t["num"], t[field]))
+
     current = {_source_key(t) for t in tables}
+    doubled = {}
+    for t in tables:
+        if "doubled_caption" in t:
+            doubled.setdefault(key_of(t, "doubled_caption"), set()).add(owner(t))
     found = {}
     for t in tables:
-        if "legacy_caption" in t:
-            key = _cap_key(placed_caption(t["num"], t["legacy_caption"]))
+        for field in ("legacy_caption", "doubled_caption"):
+            if field not in t:
+                continue
+            key = key_of(t, field)
+            if field == "legacy_caption" and doubled.get(key, set()) - {owner(t)}:
+                continue
             found.setdefault(key, []).append(t)
     return {key: ts[0] for key, ts in found.items()
-            if len({t.get("container") or t["id"] for t in ts}) == 1
-            and key not in current}
+            if len({owner(t) for t in ts}) == 1 and key not in current}
 
 
 def forced_keys(placed: list, tables: list) -> set:
@@ -173,9 +193,10 @@ def forced_keys(placed: list, tables: list) -> set:
 
     The caption each copy carries, and the one the pre-fix parser wrote for the
     same table (`_legacy_keys`). A page placed before the caption fix shows a
-    long table as a bare `Table 5`; matching only the new caption kept that
-    image beside its replacement, and no tool could clear the pair, since
-    neither caption repeats.
+    long table as a bare `Table 5`, and one placed before `latexml_math` a
+    formula followed by its TeX; matching only the new caption kept that image
+    beside its replacement, and no tool could clear the pair, since neither
+    caption repeats.
 
     Args:
         placed: The source tables this run placed.
@@ -211,8 +232,8 @@ def _without_nested_figures(body: str) -> str:
         i = span[2]
 
 
-def _table_caption(body: str, num: int) -> str:
-    """The caption of the table whose element markup is `body`.
+def _table_caption(body: str, num: int, clean=ef._clean) -> str:
+    """The caption of the table whose element markup is `body`, read by `clean`.
 
     Its own `<figcaption>` is the one not inside a nested figure: a composite
     table nests a figure per panel, each captioned "(a) …", and the table's own
@@ -221,13 +242,13 @@ def _table_caption(body: str, num: int) -> str:
     a wrapper around the figure that holds it (`Table SI-2`, which no counter
     matches).
     """
-    own = [ef._clean(c) for c in ef._CAP.findall(_without_nested_figures(body))]
+    own = [clean(c) for c in ef._CAP.findall(_without_nested_figures(body))]
     for cap in own:
         if _OPENS_AS_TABLE.match(cap):
             return cap
     if own:
         return own[0]
-    nested = [ef._clean(c) for c in ef._CAP.findall(body)]
+    nested = [clean(c) for c in ef._CAP.findall(body)]
     labelled = [cap for cap in nested if _OPENS_AS_TABLE.match(cap)]
     if len(labelled) == 1:
         return labelled[0]
@@ -263,9 +284,10 @@ def _id_of(attrs: str):
     return found.group(1) if found else None
 
 
-def _tables_inside(body: str) -> list:
+def _tables_inside(body: str, clean=ef._clean) -> list:
     """[(element id, caption)] for each captioned table a table element holds,
-    or [] when the markup does not say which caption is whose.
+    or [] when the markup does not say which caption is whose. Captions are
+    read by `clean`.
 
     LaTeXML gives two tables of a flex row one id. Each is pictured by its own
     element: a panel figure holding one table caption and a table, else — the
@@ -276,14 +298,14 @@ def _tables_inside(body: str) -> list:
     Args:
         body: The markup inside the table element (`_element_body`).
     """
-    captions = [ef._clean(c) for c in ef._CAP.findall(body)
-                if _OPENS_AS_TABLE.match(ef._clean(c))]
+    captions = [clean(c) for c in ef._CAP.findall(body)
+                if _OPENS_AS_TABLE.match(clean(c))]
     panels = []
     for opening in _NESTED_FIGURE.finditer(body):
         span = _element_span(body, opening.start())
         inner = body[span[0]:span[1]] if span else ""
-        own = [ef._clean(c) for c in ef._CAP.findall(_without_nested_figures(inner))
-               if _OPENS_AS_TABLE.match(ef._clean(c))]
+        own = [clean(c) for c in ef._CAP.findall(_without_nested_figures(inner))
+               if _OPENS_AS_TABLE.match(clean(c))]
         if len(own) == 1 and re.search(r"<table\b", inner, re.I):
             tag = body[opening.start():body.find(">", opening.start()) + 1]
             panels.append((_id_of(tag), own[0]))
@@ -292,7 +314,7 @@ def _tables_inside(body: str) -> list:
     order, depth = [], 0
     for found in _CAPTION_OR_TABLE.finditer(body):
         if found.group("cap") is not None:
-            cap = ef._clean(found.group("cap"))
+            cap = clean(found.group("cap"))
             if _OPENS_AS_TABLE.match(cap):
                 order.append(("caption", cap))
         elif found.group("close"):
@@ -313,17 +335,29 @@ def _legacy_caption(html_text: str, at: int, fid: str) -> str:
 
     The first `<figcaption>` within `_LEGACY_WINDOW` characters: empty for a long
     table, a panel's "(a) …" for a composite one, the NEXT table's for one with
-    no caption of its own. Every page placed before the fix carries this text.
+    no caption of its own. Every page placed before the fix carries this text,
+    and read as it was then (`ef._legacy_clean`): that parser was gone before
+    `latexml_math` came.
     """
     found = re.search(re.escape(fid) + r'".*?<figcaption[^>]*>(.*?)</figcaption>',
                       html_text[at:at + _LEGACY_WINDOW], re.DOTALL | re.I)
-    return ef._clean(found.group(1))[:1900] if found else ""
+    return ef._legacy_clean(found.group(1))[:1900] if found else ""
+
+
+def _with_doubled(table: dict, doubled: str) -> dict:
+    """`table` carrying `doubled_caption`, its caption as read before
+    `latexml_math`, where that differs from the caption read today."""
+    table = {k: v for k, v in table.items() if k != "doubled_caption"}
+    doubled = (doubled or "")[:1900]
+    if doubled and doubled != table["caption"]:
+        table["doubled_caption"] = doubled
+    return table
 
 
 def parse_tables(html_text: str) -> list:
-    """Ordered list of {id, num, caption, legacy_caption[, section]} for each
-    table id `SnTm` / `AnTm`; `section` is the top-level section the source
-    prints it in (`ef.enclosing_section`), when there is one.
+    """Ordered list of {id, num, caption, legacy_caption[, doubled_caption]
+    [, section]} for each table id `SnTm` / `AnTm`; `section` is the top-level
+    section the source prints it in (`ef.enclosing_section`), when there is one.
     Scans ids directly (not <figure> boundaries) so nested table-figures — which
     truncate a non-greedy `<figure>…</figure>` match — are not dropped. The id is
     what render_tables screenshots, so this is the robust key.
@@ -333,7 +367,9 @@ def parse_tables(html_text: str) -> list:
     prompt examples) had none — it was written as a bare `Table 5` — and a table
     with no caption of its own borrowed the next table's. `legacy_caption` is
     that old reading (`_legacy_caption`), the only thing that names the table an
-    image placed before the fix shows.
+    image placed before the fix shows. `doubled_caption` is the caption read as
+    it was before `latexml_math`, each formula followed by its TeX, when that
+    differs: an image placed before then carries it (`_legacy_keys`).
 
     An id holding several captioned tables (`several_tables`) is one entry per
     table when `_tables_inside` can tell them apart: `id` is the element that
@@ -348,8 +384,10 @@ def parse_tables(html_text: str) -> list:
         seen.add(fid)
         num = int(m.group(2))
         body = _element_body(html_text, m.start())
-        table = {"id": fid, "num": num, "caption": _table_caption(body, num)[:1900],
-                 "legacy_caption": _legacy_caption(html_text, m.start(), fid)}
+        table = _with_doubled(
+            {"id": fid, "num": num, "caption": _table_caption(body, num)[:1900],
+             "legacy_caption": _legacy_caption(html_text, m.start(), fid)},
+            _table_caption(body, num, ef._legacy_clean))
         section = ef.enclosing_section(sections, m.start())
         if section:
             table["section"] = section
@@ -357,7 +395,9 @@ def parse_tables(html_text: str) -> list:
             table["several_tables"] = True
             parts = _tables_inside(body)
             if parts:
-                out.extend(dict(table, id=pid, caption=cap[:1900], container=fid)
+                doubled = dict(_tables_inside(body, ef._legacy_clean))
+                out.extend(_with_doubled(dict(table, id=pid, caption=cap[:1900],
+                                              container=fid), doubled.get(pid))
                            for pid, cap in parts)
                 seen.update(pid for pid, _ in parts)
                 continue
@@ -867,11 +907,15 @@ def plan_relocation(blocks: list, tables: list, me, sections=None) -> dict:
     its images first. Everything else that this integration wrote and no person
     has edited since (`collect_papers._ours`, the rule `--clear-unprocessed`
     uses) is moved there. A caption that is not the table's own — a bare
-    `Table 5`, what the old parser read (`legacy_caption`), one cut short — is
-    replaced by the SOURCE caption, on a move or where the image already is; the
-    plan keeps the caption it replaces, so that can be undone. One the caption
-    key already identifies is kept, since the source's text can be noisier than
-    the page's (`75%75\\%`, a formula and its TeX).
+    `Table 5`, what the old parsers read (`legacy_caption`, or a formula
+    followed by its TeX inside the key's 80 characters, `doubled_caption`), one
+    cut short — is replaced by the SOURCE caption, on a move or where the image
+    already is; the plan keeps the caption it replaces, so that can be undone.
+    One the caption key already identifies is kept as it is: it differs from
+    the source only
+    where the key does not look — zero-width characters, spacing, or text past
+    the key's 80 characters, such as the TeX copy of a formula that a caption
+    placed before `latexml_math` still carries.
 
     An image is matched to its table by caption alone (`_which_table`). A table
     no text cites has only its section heading as an anchor, and that is a
