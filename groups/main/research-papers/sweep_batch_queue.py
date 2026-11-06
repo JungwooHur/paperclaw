@@ -37,10 +37,12 @@ turn is what kills them (see RESUME_PROMPT).
 Polling to completion exposed a third limit: one session cannot hold a whole batch.
 A scheduled run is capped at 50 turns by the runner, and two resumes each stopped
 there after about 10 papers with 3 subagents still in flight. So each resume gets a
-session-sized chunk (BATCH_CHUNK). The rest waits in BACKLOG, a host-only file no
-agent prompt names, and the sweeper hands out the next chunk once a queue drains:
+session-sized chunk: BATCH_CHUNK papers, or fewer when NotebookLM's live budget
+pays for fewer (budget_chunk), and none when it pays for none. The rest waits in
+BACKLOG, a host-only file no agent prompt names, and the sweeper hands out the next
+chunk once a queue drains:
 
-  * Trim    — a stranded queue keeps its first BATCH_CHUNK pending papers; the rest
+  * Trim    — a stranded queue keeps its first chunk of pending papers; the rest
               go to the FRONT of the backlog, in order.
   * Refill  — no queue (or a drained one), a non-empty backlog, nothing running:
               the next chunk becomes a fresh queue and a resume is scheduled.
@@ -51,7 +53,7 @@ writes can duplicate a paper, which the subagent's dedup check makes harmless; i
 cannot drop one. The queue is the agent's file, so right before any write the sweep
 runs `docker ps` again and compares the queue with its first read, and writes
 nothing if either changed (see still_quiet): an agent that started during the
-seconds-long NotebookLM probe writes the queue too.
+seconds-long NotebookLM probes writes the queue too.
 
 Idempotent and cheap. It writes neither file while the queue is still being worked
 or a container is up, and never schedules a second resume while one is already
@@ -88,6 +90,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+from typing import NamedTuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -194,6 +197,129 @@ def notebooklm_auth_ok():
     return True if p.returncode == 0 else None
 
 
+# Percent of each NotebookLM usage window that one paper takes.
+PAPER_FIVE_HOUR_PERCENT = 20.0
+PAPER_WEEKLY_PERCENT = 1.0
+
+# The length of NotebookLM's five-hour usage window.
+FIVE_HOUR_WINDOW = datetime.timedelta(hours=5)
+
+
+class Window(NamedTuple):
+    """One NotebookLM usage window: the percent of its allowance used and left,
+    and when it starts over (an aware datetime)."""
+    used: float
+    left: float
+    resets: datetime.datetime
+
+
+class Budget(NamedTuple):
+    """What `notebooklm usage --json` reports: whether the active window is spent,
+    and the five-hour and weekly windows."""
+    exhausted: bool
+    five_hour: Window
+    weekly: Window
+
+
+class BudgetUnreadable(Exception):
+    """The meter gave no ready budget. The message says what was missing."""
+
+
+def _is_number(v):
+    """True for a finite int or float, bools excluded."""
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
+
+
+def _window(windows, kind):
+    """The Window of `kind` in the meter's `windows` list. Raises BudgetUnreadable."""
+    found = [w for w in windows if isinstance(w, dict) and w.get("kind") == kind]
+    if len(found) != 1:
+        raise BudgetUnreadable(f"{len(found) or 'no'} {kind} window(s), not one")
+    w = found[0]
+    for key in ("used_percent", "remaining_percent"):
+        if not _is_number(w.get(key)):
+            raise BudgetUnreadable(f"{kind} {key} is {w.get(key)!r}, not a number")
+    resets = _parse_iso(w.get("resets_at"))
+    if resets is None:
+        raise BudgetUnreadable(f"{kind} resets_at is {w.get('resets_at')!r}, not a time")
+    if resets.tzinfo is None:
+        raise BudgetUnreadable(f"{kind} resets_at is {w.get('resets_at')!r}, a time "
+                               f"with no zone")
+    return Window(float(w["used_percent"]), float(w["remaining_percent"]), resets)
+
+
+def parse_usage(text):
+    """The Budget in `notebooklm usage --json` output. Raises BudgetUnreadable."""
+    try:
+        u = json.loads(text)
+    except (ValueError, RecursionError) as e:          # as in _load_json
+        raise BudgetUnreadable(f"usage printed no JSON ({type(e).__name__})") from e
+    if not isinstance(u, dict):
+        raise BudgetUnreadable(f"usage printed a JSON {type(u).__name__}, not an object")
+    if u.get("status") != "ready":
+        raise BudgetUnreadable(f"status is {u.get('status')!r}, not 'ready'")
+    if u.get("enabled") is not True:
+        raise BudgetUnreadable(f"enabled is {u.get('enabled')!r}, not true")
+    if not isinstance(u.get("is_exhausted"), bool):
+        raise BudgetUnreadable(f"is_exhausted is {u.get('is_exhausted')!r}, "
+                               f"not true or false")
+    windows = u.get("windows")
+    if not isinstance(windows, list):
+        raise BudgetUnreadable(f"windows is a {type(windows).__name__}, not a list")
+    return Budget(u["is_exhausted"], _window(windows, "five_hour"),
+                  _window(windows, "weekly"))
+
+
+def notebooklm_budget():
+    """The live Budget, from the host CLI. Raises BudgetUnreadable."""
+    try:
+        p = subprocess.run(["notebooklm", "usage", "--json"],
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as e:
+        raise BudgetUnreadable("`notebooklm usage --json` timed out after 120 s") from e
+    except (OSError, subprocess.SubprocessError) as e:
+        raise BudgetUnreadable(f"cannot run notebooklm: {type(e).__name__}: {e}") from e
+    if p.returncode != 0:
+        last = (p.stderr or p.stdout or "").strip().splitlines()[-1:]
+        raise BudgetUnreadable(f"`notebooklm usage --json` exited {p.returncode}"
+                               + (f": {last[0][:200]}" if last else ""))
+    return parse_usage(p.stdout)
+
+
+def window_papers(budget):
+    """(papers the five-hour window's remaining percent pays for, papers the
+    weekly window's does), as fractions; below 0 for a window spent past its
+    allowance."""
+    return (budget.five_hour.left / PAPER_FIVE_HOUR_PERCENT,
+            budget.weekly.left / PAPER_WEEKLY_PERCENT)
+
+
+def papers_affordable(budget):
+    """Whole papers the budget still pays for, in the window that covers fewer;
+    0 when it is exhausted. Never negative."""
+    if budget.exhausted:
+        return 0
+    return max(0, math.floor(min(window_papers(budget))))
+
+
+def weekly_binds(budget):
+    """True when the weekly window pays for no more papers than the five-hour one."""
+    five_hour, weekly = window_papers(budget)
+    return weekly <= five_hour
+
+
+def budget_text(budget):
+    """`five-hour <x>% left (resets <local HH:MM>), weekly <y>% left`, followed by
+    `(resets <local YYYY-MM-DD HH:MM>)` when the weekly window binds."""
+    resets = budget.five_hour.resets.astimezone().strftime("%H:%M")
+    text = (f"five-hour {budget.five_hour.left:.1f}% left (resets {resets}), "
+            f"weekly {budget.weekly.left:.1f}% left")
+    if weekly_binds(budget):
+        text += f" (resets {budget.weekly.resets.astimezone():%Y-%m-%d %H:%M})"
+    return text
+
+
 def _now():
     """The one clock every time comparison here reads, so a test can move it."""
     return datetime.datetime.now(datetime.timezone.utc)
@@ -298,10 +424,10 @@ def push_front(backlog, papers):
     return out
 
 
-def split_chunk(papers):
-    """(papers kept in the queue, pending papers past the first BATCH_CHUNK)."""
+def split_chunk(papers, limit):
+    """(papers kept in the queue, pending papers past the first `limit`)."""
     pending = [p for p in papers if p.get("status") == "pending"]
-    excess = pending[BATCH_CHUNK:]
+    excess = pending[limit:]
     moved = {id(p) for p in excess}
     return [p for p in papers if id(p) not in moved], excess
 
@@ -314,13 +440,13 @@ def as_pending(p):
     return p
 
 
-def write_trimmed(q, backlog):
-    """Write `q` holding at most BATCH_CHUNK pending papers, the rest moved to the
+def write_trimmed(q, backlog, limit):
+    """Write `q` holding at most `limit` pending papers, the rest moved to the
     front of the backlog. Returns (papers moved, backlog length).
 
     Queue -> backlog, so the backlog is written FIRST: a crash before the queue
     write leaves the moved papers in both files, never in neither."""
-    kept, excess = split_chunk(q.get("papers", []))
+    kept, excess = split_chunk(q.get("papers", []), limit)
     if excess:
         backlog = push_front(backlog, excess)
         _write_json(BACKLOG, {"papers": backlog})
@@ -421,20 +547,28 @@ def _is_count(v):
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
-def _parse_time(s):
-    """An aware datetime from an ISO stamp (the DB's JS `...Z` form included), or
-    None for anything else."""
+def _parse_iso(s):
+    """The datetime in an ISO stamp (the DB's JS `...Z` form included), naive when
+    the stamp names no zone, or None for anything else."""
     if not isinstance(s, str):
         return None
     try:
-        t = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
+        return None
+
+
+def _parse_time(s):
+    """An aware datetime from an ISO stamp, one that names no zone read as UTC, or
+    None for anything else."""
+    t = _parse_iso(s)
+    if t is None:
         return None
     return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
 
 
-def load_state():
-    """The backoff state, or None when there is none to trust.
+def read_state():
+    """(the backoff state, None), or (None, why there is none to trust).
 
     Never raises: a missing or broken file means n=0, which costs at most the
     resumes the backoff would have saved, while raising would stop recovery."""
@@ -442,23 +576,28 @@ def load_state():
         with open(SWEEP_STATE, encoding="utf-8") as f:
             s = json.load(f)
     except FileNotFoundError:
-        print("sweep: no backoff state — counting this batch from n=0")
-        return None
+        return None, "no backoff state"
     except (ValueError, OSError, RecursionError) as e:    # as in _load_json
-        print(f"sweep: backoff state unreadable ({type(e).__name__}) — counting this "
-              f"batch from n=0")
-        return None
+        return None, f"backoff state unreadable ({type(e).__name__})"
     if not (isinstance(s, dict) and isinstance(s.get("batch"), str)
             and _is_count(s.get("settled_at_resume"))
             and _is_count(s.get("resumes_without_progress"))):
-        print("sweep: backoff state malformed — counting this batch from n=0")
-        return None
+        return None, "backoff state malformed"
+    return s, None
+
+
+def load_state():
+    """The backoff state, or None, saying why when it is None."""
+    s, why = read_state()
+    if why:
+        print(f"sweep: {why} — counting this batch from n=0")
     return s
 
 
-def save_state(q, n):
-    """Record what the resume just scheduled was handed. The resume is already in
-    the DB, so a failed write only costs the count, never the resume.
+def save_state(q, n, budget):
+    """Record what the resume just scheduled was handed (`handed`: the pending
+    papers in `q`), and the five-hour window as `budget` read it then. The resume
+    is already in the DB, so a failed write only costs the count, never the resume.
 
     A failed write leaves the previous file in place (_write_json replaces it
     whole or not at all). With n > 0 that file is this batch's, written by the
@@ -471,7 +610,11 @@ def save_state(q, n):
             "batch": batch_id(q),
             "settled_at_resume": settled_count(q),
             "resumes_without_progress": n,
+            "handed": sum(1 for p in q.get("papers", [])
+                          if p.get("status") == "pending"),
             "resumed_at": _now().isoformat(),
+            "five_hour_used": budget.five_hour.used,
+            "five_hour_resets_at": budget.five_hour.resets.isoformat(),
         })
     except OSError as e:
         then = (f"the last one stays, so the next check counts n={n} again, not "
@@ -522,11 +665,72 @@ def backoff_left(conn, state, wait_min):
     return max(0.0, wait_min - since)
 
 
+def same_window(state, budget):
+    """True when the five-hour window `budget` reads is the one `state` recorded:
+    the same resets_at, or, when the recorded window was unused, a resets_at in
+    [the recorded one, the recorded one + FIVE_HOUR_WINDOW). An unused window's
+    resets_at slides with the clock until its first use anchors it
+    (vendor/notebooklm-py/docs/adr/0037-live-usage-and-quota-api.md)."""
+    used = state.get("five_hour_used")
+    recorded = _parse_time(state.get("five_hour_resets_at"))
+    if not _is_number(used) or recorded is None:
+        return False
+    resets = budget.five_hour.resets
+    if used == 0:
+        return recorded <= resets < recorded + FIVE_HOUR_WINDOW
+    return resets == recorded
+
+
+def drained(q):
+    """True when `q` is None or holds no paper a session still owes a run: none
+    pending, in_progress or env-failed."""
+    return not any(p.get("status") in ("pending", "in_progress") or env_failed(p)
+                   for p in (q or {}).get("papers", []))
+
+
+def report_spend(q, state, budget):
+    """Print the five-hour percent the last resume's session used, when the window
+    `budget` reads is the one `state` recorded, `q` is None or the batch `state`
+    recorded, and `state` names when its resume started. The line counts the
+    papers the session settled while `q` still holds work, and the papers it was
+    handed once `q` is drained or None, and ends with the resume's local start
+    time, the same in every later sweep's copy of the line."""
+    if state is None or not same_window(state, budget):
+        return
+    if q is not None and state["batch"] != batch_id(q):
+        return
+    started = _parse_time(state.get("resumed_at"))
+    if started is None:
+        return
+    spent = (f"sweep: last session used "
+             f"{budget.five_hour.used - state['five_hour_used']:.1f}% of the "
+             f"five-hour budget for")
+    resumed = started.astimezone().strftime("%Y-%m-%d %H:%M")
+    if not drained(q):
+        print(f"{spent} {settled_count(q) - state['settled_at_resume']} "
+              f"settled paper(s), resumed {resumed}")
+    elif _is_count(state.get("handed")):
+        print(f"{spent} {state['handed']} paper(s), resumed {resumed}")
+
+
+def budget_chunk(q, state):
+    """(the live Budget, papers the resume about to be scheduled is handed: at most
+    BATCH_CHUNK, at most papers_affordable). Prints report_spend, and the budget
+    when the chunk is 0. Raises BudgetUnreadable."""
+    budget = notebooklm_budget()
+    report_spend(q, state, budget)
+    chunk = min(BATCH_CHUNK, papers_affordable(budget))
+    if not chunk:
+        print(f"sweep: NotebookLM budget covers no paper — {budget_text(budget)} — "
+              f"writing nothing")
+    return budget, chunk
+
+
 def refill(q, backlog, a, snapshot) -> int:
     """No batch in flight: hand the next chunk of the backlog to a fresh session."""
-    if not a.dry_run:
-        clear_state()                               # the batch it described is over
     if not backlog:
+        if not a.dry_run:
+            clear_state()                           # the batch it described is over
         return 0                                    # nothing waiting
     if agent_container_running():
         print(f"sweep: {len(backlog)} papers in the backlog but an agent container "
@@ -546,10 +750,15 @@ def refill(q, backlog, a, snapshot) -> int:
         if chat_jid is None:
             return 1
 
-        chunk, rest = backlog[:BATCH_CHUNK], backlog[BATCH_CHUNK:]
+        if auth_expired():
+            return 0
+        budget, size = budget_chunk(q, read_state()[0])
+        if not size:
+            return 0
+        chunk, rest = backlog[:size], backlog[size:]
         print(f"sweep: REFILL — next {len(chunk)} of {len(backlog)} backlog papers, "
               f"no batch in flight{' (dry-run)' if a.dry_run else ''}")
-        if auth_expired() or a.dry_run or not still_quiet(snapshot):
+        if a.dry_run or not still_quiet(snapshot):
             return 0
 
         # A drained queue still holds the last session's results. `done` ones were
@@ -569,9 +778,10 @@ def refill(q, backlog, a, snapshot) -> int:
         _write_json(BACKLOG, {"papers": rest})
 
         tid = schedule_resume(conn, chat_jid)
-        save_state(fresh, 0)
+        save_state(fresh, 0, budget)
         print(f"sweep: queued {len(chunk)} papers, {len(rest)} left in the backlog, "
-              f"scheduled {tid}")
+              f"scheduled {tid}; budget covers {papers_affordable(budget)}: "
+              f"{budget_text(budget)}")
         return 0
     finally:
         conn.close()
@@ -585,7 +795,17 @@ def main(argv=None) -> int:
     ap.add_argument("--cooldown-min", type=float, default=30.0,
                     help="don't re-schedule a resume this soon after the last (default 30)")
     a = ap.parse_args(argv)
+    try:
+        return sweep(a)
+    except BudgetUnreadable as e:
+        print(f"sweep: cannot read the NotebookLM budget ({e}) — writing nothing",
+              file=sys.stderr)
+        return 1
 
+
+def sweep(a) -> int:
+    """One sweep with the parsed arguments `a`. Returns the exit status. Raises
+    BudgetUnreadable."""
     try:
         # Taken before the parse, so a write that lands between the two still
         # reads as a change in still_quiet.
@@ -603,8 +823,8 @@ def main(argv=None) -> int:
     # are retryable, not broken — count them as work so a queue that a bad session
     # marked "all failed" is still recovered once the environment is healthy again.
     retryable = [p for p in papers if env_failed(p)]
-    if not pending and not running and not retryable:
-        return refill(q, backlog, a, snapshot)      # absent or drained
+    if drained(q):
+        return refill(q, backlog, a, snapshot)
 
     age_min = (_now().timestamp() - os.path.getmtime(QUEUE)) / 60
     if age_min < a.stale_min:
@@ -633,7 +853,7 @@ def main(argv=None) -> int:
                     print(f"sweep: would move {len(pending) - BATCH_CHUNK} pending papers "
                           f"to the backlog (dry-run)")
                 elif still_quiet(snapshot):
-                    moved, left = write_trimmed(q, backlog)
+                    moved, left = write_trimmed(q, backlog, BATCH_CHUNK)
                     print(f"sweep: moved {moved} pending papers to the backlog "
                           f"({left} waiting)")
             return 0
@@ -660,7 +880,10 @@ def main(argv=None) -> int:
               f"{len(retryable)} env-failed, queue idle {age_min:.0f}m, no agent container"
               f"{f', n={n} resume(s) without progress' if n else ''}"
               f"{' (dry-run)' if a.dry_run else ''}")
-        if auth_expired() or a.dry_run or not still_quiet(snapshot):
+        if auth_expired():
+            return 0
+        budget, size = budget_chunk(q, state)
+        if not size or a.dry_run or not still_quiet(snapshot):
             return 0
 
         # Their containers are gone, so in_progress can never complete — hand them back
@@ -670,12 +893,14 @@ def main(argv=None) -> int:
         for p in running + retryable:
             p.update(as_pending(p))
         q["session_processed"] = 0                  # fresh session -> fresh cap
-        moved, left = write_trimmed(q, backlog)
+        moved, left = write_trimmed(q, backlog, size)
 
         tid = schedule_resume(conn, chat_jid)
-        save_state(q, n)
+        save_state(q, n, budget)
         print(f"sweep: reconciled {len(running)} in_progress + {len(retryable)} env-failed "
-              f"-> pending, moved {moved} to the backlog ({left} waiting), scheduled {tid}")
+              f"-> pending, kept up to {size} pending, moved {moved} to the backlog "
+              f"({left} waiting), scheduled {tid}; budget covers "
+              f"{papers_affordable(budget)}: {budget_text(budget)}")
         return 0
     finally:
         conn.close()

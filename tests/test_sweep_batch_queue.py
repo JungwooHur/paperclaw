@@ -1,9 +1,10 @@
 """A paper batch is handed to scheduled sessions one session-sized chunk at a time.
 
 A scheduled run is capped at 50 turns, and two resumes each ran out after about
-10 papers with subagents still in flight. The sweeper keeps BATCH_CHUNK papers in
-the queue a session sees and the rest in a host-only backlog, and refills the
-queue from it once nothing is running. Whatever it does, a paper must never be
+10 papers with subagents still in flight. The sweeper keeps at most BATCH_CHUNK
+papers in the queue a session sees, and no more than NotebookLM's live budget pays
+for, and the rest in a host-only backlog, and refills the queue from it once nothing
+is running. Whatever it does, a paper must never be
 dropped: a crash may leave one in both files, never in neither.
 """
 import datetime
@@ -11,13 +12,82 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import time
 
 import pytest
 
 import sweep_batch_queue as sbq
 
-CHUNK = sbq.BATCH_CHUNK
+UTC = datetime.timezone.utc
+
+# `notebooklm usage --json` on the host (CLI 0.8.6), as a Pro account printed it,
+# with all but two of its actions dropped and its percentages and reset times
+# made up.
+LIVE_USAGE = """{
+  "status": "ready",
+  "enabled": true,
+  "available": true,
+  "is_exhausted": false,
+  "active_window": "five_hour",
+  "windows": [
+    {
+      "kind": "five_hour",
+      "used_percent": 55.0,
+      "remaining_percent": 45.0,
+      "resets_at": "2026-01-01T05:00:00+00:00"
+    },
+    {
+      "kind": "weekly",
+      "used_percent": 2.5,
+      "remaining_percent": 97.5,
+      "resets_at": "2026-01-07T05:00:00+00:00"
+    }
+  ],
+  "actions": [
+    {
+      "code": 1,
+      "kind": "audio_overview",
+      "has_sufficient_quota": true,
+      "cost_tier": "high",
+      "remaining_deferred_artifact_generations": 6,
+      "estimated_cost_percent": 9.8
+    },
+    {
+      "code": 9,
+      "kind": "flashcards",
+      "has_sufficient_quota": true,
+      "cost_tier": "low",
+      "remaining_deferred_artifact_generations": 6,
+      "estimated_cost_percent": 0.4666667
+    }
+  ]
+}"""
+FIVE_HOUR_RESETS = "2026-01-01T05:00:00+00:00"
+
+
+def usage(five_hour_left=100.0, weekly_left=100.0, exhausted=False,
+          five_hour_resets=FIVE_HOUR_RESETS):
+    """The live meter's JSON with its numbers replaced. The defaults are an
+    untouched budget."""
+    u = json.loads(LIVE_USAGE)
+    u["is_exhausted"] = exhausted
+    for w, left in zip(u["windows"], (five_hour_left, weekly_left)):
+        w["remaining_percent"] = left
+        w["used_percent"] = 100.0 - left
+    u["windows"][0]["resets_at"] = five_hour_resets
+    return u
+
+
+def covering(papers):
+    """A meter whose five-hour window pays for `papers` and half of one more, and
+    whose weekly window is untouched."""
+    return usage(five_hour_left=(papers + 0.5) * sbq.PAPER_FIVE_HOUR_PERCENT)
+
+
+# The papers a resume is handed while the budget is untouched.
+CHUNK = min(sbq.BATCH_CHUNK,
+            sbq.papers_affordable(sbq.parse_usage(json.dumps(usage()))))
 
 # Copied from src/db.ts, including the context_mode migration.
 SCHEMA = """
@@ -80,7 +150,9 @@ class Env:
         conn.close()
         self.container = False
         self.auth = True
+        self.usage = usage()
         self.probes = 0
+        self.meter_reads = 0
         self.clock = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
         monkeypatch.setattr(sbq, "QUEUE", self.queue_path)
         monkeypatch.setattr(sbq, "BACKLOG", self.backlog_path)
@@ -89,10 +161,24 @@ class Env:
         monkeypatch.setattr(sbq, "_now", lambda: self.clock)
         monkeypatch.setattr(sbq, "agent_container_running", lambda: self.container)
         monkeypatch.setattr(sbq, "notebooklm_auth_ok", self._probe)
+        monkeypatch.setattr(sbq.subprocess, "run", self._run)
 
     def _probe(self):
         self.probes += 1
         return self.auth
+
+    def _run(self, args, **kwargs):
+        """The host CLI's `usage --json`, answering with self.usage: a dict is
+        printed as the meter's JSON, a CompletedProcess is returned as it is, and
+        an exception is raised."""
+        assert list(args) == ["notebooklm", "usage", "--json"], args
+        self.probes += 1
+        self.meter_reads += 1
+        if isinstance(self.usage, BaseException):
+            raise self.usage
+        if isinstance(self.usage, subprocess.CompletedProcess):
+            return self.usage
+        return subprocess.CompletedProcess(args, 0, json.dumps(self.usage), "")
 
     def advance(self, minutes):
         self.clock += datetime.timedelta(minutes=minutes)
@@ -246,8 +332,9 @@ def test_a_refill_waits_for_a_resume_already_scheduled(env):
     assert env.resumes() == ["papers-batch-resume-earlier"]
 
 
-def test_a_refill_waits_out_an_expired_notebooklm_session(env):
-    backlog_only(env)
+@pytest.mark.parametrize("setup", [backlog_only, stranded_with_excess])
+def test_an_expired_notebooklm_session_holds_the_batch_unmetered(env, setup):
+    setup(env)
     env.auth = False
     before = env.files()
 
@@ -255,16 +342,18 @@ def test_a_refill_waits_out_an_expired_notebooklm_session(env):
 
     assert env.files() == before
     assert env.resumes() == []
+    assert env.meter_reads == 0, "the budget is read only for a live session"
 
 
 def test_an_already_scheduled_resume_still_gets_a_session_sized_queue(env):
     scheduled_with_excess(env)
+    limit = sbq.BATCH_CHUNK
 
     assert env.sweep() == 0
 
-    assert ids(env.queue()["papers"]) == [f"p{i}" for i in range(CHUNK)]
-    assert ids(env.backlog()) == [f"p{i}" for i in range(CHUNK, 10)]
-    assert env.queue()["backlog_remaining"] == 10 - CHUNK
+    assert ids(env.queue()["papers"]) == [f"p{i}" for i in range(limit)]
+    assert ids(env.backlog()) == [f"p{i}" for i in range(limit, 10)]
+    assert env.queue()["backlog_remaining"] == 10 - limit
     assert env.resumes() == ["papers-batch-resume-earlier"]
 
 
@@ -277,7 +366,7 @@ def test_moved_papers_go_to_the_front_of_the_backlog_once(env):
 
     assert env.sweep() == 0
 
-    assert ids(env.backlog()) == ["p6", "p7", "p8", "p9", "p20"]
+    assert ids(env.backlog()) == [f"p{i}" for i in range(CHUNK, 10)] + ["p20"]
 
 
 def test_order_is_kept_from_the_first_session_to_the_last(env):
@@ -345,10 +434,12 @@ def lands_during(env, monkeypatch, name, container_up):
     monkeypatch.setattr(sbq, name, slow_step)
 
 
-# The NotebookLM probe takes seconds; the DB can be locked for up to 15 s.
+# The NotebookLM probes take seconds; the DB can be locked for up to 15 s.
 @pytest.mark.parametrize("setup,slow_step", [
     (backlog_only, "notebooklm_auth_ok"),
     (stranded_with_excess, "notebooklm_auth_ok"),
+    (backlog_only, "notebooklm_budget"),
+    (stranded_with_excess, "notebooklm_budget"),
     (scheduled_with_excess, "recent_resume"),
 ])
 @pytest.mark.parametrize("container_up", [True, False],
@@ -770,3 +861,354 @@ def test_a_failed_state_write_says_where_the_count_stands(
     resume_runs(env)
     out = next_resume_after(env, capsys, 8 * COOLDOWN)
     assert re.search(r"backing off\b.*\bn=3\b", out)
+
+
+# NotebookLM's live budget sizes each resume.
+#
+# Measured: a session started 6 papers with too little budget left, 3 of them
+# stopped half-translated, and the budget they had used was lost. So a resume is
+# handed only the papers the meter still pays for, and none when it pays for none.
+
+@pytest.fixture
+def seoul():
+    """Local time is UTC+9 while the test runs."""
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = "KST-9"
+    time.tzset()
+    yield
+    if old is None:
+        del os.environ["TZ"]
+    else:
+        os.environ["TZ"] = old
+    time.tzset()
+
+
+def test_the_live_meter_reads_as_its_two_windows():
+    budget = sbq.parse_usage(LIVE_USAGE)
+
+    assert budget.exhausted is False
+    assert budget.five_hour.left == pytest.approx(45.0)
+    assert budget.five_hour.used == pytest.approx(55.0)
+    assert budget.five_hour.resets == datetime.datetime(2026, 1, 1, 5, tzinfo=UTC)
+    assert budget.weekly.left == pytest.approx(97.5)
+    assert budget.weekly.resets == datetime.datetime(2026, 1, 7, 5, tzinfo=UTC)
+
+
+def test_a_refill_queues_only_what_the_budget_covers(env, capsys):
+    env.write_backlog([paper(i) for i in range(4)])
+    env.usage = covering(2)
+
+    assert env.sweep() == 0
+
+    assert ids(env.queue()["papers"]) == ["p0", "p1"]
+    assert ids(env.backlog()) == ["p2", "p3"]
+    assert env.queue()["backlog_remaining"] == 2
+    assert len(env.resumes()) == 1
+    # The line that says it scheduled names the chunk and the budget behind it.
+    left = f"{2.5 * sbq.PAPER_FIVE_HOUR_PERCENT:.1f}% left"
+    line = [ln for ln in capsys.readouterr().out.splitlines() if "scheduled" in ln]
+    assert len(line) == 1 and "queued 2 " in line[0] and left in line[0], line
+
+
+def test_a_stranded_queue_keeps_only_what_the_budget_covers(env):
+    env.write_backlog([paper(20)])
+    env.write_queue([paper(i) for i in range(6)])
+    env.usage = covering(3)
+
+    assert env.sweep() == 0
+
+    assert ids(env.queue()["papers"]) == ["p0", "p1", "p2"]
+    assert ids(env.backlog()) == ["p3", "p4", "p5", "p20"]
+    assert env.queue()["backlog_remaining"] == 4
+    assert len(env.resumes()) == 1
+
+
+@pytest.mark.parametrize("setup", [stranded_with_excess, backlog_only])
+def test_a_budget_that_covers_more_still_hands_out_one_session(
+        env, setup, monkeypatch):
+    # Cheap papers, so the untouched meter pays for more than a session holds.
+    monkeypatch.setattr(sbq, "PAPER_FIVE_HOUR_PERCENT", 5.0)
+    assert sbq.papers_affordable(sbq.parse_usage(json.dumps(env.usage))) > 10
+    setup(env)
+
+    assert env.sweep() == 0
+
+    limit = sbq.BATCH_CHUNK
+    assert ids(env.queue()["papers"]) == [f"p{i}" for i in range(limit)]
+    assert ids(env.backlog()) == [f"p{i}" for i in range(limit, 10)]
+    assert len(env.resumes()) == 1
+
+
+def test_the_weekly_window_binds_when_it_covers_fewer(env):
+    env.write_backlog([paper(i) for i in range(4)])
+    env.usage = usage(weekly_left=2.5 * sbq.PAPER_WEEKLY_PERCENT)
+
+    assert env.sweep() == 0
+
+    assert ids(env.queue()["papers"]) == ["p0", "p1"]
+    assert ids(env.backlog()) == ["p2", "p3"]
+
+
+# Each meter, and whether its weekly window pays for no more papers than its
+# five-hour one does.
+@pytest.mark.parametrize("meter,weekly_binds", [
+    (dict(exhausted=True, five_hour_left=50.0), False),
+    (dict(exhausted=True, five_hour_left=50.0, weekly_left=0.0), True),
+    (dict(five_hour_left=0.9 * sbq.PAPER_FIVE_HOUR_PERCENT), False),
+    (dict(weekly_left=0.9 * sbq.PAPER_WEEKLY_PERCENT), True),
+    (dict(exhausted=True, five_hour_left=0.0, weekly_left=0.0), True),
+], ids=["exhausted", "weekly-exhausted", "five-hour-under-one-paper",
+        "weekly-under-one-paper", "both-exhausted"])
+@pytest.mark.parametrize("setup", [stranded_with_excess, backlog_only])
+def test_a_budget_that_covers_no_paper_writes_nothing(env, setup, meter,
+                                                      weekly_binds, seoul,
+                                                      capsys):
+    setup(env)
+    env.usage = usage(**meter)
+    before = env.files()
+
+    assert env.sweep() == 0
+
+    assert env.files() == before
+    assert env.resumes() == []
+    line = [ln for ln in capsys.readouterr().out.splitlines()
+            if "covers no paper" in ln]
+    assert len(line) == 1, line
+    # The resets in local time: 05:00 UTC, the weekly one on 7 January.
+    assert re.search(r"five-hour [\d.]+% left \(resets 14:00\)", line[0]), line
+    weekly_reset = re.search(r"weekly [\d.]+% left \(resets 2026-01-07 14:00\)",
+                             line[0])
+    assert bool(weekly_reset) == weekly_binds, line
+
+
+def test_a_sweep_the_budget_stops_is_no_resume_without_progress(env, capsys):
+    first_resume(env)
+    resume_runs(env)
+    env.advance(2 * COOLDOWN + 1)               # past the wait n=1 asks for
+    env.usage = usage(exhausted=True, five_hour_left=0.0)
+    before = env.files()
+
+    assert env.sweep() == 0
+
+    assert env.files() == before
+    assert len(env.resumes()) == 1
+    env.usage = usage()
+    assert env.sweep() == 0
+    assert len(env.resumes()) == 2
+    with open(env.state_path, encoding="utf-8") as f:
+        assert json.load(f)["resumes_without_progress"] == 1
+
+
+# The meter does not clamp: a window spent past its allowance reads below 0.
+@pytest.mark.parametrize("meter", [dict(five_hour_left=-0.5),
+                                   dict(weekly_left=-0.5)],
+                         ids=["five-hour", "weekly"])
+@pytest.mark.parametrize("setup", [stranded_with_excess, backlog_only])
+def test_a_window_spent_past_its_allowance_covers_no_paper(env, setup, meter,
+                                                           capsys):
+    setup(env)
+    env.usage = usage(**meter)
+    before = env.files()
+
+    assert env.sweep() == 0
+
+    assert env.files() == before
+    assert env.resumes() == []
+    assert "covers no paper" in capsys.readouterr().out
+
+
+def meter_with(edit):
+    u = usage()
+    edit(u)
+    return u
+
+
+def drop(*path):
+    def edit(u):
+        for key in path[:-1]:
+            u = u[key]
+        del u[path[-1]]
+    return edit
+
+
+def put(value, *path):
+    def edit(u):
+        for key in path[:-1]:
+            u = u[key]
+        u[path[-1]] = value
+    return edit
+
+
+USAGE_ARGS = ["notebooklm", "usage", "--json"]
+
+
+# Each answer, and a word the line must carry to say what was wrong with it.
+@pytest.mark.parametrize("answer,why", [
+    (subprocess.CompletedProcess(USAGE_ARGS, 2, "",
+                                 "Error: No such command 'usage'.\n"),
+     "No such command"),
+    (subprocess.CompletedProcess(USAGE_ARGS, 0, "Live compute usage\n", ""), "JSON"),
+    (subprocess.CompletedProcess(USAGE_ARGS, 0, "[]", ""), "object"),
+    (meter_with(put("skipped", "status")), "status"),
+    (meter_with(put(False, "enabled")), "enabled"),
+    (meter_with(drop("is_exhausted")), "is_exhausted"),
+    (meter_with(lambda u: u["windows"].pop()), "weekly"),
+    (meter_with(put(None, "windows", 0, "remaining_percent")), "remaining_percent"),
+    (meter_with(put("45%", "windows", 1, "remaining_percent")), "remaining_percent"),
+    (meter_with(drop("windows", 0, "used_percent")), "used_percent"),
+    (meter_with(drop("windows", 1, "resets_at")), "resets_at"),
+    (meter_with(put("2026-01-01T05:00:00", "windows", 0, "resets_at")), "no zone"),
+    (meter_with(lambda u: u["windows"].append(dict(u["windows"][0]))),
+     "2 five_hour"),
+    (FileNotFoundError(2, "No such file or directory", "notebooklm"), "notebooklm"),
+    (subprocess.TimeoutExpired(USAGE_ARGS, 120), "timed out"),
+], ids=["cli-without-usage", "not-json", "not-an-object", "skipped", "disabled",
+        "no-is_exhausted", "no-weekly-window", "percent-missing", "percent-text",
+        "used-missing", "no-resets_at", "naive-resets_at", "two-five_hour-windows",
+        "no-cli", "timeout"])
+@pytest.mark.parametrize("setup", [stranded_with_excess, backlog_only])
+def test_a_budget_that_cannot_be_read_stops_the_sweep_loudly(env, setup, answer,
+                                                             why, capsys):
+    setup(env)
+    env.usage = answer
+    before = env.files()
+
+    assert env.sweep() == 1
+
+    assert env.files() == before
+    assert env.resumes() == []
+    err = capsys.readouterr().err
+    assert "cannot read the NotebookLM budget" in err and why in err, err
+
+
+SPENT = r"^sweep: last session used 34\.5% of the five-hour budget for "
+STAMP = r"\d{4}-\d\d-\d\d \d\d:\d\d"
+
+
+def first_chunk_of_four(env, scheduled_by):
+    """The first resume, handed 4 papers beside one that failed for a reason of
+    its own, with one more left in the backlog, by the stranded path or by a
+    refill."""
+    env.usage = usage(five_hour_left=90.0)
+    broken = paper(9, "failed", error="no PDF found")
+    if scheduled_by == "stranded":
+        env.write_backlog([paper(10)])
+        env.write_queue([paper(i) for i in range(4)] + [broken])
+    else:
+        env.write_backlog([paper(i) for i in range(5)])
+        env.write_queue([broken])
+    assert env.sweep() == 0
+    assert len(env.resumes()) == 1
+    statuses = [p["status"] for p in env.queue()["papers"]]
+    assert sorted(statuses) == ["failed"] + ["pending"] * 4, statuses
+
+
+@pytest.mark.parametrize("scheduled_by", ["stranded", "refill"])
+@pytest.mark.parametrize("finished,deleted,line", [
+    (2, False, SPENT + r"2 settled paper\(s\), resumed " + STAMP + "$"),
+    (4, False, SPENT + r"4 paper\(s\), resumed " + STAMP + "$"),
+    (4, True, SPENT + r"4 paper\(s\), resumed " + STAMP + "$"),
+], ids=["stranded", "drained", "deleted"])
+def test_a_session_reports_what_it_spent(env, capsys, scheduled_by, finished,
+                                         deleted, line):
+    first_chunk_of_four(env, scheduled_by)
+    resume_runs(env, finished=finished)
+    if deleted:
+        os.remove(env.queue_path)               # as a session that drains it does
+    env.usage = usage(five_hour_left=55.5)
+    env.advance(5)
+    assert env.sweep() == 0                     # the timer's next run, in the cooldown
+    env.advance(COOLDOWN)
+    capsys.readouterr()
+
+    assert env.sweep() == 0
+
+    out = capsys.readouterr().out
+    assert len(re.findall(line, out, re.M)) == 1, out
+    assert len(env.resumes()) == 2
+
+
+def test_the_spend_line_names_the_resume_it_measures(env, capsys):
+    first_chunk_of_four(env, "stranded")
+    resumed = sbq.load_state()["resumed_at"]
+    resume_runs(env, finished=4)
+    env.usage = usage(exhausted=True, five_hour_left=0.0)
+    lines = []
+    for _ in range(3):                          # three sweeps while nothing is affordable
+        env.advance(COOLDOWN + 1)
+        capsys.readouterr()
+        assert env.sweep() == 0
+        lines += [ln for ln in capsys.readouterr().out.splitlines()
+                  if "last session used" in ln]
+
+    stamp = sbq._parse_time(resumed).astimezone().strftime("%Y-%m-%d %H:%M")
+    assert len(lines) == 3 and len(set(lines)) == 1, lines
+    assert lines[0].endswith(f", resumed {stamp}"), lines
+
+
+@pytest.mark.parametrize("finished,papers", [
+    (2, [paper(i) for i in range(20, 24)]),
+    (4, [paper(i, "done") for i in range(20, 24)]),
+], ids=["stranded", "drained"])
+def test_no_spend_is_reported_for_another_batch(env, capsys, finished, papers):
+    first_chunk_of_four(env, "stranded")
+    resume_runs(env, finished=finished)
+    env.write_queue(papers, created_at="2026-10-02T00:00:00Z")
+    env.usage = usage(five_hour_left=55.5)
+    env.advance(COOLDOWN + 1)
+    capsys.readouterr()
+
+    assert env.sweep() == 0
+
+    assert "last session used" not in capsys.readouterr().out
+    assert len(env.resumes()) == 2
+
+
+# The five-hour window's resets_at slides with the clock until its first use
+# anchors it (vendor/notebooklm-py/docs/adr/0037-live-usage-and-quota-api.md), so a
+# resume handed an unused window reads a later resets_at once its session used it.
+# The resume is recorded with the reset at 05:00.
+@pytest.mark.parametrize("left_then,resets_now,reported", [
+    (100.0, "2026-01-01T06:00:00+00:00", True),
+    (100.0, "2026-01-01T09:59:59+00:00", True),
+    (100.0, "2026-01-01T10:00:00+00:00", False),
+    (100.0, "2026-01-01T04:59:59+00:00", False),
+    (90.0, "2026-01-01T05:00:00+00:00", True),
+    (90.0, "2026-01-01T06:00:00+00:00", False),
+    (90.0, "2026-01-01T10:00:00+00:00", False),
+], ids=["unused-then-anchored-1h-on", "unused-then-anchored-just-inside-5h",
+        "unused-then-5h-on", "unused-then-earlier", "used-same-reset",
+        "used-then-moved-1h", "used-then-reset"])
+def test_spend_is_reported_only_inside_the_window_the_resume_started_in(
+        env, capsys, left_then, resets_now, reported):
+    env.usage = usage(five_hour_left=left_then)
+    first_resume(env)
+    resume_runs(env, finished=2)
+    env.usage = usage(five_hour_left=left_then - 34.5, five_hour_resets=resets_now)
+    env.advance(COOLDOWN + 1)
+    capsys.readouterr()
+
+    assert env.sweep() == 0
+
+    out = capsys.readouterr().out
+    assert bool(re.search(SPENT + r"2 settled paper\(s\), resumed " + STAMP + "$", out, re.M)) == reported, out
+    assert len(env.resumes()) == 2
+
+
+def test_no_spend_is_reported_from_a_state_without_a_reading(env, capsys):
+    env.usage = usage(five_hour_left=90.0)
+    first_resume(env)
+    resume_runs(env, finished=2)
+    env.usage = usage(five_hour_left=55.5)
+    with open(env.state_path, encoding="utf-8") as f:
+        state = json.load(f)
+    state = {k: v for k, v in state.items() if not k.startswith("five_hour")}
+    with open(env.state_path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    env.advance(COOLDOWN + 1)
+    capsys.readouterr()
+
+    assert env.sweep() == 0
+
+    assert "last session used" not in capsys.readouterr().out
+    assert len(env.resumes()) == 2

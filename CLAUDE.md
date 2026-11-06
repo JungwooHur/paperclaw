@@ -260,8 +260,8 @@ Two fixes:
   papers. The rest waits in `research-papers/papers_backlog.json`, a host-only file
   that no agent prompt names, so an agent that deletes the queue at the end cannot
   lose it.
-  - A stranded queue keeps its first 6 pending papers, and the rest move to the
-    FRONT of the backlog.
+  - A stranded queue keeps its first 6 pending papers, fewer when the NotebookLM
+    budget covers fewer (below), and the rest move to the FRONT of the backlog.
   - A queue that is gone or drained is refilled with the next chunk, and a resume is
     scheduled, when no container is up and no resume is recent.
   - While a resume is already scheduled, a queue with too many papers is trimmed
@@ -284,6 +284,26 @@ cap would also reach the main group only while its runner copy is unedited
 the chunking, and `src/task-scheduler.test.ts` covers the close. **When a batch looks
 stalled, read `papers_backlog.json` and the `papers-batch-resume-*` tasks as well as
 the queue — the queue only ever holds one session's share.**
+
+**The live NotebookLM budget caps each chunk.** A session once started 6 papers with
+too little budget left; 3 stopped half-translated, and the budget they had used was
+lost. So at both scheduling points, after the auth probe and the backoff, the sweep
+reads `notebooklm usage --json` and hands the resume no more whole papers than both
+windows' `remaining_percent` pay for at `PAPER_FIVE_HOUR_PERCENT` and
+`PAPER_WEEKLY_PERCENT`, and none when `is_exhausted`. The constants come from one Pro
+account's meter: an ask is about 0.52 % of the five-hour window, a paper 30-45 asks,
+and weekly use about a 21st of five-hour use. A budget that covers no paper prints
+`budget covers no paper` with the reset time, writes nothing and leaves the backoff
+count alone. A meter it cannot read (a non-zero exit, a status other than `ready`, a
+missing window or field) prints `cannot read the NotebookLM budget (<why>)`, writes
+nothing and exits 1: there is no fallback, and the next cycle tries again. To
+recalibrate, grep the healer journal for `last session used`. The next sweep that
+reads the budget prints it when the last resume's batch is stranded, drained or
+deleted and the five-hour window is the one that resume started in, and repeats it
+on every later sweep until the next resume; the line ends with that resume's start
+time, so the copies read as one measurement. An unused
+window's `resets_at` slides until its first use, so it matches for five hours. A
+drained last chunk prints none: with the backlog empty, nothing reads the budget.
 
 ## WhatsApp connection can hang silently (watchdog)
 
