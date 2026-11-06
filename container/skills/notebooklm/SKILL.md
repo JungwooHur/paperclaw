@@ -12,17 +12,18 @@ Use `notebooklm` CLI to offload paper reading to Google NotebookLM. This saves C
 
 Auth state is mounted from the host at `~/.notebooklm/` and is shared by every container and subagent. If commands fail with auth errors, tell the user to run `notebooklm login` on the host machine.
 
-**IMPORTANT:** Always pass `--notebook <id>` explicitly to every command. Every call shares one context file (the selected notebook and the last conversation). Parallel subagents would overwrite it, and an `ask` could then be answered from another paper's notebook. So the `notebooklm` wrapper deletes that file before every call. A command without `--notebook` fails with "No notebook specified. Use 'notebooklm use <id>' ...": do not follow that hint, since `notebooklm use <id>` is refused (exit 2); pass `--notebook <id>` instead. The wrapper also refuses `-p`/`--profile`, `--storage`, `NOTEBOOKLM_PROFILE`, `NOTEBOOKLM_HOME`, `NOTEBOOKLM_AUTH_JSON` and every `profile` command except `profile list`. It refuses every call while the shared `~/.notebooklm/config.json` names a default profile other than `default`; tell the user to run `notebooklm profile switch default` on the host. **Never copy `storage_state.json` into a private profile:** the two copies' cookies rotate apart, and the shared one gets signed out for every later run.
+**IMPORTANT:** Always pass `--notebook <id>` explicitly to every command. Every call shares one context file (the selected notebook and the last conversation). Parallel subagents would overwrite it, and an `ask` could then be answered from another paper's notebook. So the `notebooklm` wrapper deletes that file before every call. A command without `--notebook` fails with "No notebook specified. Use 'notebooklm use <id>' ...": do not follow that hint, since `notebooklm use <id>` is refused (exit 2); pass `--notebook <id>` instead. The wrapper also refuses `-p`/`--profile`, `--storage`, `NOTEBOOKLM_PROFILE`, `NOTEBOOKLM_HOME`, `NOTEBOOKLM_AUTH_JSON`, `--backend android` (and `NOTEBOOKLM_BACKEND=android`) and every `profile` command except `profile list`. It refuses every call while the shared `~/.notebooklm/config.json` names a default profile other than `default`; tell the user to run `notebooklm profile switch default` on the host. **Never copy `storage_state.json` into a private profile:** the two copies' cookies rotate apart, and the shared one gets signed out for every later run.
 
 ## Core Commands
 
 ```bash
 # Create a notebook for a paper
 notebooklm create "Paper: ARXIV_ID" --json
-# Returns: {"id": "notebook-uuid", "title": "Paper: ARXIV_ID", ...}
+# Returns: {"notebook": {"id": "notebook-uuid", "title": "Paper: ARXIV_ID", ...}}
 
 # Add paper as source (wait for processing)
-notebooklm source add "https://ar5iv.labs.arxiv.org/html/ARXIV_ID" --notebook <id> --wait
+notebooklm source add "https://arxiv.org/html/ARXIV_ID" --notebook <id> --json   # prints the source id
+notebooklm source wait <source_id> --notebook <id>
 
 # Check source status
 notebooklm source list --notebook <id> --json

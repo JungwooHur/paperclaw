@@ -11,6 +11,7 @@ before every call and refuses the ways around the shared cookie jar.
 The wrapper runs here as the container runs it, with HOME pointed at a scratch
 directory and the real CLI replaced by a fake that records each call.
 """
+import ast
 import json
 import os
 import re
@@ -147,6 +148,118 @@ def test_a_second_cookie_jar_is_refused(box, args):
     assert "storage_state.json" in proc.stderr
 
 
+@pytest.mark.parametrize("args", [
+    ["--backend", "android", "use", "x"],
+    ["--backend", "android", "list"],
+    ["--backend=android", "list"],
+    ["-v", "--backend", "android", "source", "list", "-n", "nb-mine"],
+], ids=lambda args: " ".join(args))
+def test_the_android_backend_is_refused(box, args):
+    # Android signs in with master_token.json, a second credential beside the
+    # shared storage_state.json.
+    proc = box(*args)
+
+    assert proc.returncode == 2
+    assert box.calls() == []
+    assert len(proc.stderr.strip().splitlines()) == 1
+    assert "master_token.json" in proc.stderr
+    assert "storage_state.json" in proc.stderr
+
+
+def test_the_android_backend_by_env_is_refused(box):
+    proc = box("list", "--json", NOTEBOOKLM_BACKEND="android")
+
+    assert proc.returncode == 2
+    assert box.calls() == []
+    assert len(proc.stderr.strip().splitlines()) == 1
+    assert "master_token.json" in proc.stderr
+
+
+@pytest.mark.parametrize("value", ["web", ""], ids=["web", "empty"])
+def test_the_web_backend_by_env_passes(box, value):
+    # The CLI fails on an empty NOTEBOOKLM_BACKEND by itself.
+    proc = box("list", "--json", NOTEBOOKLM_BACKEND=value)
+
+    assert proc.returncode == 0, proc.stderr
+    assert [c["argv"] for c in box.calls()] == [["list", "--json"]]
+
+
+@pytest.mark.parametrize("args", [
+    # --backend takes a value: `web` is not the subcommand, `use` is.
+    ["--backend", "web", "use", "nb-mine"],
+    ["--backend", "web", "profile", "switch", "x"],
+    ["--quiet", "--backend", "web", "use", "nb-mine"],
+], ids=lambda args: " ".join(args))
+def test_the_backend_value_is_not_the_subcommand(box, args):
+    proc = box(*args)
+
+    assert proc.returncode == 2
+    assert box.calls() == []
+    assert len(proc.stderr.strip().splitlines()) == 1
+
+
+_CLI_ROOT = "vendor/notebooklm-py/src/notebooklm/notebooklm_cli.py"
+
+
+def _root_options():
+    """(name, takes_value) for every option of the vendored CLI's root group.
+
+    Read from the decorators of `cli`, so an upgrade that adds a root option
+    shows up here without anyone remembering to look.
+    """
+    with open(os.path.join(REPO, _CLI_ROOT), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    [cli] = [node for node in tree.body
+             if isinstance(node, ast.FunctionDef) and node.name == "cli"]
+    options = []
+    for deco in cli.decorator_list:
+        if not (isinstance(deco, ast.Call) and isinstance(deco.func, ast.Attribute)):
+            continue
+        if deco.func.attr == "version_option":
+            options.append(("--version", False))
+        elif deco.func.attr == "option":
+            keywords = {k.arg: k.value for k in deco.keywords}
+            flag = any(isinstance(keywords.get(k), ast.Constant)
+                       and keywords[k].value is True for k in ("is_flag", "count"))
+            options += [(arg.value, not flag) for arg in deco.args
+                        if isinstance(arg, ast.Constant)
+                        and str(arg.value).startswith("-")]
+    return options
+
+
+def test_the_root_options_are_read():
+    names = {name for name, _ in _root_options()}
+
+    assert {"--storage", "-p", "--backend", "-v", "--quiet"} <= names
+
+
+@pytest.mark.parametrize("name,takes_value", _root_options(),
+                         ids=[name for name, _ in _root_options()])
+def test_no_root_option_hides_the_subcommand(box, name, takes_value):
+    # The scan must step over each root option, and over the value of one that
+    # takes a value; otherwise the value reads as the subcommand and the `use`
+    # after it runs.
+    args = [name, "web", "use", "nb-mine"] if takes_value else [name, "use", "nb-mine"]
+
+    proc = box(*args)
+
+    assert proc.returncode == 2
+    assert box.calls() == []
+
+
+@pytest.mark.parametrize("args", [
+    ["--backend", "web", "list", "--json"],
+    ["--backend=web", "list", "--json"],
+    ["--quiet", "source", "list", "-n", "nb-mine", "--json"],
+    ["--quiet", "--backend", "web", "usage", "--json"],
+], ids=lambda args: " ".join(args))
+def test_the_web_backend_and_quiet_pass(box, args):
+    proc = box(*args)
+
+    assert proc.returncode == 0, proc.stderr
+    assert [c["argv"] for c in box.calls()] == [args]
+
+
 @pytest.mark.parametrize("var", [
     "NOTEBOOKLM_PROFILE", "NOTEBOOKLM_HOME", "NOTEBOOKLM_AUTH_JSON"])
 def test_a_second_cookie_jar_by_env_is_refused(box, var):
@@ -250,6 +363,31 @@ def test_the_default_profile_passes(box, config):
     assert proc.returncode == 0, proc.stderr
     assert [c["argv"] for c in box.calls()] == [
         ["ask", "q", "-n", "nb-mine", "--json"]]
+
+
+# Answers `--get-or-create` with the title it was given, so a test can tell which
+# token the wrapper read as the title.
+_ECHO_REGISTRY = """import json, sys
+title = sys.argv[sys.argv.index("--title") + 1]
+print(json.dumps({"notebook": {"id": "nb-registered", "title": title}}))
+"""
+
+
+@pytest.mark.parametrize("args", [
+    ["--quiet", "create", "T", "--json"],
+    ["--backend", "web", "create", "T", "--json"],
+    ["-v", "create", "-u", "T", "--json"],
+    ["create", "--json", "T"],
+])
+def test_create_goes_through_the_registry_wherever_its_title_sits(box, args):
+    registry = box.tmp / "registry.py"
+    registry.write_text(_ECHO_REGISTRY)
+
+    proc = box(*args, registry=str(registry))
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["notebook"] == {"id": "nb-registered", "title": "T"}
+    assert box.calls() == []
 
 
 def test_a_failed_registry_falls_through_with_the_original_argv(box):

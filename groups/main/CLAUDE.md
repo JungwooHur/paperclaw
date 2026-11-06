@@ -254,7 +254,7 @@ Known fixes accumulated so far:
 | A duplicate pair survives `--dedupe` forever: a blank stub page sitting next to the real page | `_dedup_key` returned the arxiv id **or**, failing that, the normalized title. The commonest duplicate shape is a stub with an EMPTY Paper URL beside the real page that has one — so the two got different keys (`title:…` vs `arxiv:…`), landed in different groups, and were never seen as duplicates. Backfilling a URL onto one of a pair actively *breaks* their grouping, which is a trap when repairing a page by hand | `_dedup_keys` emits BOTH keys for every page and `_group_by_identity` unions pages sharing ANY key (union-find), so a stub groups with its twin through the title while two URL-bearing copies still group through the arxiv id. Verified on the live shapes: stub+URL'd pair groups, both-URL'd pair groups, a retitled page with the same arxiv id groups, and two genuinely different papers stay apart |
 | The resolver answers "which paper?" for a message that names its paper, while the retroactive backstop attributes the SAME message correctly | Two tierings, one question. `resolve_paper.py` scores arxiv id -> title keywords -> pasted-body grep and never gained the naming evidence the backstop had learned, so a name — the acronym or model number a title opens with — was read on one path and invisible on the other. The failure direction is safe (it asks rather than writing to the wrong page), but a reader who named the paper precisely is asked to name it again. The backstop's own copy also did not do what its comment claimed: it keyed names by `nm.lower()` and matched with `re.I`, so the case-SENSITIVE acronym rule it documents was never in force and a lowercase English word could resolve on it | One definition both paths import: `auto_save_qa.named_paper(text, papers)`. The resolver calls it ABOVE its keyword tier (naming is evidence, a score is a guess) and BELOW the id tier (an explicit id is the one signal stronger than a name), reporting `how = name`. Case-sensitivity is now real — a digit-carrying model number matches in any case, a pure acronym only in capitals. The page-body test is injectable, so the shared rule is unit-tested with plain dicts and no Notion access, and it now runs only for a name the text actually contains instead of fetching a body per candidate on every call |
 | `verify_sections` reports appendix subsections `C.1`-`C.4` as duplicates of each other, and CONTENT_LOSS or SUMMARIZED on complete appendix sections | Measurement bugs on a paper whose appendices follow its reference list. (1) `_KEY_RE` tried the roman-numeral alternative first, so `C.2` keyed as `C` (100) and collided with `Appendix C` and every sibling; `A.1`-style keys were shadowed the same way for C, I, L, V, X. (2) The tail cut at the last `References` removed the appendices from the measured source, so an appendix subsection was unlocated, or was "located" in the table of contents at the top and measured against whatever followed it there (~1,411 source chars against a true ~430). (3) The final section's span ran to the end of the arxiv page and counted its chrome (`Experimental support, please view the build logs ... Instructions for reporting errors`). Measuring the appendices then exposed two more, each a false finding on a complete section: (4) a TABLE whose cells are sentences (worked examples, prompts) passes `_prose_chars` as prose, so an appendix made of such tables, all present on the page as images, read as CONTENT_LOSS against thousands of characters; (5) a lettered heading the page lacks (`Appendix C`, `C.1`, when the page carries those titles unlabelled) was not a span stop, so the subsection before it was measured against the whole next appendix and read as SUMMARIZED; and (6) measured to the end of the document, the last appendix also took in a NeurIPS paper checklist printed after it — unlettered, and each item's number on a line of its own (`1.` then `Claims`), so no heading stopped the span (~20,700 source chars against a true ~1,200) | The `[A-Z](?:[.-]\d+)+` key alternative comes first. When a lettered heading of the page really sits past the cut, `source_section_chars` measures to the end of the document minus the arxiv chrome, and stops each span at the first `References` heading after its start, so the bibliography is never counted into the section before it; a `Paper Checklist` heading (or a line reading only `Checklist`) is a back-matter heading in `_TAIL_RE` like `References`, so the checklist ends a span too, and appendices printed after it are still measured. The arXiv text blanks every `ltx_table` float (`_drop_tables`) to a placeholder as long as its text: it counts toward whether a span is a real section (under 200 chars is a contents-list hit) but never toward the section's text — dropped outright, a sentence-plus-table section came out unmeasured and the empty-section rule called it a dropped translation. And a span stops at `C.1 …` / `Appendix C …` as it does at `4.2 …`. Gated by `tests/test_appendix_after_references.py`, which fails when any one of those is reverted. Read-only A/B against HEAD on 10 DB pages whose appendices follow their references and 16 that do not: nothing added; removed 1 DUPLICATE (the `C.1`-`C.4` collision), 3 CONTENT_LOSS and 4 SUMMARIZED, each traced by hand to table text (5), the bibliography (1) or the chrome beside tables (1). The first version of (1)-(3) alone added a CONTENT_LOSS from (4) and a SUMMARIZED from (5) on the same pages. (6) was found the same way, on public NeurIPS papers: of 8 carrying a checklist, the 4 whose last appendix took it in now measure within ~60 chars of their own span, and no section of 877 measures worse than before these fixes. **Before acting on a CONTENT_LOSS/SUMMARIZED flag on an appendix, still measure the source span by hand** |
-| An `ask` is answered from ANOTHER paper's sources (a section-list ask returned another paper's sections), sources land in an older paper's notebook, or every resume fails on auth after a subagent gave itself a private profile | Every CLI call shares one context file, `~/.notebooklm/profiles/default/context.json`: `use` writes the notebook, every `ask` writes the conversation. The wrapper's flock serializes single commands, not a subagent's sequence of them. `ask -n X` resumes the cached conversation whenever X is the cached notebook, and a parallel subagent's ask may have replaced it with a conversation of ITS notebook; a command without `-n` acts on whichever notebook was selected last. The one workaround tried, a private profile (`-p`) seeded with a copy of `storage_state.json`, made two cookie jars whose cookies rotate independently: whichever rotated last stayed valid, the shared one was signed out (0.8.1 reports that as `CSRF token not found in HTML`), and five resumes in a row failed | `container/bin/notebooklm` deletes the context file, and the legacy `~/.notebooklm/context.json`, under its lock before every call: a command without `--notebook` fails with "No notebook specified. Use 'notebooklm use <id>' ..." (that `use` hint is refused; pass `--notebook` instead), and `ask` resumes the named notebook's own latest conversation from the server. It refuses with exit 2 `use`, every `profile` command but `list`, the root options `-p`/`--profile`/`--storage`, a non-empty `NOTEBOOKLM_PROFILE`, `NOTEBOOKLM_HOME` or `NOTEBOOKLM_AUTH_JSON`, and any call while `config.json` names a `default_profile` other than `default` (a `profile switch` on the host); `create --use` no longer calls `use`, and a failed registry falls through to the real `create` with the original arguments. **Pass `--notebook <id>` to every command, and never copy `storage_state.json`.** `tests/test_notebooklm_wrapper.py` runs the wrapper against a fake CLI |
+| An `ask` is answered from ANOTHER paper's sources (a section-list ask returned another paper's sections), sources land in an older paper's notebook, or every resume fails on auth after a subagent gave itself a private profile | Every CLI call shares one context file, `~/.notebooklm/profiles/default/context.json`: `use` writes the notebook, every `ask` writes the conversation. The wrapper's flock serializes single commands, not a subagent's sequence of them. `ask -n X` resumes the cached conversation whenever X is the cached notebook, and a parallel subagent's ask may have replaced it with a conversation of ITS notebook; a command without `-n` acts on whichever notebook was selected last. The one workaround tried, a private profile (`-p`) seeded with a copy of `storage_state.json`, made two cookie jars whose cookies rotate independently: whichever rotated last stayed valid, the shared one was signed out (0.8.1 reports that as `CSRF token not found in HTML`), and five resumes in a row failed | `container/bin/notebooklm` deletes the context file, and the legacy `~/.notebooklm/context.json`, under its lock before every call: a command without `--notebook` fails with "No notebook specified. Use 'notebooklm use <id>' ..." (that `use` hint is refused; pass `--notebook` instead), and `ask` resumes the named notebook's own latest conversation from the server. It refuses with exit 2 `use`, every `profile` command but `list`, the root options `-p`/`--profile`/`--storage`, a non-empty `NOTEBOOKLM_PROFILE`, `NOTEBOOKLM_HOME` or `NOTEBOOKLM_AUTH_JSON`, a root `--backend` or a non-empty `NOTEBOOKLM_BACKEND` other than `web` (the android backend signs in with `master_token.json`, a second credential), and any call while `config.json` names a `default_profile` other than `default` (a `profile switch` on the host); `create --use` no longer calls `use`, and a failed registry falls through to the real `create` with the original arguments. **Pass `--notebook <id>` to every command, and never copy `storage_state.json`.** `tests/test_notebooklm_wrapper.py` runs the wrapper against a fake CLI |
 
 ## Language Policy (Token Optimization)
 
@@ -578,34 +578,38 @@ use the tool above.
   kill a rebuild, CONFIRM it actually died (`ps`) before relaunching, and give each
   run its own log file (a shared `>` log interleaves and hides the second process).
 
-#### NotebookLM daily rate limit (plan long batches around it)
+#### NotebookLM usage limits (plan long batches around them)
 
 `notebooklm ask` is a **web-UI chat query**, not an API call: the CLI is
-`notebooklm-py` (an unofficial browser-session wrapper that drives
-notebooklm.google.com as the logged-in Google account, auth via a Playwright
-cookie store — that's why `notebooklm login` needs Chromium). So **every ask
-counts against that account's daily chat-query quota**, shared with any human
-chatting in the same account's web UI. Documented per-tier caps (2026): Free 50,
-Plus 200, Pro 500, Ultra 2,500–5,000 chats/day.
+`notebooklm-py` (an unofficial browser-session wrapper that drives the web app as
+the logged-in Google account, auth via a Playwright cookie store — that's why
+`notebooklm login` needs Chromium). So **every ask spends that account's
+NotebookLM usage**, shared with any human using the same account's web UI.
 
-A full book is ~150–200 tiling chunks = ~150–200 asks (a chunk that comes back
-SHORT retries up to 4× → up to 4 asks), so **2–3 books can drain a ~500/day
-window** — which is exactly how a multi-book queue stalls midway in runs of empty
-answers. Planning:
+The limit is **compute, not a count of chats**
+([Google's help page](https://support.google.com/gemininotebook/answer/17670842)):
+a budget that **refreshes every 5 hours, up to a weekly limit**. An ask costs more
+the more complex the prompt and the longer its conversation. Plans scale the budget:
+Plus 2×, Pro 4× the free one, Ultra 5× or 20× Pro. Usage cannot be bought on its
+own. Per-day chat caps (50/200/500…) no longer apply.
 
-- The quota is a **rolling ~24h window from first use**, NOT a fixed midnight
-  reset (verified: a batch spending ~470 asks across local midnight still tripped
-  mid-run). When it trips, `ask` returns empty; `translate_fulltext.py` aborts
-  after 5 consecutive empties with the chunk cache intact — it's **resumable**, so
-  just re-run after the window reopens.
-- **Budget ~450–470 chunks/day** and split large backlogs across days rather than
-  re-tripping the limit mid-run.
-- Recovery: wait ~24h from when the empties first appeared; retrying early just
-  returns more empties. If empties persist after a clean 24h wait, the session
-  cookie may be stale — re-run `notebooklm login`.
-- Heavy bursts can also trip a *separate* batchexecute throttle (surfaced as the
-  library's `RateLimitError`), distinct from the daily cap — the tool already
-  paces 3s/chunk to avoid it.
+Measured on a Pro account: a paper costs 30-45 asks (75k-130k characters of
+question and answer), and one batch exhausted the five-hour budget after ~310 asks,
+about 8 papers, in 2.5 hours. A book (150-200 tiling chunks) can take most of a
+window.
+
+- **Read the meter, don't guess:** `notebooklm usage --json` (0.8.6+) prints
+  `is_exhausted`, `active_window`, and a `windows` list whose `five_hour` and
+  `weekly` entries carry `used_percent`, `remaining_percent` and `resets_at`.
+- When the budget runs out, `ask` comes back empty or fails. `translate_fulltext.py`
+  aborts after 5 consecutive empties with the chunk cache intact, so it resumes after
+  the reset. A paper batch's resume settles nothing and the sweeper backs off (root
+  `CLAUDE.md`).
+- Recovery: wait for `resets_at`, at most 5 hours unless the weekly limit is spent.
+  Retrying earlier only returns more empties. If empties persist past the reset, the
+  session cookie may be stale — re-run `notebooklm login`.
+- Heavy bursts can also trip a *separate* batchexecute throttle (the library's
+  `RateLimitError`) — the tool already paces 3s/chunk to avoid it.
 
 ### Full Paper Processing (via NotebookLM) — short arxiv papers
 
