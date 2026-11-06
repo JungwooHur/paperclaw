@@ -593,14 +593,17 @@ the more complex the prompt and the longer its conversation. Plans scale the bud
 Plus 2×, Pro 4× the free one, Ultra 5× or 20× Pro. Usage cannot be bought on its
 own. Per-day chat caps (50/200/500…) no longer apply.
 
-Measured on a Pro account: a paper costs 30-45 asks (75k-130k characters of
-question and answer), and one batch exhausted the five-hour budget after ~310 asks,
-about 8 papers, in 2.5 hours. A book (150-200 tiling chunks) can take most of a
-window.
+Measured on a Pro account: an ask takes about 0.5 % of the five-hour window, and a
+paper 30-45 asks (75k-130k characters of question and answer), so a window covers
+about 5 papers. A book (150-200 tiling chunks) can take a whole window.
 
 - **Read the meter, don't guess:** `notebooklm usage --json` (0.8.6+) prints
   `is_exhausted`, `active_window`, and a `windows` list whose `five_hour` and
   `weekly` entries carry `used_percent`, `remaining_percent` and `resets_at`.
+- The host sweeper reads this meter before every resume it schedules and hands that
+  resume only the papers the remaining budget pays for, none when it pays for none
+  (root `CLAUDE.md`, queue sweeper). The step-7 overflow resume you schedule
+  yourself is outside that gate.
 - When the budget runs out, `ask` comes back empty or fails. `translate_fulltext.py`
   aborts after 5 consecutive empties with the chunk cache intact, so it resumes after
   the reset. A paper batch's resume settles nothing and the sweeper backs off (root
