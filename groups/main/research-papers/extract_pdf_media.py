@@ -37,8 +37,10 @@ page's actual content instead. Text blocks are split into `barriers` (justified
 body prose, headings) and `elements` (everything else: vector drawings, raster
 images, axis labels, sub-captions). Starting at the caption, the region grows
 away from it one element at a time and stops as soon as a barrier is nearer than
-the next element — i.e. at the first line of body text. Page furniture is never
-reached because body text always sits between it and the figure. The crop box is
+the next element — i.e. at the first line of body text. Only a barrier
+overlapping the caption's x-span ends the walk; one beside it bounds the
+caption's column instead. Page furniture is never reached because body text
+always sits between it and the figure. The crop box is
 then the UNION of what was actually collected (plus the caption), so a
 single-column figure keeps its full width and a two-column figure keeps its own
 column, with no caption-shape guessing.
@@ -67,6 +69,8 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import extract_paper_figures as ef  # noqa: E402
+import extract_paper_tables as et  # noqa: E402
 import reference_section  # noqa: E402
 
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -87,7 +91,9 @@ _BARRIER_MIN_LINES = 2
 _BARRIER_FULL_FRAC = 0.85    # a "full-measure" line is this much of the block width
 _BARRIER_FULL_SHARE = 0.6    # ...and this share of lines must be full-measure
 _HEADING_SIZE_DELTA = 0.6    # a block this much larger than body text is a heading
+_BODY_SIZE_TOL = 0.3         # text this close to body size is set at body size
 _BARRIER_MIN_SIZE_FRAC = 0.75  # prose is set at body size; small print is figure furniture
+_COLUMN_TOL = 2.0            # content may reach this far past a barrier beside it
 
 # Page furniture: running heads/feet, and the rotated arxiv stamp in the margin.
 _FURNITURE_SAMPLE = 24       # pages sampled to learn the running head/foot
@@ -120,7 +126,11 @@ ED_PREFIX = "ed_"
 
 # A caption line that marks ANOTHER float's boundary must carry its separator.
 _PUNCTUATED = re.compile(
-    r"^\s*(?:Extended\s+Data\s+)?(?:Fig\.?|Figure|Table|TABLE)\s*0*\d+\s*[:.|]", re.I)
+    r"^\s*(?:Extended\s+Data\s+)?(?:Fig\.?|Figure|Table|TABLE)\s*0*"
+    r"(?:[A-Z]\.?)?\d+(?:\.\d+)?\s*[:.|]", re.I)
+
+# A printed label that opens with a letter: `S2`, `B.1`, `A1`; group 1 is the letter.
+_LETTERED = re.compile(r"([A-Za-z])\.?\d")
 
 
 def base_kind(kind: str) -> str:
@@ -128,8 +138,26 @@ def base_kind(kind: str) -> str:
     return kind[len(ED_PREFIX):] if kind.startswith(ED_PREFIX) else kind
 
 
+def lettered_caption(text: str):
+    """(kind, label) when this text opens a caption whose label carries a letter.
+
+    The label is the one the HTML injectors read from a caption
+    (`extract_paper_figures.figure_label`, `extract_paper_tables.printed_label`),
+    kept as printed: "S2", "B.1", "A1". None for a numbered caption.
+    """
+    for kind, label in (("figure", ef.figure_label("", text)),
+                        ("table", et.printed_label(text))):
+        if isinstance(label, str) and _LETTERED.match(label):
+            return kind, label
+    return None
+
+
 def caption_kind(text: str):
-    """(kind, number) of the caption this text opens, or None."""
+    """(kind, label) of the caption this text opens, or None.
+
+    The label is an int for a numbered caption and the printed string for a
+    lettered one (`lettered_caption`).
+    """
     found = ED_CAPTION.match(text)
     if found:
         kind = "table" if found.group(1).lower().startswith("tab") else "figure"
@@ -138,7 +166,14 @@ def caption_kind(text: str):
     if found:
         kind = "table" if found.group(1).lower().startswith("tab") else "figure"
         return kind, int(found.group(2))
-    return None
+    return lettered_caption(text)
+
+
+def opens_caption(text: str, kind: str, label) -> bool:
+    """Does `text` open the caption of `kind label`?"""
+    if isinstance(label, int):
+        return bool(caption_opener(kind, label).match(text))
+    return caption_kind(text) == (kind, label)
 
 
 def caption_opener(kind: str, num: int):
@@ -164,10 +199,6 @@ def caption_opener(kind: str, num: int):
     return re.compile(rf"^\s*{lead}{word}\s*0*{num}(?!\d)\s*[:.|]?", re.I)
 
 
-# The old name, kept because several call sites read better with it.
-_caption_re = caption_opener
-
-
 def _spans(block):
     for line in block.get("lines", ()):
         for span in line.get("spans", ()):
@@ -178,20 +209,40 @@ def _block_text(block) -> str:
     return " ".join(s["text"] for s in _spans(block))
 
 
-def _body_size(blocks) -> float:
-    """The page's dominant font size — used to tell headings from body text."""
-    hist = {}
+def _size_histogram(blocks, hist: dict) -> dict:
+    """Adds each text span's character count to `hist`, keyed by its font size."""
     for b in blocks:
         if b.get("type") != 0:
             continue
         for s in _spans(b):
             key = round(s.get("size", 0), 1)
             hist[key] = hist.get(key, 0) + len(s.get("text", ""))
+    return hist
+
+
+def _body_size(blocks) -> float:
+    """The dominant font size of these blocks, by characters."""
+    hist = _size_histogram(blocks, {})
     return max(hist, key=hist.get) if hist else 10.0
 
 
-def _is_barrier(block, body_size: float) -> bool:
+def document_body_size(doc) -> float:
+    """The document's body text size: its dominant font size over every page.
+
+    Barriers are told from figure content by this size (`_is_barrier`).
+    """
+    hist = {}
+    for page in doc:
+        _size_histogram(page.get_text("dict")["blocks"], hist)
+    return max(hist, key=hist.get) if hist else 10.0
+
+
+def _is_barrier(block, body_size: float, page_size: float = None) -> bool:
     """True for body prose or a heading — content a figure never spans.
+
+    `body_size` is the document's body text size and `page_size` the dominant
+    size on this page. Text at body size is a barrier on a page whose dominant
+    print is smaller (a page of tables), whatever its measure.
 
     Body prose is recognised by MEASURE: most of its lines run the full width of
     the block. Figure furniture (axis ticks, legends, sub-captions such as
@@ -208,11 +259,15 @@ def _is_barrier(block, body_size: float) -> bool:
     sizes = [round(s.get("size", 0), 1) for s in _spans(block)]
     if sizes and max(sizes) >= body_size + _HEADING_SIZE_DELTA:
         return True
+    if (sizes and page_size is not None
+            and max(sizes) >= body_size - _BODY_SIZE_TOL
+            and max(sizes) >= page_size + _HEADING_SIZE_DELTA):
+        return True
     # The measure test below is relative to the block's OWN width, so it is blind
     # to scale: a prompt bubble drawn inside a figure is a narrow wrapped
     # paragraph whose lines are flush to its own little box, and it reads as body
     # prose just as strongly as a real column does. Size is the signal that is not
-    # scale-free — body prose is set at the page's dominant size by definition,
+    # scale-free — body prose is set at the document's body size by definition,
     # while figure furniture is set much smaller. Without this, two bubbles inside
     # a teaser figure ended the upward walk two thirds of the way up and the
     # figure shipped with its top third cut off.
@@ -368,19 +423,18 @@ def _overlaps(a, b) -> bool:
     return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
 
-def find_caption(page, kind: str, num: int):
+def find_caption(page, kind: str, num):
     """Caption box for `kind num` on this page, or None.
 
     A long caption is split by the PDF into several blocks; they are stitched
     back on while the text has not reached a sentence end and the next block is
     close by, in the same column, at the same font size.
     """
-    pat = _caption_re(kind, num)
     blocks = [b for b in page.get_text("dict")["blocks"] if b.get("type") == 0]
     blocks.sort(key=lambda b: b["bbox"][1])
     start = None
     for i, b in enumerate(blocks):
-        if pat.match(_block_text(b)):
+        if opens_caption(_block_text(b), kind, num):
             start = i
             break
     if start is None:
@@ -406,13 +460,15 @@ def _page_parts(page, caption_box, body_size: float, band):
     """Split the page into (barriers, elements), excluding caption and furniture."""
     head_bottom, foot_top = band
     rect = page.rect
+    blocks = page.get_text("dict")["blocks"]
+    page_size = _body_size(blocks)
 
     def _furniture(box):
         return (box[3] <= head_bottom or box[1] >= foot_top
                 or _is_stamp(box, rect))
 
     barriers, elements = [], []
-    for b in page.get_text("dict")["blocks"]:
+    for b in blocks:
         box = tuple(b["bbox"])
         if _furniture(box):
             continue
@@ -421,7 +477,7 @@ def _page_parts(page, caption_box, body_size: float, band):
             continue
         if _overlaps(box, caption_box):
             continue                      # the caption is the anchor, not content
-        (barriers if _is_barrier(b, body_size) else elements).append(box)
+        (barriers if _is_barrier(b, body_size, page_size) else elements).append(box)
     for d in page.get_drawings():
         r = d["rect"]
         if r.y1 - r.y0 <= 0.2 and r.x1 - r.x0 <= 0.2:
@@ -433,13 +489,47 @@ def _page_parts(page, caption_box, body_size: float, band):
     return barriers, elements
 
 
+def _across(caption_box, box) -> bool:
+    """Does `box` overlap the caption's x-span?"""
+    return box[0] < caption_box[2] and box[2] > caption_box[0]
+
+
+def _column(caption_box, barriers, y0: float, y1: float) -> tuple:
+    """(x_lo, x_hi): the caption's column over y0..y1.
+
+    Bounded by the barriers lying entirely to the left or right of the caption's
+    x-span that overlap y0..y1 vertically; open where there are none.
+    """
+    lo, hi = float("-inf"), float("inf")
+    for b in barriers:
+        if b[1] >= y1 or b[3] <= y0 or _across(caption_box, b):
+            continue
+        if b[2] <= caption_box[0]:
+            lo = max(lo, b[2])
+        else:
+            hi = min(hi, b[0])
+    return lo, hi
+
+
+def _in_column(box, column) -> bool:
+    return (box[0] >= column[0] - _COLUMN_TOL
+            and box[2] <= column[1] + _COLUMN_TOL)
+
+
 def _grow(caption_box, barriers, elements, upward: bool) -> float:
     """Find how far the figure/table body extends away from its caption.
 
     Repeatedly steps to the nearest element on the far side of the caption and
     stops when a barrier is nearer than that element — the first body-text line
-    ends the region. Returns the far edge (a y coordinate).
+    ends the region. Only a barrier overlapping the caption's x-span bounds the
+    walk; the others confine it to the caption's column (`_column`), so an
+    element is reachable only if it stays in the column of the region it would
+    end. Returns the far edge (a y coordinate).
     """
+    elements = [e for e in elements if _in_column(e, _column(
+        caption_box, barriers, *((e[1], caption_box[3]) if upward
+                                 else (caption_box[1], e[3]))))]
+    barriers = [b for b in barriers if _across(caption_box, b)]
     edge = caption_box[1] if upward else caption_box[3]
     while True:
         if upward:
@@ -468,15 +558,22 @@ def _grow(caption_box, barriers, elements, upward: bool) -> float:
     return edge
 
 
-def crop_box(page, kind: str, num: int, band=(float("-inf"), float("inf"))):
-    """Crop rectangle for `kind num` on `page`, or None if it isn't there."""
+def crop_box(page, kind: str, num, band=(float("-inf"), float("inf")),
+             body_size: float = None):
+    """Crop rectangle for `kind num` on `page`, or None if it isn't there.
+
+    `body_size` is the document's (`document_body_size`), computed here when
+    not given.
+    """
     import fitz
 
     caption_box = find_caption(page, kind, num)
     if caption_box is None:
         return None
+    if body_size is None:
+        body_size = document_body_size(page.parent)
     blocks = page.get_text("dict")["blocks"]
-    barriers, elements = _page_parts(page, caption_box, _body_size(blocks), band)
+    barriers, elements = _page_parts(page, caption_box, body_size, band)
     # ANOTHER float's caption is a hard boundary. The walk stops at body prose, but
     # a figure stacked directly above another figure or a table has no prose between
     # them, so the region kept growing: one crop swallowed the table AND the figure
@@ -512,9 +609,11 @@ def crop_box(page, kind: str, num: int, band=(float("-inf"), float("inf"))):
     # vertically enclosed by an already-crossed element (a plot's legend beside
     # its axes, a rotated axis title) is never stepped on, and taking only the
     # stepped-on boxes clipped those off the side of the figure.
+    column = _column(caption_box, barriers, min(top, caption_box[1]),
+                     max(bottom, caption_box[3]))
     inside = [e for e in elements
               if e[3] > top + 0.5 and e[1] < bottom - 0.5
-              and not _too_big(e, page.rect)]
+              and not _too_big(e, page.rect) and _in_column(e, column)]
     boxes = inside
     if not boxes:
         return None
@@ -534,19 +633,23 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
                  only: set = None) -> dict:
     """Render every figure/table found in the PDF.
 
-    Returns {(kind, num): {"path", "page", "caption"}}. A number is rendered from
-    the FIRST page whose caption line introduces it, so a body reference
-    ("as Figure 3 shows") never wins over the real caption.
+    Returns {(kind, label): {"path", "page", "caption"}}, the label as
+    `caption_kind` reads it. A label is rendered from the FIRST page whose
+    caption line introduces it, so a body reference ("as Figure 3 shows") never
+    wins over the real caption.
 
-    `only` restricts rendering to those numbers — used to fill the specific figures
-    the HTML could not supply, without re-rendering the ones it already did.
+    `only` restricts rendering to those figure labels — used to fill the specific
+    figures the HTML could not supply, without re-rendering the ones it already
+    did.
     """
     import fitz
 
     os.makedirs(out_dir, exist_ok=True)
+    wanted = None if only is None else {ef._label_key(n) for n in only}
     doc = fitz.open(pdf_path)
     try:
         head_text, foot_text = learn_furniture(doc)
+        body_size = document_body_size(doc)
         found = {}
         for pno in range(doc.page_count):
             page = doc[pno]
@@ -558,11 +661,12 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
                 if seen is None:
                     continue
                 kind, num = seen
-                if only is not None and (kind != "figure" or num not in only):
+                if wanted is not None and (kind != "figure"
+                                           or ef._label_key(num) not in wanted):
                     continue
                 if base_kind(kind) not in kinds or (kind, num) in found:
                     continue
-                rect = crop_box(page, kind, num, band)
+                rect = crop_box(page, kind, num, band, body_size)
                 if rect is None:
                     continue
                 out = os.path.join(out_dir, f"{kind}{num}.png")
@@ -603,7 +707,6 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     """Render from the PDF and insert each image after its first mention."""
     import time
 
-    import extract_paper_figures as ef
     import verify_sections as vs
     from notion_upload import upload_image
     from translate_fulltext import notion
@@ -611,8 +714,7 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     blocks = vs.fetch_blocks(page_id)
 
     def _img_caption(b):
-        return "".join(c.get("plain_text", "") for c in
-                       ((b.get("image") or {}).get("caption") or [])).strip().lower()
+        return _image_caption(b).strip().lower()
 
     def _img_kind(b):
         # Extended Data is counted apart: a page holding the main figures says
@@ -635,10 +737,10 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     if only is not None:
         present = set()
         for b in page_images:
-            m = re.match(r"\s*(?:figure|fig\.?|그림)\s*0*(\d+)", _img_caption(b))
-            if m:
-                present.add(int(m.group(1)))
-        only = {n for n in only if n not in present}
+            label = _image_figure_label(_image_caption(b))
+            if label is not None:
+                present.add(ef._label_key(label))
+        only = {n for n in only if ef._label_key(n) not in present}
         if not only:
             rep = {"page": page_id, "existing": have, "kinds": [], "found": 0,
                    "placed": 0, "replaced": 0, "text_archived": 0,
@@ -682,30 +784,9 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
                 time.sleep(0.2)
             blocks = vs.fetch_blocks(page_id)
 
-    # Resolve every anchor first, then fill the gaps: a figure the body never
-    # cites belongs beside its neighbours, not at the end of the page. Shared
-    # with the HTML path so the two cannot drift.
-    import extract_paper_figures as _ef
-    resolved = {key: _anchor_for(key[0], key[1], blocks) for key in media}
-    for kind_ in {k for k, _n in media}:
-        nums = [n for k, n in media if k == kind_]
-        filled = _ef.fill_anchor_gaps(nums, {n: resolved[(kind_, n)] for n in nums})
-        for n in nums:
-            resolved[(kind_, n)] = filled.get(n)
-    # Then the figures already on the page, which are the only neighbours when a
-    # run is injecting just the missing numbers.
-    placed = _placed_figures(blocks)
-    for (kind_, n), anchor in list(resolved.items()):
-        if anchor or kind_ != "figure":
-            continue
-        spot = _ef.neighbour_spot(n, placed)
-        if spot is None:
-            continue
-        at, side = spot
-        at = at if side == "after" else max(at - 1, 0)
-        resolved[(kind_, n)] = blocks[at]["id"]
+    resolved = placements(list(media), blocks)
     groups, order = {}, []
-    for (kind, num) in sorted(media, key=lambda k: (k[0], k[1])):
+    for (kind, num) in sorted(media, key=_float_order):
         item = media[(kind, num)]
         anchor = resolved.get((kind, num)) or "__end__"
         if anchor not in groups:
@@ -907,32 +988,96 @@ def _archive_flattened_tables(page_id: str, blocks: list, apply: bool) -> int:
     return len(doomed)
 
 
-def _placed_figures(blocks: list) -> dict:
-    """{figure number: index of its image block} for figures already on the page."""
-    import extract_paper_figures as ef
+def _image_caption(block: dict) -> str:
+    """The plain text of an image block's caption."""
+    return "".join(s.get("plain_text", "") for s in
+                   ((block.get("image") or {}).get("caption") or []))
 
+
+def _lettered_figure(caption: str):
+    """The lettered figure label this caption opens with (`lettered_caption`), or None."""
+    seen = lettered_caption(caption)
+    return seen[1] if seen and seen[0] == "figure" else None
+
+
+def _image_figure_label(caption: str):
+    """The figure label an image caption opens with, for telling what is placed."""
+    found = re.match(r"\s*(?:figure|fig\.?|그림)\s*0*(\d+)", caption.lower())
+    return int(found.group(1)) if found else _lettered_figure(caption)
+
+
+def _placed_figures(blocks: list) -> dict:
+    """{figure label: index of its image block} for figures already on the page."""
     found = {}
     for i, b in enumerate(blocks):
         if b.get("type") != "image":
             continue
-        caption = "".join(s.get("plain_text", "") for s in
-                          ((b.get("image") or {}).get("caption") or []))
+        caption = _image_caption(b)
         seen = ef.caption_number(caption) or ef.caption_number(caption + ":")
         if seen and seen[0] == "figure":
             found[seen[1]] = i
+        elif _lettered_figure(caption):
+            found[_lettered_figure(caption)] = i
     return found
 
 
-def _anchor_for(kind: str, num: int, blocks: list):
-    """Block to insert after: the first body mention of this figure/table."""
-    import extract_paper_figures as ef
+def _neighbour_spot(label, placed: dict):
+    """`ef.neighbour_spot` among the placed figures in `label`'s own series.
 
+    The series is the label's letter (`ef._series_key`); numbered labels are one
+    series of their own.
+    """
+    series, index = ef._series_key(label)
+    same = {ef._series_key(n)[1]: at for n, at in placed.items()
+            if isinstance(n, int) == isinstance(label, int)
+            and ef._series_key(n)[0] == series}
+    return ef.neighbour_spot(index, same)
+
+
+def _float_order(key):
+    """Sort key for (kind, label): by kind, then series and number."""
+    return key[0], ef._series_key(key[1]), str(key[1])
+
+
+def placements(keys: list, blocks: list) -> dict:
+    """{(kind, label): id of the block to insert after, or None for the page end}.
+
+    The first mention (`_anchor_for`); else the anchor of a neighbour in the same
+    batch and series (`ef.fill_anchor_gaps`); else, for a figure, beside the
+    figures of its series already on the page (`_neighbour_spot`).
+    """
+    resolved = {key: _anchor_for(key[0], key[1], blocks) for key in keys}
+    for kind_ in {k for k, _n in keys}:
+        nums = [n for k, n in keys if k == kind_]
+        filled = ef.fill_anchor_gaps(nums, {n: resolved[(kind_, n)] for n in nums})
+        for n in nums:
+            resolved[(kind_, n)] = filled.get(n)
+    placed = _placed_figures(blocks)
+    for (kind_, n), anchor in list(resolved.items()):
+        if anchor or kind_ != "figure":
+            continue
+        spot = _neighbour_spot(n, placed)
+        if spot is None:
+            continue
+        at, side = spot
+        at = at if side == "after" else max(at - 1, 0)
+        resolved[(kind_, n)] = blocks[at]["id"]
+    return resolved
+
+
+def _anchor_for(kind: str, num, blocks: list):
+    """Block to insert after: the first body mention of this figure/table, else,
+    for a lettered label, the heading of the appendix its letter names."""
     if kind.startswith(ED_PREFIX):
         return _extended_data_anchor(base_kind(kind), num, blocks)
     # The same rule the HTML injectors read: a particle after the number, a
     # lowercase "fig. 5", an Extended Data mention that names another figure, and
     # another float's caption cross-referencing this one are all handled there.
-    return ef.first_mention(kind, num, blocks)
+    found = ef.first_mention(kind, num, blocks)
+    if found or isinstance(num, int):
+        return found
+    letter = _LETTERED.match(num)
+    return ef.appendix_anchor(letter.group(1), blocks) if letter else None
 
 
 # "Extended Data Fig. 3", "Extended Data Figs. 7–9", "Extended Data Table 1".
