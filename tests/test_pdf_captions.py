@@ -110,3 +110,16 @@ class TestASentenceIsAMention:
         assert pm.image_label("Figure 2 results") == ("figure", 2)
         assert pm.image_label("그림 S2: 보충 그림") == ("figure", "S2")
         assert pm.image_label("table 3 fits") == ("table", 3)
+
+
+def test_a_caption_ending_a_sentence_is_not_stitched_to_the_next_block():
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 300), "Figure 2: A caption that ends here.", fontsize=9)
+    page.insert_text((72, 322), "the next block runs on in the same size", fontsize=9)
+    assert len([b for b in page.get_text("dict")["blocks"]
+                if 280 < b["bbox"][1] < 330]) == 2
+    (box, _), = pm.caption_boxes(page, "figure", 2)
+    assert box[3] < 305

@@ -198,7 +198,8 @@ class TestPlacement:
     def test_an_unmentioned_one_joins_its_own_series_on_the_page(self):
         blocks = self.BLOCKS + [image("i2", "Figure 2: body"),
                                 image("s1", "Figure S1: supplementary")]
-        placed = pm.placements([("figure", "S5"), ("figure", 9)], blocks)
+        placed = pm.placements([("figure", "S5"), ("figure", 9)], blocks,
+                               {("figure", "S5"): "", ("figure", 9): ""})
         assert placed[("figure", "S5")] == "s1"
         assert placed[("figure", 9)] == "i2"
 
@@ -237,7 +238,8 @@ class TestOrderingMixedLabels:
         blocks = [para("p", "본문 " * 600), para("m", "Figure S2와 그림 2를 보라.")]
         monkeypatch.setattr(vs, "fetch_blocks", lambda _: blocks)
         monkeypatch.setattr(pm, "fetch_pdf", lambda *_: "paper.pdf")
-        media = {key: {"path": "x.png", "page": 1, "caption": "c", "box": [0, 0, 1, 1]}
+        media = {key: {"path": "x.png", "page": 1, "caption": "c", "box": [0, 0, 1, 1],
+                       "roman": ""}
                  for key in (("figure", "S2"), ("table", "A.1"), ("figure", 2))}
         monkeypatch.setattr(pm, "render_media", lambda *a, **k: dict(media))
         rep = pm.inject("p", "paper.pdf", apply=False, keep_text=True)
@@ -277,3 +279,101 @@ class TestOnlyAndWarnings:
 
 def test_a_dotted_label_is_no_neighbour_of_a_number():
     assert pm._neighbour_spot(5, {"3.1": 4}) is None
+
+
+def test_a_lettered_label_finds_its_neighbour_in_its_own_letter_only():
+    assert pm._neighbour_spot("S3", {"S1": 3, "A2": 7}) == (3, "after")
+
+
+class TestRomanTables:
+    """A table printed `TABLE IV` is keyed 4 and placed at a `Table IV` mention."""
+
+    BLOCKS = [para("p", "본문 " * 600),
+              para("en", "As shown in Table IV, both methods converge."),
+              para("ko", "표 IV에서 보듯이 두 방법 모두 수렴한다.")]
+
+    def test_the_rendered_table_keeps_its_numeral(self, tmp_path):
+        media = render(tmp_path, [[("TABLE IV Results of both runs.", BOX)],
+                                  [("Table 2: Arabic.", BOX)]])
+        assert media[("table", 4)]["roman"] == "iv"
+        assert media[("table", 2)]["roman"] == ""
+
+    def test_it_is_placed_at_its_mention(self):
+        assert pm.placements([("table", 4)], self.BLOCKS,
+                             {("table", 4): "iv"}) == {("table", 4): "en"}
+
+    def test_it_is_placed_at_a_korean_mention(self):
+        assert pm.placements([("table", 4)], self.BLOCKS[:1] + self.BLOCKS[2:],
+                             {("table", 4): "iv"}) == {("table", 4): "ko"}
+
+    def test_an_arabic_table_is_not_placed_at_a_roman_mention(self):
+        assert pm.placements([("table", 4)], self.BLOCKS,
+                             {("table", 4): ""}) == {("table", 4): None}
+
+    def test_a_dry_run_plans_it_after_its_mention(self, monkeypatch):
+        monkeypatch.setattr(vs, "fetch_blocks", lambda _: self.BLOCKS)
+        monkeypatch.setattr(pm, "fetch_pdf", lambda *_: "paper.pdf")
+        media = {("table", 4): {"path": "x.png", "page": 1, "caption": "c",
+                                "box": [0, 0, 1, 1], "roman": "iv"}}
+        monkeypatch.setattr(pm, "render_media", lambda *a, **k: dict(media))
+        rep = pm.inject("p", "paper.pdf", apply=False, keep_text=True,
+                        kinds=("table",))
+        assert rep["planned"] == [{"kind": "table", "label": 4, "after": "en"}]
+
+
+class TestContinuedTables:
+
+    def test_a_continuation_line_is_no_caption(self):
+        for text in ("Table A9 – continued from previous page",
+                     "TABLE III (Continued)", "Table 5: (continued)",
+                     "Table 2 cont'd", "Table 6. Continued."):
+            assert pm.caption_kind(text) is None, text
+
+    def test_a_caption_on_continued_work_is_one(self):
+        assert pm.caption_kind("Table 4: Continued pretraining on more data.") == (
+            "table", 4)
+
+    def test_the_table_renders_from_its_caption_not_its_continuation(self, tmp_path):
+        path = tmp_path / "paper.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=PAGE[0], height=PAGE[1])
+        page.insert_text((60, 50), "Table 7 - continued from previous page",
+                         fontsize=8)
+        page.draw_rect(fitz.Rect(*BOX), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+        page = doc.new_page(width=PAGE[0], height=PAGE[1])
+        page.insert_text((60, 50), "Table 7: Settings of every run.", fontsize=8)
+        page.draw_rect(fitz.Rect(*BOX), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+        doc.save(path)
+        media = pm.render_media(str(path), str(tmp_path / "out"))
+        assert media[("table", 7)]["page"] == 2
+
+
+class TestWhatRenderMediaReports:
+
+    def test_only_names_figures_never_tables(self, tmp_path):
+        media = render(tmp_path, [[("Figure 1: A figure.", BOX)],
+                                  [("Table 1: A table.", BOX)]], only={1})
+        assert set(media) == {("figure", 1)}
+
+    def test_a_caption_read_but_not_found_fails_loudly(self, tmp_path, monkeypatch):
+        path = pdf(tmp_path, [[("Figure 1: A figure.", BOX)]])
+        monkeypatch.setattr(pm, "float_crop", lambda *a, **k: (None, None, None))
+        try:
+            pm.render_media(path, str(tmp_path / "out"))
+        except RuntimeError as err:
+            assert "figure 1 on page 1" in str(err)
+        else:
+            raise AssertionError("no error")
+
+    def test_inject_reports_what_it_did_not_render(self, monkeypatch):
+        blocks = [para("p", "본문 " * 600)]
+        monkeypatch.setattr(vs, "fetch_blocks", lambda _: blocks)
+        monkeypatch.setattr(pm, "fetch_pdf", lambda *_: "paper.pdf")
+        lost = {"kind": "table", "label": 3, "page": 2, "problem": pm.NO_TABLE_BESIDE}
+
+        def render_media(*a, unrendered, **k):
+            unrendered.append(lost)
+            return {}
+        monkeypatch.setattr(pm, "render_media", render_media)
+        rep = pm.inject("p", "paper.pdf", apply=False, keep_text=True)
+        assert rep["unrendered"] == [lost] and rep["found"] == 0

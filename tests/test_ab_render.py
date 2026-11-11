@@ -137,3 +137,26 @@ class TestUnrendered:
         entry["rendered"] = {"base": [], "branch": []}
         assert ("unrendered paper figure|'S1' p2: base not read; branch x"
                 in ab.summary_table({"paper": entry}).splitlines())
+
+
+def test_a_rendered_caption_is_not_listed_unrendered(tmp_path):
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.draw_rect(fitz.Rect(150, 80, 460, 260), color=(0, 0, 0),
+                   fill=(0.2, 0.4, 0.8))
+    page.insert_text((150, 280), "Figure 1: A figure with its drawing.", fontsize=9)
+    text = ("Body prose fills the column with justified lines of ordinary words "
+            "so that every line runs the full measure. ") * 4
+    page.insert_textbox(fitz.Rect(72, 300, 540, 420), text, fontsize=10,
+                        align=fitz.TEXT_ALIGN_JUSTIFY)
+    page.insert_text((72, 434), "Figure 7: A caption whose figure is elsewhere.",
+                     fontsize=9)
+    page.insert_textbox(fitz.Rect(72, 446, 540, 600), text, fontsize=10,
+                        align=fitz.TEXT_ALIGN_JUSTIFY)
+    path = tmp_path / "two.pdf"
+    doc.save(path)
+    result = ab.render_side(SCRIPTS, str(path), str(tmp_path / "out"))
+    assert list(result["media"]) == ["figure|1"]
+    assert list(result["unrendered"]) == ["figure|7"]
