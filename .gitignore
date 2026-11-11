@@ -67,6 +67,7 @@ groups/main/research-papers/*
 !groups/main/research-papers/sweep_batch_queue.py
 !groups/main/research-papers/latexml_math.py
 !groups/main/research-papers/systemd/
+!groups/main/research-papers/tools/
 
 # Secrets & personal data (public repo — see scripts/check-sensitive.sh)
 *.keys.json

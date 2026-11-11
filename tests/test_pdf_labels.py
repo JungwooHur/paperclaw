@@ -59,6 +59,77 @@ class TestLetteredLabelsAreRendered:
         assert box[0] <= 60 and box[1] <= 60 and box[2] >= 500 and box[3] >= 250
 
 
+class TestTheCaptionStylesNumbersAccept:
+    """A lettered, dotted or roman label is read in every style a number is."""
+
+    def test_a_pipe_after_the_label(self, tmp_path):
+        media = render(tmp_path, [[("Figure A1 | Grid over cycle length.", BOX)]])
+        assert ("figure", "A1") in media
+
+    def test_no_separator(self, tmp_path):
+        media = render(tmp_path, [[("Figure S3 Caption that runs straight on.", BOX)]])
+        assert ("figure", "S3") in media
+
+    def test_upper_case(self, tmp_path):
+        media = render(tmp_path, [[("FIGURE S4. An upper-case caption.", BOX)]])
+        assert ("figure", "S4") in media
+
+    def test_a_dotted_number(self, tmp_path):
+        media = render(tmp_path, [[("Figure 3.1: A chapter-numbered figure.", BOX)]])
+        assert ("figure", "3.1") in media
+
+    def test_a_roman_table_number(self, tmp_path):
+        doc = fitz.open()
+        page = doc.new_page(width=PAGE[0], height=PAGE[1])
+        page.insert_text((250, 60), "TABLE IV", fontsize=8)
+        page.insert_text((200, 72), "RESULTS ON THE REAL ROBOT", fontsize=8)
+        page.draw_rect(fitz.Rect(*BOX[:1], 80, *BOX[2:]), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        path = tmp_path / "paper.pdf"
+        doc.save(path)
+        media = pm.render_media(str(path), str(tmp_path / "out"))
+        assert ("table", 4) in media
+
+
+class TestASentenceIsNotACaption:
+    """A body paragraph that opens with a float label is a mention of it."""
+
+    def test_an_earlier_mention_does_not_take_the_label(self, tmp_path):
+        doc = fitz.open()
+        page = doc.new_page(width=PAGE[0], height=PAGE[1])
+        page.insert_textbox(fitz.Rect(60, 400, 500, 600),
+                            "Table II examines the performance of the method on "
+                            "the real robot across every setting we tried.",
+                            fontsize=10)
+        page.draw_rect(fitz.Rect(60, 610, 500, 700), color=(0, 0, 0))
+        page = doc.new_page(width=PAGE[0], height=PAGE[1])
+        page.insert_text((250, 60), "TABLE II", fontsize=8)
+        page.draw_rect(fitz.Rect(60, 80, 500, 250), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        path = tmp_path / "paper.pdf"
+        doc.save(path)
+        media = pm.render_media(str(path), str(tmp_path / "out"))
+        assert media[("table", 2)]["page"] == 2
+
+    def test_a_mention_above_the_caption_on_its_page(self, tmp_path):
+        doc = fitz.open()
+        page = doc.new_page(width=PAGE[0], height=PAGE[1])
+        page.insert_textbox(fitz.Rect(60, 60, 300, 300),
+                            "Figure 6 shows these results for both data sets, "
+                            "and the variance across annotators is small. "
+                            + "Every line of this paragraph runs the full measure "
+                            "of its column, as body prose does. " * 4,
+                            fontsize=10, align=fitz.TEXT_ALIGN_JUSTIFY)
+        page.draw_rect(fitz.Rect(320, 60, 520, 250), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((320, 268), "Figure 6: Variance across annotators.",
+                         fontsize=8)
+        path = tmp_path / "paper.pdf"
+        doc.save(path)
+        box = pm.render_media(str(path), str(tmp_path / "out"))[("figure", 6)]["box"]
+        assert box[0] >= 300 and box[1] <= 60
+
+
 class TestNumberedLabelsAreUnchanged:
 
     def test_a_numbered_figure_keeps_an_integer_key(self, tmp_path):
@@ -151,6 +222,27 @@ class TestFillingOnlyWhatIsMissing:
             AssertionError("fetched the PDF for a figure already placed")))
         rep = pm.inject("p", "paper.pdf", apply=False, kinds=("figure",), only={2})
         assert rep.get("skipped_existing")
+
+
+class TestOrderingMixedLabels:
+
+    def test_numbered_floats_come_before_each_lettered_series(self):
+        keys = [("figure", "S10"), ("figure", "S2"), ("figure", 10),
+                ("figure", "A1"), ("figure", 2), ("table", 1), ("table", "A.1")]
+        assert sorted(keys, key=pm._float_order) == [
+            ("figure", 2), ("figure", 10), ("figure", "A1"), ("figure", "S2"),
+            ("figure", "S10"), ("table", 1), ("table", "A.1")]
+
+    def test_a_dry_run_plans_each_float_in_that_order(self, monkeypatch, tmp_path):
+        blocks = [para("p", "본문 " * 600), para("m", "Figure S2와 그림 2를 보라.")]
+        monkeypatch.setattr(vs, "fetch_blocks", lambda _: blocks)
+        monkeypatch.setattr(pm, "fetch_pdf", lambda *_: "paper.pdf")
+        media = {key: {"path": "x.png", "page": 1, "caption": "c", "box": [0, 0, 1, 1]}
+                 for key in (("figure", "S2"), ("table", "A.1"), ("figure", 2))}
+        monkeypatch.setattr(pm, "render_media", lambda *a, **k: dict(media))
+        rep = pm.inject("p", "paper.pdf", apply=False, keep_text=True)
+        assert [(p["kind"], p["label"]) for p in rep["planned"]] == [
+            ("figure", 2), ("figure", "S2"), ("table", "A.1")]
 
 
 def test_the_label_rule_is_the_html_injectors():

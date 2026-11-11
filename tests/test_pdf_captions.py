@@ -3,13 +3,17 @@
 Papers punctuate captions differently and the differences are invisible until a
 whole paper comes out with no figures. Two forms have already cost this project
 a silent zero: the short word (`Fig. 7:` where only `Figure 7:` was accepted),
-and now a caption with no separator at all (`Figure 1 Language modeling…`).
+and a caption with no separator at all (`Figure 1 Language modeling…`). A label
+that is not a plain number (`S2`, `B.1`, `3.1`, `TABLE IV`) is read in each of
+those styles too, and a body sentence that opens with a label is not a caption.
 """
+import pytest
+
 import extract_pdf_media as pm
 
 
 def matches(text, num=1, kind="figure"):
-    return bool(pm.caption_opener(kind, num).match(text))
+    return pm.opens_caption(text, kind, num)
 
 
 class TestThePunctuatedForms:
@@ -19,6 +23,9 @@ class TestThePunctuatedForms:
 
     def test_a_period_after_the_number(self):
         assert matches("Figure 1. Language modeling performance")
+
+    def test_a_pipe_after_the_number(self):
+        assert matches("Fig. 1 | Language modeling performance")
 
     def test_the_short_word(self):
         assert matches("Fig. 1: Language modeling performance")
@@ -57,32 +64,49 @@ class TestNotMatchingTheWrongFigure:
     def test_a_table_is_not_a_figure(self):
         assert not matches("Table 1: Something")
 
+    def test_a_dotted_label_is_not_its_chapter_number(self):
+        assert not matches("Figure 3.1: Something", num=3)
 
-class TestTheScanThatEnumeratesThem:
-    """`caption_opener` locates one number's caption; this one sweeps a page for
-    whatever it finds. They must agree — when only one of them learned about
-    `Fig.`, the other kept the whole PDF path at zero, and the same happened
-    again with the missing separator."""
 
-    def test_it_finds_a_caption_with_no_separator(self):
-        m = pm.ANY_CAPTION.match("Figure 1 Language modeling performance")
-        assert m and m.group(2) == "1"
+class TestTheLabelAsPrinted:
 
-    def test_it_still_finds_a_punctuated_one(self):
-        m = pm.ANY_CAPTION.match("Fig. 4: Left: the loss")
-        assert m and m.group(2) == "4"
+    @pytest.mark.parametrize("text, expected", [
+        ("Figure S2: A supplementary figure.", ("figure", "S2")),
+        ("Figure B.1. An appendix figure.", ("figure", "B.1")),
+        ("Table A.1: An appendix table.", ("table", "A.1")),
+        ("Figure A1 | Grid over cycle length.", ("figure", "A1")),
+        ("Figure   A4   |   Comparison to prior fits.", ("figure", "A4")),
+        ("Figure S3 Caption that runs straight on.", ("figure", "S3")),
+        ("FIGURE S4. An upper-case caption.", ("figure", "S4")),
+        ("Figure 3.1: A chapter-numbered figure.", ("figure", "3.1")),
+        ("Table G.10: A two-digit appendix table.", ("table", "G.10")),
+        ("TABLE IV", ("table", 4)),
+        ("TABLE   II   Results on the real robot", ("table", 2)),
+        ("Extended Data Fig. 3 | A journal figure.", ("ed_figure", 3)),
+        ("Extended Data Table 2: A journal table.", ("ed_table", 2)),
+    ])
+    def test_it_is_read(self, text, expected):
+        assert pm.caption_kind(text) == expected
 
-    def test_it_tells_a_table_from_a_figure(self):
-        m = pm.ANY_CAPTION.match("Table 3 Fits to the data")
-        assert m and m.group(1).lower().startswith("tab")
+    def test_a_numbered_label_is_an_int(self):
+        assert pm.caption_kind("Figure 12 Something") == ("figure", 12)
 
-    def test_it_reads_the_whole_number(self):
-        m = pm.ANY_CAPTION.match("Figure 12 Something")
-        assert m and m.group(2) == "12"
+    def test_a_figure_is_never_roman(self):
+        assert pm.caption_kind("Figure I: Something") is None
 
-    def test_it_agrees_with_the_single_number_matcher(self):
-        for text in ("Figure 1 no separator", "Fig. 1: punctuated",
-                     "Figure 1. period", "Figure   1   spaced"):
-            swept = pm.ANY_CAPTION.match(text)
-            assert swept and swept.group(2) == "1", text
-            assert pm.caption_opener("figure", 1).match(text), text
+
+class TestASentenceIsAMention:
+
+    @pytest.mark.parametrize("text", [
+        "Figure 6 shows these results for both data sets.",
+        "Table II examines the performance of the algorithm.",
+        "Figure S2 compares the two runs.",
+        "Table 2, the largest of them, lists every setting.",
+    ])
+    def test_it_opens_no_caption(self, text):
+        assert pm.caption_kind(text) is None
+
+    def test_an_image_caption_is_read_however_it_continues(self):
+        assert pm.image_label("Figure 2 results") == ("figure", 2)
+        assert pm.image_label("그림 S2: 보충 그림") == ("figure", "S2")
+        assert pm.image_label("table 3 fits") == ("table", 3)
