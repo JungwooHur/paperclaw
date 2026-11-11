@@ -15,9 +15,14 @@ in one of four categories:
   changed    rendered on both, on another page or with a box that moved
   same       rendered on both with the same box
 
+A caption a side reads (its own `caption_kind`) and renders nothing for is
+that side's `unrendered`, with the problem it reported (None when it reported
+none, or cannot report).
+
 Written under `--out`:
 
-  report.json             {pdf: {category: [{key, page, base, branch, delta}]}}
+  report.json             {pdf: {category: [{key, page, base, branch, delta}],
+                                 "unrendered": {side: {key: {page, problem}}}}}
   sheets/<category>-NN.png  one row per float: its page with the base box in red
                           and the branch box in green, then the base crop and
                           the branch crop
@@ -42,7 +47,7 @@ BOX_TOL = 0.5
 RELABEL_OVERLAP = 0.5
 
 _ROW_HEIGHT = 560
-_PAGE_ZOOM = 0.7
+_THUMB_WIDTH = 428
 _CROP_WIDTH = 620
 _LABEL_HEIGHT = 18
 _RED = (0.85, 0.05, 0.05)
@@ -115,23 +120,48 @@ def compare(base: dict, branch: dict, tol: float = BOX_TOL) -> dict:
 
 
 def render_one(scripts_dir: str, pdf: str, out_dir: str) -> dict:
-    """Runs `render_media` from `scripts_dir` on `pdf` in this process."""
+    """Runs `render_media` from `scripts_dir` on `pdf` in this process.
+
+    Returns {"media": {key: {page, box, path}}, "unrendered": {key: {page,
+    problem}}}.
+    """
+    import inspect
+
+    import fitz
+
     sys.path.insert(0, scripts_dir)
     import extract_pdf_media as pm
 
     here = os.path.dirname(os.path.abspath(pm.__file__))
     if here != os.path.abspath(scripts_dir):
         raise RuntimeError(f"imported {pm.__file__}, not the copy in {scripts_dir}")
-    media = pm.render_media(pdf, out_dir)
-    return {key_of(kind, label): {"page": item["page"], "box": item["box"],
-                                  "path": item["path"]}
-            for (kind, label), item in media.items()}
+    reported = []
+    if "unrendered" in inspect.signature(pm.render_media).parameters:
+        media = pm.render_media(pdf, out_dir, unrendered=reported)
+    else:
+        media = pm.render_media(pdf, out_dir)
+    media = {key_of(kind, label): {"page": item["page"], "box": item["box"],
+                                   "path": item["path"]}
+             for (kind, label), item in media.items()}
+    problems = {key_of(u["kind"], u["label"]): u["problem"] for u in reported}
+    unrendered = {}
+    with fitz.open(pdf) as doc:
+        for pno in range(doc.page_count):
+            for b in doc[pno].get_text("dict")["blocks"]:
+                if b.get("type") != 0:
+                    continue
+                seen = pm.caption_kind(pm._block_text(b))
+                key = None if seen is None else key_of(*seen)
+                if key is None or key in media or key in unrendered:
+                    continue
+                unrendered[key] = {"page": pno + 1, "problem": problems.get(key)}
+    return {"media": media, "unrendered": unrendered}
 
 
 def render_side(scripts_dir: str, pdf: str, out_dir: str) -> dict:
     """`render_one` in a subprocess, so each side imports its own scripts."""
     os.makedirs(out_dir, exist_ok=True)
-    result = os.path.join(out_dir, "media.json")
+    result = os.path.join(out_dir, "render.json")
     proc = subprocess.run(
         [sys.executable, os.path.abspath(__file__), "--render-one", scripts_dir,
          pdf, out_dir], capture_output=True, text=True, check=False)
@@ -159,9 +189,10 @@ def export_base(ref: str, out_root: str) -> tuple:
 
 
 def ab_one(pdf: str, base_root: str, branch_root: str) -> dict:
+    """`compare` of one PDF's two sides, with each side's unrendered captions."""
     stem = os.path.splitext(os.path.basename(pdf))[0]
     base_out = os.path.join(base_root, "media", stem)
-    cached = os.path.join(base_out, "media.json")
+    cached = os.path.join(base_out, "render.json")
     if os.path.exists(cached):
         with open(cached, encoding="utf-8") as fh:
             base = json.load(fh)
@@ -169,12 +200,20 @@ def ab_one(pdf: str, base_root: str, branch_root: str) -> dict:
         base = render_side(os.path.join(base_root, "src", SCRIPTS_IN_REPO), pdf,
                            base_out)
     branch = render_side(SCRIPTS, pdf, os.path.join(branch_root, stem))
-    return compare(base, branch)
+    out = compare(base["media"], branch["media"])
+    out["unrendered"] = {"base": base["unrendered"], "branch": branch["unrendered"]}
+    out["rendered"] = {"base": sorted(base["media"]), "branch": sorted(branch["media"])}
+    return out
 
 
 def _fit(rect_w: float, rect_h: float, w: float, h: float) -> tuple:
     scale = min(rect_w / w, rect_h / h, 1.0)
     return w * scale, h * scale
+
+
+def thumb_zoom(width: float, height: float) -> float:
+    """Zoom of a page thumbnail: `_THUMB_WIDTH` wide, or less to fit the row."""
+    return min(_THUMB_WIDTH / width, (_ROW_HEIGHT - _LABEL_HEIGHT - 8) / height)
 
 
 def _row(sheet, y: float, pdf: str, row: dict, doc_cache: dict) -> None:
@@ -188,15 +227,16 @@ def _row(sheet, y: float, pdf: str, row: dict, doc_cache: dict) -> None:
              + (f"  delta {row['delta']}" if row["delta"] else ""))
     sheet.insert_text((8, y + 13), title, fontsize=11)
     top = y + _LABEL_HEIGHT
-    pix = page.get_pixmap(matrix=fitz.Matrix(_PAGE_ZOOM, _PAGE_ZOOM), alpha=False)
+    zoom = thumb_zoom(page.rect.width, page.rect.height)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     sheet.insert_image(fitz.Rect(8, top, 8 + pix.width, top + pix.height), pixmap=pix)
     for item, color in ((row["base"], _RED), (row["branch"], _GREEN)):
         if item is None or item["page"] != row["page"]:
             continue
-        box = [v * _PAGE_ZOOM for v in item["box"]]
+        box = [v * zoom for v in item["box"]]
         sheet.draw_rect(fitz.Rect(8 + box[0], top + box[1], 8 + box[2], top + box[3]),
                         color=color, width=2)
-    x = 16 + pix.width
+    x = 16 + _THUMB_WIDTH
     for item, color, name in ((row["base"], _RED, "base"),
                               (row["branch"], _GREEN, "branch")):
         sheet.insert_text((x, top + 12), name if item else f"{name}: none",
@@ -221,7 +261,7 @@ def contact_sheets(report: dict, pdfs: dict, out_dir: str, per_sheet: int) -> li
         if name.endswith(".png"):
             os.remove(os.path.join(out_dir, name))
     written, doc_cache = [], {}
-    page_w = 8 + 612 * _PAGE_ZOOM + 2 * (_CROP_WIDTH + 12) + 16
+    page_w = 8 + _THUMB_WIDTH + 2 * (_CROP_WIDTH + 12) + 16
     for category in SHEET_CATEGORIES:
         rows = [(stem, row) for stem in sorted(report)
                 for row in report[stem][category]]
@@ -242,16 +282,44 @@ def contact_sheets(report: dict, pdfs: dict, out_dir: str, per_sheet: int) -> li
     return written
 
 
+UNRENDERED_COLUMNS = ("unr base", "unr branch", "silent")
+
+
+def _unrendered_counts(entry: dict) -> dict:
+    """{column: count}: each side's unrendered captions, and the branch's that
+    carry no problem."""
+    base, branch = entry["unrendered"]["base"], entry["unrendered"]["branch"]
+    return {"unr base": len(base), "unr branch": len(branch),
+            "silent": sum(1 for u in branch.values() if u["problem"] is None)}
+
+
 def summary_table(report: dict) -> str:
-    """One line per PDF and a total: the count in each category."""
-    lines = [f"{'pdf':<28}" + "".join(f"{c:>10}" for c in CATEGORIES)]
-    totals = dict.fromkeys(CATEGORIES, 0)
+    """One line per PDF and a total: the count in each category and of
+    unrendered captions, then one line per caption either side leaves
+    unrendered."""
+    columns = CATEGORIES + UNRENDERED_COLUMNS
+    lines = [f"{'pdf':<28}" + "".join(f"{c:>11}" for c in columns)]
+    totals = dict.fromkeys(columns, 0)
     for stem in sorted(report):
         counts = {c: len(report[stem][c]) for c in CATEGORIES}
-        for c in CATEGORIES:
+        counts.update(_unrendered_counts(report[stem]))
+        for c in columns:
             totals[c] += counts[c]
-        lines.append(f"{stem:<28}" + "".join(f"{counts[c]:>10}" for c in CATEGORIES))
-    lines.append(f"{'TOTAL':<28}" + "".join(f"{totals[c]:>10}" for c in CATEGORIES))
+        lines.append(f"{stem:<28}" + "".join(f"{counts[c]:>11}" for c in columns))
+    lines.append(f"{'TOTAL':<28}" + "".join(f"{totals[c]:>11}" for c in columns))
+    for stem in sorted(report):
+        sides, rendered = report[stem]["unrendered"], report[stem]["rendered"]
+
+        def _status(side, key):
+            if key in sides[side]:
+                return sides[side][key]["problem"]
+            return "rendered" if key in rendered[side] else "not read"
+
+        for key in sorted(set(sides["base"]) | set(sides["branch"])):
+            page = (sides["branch"].get(key) or sides["base"].get(key))["page"]
+            lines.append(f"unrendered {stem} {key} p{page}: "
+                         f"base {_status('base', key)}; "
+                         f"branch {_status('branch', key)}")
     return "\n".join(lines)
 
 
@@ -259,9 +327,9 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--render-one"]:
         scripts_dir, pdf, out_dir = argv[1:4]
-        media = render_one(scripts_dir, pdf, out_dir)
-        with open(os.path.join(out_dir, "media.json"), "w", encoding="utf-8") as fh:
-            json.dump(media, fh, indent=1)
+        result = render_one(scripts_dir, pdf, out_dir)
+        with open(os.path.join(out_dir, "render.json"), "w", encoding="utf-8") as fh:
+            json.dump(result, fh, indent=1)
         return 0
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("pdfs", nargs="+", help="local PDF files")

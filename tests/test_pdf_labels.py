@@ -248,3 +248,32 @@ class TestOrderingMixedLabels:
 def test_the_label_rule_is_the_html_injectors():
     caption = "Figure B.1. An appendix figure."
     assert pm.caption_kind(caption) == ("figure", ef.figure_label("", caption))
+
+
+class TestOnlyAndWarnings:
+
+    def test_only_names_a_label_however_it_is_written(self, tmp_path):
+        media = render(tmp_path, [[("Figure 2: A numbered figure.", BOX)],
+                                  [("Figure S1: A supplementary figure.", BOX)]],
+                       only={"02", "s1"})
+        assert set(media) == {("figure", 2), ("figure", "S1")}
+
+    def test_a_label_rendered_on_another_page_is_not_reported(self, tmp_path, capsys):
+        path = tmp_path / "paper.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=PAGE[0], height=PAGE[1])
+        page.insert_text((60, 300), "Figure 3: A caption before its figure.",
+                         fontsize=8)
+        page = doc.new_page(width=PAGE[0], height=PAGE[1])
+        page.draw_rect(fitz.Rect(*BOX), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+        page.insert_text((BOX[0], BOX[3] + 18), "Figure 3: The figure.", fontsize=8)
+        doc.save(path)
+        unrendered = []
+        media = pm.render_media(str(path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert media[("figure", 3)]["page"] == 2
+        assert unrendered == [] and "WARN" not in capsys.readouterr().err
+
+
+def test_a_dotted_label_is_no_neighbour_of_a_number():
+    assert pm._neighbour_spot(5, {"3.1": 4}) is None
