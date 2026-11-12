@@ -2276,3 +2276,541 @@ def test_small_print_running_on_past_the_caption_beside_a_figure_is_left_out(tmp
     box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
         ("figure", 14)]["box"]
     assert box[2] <= LEFT[1] + pm._PAD and box[1] <= 60
+
+
+class TestSmallPrintProseInTheOtherColumn:
+    """A two-column first page: a 9 pt abstract (body 10 pt) in the left
+    column beside a right-column figure, a heading under it."""
+
+    def page(self, doc):
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        abstract = prose(page, LEFT[0], LEFT[1], 400, size=9)
+        page.insert_text((LEFT[0], 430), "1. Introduction", fontsize=12)
+        page.draw_rect(fitz.Rect(330, 100, 530, 380), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((RIGHT[0], 410), "Figure 1: Results of the experiments.",
+                         fontsize=9)
+        prose(page, RIGHT[0], RIGHT[1], 700)
+        return page, abstract
+
+    def test_the_layout_is_the_one_described(self):
+        doc = fitz.open()
+        page, abstract = self.page(doc)
+        caption = blocks_starting(page, "Figure 1")[0]
+        assert 100 < abstract[1] and abstract[3] < caption[1]
+        block = [b for b in page.get_text("dict")["blocks"]
+                 if tuple(b["bbox"]) == abstract][0]
+        body = pm.body_text(doc)
+        assert pm._is_barrier(block, body) and not pm._is_prose(block, body)
+
+    def test_the_figure_leaves_the_abstract_out(self, tmp_path):
+        doc = fitz.open()
+        self.page(doc)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 1)]["box"]
+        assert box[0] >= RIGHT[0] - pm._PAD and box[1] <= 100 and box[3] >= 380
+
+    def test_a_crop_holding_the_abstract_is_refused(self):
+        doc = fitz.open()
+        page, _ = self.page(doc)
+        caption = blocks_starting(page, "Figure 1")[0]
+        assert pm._crop_problem(page, fitz.Rect(48, 94, 536, caption[1]), "figure",
+                                1, caption, pm.body_text(doc)) == pm.HOLDS_PROSE
+
+
+def test_heading_size_lines_beside_a_short_caption_are_no_prose():
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(100, 160, 560, 300), color=(0, 0, 0))
+    for y in (130, 146):
+        page.insert_text((300, y), "the title of the panel at the right side",
+                         fontsize=12)
+    page.insert_text((100, 320), "Figure 5: A short caption.", fontsize=9)
+    caption = blocks_starting(page, "Figure 5")[0]
+    assert caption[2] < 300
+    assert pm._crop_problem(page, fitz.Rect(94, 94, 566, caption[1]), "figure", 5,
+                            caption, pm.body_text(doc)) is None
+
+
+def test_small_print_across_the_caption_beside_the_plot_is_kept(tmp_path):
+    # An 8 pt paragraph (body 10 pt) right of a plot, both over one caption.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(100, 100, 300, 300), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+    assert page.insert_textbox(fitz.Rect(320, 150, 520, 270), PROSE[:300], fontsize=8,
+                               align=fitz.TEXT_ALIGN_JUSTIFY) > 0
+    page.insert_text((100, 320), "Figure 8: A plot and a note on it, set side by side "
+                     "under one caption.", fontsize=9)
+    prose(page, 72, 540, 700)
+    note = [b for b in page.get_text("dict")["blocks"] if b["bbox"][0] >= 320][0]
+    assert pm._is_barrier(note, pm.body_text(doc)) and note["bbox"][3] < 300
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 8)]["box"]
+    assert box[1] <= 100 and box[2] >= note["bbox"][2]
+
+
+def test_a_running_heads_row_takes_only_the_lines_beside_it():
+    lines = [((175, 56, 420, 64), "A report"), ((122, 61.4, 182, 72.5), "North"),
+             ((128, 68.7, 175, 79.9), "extreme highs"),
+             ((139, 76.1, 164, 87.2), "Jun-Aug")]
+    assert pm._row_at(lines, 0) == (56, 72.5)
+    assert pm._row_at(lines, 3) == (68.7, 87.2)
+
+
+def clipped_fill(page, clip, top):
+    """A filled triangle from y `top` down to the bottom of `clip` (x0, y0, x1,
+    y1), drawn through `clip` as its clip path."""
+    doc, height = page.parent, page.rect.height
+    x0, y0, x1, y1 = clip
+    xref = doc.get_new_xref()
+    doc.update_object(xref, "<<>>")
+    doc.update_stream(xref, (f"q {x0} {height - y1} {x1 - x0} {y1 - y0} re W n "
+                             f"0.7 0.8 0.9 rg {x0} {height - y1} m "
+                             f"{x1} {height - top} l {x1} {height - y1} l f Q").encode())
+    doc.xref_set_key(page.xref, "Contents", "[" + " ".join(
+        f"{c} 0 R" for c in page.get_contents() + [xref]) + "]")
+
+
+class TestAFigureUnderTheRunningHead:
+    """Pages under one running head; on the last, a figure whose title rows
+    run from the head's row down to the plot."""
+
+    def doc(self, titles=True, plot_top=100):
+        doc = fitz.open()
+        for i in range(5):
+            page = doc.new_page(width=LETTER[0], height=LETTER[1])
+            page.insert_text((175, 62), "A REPORT ON WEATHER FORECASTS", fontsize=8)
+            prose(page, 72, 540, 700)
+        if titles:
+            for y in (70, 77.3, 84.7):
+                for x in (122, 255, 409):
+                    page.insert_text((x, y), "title of a column", fontsize=8)
+        page.draw_rect(fitz.Rect(300, plot_top, 520, 400), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((100, 420), "Figure 46: Scores of every region.", fontsize=9)
+        return doc
+
+    def test_the_layout_is_the_one_described(self):
+        page = self.doc()[-1]
+        lines = pm._page_lines(page)
+        head, first, last = lines[0][0], lines[1][0], lines[9][0]
+        assert first[1] < head[3] and last[1] - head[3] > pm._FURNITURE_GAP
+        assert all(b[1] < a[3] for (a, _), (b, _) in zip(lines[1:9], lines[2:10]))
+
+    def test_the_title_rows_are_kept(self, tmp_path):
+        box = pm.render_media(save(self.doc(), tmp_path), str(tmp_path / "out"))[
+            ("figure", 46)]["box"]
+        assert box[1] <= 61.4 and box[3] >= 400
+
+    def test_a_drawing_its_clip_keeps_under_the_band_is_cut_to_the_band(self, tmp_path):
+        doc = self.doc(titles=False)
+        clipped_fill(doc[-1], (300, 100, 520, 400), 40)
+        assert [tuple(d["rect"])[1] for d in doc[-1].get_drawings()] == [100, 40]
+        heads, feet = pm.learn_furniture(doc)
+        band = pm.furniture_band(doc[-1], heads, feet)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 46)]["box"]
+        assert band[0] <= box[1] <= 100
+
+    def test_a_clip_ends_with_its_own_drawing(self, tmp_path):
+        # A clipped fill under the caption, then one its clip leaves visible
+        # across the band.
+        doc = self.doc(titles=False)
+        clipped_fill(doc[-1], (300, 500, 520, 600), 500)
+        clipped_fill(doc[-1], (300, 60, 520, 400), 60)
+        heads, feet = pm.learn_furniture(doc)
+        assert pm.furniture_band(doc[-1], heads, feet)[0] > 60
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 46)]["box"]
+        assert box[1] <= 60
+
+    def test_the_band_cuts_no_element_across_it(self, tmp_path):
+        doc = self.doc(titles=False, plot_top=60)
+        heads, feet = pm.learn_furniture(doc)
+        band = pm.furniture_band(doc[-1], heads, feet)
+        assert 60 < band[0] < 400
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 46)]["box"]
+        assert box[1] <= 60
+
+
+class TestAnAlgorithmAboveAFigure:
+    """The right column: a ruled algorithm box, then a figure and its caption;
+    prose in the left column."""
+
+    def page(self, doc):
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, LEFT[0], LEFT[1], 400)
+        prose(page, LEFT[0], LEFT[1], 700)
+        page.draw_line((RIGHT[0], 56), (RIGHT[1], 56))
+        page.insert_text((RIGHT[0] + 4, 66), "Algorithm 1: Update rule",
+                         fontsize=10)
+        page.draw_line((RIGHT[0], 70), (RIGHT[1], 70))
+        for i in range(12):
+            page.insert_text((RIGHT[0] + 4, 84 + 16 * i), f"{i + 1}  update the state",
+                             fontsize=10)
+        page.draw_line((RIGHT[0], 282), (RIGHT[1], 282))
+        page.draw_rect(fitz.Rect(320, 330, 530, 440), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((RIGHT[0], 470), "Figure 3: Two views of the scene.",
+                         fontsize=8)
+        prose(page, RIGHT[0], RIGHT[1], 700)
+        return page
+
+    def test_the_figure_starts_under_the_algorithm(self, tmp_path):
+        doc = fitz.open()
+        self.page(doc)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 3)]["box"]
+        assert box[1] >= 282 and box[1] <= 330 and box[3] >= 440
+
+    def test_a_crop_holding_the_algorithm_is_refused(self):
+        doc = fitz.open()
+        page = self.page(doc)
+        caption = blocks_starting(page, "Figure 3")[0]
+        assert pm._crop_problem(page, fitz.Rect(300, 50, 548, caption[1]), "figure",
+                                3, caption, pm.body_text(doc)) == pm.HOLDS_FLOAT
+
+
+_GLYPH_NAMES = {" ": "space", ":": "colon", ".": "period", **{
+    str(i): name for i, name in enumerate(
+        ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+         "nine"))}}
+
+
+def descending_caption_page(doc, x, y, text, size):
+    """A new page whose first text is `text` at baseline (x, y), set in a Type 3
+    font whose metrics end at the baseline while its glyphs, boxes, reach
+    `size` / 4 under it."""
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    glyph = doc.get_new_xref()
+    doc.update_object(glyph, "<<>>")
+    doc.update_stream(glyph, b"500 0 0 -250 450 600 d1 0 -250 450 850 re f")
+    names = {c: _GLYPH_NAMES.get(c, c) for c in set(text)}
+    font = doc.get_new_xref()
+    doc.update_object(font, (
+        "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 700] "
+        "/FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << "
+        + " ".join(f"/{n} {glyph} 0 R" for n in sorted(set(names.values())))
+        + " >> /Encoding << /Differences ["
+        + " ".join(f"{ord(c)} /{n}" for c, n in sorted(names.items()))
+        + "] >> /FirstChar 32 /LastChar 122 /Widths [" + " ".join(["500"] * 91)
+        + "] >>"))
+    content = doc.get_new_xref()
+    doc.update_object(content, "<<>>")
+    doc.update_stream(content, f"BT /T3 {size} Tf {x} {LETTER[1] - y} Td ({text}) Tj "
+                      "ET".encode())
+    doc.xref_set_key(page.xref, "Resources", f"<< /Font << /T3 {font} 0 R >> >>")
+    doc.xref_set_key(page.xref, "Contents", f"{content} 0 R")
+    return page
+
+
+class TestACaptionWhoseGlyphsPassItsBox:
+
+    def page(self, doc):
+        body_pages(doc)
+        page = descending_caption_page(doc, 150, 70, "Table 2: Results of every run.",
+                                       8)
+        ruled_table(page, 150, 450, 74, 4)
+        prose(page, 72, 540, 400)
+        return page
+
+    def test_the_layout_is_the_one_described(self):
+        doc = fitz.open()
+        page = self.page(doc)
+        caption = blocks_starting(page, "Table 2")[0]
+        assert caption[3] == 70
+        pix = page.get_pixmap(matrix=fitz.Matrix(4, 4), clip=fitz.Rect(150, 70, 450, 73),
+                              colorspace=fitz.csGRAY)
+        ink = [y for y in range(pix.height)
+               if min(pix.samples[y * pix.width:(y + 1) * pix.width]) < 128]
+        assert ink and 71.9 <= 70 + (ink[-1] + 1) / 4 <= 72.1
+
+    def test_the_crop_starts_under_the_glyphs(self, tmp_path):
+        doc = fitz.open()
+        self.page(doc)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert 72 <= box[1] <= 73.5
+
+
+class TestWhatTheR3RulesRequire:
+
+    def test_one_row_of_the_tables_cells_is_no_part(self, tmp_path):
+        def row(page, top):
+            page.draw_line((160, top), (440, top))
+            page.insert_text((160, top + 10), "network 9", fontsize=8)
+            page.insert_text((400, top + 10), "4.75", fontsize=8)
+            page.draw_line((160, top + 14), (440, top + 14))
+        doc = fitz.open()
+        body_pages(doc)
+        bottom, top = TestWhatContinuesATable().page(doc, row, caption=False)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 4)]["box"]
+        assert bottom <= box[3] < top
+
+    def test_prose_lines_inside_a_frame_are_content(self):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_rect(fitz.Rect(150, 100, 460, 300), color=(0, 0, 0))
+        for y in (140, 152):
+            page.insert_text((156, y), "a sample of the text that the model writes",
+                             fontsize=10)
+        page.insert_text((150, 320), "Figure 6: Samples of the model.", fontsize=9)
+        caption = blocks_starting(page, "Figure 6")[0]
+        assert pm._crop_problem(page, fitz.Rect(144, 94, 466, caption[1]), "figure",
+                                6, caption, pm.body_text(doc)) is None
+
+    def test_a_rule_in_the_head_bounds_no_prose_lines(self):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_line((72, 50), (540, 50))
+        for y in (110, 122):
+            page.insert_text((80, y), "a line of the prose above the table it opens",
+                             fontsize=10)
+        page.draw_line((72, 130), (540, 130))
+        page.draw_rect(fitz.Rect(80, 140, 520, 300), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((80, 320), "Figure 6: Under two lines of prose.", fontsize=9)
+        caption = blocks_starting(page, "Figure 6")[0]
+        body = pm.body_text(doc)
+        rect = fitz.Rect(74, 94, 526, caption[1])
+        assert pm._crop_problem(page, rect, "figure", 6, caption, body,
+                                (52, 760)) == pm.HOLDS_PROSE
+
+    def test_one_vertical_rule_makes_no_grid(self):
+        box, float_ = (110, 150, 290, 200), (100, 100, 500, 300)
+        rule = (299.5, 100, 300.5, 300)
+        assert pm._grid_columns(box, [float_], [rule]) == []
+        assert pm._grid_columns(box, [float_], [rule, (299.5, 120, 300.5, 180)]) == [
+            (rule, float_)]
+
+    def test_a_note_mostly_past_the_float_is_not_its_own(self):
+        box = (100, 100, 300, 200)
+        assert pm._with_notes(box, [(250, 203, 500, 213)]) == box
+        assert pm._with_notes(box, [(100, 203, 290, 213)]) == (100, 100, 300, 213)
+
+    def test_a_float_grazing_the_caption_can_be_foreign(self):
+        caption = (100, 300, 300, 310)
+        wall = (330, 150, 540, 350)
+        parts = pm._Parts()
+        parts.drawings = [(100, 200, 400, 200.5), (100, 300.5, 400, 301)]
+        parts.barriers, parts.walls = [wall], [wall]
+        parts.elements = parts.drawings + [wall]
+        assert pm._foreign_floats(caption, parts) == [(100, 200, 400, 301)]
+        parts.drawings = [(100, 309, 400, 309.5), (100, 400, 400, 400.5)]
+        parts.elements = parts.drawings + [wall]
+        assert pm._foreign_floats(caption, parts) == [(100, 309, 400, 400.5)]
+
+
+def algorithm_box(page, x0, x1, top, bottom, inner=None):
+    """A ruled algorithm box: rules at `top`, under its title and at `bottom`,
+    numbered lines between, and a rule from x0 to `inner` under its fifth line
+    when given."""
+    page.draw_line((x0, top), (x1, top))
+    page.insert_text((x0 + 4, top + 10), "Algorithm 1: Training", fontsize=8)
+    page.draw_line((x0, top + 14), (x1, top + 14))
+    y = top + 26
+    for i in range(int((bottom - top - 30) // 10)):
+        page.insert_text((x0 + 4, y), f"{i + 1}  update the weights", fontsize=8)
+        if inner and i == 4:
+            page.draw_line((x0, y + 2), (inner, y + 2))
+        y += 10
+    page.draw_line((x0, bottom), (x1, bottom))
+
+
+class TestWhatTheR4RulesRequire:
+
+    def test_the_foot_band_cuts_no_table_across_it(self, tmp_path):
+        doc = fitz.open()
+        for i in range(5):
+            page = doc.new_page(width=LETTER[0], height=LETTER[1])
+            prose(page, 72, 540, 400)
+            page.insert_text((300, 770), f"{i + 1}", fontsize=9)
+        page.insert_text((150, 600), "Table 3: Results of every run.", fontsize=8)
+        ruled_table(page, 150, 450, 606, 8)
+        page.draw_line((300, 606), (300, 762))
+        heads, feet = pm.learn_furniture(doc)
+        assert 700 < pm.furniture_band(page, heads, feet)[1] < 762
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 3)]["box"]
+        assert box[3] >= 762
+
+    def test_an_algorithm_box_open_at_the_foot_leaves_the_table_under_it(self, tmp_path):
+        # The next rule of the algorithm's extent under its title is Table 2's.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_line((150, 60), (450, 60))
+        page.insert_text((154, 70), "Algorithm 1: Training", fontsize=8)
+        page.draw_line((150, 74), (450, 74))
+        for i in range(4):
+            page.insert_text((154, 86 + 10 * i), f"{i + 1}  update the weights",
+                             fontsize=8)
+        page.insert_text((150, 150), "Table 2: Results of the experiments.", fontsize=8)
+        bottom = ruled_table(page, 150, 450, 156, 4)
+        prose(page, 72, 540, 700)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert box[1] <= 156 and box[3] >= bottom
+
+    def test_a_figure_under_an_algorithm_box_open_at_the_foot_is_refused(
+            self, tmp_path):
+        # The next rule of the algorithm's extent under its title is Table 5's,
+        # under Figure 3's caption.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_line((150, 60), (450, 60))
+        page.insert_text((154, 70), "Algorithm 1: Training", fontsize=8)
+        page.draw_line((150, 74), (450, 74))
+        for i in range(4):
+            page.insert_text((154, 86 + 10 * i), f"{i + 1}  update the weights",
+                             fontsize=8)
+        page.draw_rect(fitz.Rect(160, 140, 440, 260), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((150, 280), "Figure 3: Under the algorithm.", fontsize=8)
+        page.insert_text((150, 300), "Table 5: Under the figure.", fontsize=8)
+        ruled_table(page, 150, 450, 306, 4)
+        prose(page, 72, 540, 700)
+        unrendered = []
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert ("figure", 3) not in media and ("table", 5) in media
+        assert [u["label"] for u in unrendered] == [3]
+
+    def table_under(self, page, text_bottom):
+        top = text_bottom + 4
+        bottom = ruled_table(page, 72, 540, top, 4)
+        page.insert_text((72, bottom + 14), "Table 3: Results under the text.",
+                         fontsize=9)
+        prose(page, 72, 540, 700)
+        return top
+
+    def test_a_paragraph_opening_on_an_algorithm_is_no_algorithm_box(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        para = prose(page, 72, 540, 200)
+        page.add_redact_annot(fitz.Rect(para))
+        page.apply_redactions()
+        assert page.insert_textbox(fitz.Rect(para[0], para[1], para[2], para[3] + 40),
+                                   "Algorithm 1 summarizes the method. " + PROSE[:280],
+                                   fontsize=10, align=fitz.TEXT_ALIGN_JUSTIFY) > 0
+        block = blocks_starting(page, "Algorithm 1")[0]
+        assert pm._is_prose([b for b in page.get_text("dict")["blocks"]
+                             if tuple(b["bbox"]) == block][0], pm.body_text(doc))
+        top = self.table_under(page, block[3])
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 3)]["box"]
+        assert box[1] <= top
+
+    def test_a_line_opening_on_an_algorithm_far_over_rules_is_no_algorithm_box(
+            self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 150)
+        page.insert_text((72, 180), "Algorithm 1 converges in a few steps.", fontsize=10)
+        top = self.table_under(page, 220)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 3)]["box"]
+        assert box[1] <= top
+
+    def test_a_shorter_rule_in_the_algorithm_does_not_close_it(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, LEFT[0], LEFT[1], 400)
+        prose(page, LEFT[0], LEFT[1], 700)
+        algorithm_box(page, RIGHT[0], RIGHT[1], 56, 282, inner=470)
+        page.draw_rect(fitz.Rect(320, 330, 530, 440), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((RIGHT[0], 470), "Figure 3: Two views of the scene.",
+                         fontsize=8)
+        prose(page, RIGHT[0], RIGHT[1], 700)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 3)]["box"]
+        assert 282 <= box[1] <= 330
+
+    def test_the_padding_stops_at_the_rule_over_the_algorithms_title(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((150, 70), "Table 4: Results of the experiments.", fontsize=8)
+        bottom = ruled_table(page, 150, 450, 76, 4)
+        algorithm_box(page, 150, 450, bottom + 4, bottom + 80)
+        prose(page, 72, 540, 720)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 4)]["box"]
+        assert bottom <= box[3] <= bottom + 4
+
+    def test_an_algorithm_in_the_other_column_does_not_clamp_the_padding(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        algorithm_box(page, LEFT[0], LEFT[1], 100, 287)
+        prose(page, LEFT[0], LEFT[1], 700)
+        page.draw_rect(fitz.Rect(320, 290, 530, 400), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((RIGHT[0], 420), "Figure 7: A right-column figure.", fontsize=8)
+        prose(page, RIGHT[0], RIGHT[1], 700)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 7)]["box"]
+        assert box[1] <= 290 - pm._PAD + 0.5
+
+    def test_a_framed_tables_caption_glyphs_stay_out_of_its_crop(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = descending_caption_page(doc, 160, 70, "Table 2: Results of every run.",
+                                       8)
+        page.draw_rect(fitz.Rect(140, 55, 470, 160), color=(0, 0, 0))
+        ruled_table(page, 150, 450, 76, 4)
+        prose(page, 72, 540, 400)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert 72 <= box[1] <= 75.5
+
+    def test_the_glyphs_give_way_to_the_tables_print_beside_the_caption(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = descending_caption_page(doc, 150, 70, "Table 2: Results of every run.",
+                                       8)
+        page.draw_rect(fitz.Rect(400, 71, 410, 75), color=(0, 0, 0), fill=(0, 0, 0))
+        ruled_table(page, 150, 450, 76, 4)
+        prose(page, 72, 540, 400)
+        assert blocks_starting(page, "Table 2")[0][2] < 400
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert box[1] <= 71
+
+    def test_the_other_columns_print_does_not_stop_the_glyphs(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = descending_caption_page(doc, LEFT[0], 70,
+                                       "Table 2: Results of every run.", 8)
+        ruled_table(page, LEFT[0], LEFT[1], 76, 4)
+        _paragraph(page, RIGHT[0], RIGHT[1], 71)
+        prose(page, LEFT[0], LEFT[1], 400)
+        assert 70 < min(b["bbox"][1] for b in page.get_text("dict")["blocks"]
+                        if b["bbox"][0] >= RIGHT[0]) < 72
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert 72 <= box[1] <= 76
+
+    def test_glyphs_touching_the_tables_top_rule_keep_the_whole_rule(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = descending_caption_page(doc, 150, 70, "Table 2: Results of every run.",
+                                       8)
+        ruled_table(page, 150, 450, 72.5, 4)
+        prose(page, 72, 540, 400)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert box[1] <= 72
