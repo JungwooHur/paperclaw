@@ -148,6 +148,16 @@ _SENTENCE_GOES_ON = re.compile(r"\s*(?:[a-z]|[,;])")
 # The title opening an algorithm box: `Algorithm 2`, `ALGORITHM S1`.
 _ALGORITHM = re.compile(r"\s*algorithm\s+[A-Z]?\d+\b", re.I)
 
+# A section number: `3`, `3.1.`, `A.2`.
+_SECTION = r"\s*(?:[1-9]\d?|[A-Z](?=\.\d))(?:\.\d{1,2})*\.?"
+
+# A section number and the first letter of the heading it opens: `3 M`,
+# `3.1. M`, `A.2 M`.
+_SECTION_NUMBER = re.compile(_SECTION + r"\s+[A-Z]")
+
+# A small-capitals typeface, by name.
+_SMALL_CAPS_FONT = re.compile(r"cmcsc|smallcap|caps\b", re.I)
+
 # What a continued table's header carries after its label: `– continued from
 # previous page`, `(Continued)`, `cont'd`.
 _CONTINUED = re.compile(
@@ -366,10 +376,44 @@ def _prose_shaped(block, measure) -> bool:
             and sum(n for _, n in lines) >= _PROSE_MIN_CHARS * len(lines))
 
 
+def _title_line(block) -> bool:
+    """Is the block one printed line of one line object, or of two whose first
+    is a bare section number (`_SECTION`), on one baseline (`_BASELINE_TOL`)?"""
+    lines = [ln for ln in block.get("lines") or () if ln.get("spans")]
+    if not 1 <= len(lines) <= 2:
+        return False
+    bases = [ln["spans"][0]["origin"][1] for ln in lines]
+    first = "".join(s["text"] for s in lines[0]["spans"])
+    return (max(bases) - min(bases) <= _BASELINE_TOL
+            and (len(lines) == 1 or re.fullmatch(_SECTION + r"\s*", first) is not None))
+
+
+def _small_caps(block) -> bool:
+    """Is most of the block's print in a small-capitals face (`_SMALL_CAPS_FONT`),
+    or are all its letters capitals in two sizes or more?"""
+    spans = [s for s in _spans(block) if s["text"].strip()]
+    chars = sum(len(s["text"].strip()) for s in spans)
+    named = sum(len(s["text"].strip()) for s in spans
+                if _SMALL_CAPS_FONT.search(s.get("font", "")))
+    lettered = [s for s in spans if any(c.isalpha() for c in s["text"])]
+    capitals = bool(lettered) and all(
+        c.isupper() for s in lettered for c in s["text"] if c.isalpha())
+    return (2 * named > chars
+            or capitals and len({round(s.get("size", 0), 1) for s in lettered}) > 1)
+
+
 def _is_heading(block, body: Body) -> bool:
-    """Is some of the block's print `_HEADING_SIZE_DELTA` or more over body size?"""
+    """Is some of the block's print `_HEADING_SIZE_DELTA` or more over body
+    size, or is the block a title line (`_title_line`) with print at body size
+    or over that opens on a section number (`_SECTION_NUMBER`) or is set in
+    small capitals (`_small_caps`)?"""
     sizes = [round(s.get("size", 0), 1) for s in _spans(block)]
-    return bool(sizes) and max(sizes) >= body.size + _HEADING_SIZE_DELTA
+    if not sizes:
+        return False
+    if max(sizes) >= body.size + _HEADING_SIZE_DELTA:
+        return True
+    return (max(sizes) >= body.size - _BODY_SIZE_TOL and _title_line(block)
+            and bool(_SECTION_NUMBER.match(_block_text(block)) or _small_caps(block)))
 
 
 def _is_barrier(block, body: Body) -> bool:
@@ -1232,15 +1276,19 @@ def _boxed_prose(caption_box, parts: _Parts, edge: float, upward: bool) -> bool:
 
 
 def _table_end(caption_box, parts: _Parts, upward: bool, edge: float,
-               elements, cells, column=None) -> float:
-    """Where a table walked to `edge` ends.
+               elements, cells, column=None, stops=()):
+    """Where a table walked to `edge` ends, or `RUNS_ON` when it cannot tell.
 
     Its first part is its ruled float nearest the caption, and each next one
-    the ruled float that continues it (`_table_part`). It ends at the far edge
-    of its last part, and of what is printed within `_NOTE_GAP` past it, when
-    what follows before `edge` starts more than `_NOTE_GAP` away and is not a
-    row of cells within twice that and within the table's width; else at
-    `edge`.
+    the ruled float that continues it (`_table_part`) or, unless the walk
+    ends at another float's caption claiming what lies before it
+    (`_ends_at_caption`, `stops` among the barriers), that it runs on to
+    (`_run_on`). It ends at the far edge of its last part, and of what is
+    printed within `_NOTE_GAP` past it, when what follows before `edge`
+    starts more than `_NOTE_GAP` away or, under a claiming caption, is a
+    graphic. It ends at `edge` when nothing follows, or a row of cells within
+    twice `_NOTE_GAP` and within the table's width, which a claiming caption
+    leaves to the table as printed past it.
     """
     lo, hi = (edge, caption_box[1]) if upward else (caption_box[3], edge)
     column = column or _column(caption_box, parts.walls, lo, hi)
@@ -1249,6 +1297,9 @@ def _table_end(caption_box, parts: _Parts, upward: bool, edge: float,
              and r[1] >= lo - 1 and r[3] <= hi + 1]
     if not ruled:
         return edge
+    claimed = _ends_at_caption(caption_box, parts, parts.barriers + list(stops), edge,
+                               upward, cells)
+    texts = {t for t, _ in parts.texts}
     table = max(ruled, key=lambda r: r[3]) if upward else min(ruled, key=lambda r: r[1])
     in_cells = set().union(*(blocks for _, blocks in cells)) if cells else set()
     past = [e for e in elements if _in_column(e, column) and not _contains(table, e)]
@@ -1262,19 +1313,38 @@ def _table_end(caption_box, parts: _Parts, upward: bool, edge: float,
             nearest = min((e for e in past if e[1] >= far - 0.5 and e[3] <= edge + 0.5),
                           key=lambda e: e[1], default=None)
             gap = None if nearest is None else nearest[1] - far
-        if nearest is None or (nearest in in_cells and gap <= 2 * _NOTE_GAP
-                               and nearest[0] >= table[0] - _RULE_ALIGN
-                               and nearest[2] <= table[2] + _RULE_ALIGN):
+        if nearest is None:
             return edge
-        if gap > _NOTE_GAP:
+        row = (nearest in in_cells and gap <= 2 * _NOTE_GAP
+               and nearest[0] >= table[0] - _RULE_ALIGN
+               and nearest[2] <= table[2] + _RULE_ALIGN)
+        if row and not claimed:
+            return edge
+        if not row and (gap > _NOTE_GAP or (claimed and nearest not in texts)):
             part = _table_part(caption_box, parts, table, ruled, far, upward, cells)
-            if part is None:
-                return far
+            if part is None and not claimed:
+                part = _run_on(parts, table, ruled, far, upward, cells, past, column)
+            if part is None or part == RUNS_ON:
+                return far if part is None else part
             table, far = part, part[1] if upward else part[3]
             past = [e for e in past if not _contains(part, e)]
             continue
         far = min(far, nearest[1]) if upward else max(far, nearest[3])
         past.remove(nearest)
+
+
+def _held_rows(parts: _Parts, table, part, cells) -> list:
+    """The rows of `cells` within `part` with a block at the size of a block
+    in the rows within `table`, each as the sizes of its blocks."""
+    sizes = {box: _body_size([block]) for box, block in parts.texts}
+
+    def row_sizes(box):
+        return [[sizes[b] for b in blocks if b in sizes]
+                for row, blocks in cells if _contains(box, row)]
+
+    own = [size for row in row_sizes(table) for size in row]
+    return [row for row in row_sizes(part)
+            if any(abs(a - b) <= _BODY_SIZE_TOL for a in row for b in own)]
 
 
 def _table_part(caption_box, parts: _Parts, table, ruled, far: float,
@@ -1283,10 +1353,11 @@ def _table_part(caption_box, parts: _Parts, table, ruled, far: float,
     it continues `table`, else None.
 
     It continues the table when it is as wide (`_SAME_EXTENT`), holds two or
-    more rows of cells at the size of the table's own or carries on every one
-    of its vertical rules, lies in no frame (a drawing enclosing it), and
-    does not run into another float's caption (the nearest barrier past it
-    across the caption's x-span, with no drawing between).
+    more rows of cells at the size of the table's own (`_held_rows`) or
+    carries on every one of its vertical rules, lies in no frame (a drawing
+    enclosing it), and does not run into another float's caption (the
+    nearest barrier past it across the caption's x-span, with no drawing
+    between).
     """
     beyond = [r for r in ruled if r is not table
               and (r[3] <= far + 0.5 if upward else r[1] >= far - 0.5)
@@ -1295,15 +1366,7 @@ def _table_part(caption_box, parts: _Parts, table, ruled, far: float,
     if not beyond:
         return None
     part = max(beyond, key=lambda r: r[3]) if upward else min(beyond, key=lambda r: r[1])
-    sizes = {box: _body_size([block]) for box, block in parts.texts}
-
-    def row_sizes(box):
-        return [[sizes[b] for b in blocks if b in sizes]
-                for row, blocks in cells if _contains(box, row)]
-
-    own = [size for row in row_sizes(table) for size in row]
-    held = [row for row in row_sizes(part)
-            if any(abs(a - b) <= _BODY_SIZE_TOL for a in row for b in own)]
+    held = _held_rows(parts, table, part, cells)
     verticals = _verticals(parts.drawings)
 
     def rule_xs(box):
@@ -1329,6 +1392,41 @@ def _table_part(caption_box, parts: _Parts, table, ruled, far: float,
     return part
 
 
+def _run_on(parts: _Parts, table, ruled, far: float, upward: bool, cells,
+            past, column):
+    """The ruled float of `ruled` nearest past `far` on the `upward` side
+    when `table` runs on to it; None when there is none, a barrier in
+    `column` stands between them or it is an algorithm box (text over it or
+    between opens on `_ALGORITHM`); else `RUNS_ON`.
+
+    The table runs on to it when nothing but text of `past` lies between
+    them and it holds a row of cells at the size of the table's own
+    (`_held_rows`).
+    """
+    beyond = [r for r in ruled if r is not table
+              and (r[3] <= far + 0.5 if upward else r[1] >= far - 0.5)]
+    if not beyond:
+        return None
+    part = max(beyond, key=lambda r: r[3]) if upward else min(beyond, key=lambda r: r[1])
+    lo, hi = (part[3], far) if upward else (far, part[1])
+    span = (min(table[0], part[0]), max(table[2], part[2]))
+
+    def between(box):
+        return (box[1] >= lo - 0.5 and box[3] <= hi + 0.5
+                and box[0] < span[1] and box[2] > span[0])
+
+    if any(between(b) and _in_column(b, column) for b in parts.barriers):
+        return None
+    if any((between(box) or _overlaps(part, box)) and _ALGORITHM.match(_block_text(block))
+           for box, block in parts.texts):
+        return None
+    texts = {t for t, _ in parts.texts}
+    if (any(between(e) and e not in texts and not _member(part, e) for e in past)
+            or not _held_rows(parts, table, part, cells)):
+        return RUNS_ON
+    return part
+
+
 NO_TABLE_BESIDE = "no table structure beside its caption"
 NOTHING_BESIDE = "nothing to crop beside its caption"
 NO_GRAPHICS = "the crop holds no drawing or image"
@@ -1336,6 +1434,7 @@ HOLDS_PROSE = "the crop holds body prose"
 HOLDS_CAPTION = "the crop holds another float's caption"
 HOLDS_HEADING = "the crop holds a heading"
 HOLDS_FLOAT = "the crop holds another caption's ruled float"
+RUNS_ON = "a ruled block no caption claims follows the table"
 
 
 def float_crop(page, kind: str, num, band=(float("-inf"), float("inf")),
@@ -1450,10 +1549,15 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
             return None, found
         upward, top, bottom, elements = found
         column = wide
-    boxes = [e for e in elements
+    texts = {t for t, _ in parts.texts}
+    visible = _visible(page)
+    off = [e for e in elements if _too_big(e, page.rect) and (e in texts or (
+        visible.get(e) and (_horizontals([visible[e]]) or _verticals([visible[e]]))))]
+    taken = [e for e in elements
              if e[3] > top + 0.5 and e[1] < bottom - 0.5
-             and not _too_big(e, page.rect) and _in_column(e, column)
+             and (e in off or not _too_big(e, page.rect)) and _in_column(e, column)
              and (e[3] <= caption_box[3] if upward else e[1] >= caption_box[1])]
+    boxes = [_on_page(visible.get(e, e), page.rect) if e in off else e for e in taken]
     boxes += [b for b in parts.loose
               if b[1] >= top - 0.5 and b[3] <= bottom + 0.5 and _in_column(b, column)
               and (b not in parts.small or _across(caption_box, b))]
@@ -1464,14 +1568,26 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
                                                 bottom, upward, body)
     # Padding never reaches back into the caption the crop just left out (nor
     # its glyphs), nor past the content into the running head or foot, nor
-    # into a wall or a foreign float; content keeps its width.
-    visible = _visible(page)
+    # into a wall, a foreign float or an element, no rule, the crop leaves out
+    # past its far edge; content keeps its width.
     seen = [v for v in (visible.get(b, b) for b in boxes) if v is not None]
     x0, x1 = min(b[0] for b in boxes), max(b[2] for b in boxes)
+    if upward:
+        drawn = [v for v in (visible.get(b, b) for b in boxes if b in parts.drawings)
+                 if v is not None]
+        head = _head_print(page, band, drawn, x0, x1)
+        boxes, seen = boxes + head, seen + head
+        top = min([top] + [h[1] for h in head])
+    left_out = [e for e in elements
+                if e not in taken and e[0] < x1 and e[2] > x0
+                and not _horizontals([e]) and not _verticals([e])
+                and (e[1] < top - 0.5 and e[3] <= top + 0.5 if upward
+                     else e[3] > bottom + 0.5 and e[1] >= bottom - 0.5)]
     across = [w for w in parts.walls + foreign if _across(caption_box, w)]
     top_limit = max([min(band[0], min((v[1] for v in seen), default=top)),
                      _CLAMP if upward else max(_CLAMP, caption_box[3])]
-                    + [w[3] for w in across if w[3] <= top + 0.5])
+                    + [w[3] for w in across if w[3] <= top + 0.5]
+                    + [e[3] for e in left_out if upward])
     if not upward:
         under = [e[1] for e in parts.elements + parts.barriers
                  if e[1] >= caption_box[3] and e[0] < x1 and e[2] > x0]
@@ -1480,7 +1596,8 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
     bottom_limit = min([max(band[1], max((v[3] for v in seen), default=bottom)),
                         min(page.rect.height - _CLAMP, caption_box[1])
                         if upward else page.rect.height - _CLAMP]
-                       + [w[1] for w in across if w[1] >= bottom - 0.5])
+                       + [w[1] for w in across if w[1] >= bottom - 0.5]
+                       + [e[1] for e in left_out if not upward])
     beside = [w for w in parts.walls + foreign if w[1] < bottom and w[3] > top]
     left_limit = max([_CLAMP] + [w[2] for w in beside if w[2] <= x0 + _COLUMN_TOL])
     right_limit = min([page.rect.width - _CLAMP]
@@ -1494,6 +1611,27 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
         return None, NOTHING_BESIDE
     problem = _crop_problem(page, rect, kind, num, caption_box, body, band)
     return (None, problem) if problem else (rect, None)
+
+
+def _on_page(box, page_rect) -> tuple:
+    """`box` cut to the page."""
+    return (max(box[0], 0.0), max(box[1], 0.0), min(box[2], page_rect.width),
+            min(box[3], page_rect.height))
+
+
+def _head_print(page, band, drawn, x0: float, x1: float) -> list:
+    """Boxes of the page's text lines over `band` (its running head row)
+    within x0..x1 that come within `_RULE_TOUCH` of one of the `drawn`
+    boxes: a float's print, not furniture."""
+    out = []
+    for box, _ in _page_lines(page):
+        if box[3] > band[0] or box[0] < x0 - 0.5 or box[2] > x1 + 0.5:
+            continue
+        near = (box[0] - _RULE_TOUCH, box[1] - _RULE_TOUCH,
+                box[2] + _RULE_TOUCH, box[3] + _RULE_TOUCH)
+        if any(_overlaps(near, d) for d in drawn):
+            out.append(box)
+    return out
 
 
 def _visible(page) -> dict:
@@ -1628,7 +1766,9 @@ def _region(caption_box, kind: str, parts: _Parts, body: Body, cells: list,
             return HOLDS_PROSE
         elements = [e for e in parts.elements if e not in stops]
         edge = _table_end(caption_box, parts, upward, edge, elements, cells,
-                          column)
+                          column, stops)
+        if edge == RUNS_ON:
+            return edge
     else:
         # Body-size text a figure reaches across a gap is the prose around it.
         upward, elements = True, parts.elements

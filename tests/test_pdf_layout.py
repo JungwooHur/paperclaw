@@ -2213,7 +2213,7 @@ class TestWhatContinuesATable:
             page.draw_line((160, top + 36), (440, top + 36))
         doc = fitz.open()
         body_pages(doc)
-        bottom, top = self.page(doc, grid, caption=False)
+        bottom, top = self.page(doc, grid, caption=True)
         box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
             ("table", 4)]["box"]
         assert bottom <= box[3] < top
@@ -2548,7 +2548,7 @@ class TestWhatTheR3RulesRequire:
             page.draw_line((160, top + 14), (440, top + 14))
         doc = fitz.open()
         body_pages(doc)
-        bottom, top = TestWhatContinuesATable().page(doc, row, caption=False)
+        bottom, top = TestWhatContinuesATable().page(doc, row, caption=True)
         box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
             ("table", 4)]["box"]
         assert bottom <= box[3] < top
@@ -2814,3 +2814,542 @@ class TestWhatTheR4RulesRequire:
         box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
             ("table", 2)]["box"]
         assert box[1] <= 72
+
+
+def heading_over_a_plot(doc, heading):
+    """A page of prose ending at y 190, the line `heading(page)` sets at
+    baseline y 218, a plot of 5 pt tick labels from y 228 to 420 and its
+    caption at y 440; the document's body size is 10 pt."""
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    prose(page, 72, 540, 190)
+    heading(page)
+    page.draw_rect(fitz.Rect(100, 228, 500, 420), color=(0, 0, 0))
+    for i in range(10):
+        for j in range(4):
+            page.insert_text((110 + 38 * i, 245 + 45 * j), f"0.{i}{j}", fontsize=5)
+    page.insert_text((72, 440), "Figure 4: Scores over the second task.", fontsize=9)
+    prose(page, 72, 540, 700)
+    return page
+
+
+def small_caps(page):
+    page.insert_text((72, 218), "R", fontsize=10)
+    page.insert_text((72 + fitz.get_text_length("R", fontsize=10), 218),
+                     "ESULTS ON THE SECOND TASK", fontsize=8)
+
+
+class TestAHeadingAtBodySize:
+    """A one-line heading set at body size directly over a plot."""
+
+    HEADINGS = {
+        "numbered": lambda page: page.insert_text(
+            (72, 218), "A.2 Results on the second task", fontsize=10),
+        "numbered apart": lambda page: (
+            page.insert_text((72, 218), "A.2", fontsize=10),
+            page.insert_text((96, 218), "Results on the second task", fontsize=10)),
+        "small caps": small_caps,
+    }
+
+    def test_the_layout_is_the_one_described(self):
+        for heading in self.HEADINGS.values():
+            doc = fitz.open()
+            page = heading_over_a_plot(doc, heading)
+            lines = [b for b in page.get_text("dict")["blocks"]
+                     if 200 < b["bbox"][1] < 228 and b.get("type") == 0]
+            assert len(lines) == 1 and 228 - lines[0]["bbox"][3] < pm._NOTE_GAP
+            assert not pm._is_barrier(lines[0], pm.Body(10.0 + pm._HEADING_SIZE_DELTA,
+                                                         None))
+
+    def test_it_ends_the_figure(self, tmp_path):
+        for name, heading in self.HEADINGS.items():
+            doc = fitz.open()
+            page = heading_over_a_plot(doc, heading)
+            line = [b["bbox"] for b in page.get_text("dict")["blocks"]
+                    if 200 < b["bbox"][1] < 228][0]
+            box = pm.render_media(save(doc, tmp_path), str(tmp_path / name))[
+                ("figure", 4)]["box"]
+            assert line[3] <= box[1] <= 228 and box[3] >= 420, name
+
+
+    def test_bold_column_titles_over_a_figure_are_its_own(self, tmp_path):
+        doc = fitz.open()
+        page = heading_over_a_plot(doc, lambda page: [
+            page.insert_text((x, 218), "Human player", fontsize=10, fontname="hebo")
+            for x in (110, 310)])
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 4)]["box"]
+        assert box[1] <= min(b[1] for b in blocks_starting(page, "Human"))
+
+    def test_a_label_in_capitals_of_one_size_is_its_own(self, tmp_path):
+        doc = fitz.open()
+        page = heading_over_a_plot(doc, lambda page: page.insert_text(
+            (72, 218), "ENCODER OUTPUT", fontsize=10))
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 4)]["box"]
+        assert box[1] <= blocks_starting(page, "ENCODER")[0][1]
+
+    def test_a_small_numbered_label_is_its_own(self, tmp_path):
+        doc = fitz.open()
+        page = heading_over_a_plot(doc, lambda page: page.insert_text(
+            (72, 222), "2 Layers", fontsize=5))
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 4)]["box"]
+        assert box[1] <= blocks_starting(page, "2 Layers")[0][1]
+
+    def test_a_numbered_row_of_cells_is_no_heading(self):
+        for cells in (("1 Baseline", "45.2"), ("1", "Baseline", "45.2")):
+            doc = fitz.open()
+            page = doc.new_page(width=LETTER[0], height=LETTER[1])
+            for i, cell in enumerate(cells):
+                page.insert_text((72 + 80 * i, 100), cell, fontsize=10)
+            row = [b for b in page.get_text("dict")["blocks"] if b.get("type") == 0]
+            assert len(row) == 1 and len(row[0]["lines"]) == len(cells)
+            assert pm._SECTION_NUMBER.match(pm._block_text(row[0]))
+            assert not pm._is_heading(row[0], pm.Body(10.0, None)), cells
+
+    def test_a_line_in_a_small_capitals_face_is_a_heading(self):
+        def line(font):
+            return {"lines": [{"bbox": (72, 90, 150, 100), "spans": [
+                {"text": "Introduction", "size": 10.0, "font": font, "flags": 4,
+                 "origin": (72, 98)}]}]}
+        body = pm.Body(10.0, None)
+        assert pm._is_heading(line("CMCSC10"), body)
+        assert not pm._is_heading(line("CMR10"), body)
+
+
+def test_a_tick_label_as_the_pages_top_line_stays_whole(tmp_path):
+    # Every page opens on a number, so the learned head is a number.
+    doc = fitz.open()
+    for i in range(4):
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((300, 40), f"{i + 1}", fontsize=9)
+        prose(page, 72, 540, 400)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(88, 38, 300, 120), color=(0.8, 0.8, 0.8))
+    page.draw_rect(fitz.Rect(100, 40, 300, 110), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+    page.insert_text((92, 42), "1", fontsize=5)
+    page.insert_text((92, 80), "0", fontsize=5)
+    page.insert_text((72, 140), "Figure 1: A plot at the top of the page.", fontsize=9)
+    prose(page, 72, 540, 400)
+    heads, feet = pm.learn_furniture(doc)
+    tick = pm._page_lines(page)[0][0]
+    assert heads == {"#"} and tick[3] <= pm.furniture_band(page, heads, feet)[0]
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 1)]["box"]
+    assert box[1] <= tick[1] and box[3] >= 120
+
+
+def test_a_tick_label_touching_the_plot_as_the_pages_top_line_stays_whole(tmp_path):
+    doc = fitz.open()
+    for i in range(4):
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((300, 40), f"{i + 1}", fontsize=9)
+        prose(page, 72, 540, 400)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(100, 40, 300, 110), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+    page.insert_text((97, 42), "1", fontsize=5)
+    page.insert_text((92, 80), "0", fontsize=5)
+    page.insert_text((72, 140), "Figure 1: A plot at the top of the page.", fontsize=9)
+    prose(page, 72, 540, 400)
+    tick = pm._page_lines(page)[0][0]
+    assert 0 < 100 - tick[2] < pm._RULE_TOUCH
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 1)]["box"]
+    assert box[1] <= tick[1]
+
+
+def test_a_tall_tick_label_as_the_pages_top_line_stays_whole(tmp_path):
+    # Its box starts 10 pt over the plot it overlaps.
+    doc = fitz.open()
+    for i in range(4):
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((300, 40), f"{i + 1}", fontsize=9)
+        prose(page, 72, 540, 400)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(88, 40, 300, 120), color=(0.8, 0.8, 0.8))
+    page.draw_rect(fitz.Rect(100, 40, 300, 110), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+    page.insert_text((90, 41), "1", fontsize=10)
+    page.insert_text((92, 80), "0", fontsize=5)
+    page.insert_text((72, 140), "Figure 1: A plot at the top of the page.", fontsize=9)
+    prose(page, 72, 540, 400)
+    tick = pm._page_lines(page)[0][0]
+    assert 40 - tick[1] > pm._PAD
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 1)]["box"]
+    assert box[1] <= tick[1]
+
+
+def test_a_running_head_across_the_plots_top_is_no_print_of_it(tmp_path):
+    doc = TestAFigureUnderTheRunningHead().doc(titles=False, plot_top=60)
+    head = pm._page_lines(doc[-1])[0][0]
+    assert head[0] < 300 < head[2] and head[3] > 60
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 46)]["box"]
+    assert box[0] >= 300 - pm._PAD and box[1] >= 60 - 0.5
+
+
+def image_rect(page, rect):
+    page.insert_image(rect, pixmap=fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 30), False))
+
+
+def filled_rect(page, rect):
+    page.draw_rect(rect, color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+
+
+def test_a_table_stacked_over_a_figure_ends_at_its_last_rule(tmp_path):
+    for name, graphic in (("image", image_rect), ("drawing", filled_rect)):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((150, 60), "Table 5: Time of every part.", fontsize=9)
+        bottom = ruled_table(page, 72, 540, 66, 4)
+        graphic(page, fitz.Rect(72, bottom + 3, 540, bottom + 130))
+        page.insert_text((72, bottom + 142), "Figure 5: Time of every part, drawn.",
+                         fontsize=9)
+        prose(page, 72, 540, 700)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / name))[
+            ("table", 5)]["box"]
+        assert bottom <= box[3] <= bottom + 3, name
+
+
+def test_a_figure_left_short_of_its_frame_rule_keeps_it(tmp_path):
+    # A heading whose box ends 0.2 pt under the rule over the plot ends the walk.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_text((72, 96), "Results", fontsize=14)
+    page.draw_line((72, 100), (540, 100))
+    page.draw_rect(fitz.Rect(100, 102, 500, 300), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+    page.insert_text((72, 320), "Figure 2: A plot under a rule.", fontsize=9)
+    prose(page, 72, 540, 700)
+    heading = blocks_starting(page, "Results")[0]
+    assert 100 < heading[3] < 100.5
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 2)]["box"]
+    assert box[1] <= 99.5
+
+
+class TestATableOverAFigure:
+    """A table captioned above, stacked over a figure captioned below."""
+
+    def page(self, doc, table):
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((150, 60), "Table 5: Time of every part.", fontsize=9)
+        bottom = table(page)
+        filled_rect(page, fitz.Rect(72, bottom + 3, 540, bottom + 130))
+        page.insert_text((72, bottom + 142), "Figure 5: Time of every part, drawn.",
+                         fontsize=9)
+        prose(page, 72, 540, 700)
+        return page, bottom
+
+    def test_rows_under_its_header_rules_are_its_own(self, tmp_path):
+        def table(page):
+            page.draw_line((72, 66), (540, 66))
+            page.insert_text((76, 76), "Model", fontsize=8)
+            page.insert_text((500, 76), "Error", fontsize=8)
+            page.draw_line((72, 79), (540, 79))
+            for i in range(4):
+                page.insert_text((76, 89 + 10 * i), f"network {i}", fontsize=8)
+                page.insert_text((500, 89 + 10 * i), f"{5 + i * 0.37:.2f}", fontsize=8)
+            return 121
+        doc = fitz.open()
+        page, bottom = self.page(doc, table)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 5)]["box"]
+        assert 118 <= box[3] <= bottom + 3
+
+    def test_its_note_is_its_own(self, tmp_path):
+        def table(page):
+            rule = ruled_table(page, 72, 540, 66, 4)
+            page.insert_text((76, rule + 9), "* averaged over three runs", fontsize=7)
+            return rule + 11
+        doc = fitz.open()
+        page, bottom = self.page(doc, table)
+        note = blocks_starting(page, "* averaged")[0]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 5)]["box"]
+        assert note[3] <= box[3] <= bottom + 3
+
+
+def test_a_ruled_block_past_a_heading_is_no_part(tmp_path):
+    # The heading stands left of the caption's x-span, so the walk passes it.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_text((300, 70), "Table 4: Results.", fontsize=8)
+    bottom = ruled_table(page, 150, 450, 76, 4)
+    page.insert_text((150, bottom + 20), "Next part", fontsize=14)
+    top = bottom + 30
+    ruled_table(page, 200, 400, top, 3)
+    prose(page, 72, 540, 700)
+    caption = blocks_starting(page, "Table 4")[0]
+    heading = blocks_starting(page, "Next part")[0]
+    assert heading[2] < caption[0]
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 4)]["box"]
+    assert bottom <= box[3] < top
+
+
+class TestTwoRuledBlocksUnderOneCaption:
+    """A table captioned above, then a narrower ruled block of three columns."""
+
+    def page(self, doc, between=None, gap=12, size=8):
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((85, 100), "Table 1: Scores on the first (top) and the "
+                         "second (bottom) task.", fontsize=9)
+        first = ruled_table(page, 85, 511, 106, 4)
+        if between:
+            between(page, first)
+        second = ruled_table(page, 135, 462, first + gap, 4, size=size)
+        for i in range(5):
+            page.insert_text((300, first + gap + 2 * size + 7 + (size + 2) * i),
+                             f"{i}", fontsize=size)
+        prose(page, 72, 540, 700)
+        return first, second
+
+    def test_the_layout_is_the_one_described(self):
+        doc = fitz.open()
+        self.page(doc)
+        floats = pm._ruled_floats([tuple(d["rect"]) for d in doc[-1].get_drawings()])
+        assert len(floats) == 2
+        a, b = sorted(floats, key=lambda f: f[1])
+        assert min(a[2], b[2]) - max(a[0], b[0]) < pm._SAME_EXTENT * (a[2] - a[0])
+        assert b[1] - a[3] > pm._NOTE_GAP
+
+    def test_the_second_block_joins_the_table(self, tmp_path):
+        doc = fitz.open()
+        first, second = self.page(doc)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 1)]["box"]
+        assert box[1] <= 106 and box[3] >= second
+
+    def test_one_row_of_the_tables_cells_joins_it(self, tmp_path):
+        def row(page, top):
+            page.draw_line((160, top), (440, top))
+            page.insert_text((160, top + 10), "network 9", fontsize=8)
+            page.insert_text((400, top + 10), "4.75", fontsize=8)
+            page.draw_line((160, top + 14), (440, top + 14))
+        doc = fitz.open()
+        body_pages(doc)
+        bottom, top = TestWhatContinuesATable().page(doc, row, caption=False)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 4)]["box"]
+        assert box[3] >= top + 14
+
+    def refused(self, doc, tmp_path):
+        unrendered = []
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert ("table", 1) not in media and ("table", 4) not in media
+        return [u["problem"] for u in unrendered]
+
+    def test_a_graphic_between_them_refuses_the_crop(self, tmp_path):
+        doc = fitz.open()
+        self.page(doc, lambda page, first: filled_rect(
+            page, fitz.Rect(140, first + 10, 460, first + 20)), gap=30)
+        assert self.refused(doc, tmp_path) == [pm.RUNS_ON]
+
+    def test_a_block_of_other_print_refuses_the_crop(self, tmp_path):
+        def grid(page, top):
+            page.draw_line((160, top), (440, top))
+            for i in range(3):
+                page.insert_text((160, top + 9 + 8 * i), f"label {i}", fontsize=5)
+                page.insert_text((400, top + 9 + 8 * i), f"{i}", fontsize=5)
+            page.draw_line((160, top + 36), (440, top + 36))
+        doc = fitz.open()
+        body_pages(doc)
+        TestWhatContinuesATable().page(doc, grid, caption=False)
+        assert self.refused(doc, tmp_path) == [pm.RUNS_ON]
+
+
+def test_a_table_running_off_the_page_reaches_the_page_edge(tmp_path):
+    a4 = (595.3, 841.9)
+    doc = fitz.open()
+    for _ in range(2):
+        prose(doc.new_page(width=a4[0], height=a4[1]), 72, 520, 700)
+    page = doc.new_page(width=a4[0], height=a4[1])
+    for y in (85, 105, 150):
+        page.draw_line((62, y), (636, y))
+    head = "Score with the longest prompt "
+    page.insert_text((592 - fitz.get_text_length(head, fontsize=10), 98), head + "W",
+                     fontsize=10)
+    for i in range(4):
+        page.insert_text((70, 118 + 10 * i), f"model {i}", fontsize=8)
+        page.insert_text((300, 118 + 10 * i), f"{40 + i}.5", fontsize=8)
+    page.insert_text((62, 165), "Table 16: Accuracy under four formulations.", fontsize=9)
+    prose(page, 72, 520, 500)
+    line = blocks_starting(page, "Score with")[0]
+    assert line[2] > a4[0] + 2
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 16)]["box"]
+    assert abs(box[2] - a4[0]) < 0.5
+
+
+def clipped_bar(page, clip, x, top):
+    """A 0.2 pt wide bar at `x` from y `top` down to the bottom of `clip`
+    (x0, y0, x1, y1), drawn through `clip` as its clip path."""
+    doc, height = page.parent, page.rect.height
+    x0, y0, x1, y1 = clip
+    xref = doc.get_new_xref()
+    doc.update_object(xref, "<<>>")
+    doc.update_stream(xref, (f"q {x0} {height - y1} {x1 - x0} {y1 - y0} re W n "
+                             f"0.2 0.4 0.8 rg {x} {height - y1} 0.2 {y1 - top} re f Q"
+                             ).encode())
+    doc.xref_set_key(page.xref, "Contents", "[" + " ".join(
+        f"{c} 0 R" for c in page.get_contents() + [xref]) + "]")
+
+
+def test_bars_clipped_on_the_page_leave_the_running_head_out(tmp_path):
+    # Their paths start 600 pt over the page; their clip ends them at y 60.
+    doc = fitz.open()
+    two_sided(doc, 4, 60)
+    for x in (200, 250, 300):
+        clipped_bar(doc[-1], (150, 60, 460, 250), x, -600)
+    assert min(d["rect"].y0 for d in doc[-1].get_drawings()) == -600
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 4)]["box"]
+    assert box[1] >= 48.5
+
+
+def clipped_line(page, clip, x0, x1, y):
+    """A 0.4 pt high bar from x `x0` to `x1` at y `y`, drawn through `clip`
+    (x0, y0, x1, y1) as its clip path."""
+    doc, height = page.parent, page.rect.height
+    cx0, cy0, cx1, cy1 = clip
+    xref = doc.get_new_xref()
+    doc.update_object(xref, "<<>>")
+    doc.update_stream(xref, (f"q {cx0} {height - cy1} {cx1 - cx0} {cy1 - cy0} re W n "
+                             f"0 0 0 rg {x0} {height - y - 0.4} {x1 - x0} 0.4 re f Q"
+                             ).encode())
+    doc.xref_set_key(page.xref, "Contents", "[" + " ".join(
+        f"{c} 0 R" for c in page.get_contents() + [xref]) + "]")
+
+
+def test_a_gridline_clipped_on_the_page_is_its_visible_part(tmp_path):
+    # Its path starts 600 pt left of the page; its clip leaves x 130-450.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    prose(page, 72, 540, 80)
+    page.draw_rect(fitz.Rect(150, 100, 450, 300), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+    clipped_line(page, (130, 100, 450, 300), -600, 450, 200)
+    page.insert_text((150, 320), "Figure 6: A plot with a gridline.", fontsize=9)
+    prose(page, 72, 540, 700)
+    assert min(d["rect"].x0 for d in page.get_drawings()) == -600
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 6)]["box"]
+    assert box[0] <= 130 and box[1] >= 80
+
+
+class TestWhatTheR5RulesRequire:
+
+    def test_a_booktabs_table_headed_algorithm_is_a_table(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((150, 70), "Table 3: Error of each method.", fontsize=8)
+        page.draw_line((150, 76), (450, 76))
+        page.insert_text((154, 86), "Algorithm", fontsize=8)
+        page.insert_text((410, 86), "Error", fontsize=8)
+        page.draw_line((150, 89), (450, 89))
+        for i in range(4):
+            page.insert_text((154, 99 + 10 * i), f"network {i}", fontsize=8)
+            page.insert_text((410, 99 + 10 * i), f"{5 + i * 0.37:.2f}", fontsize=8)
+        page.draw_line((150, 133), (450, 133))
+        prose(page, 72, 540, 400)
+        assert blocks_starting(page, "Algorithm")
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 3)]["box"]
+        assert box[1] <= 76 and box[3] >= 133
+
+    def test_a_rule_beside_an_algorithms_title_does_not_close_it(self, tmp_path):
+        # The left table's header rule is the first rule under the title.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((LEFT[0], 94), "Table 2: Results.", fontsize=8)
+        bottom = ruled_table(page, LEFT[0], LEFT[1], 100, 4)
+        algorithm_box(page, RIGHT[0], RIGHT[1], 100, 287)
+        prose(page, LEFT[0], LEFT[1], 700)
+        prose(page, RIGHT[0], RIGHT[1], 700)
+        title = blocks_starting(page, "Algorithm 1")[0]
+        assert title[3] - 1 <= 113 < 114
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert box[1] <= 100 and box[3] >= bottom
+
+    def algorithms(self, page, caption_box=(0, 0, 1, 1)):
+        doc = page.parent
+        return pm._algorithms(page.get_text("dict")["blocks"],
+                              pm._page_rules(page), pm.body_text(doc), caption_box)
+
+    def test_an_algorithm_with_no_rule_over_its_title_starts_at_the_title(self):
+        # A rule of its extent stands 20 pt over the title.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_line((150, 100), (450, 100))
+        page.insert_text((154, 130), "Algorithm 1: Training", fontsize=8)
+        page.draw_line((150, 134), (450, 134))
+        page.insert_text((154, 146), "1  update the weights", fontsize=8)
+        page.draw_line((150, 150), (450, 150))
+        title = blocks_starting(page, "Algorithm 1")[0]
+        assert self.algorithms(page) == [(150, title[1], 450, 150)]
+
+    def test_stacked_algorithms_close_at_their_own_rules(self):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        algorithm_box(page, 150, 450, 100, 160)
+        algorithm_box(page, 150, 450, 170, 230)
+        assert self.algorithms(page) == [(150, 100, 450, 160), (150, 170, 450, 230)]
+
+    def test_an_algorithm_running_over_a_caption_ends_at_its_top(self):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_line((150, 60), (450, 60))
+        page.insert_text((154, 70), "Algorithm 1: Training", fontsize=8)
+        page.draw_line((150, 74), (450, 74))
+        page.insert_text((154, 86), "1  update the weights", fontsize=8)
+        page.draw_line((150, 200), (450, 200))
+        caption = (150, 150, 300, 160)
+        assert self.algorithms(page, caption) == [(150, 60, 450, 150)]
+
+    def test_ragged_small_print_beside_the_caption_is_no_prose(self):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_rect(fitz.Rect(100, 100, 300, 300), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+        page.insert_text((320, 150), "a long line of legend text that runs on and on "
+                         "past forty characters", fontsize=6)
+        page.insert_text((320, 158), "a shorter line of legend text, forty-odd chars",
+                         fontsize=6)
+        page.insert_text((100, 320), "Figure 5: A short caption.", fontsize=9)
+        caption = blocks_starting(page, "Figure 5")[0]
+        note = [b for b in page.get_text("dict")["blocks"] if b["bbox"][0] >= 320][0]
+        assert not pm._is_barrier(note, pm.body_text(doc))
+        assert all(n >= pm._PROSE_LINE_CHARS for _, n in pm._lines(note))
+        assert pm._crop_problem(page, fitz.Rect(94, 94, 566, caption[1]), "figure", 5,
+                                caption, pm.body_text(doc)) is None
+
+    def test_the_glyphs_give_way_to_small_print_beside_the_caption(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = descending_caption_page(doc, 150, 70, "Table 2: Results of every run.",
+                                       8)
+        assert page.insert_textbox(fitz.Rect(300, 70.5, 420, 122), PROSE[:115],
+                                   fontsize=8, align=fitz.TEXT_ALIGN_JUSTIFY) > 0
+        ruled_table(page, 150, 450, 124, 4)
+        prose(page, 72, 540, 400)
+        caption = blocks_starting(page, "Table 2")[0]
+        note = [b for b in page.get_text("dict")["blocks"] if b["bbox"][0] >= 300][0]
+        body = pm.body_text(doc)
+        assert pm._is_barrier(note, body) and not pm._is_prose(note, body)
+        assert caption[2] < 300 and caption[3] < note["bbox"][1] < 72
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert box[1] <= note["bbox"][1]
