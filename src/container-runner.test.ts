@@ -429,15 +429,17 @@ describe('container-runner agent-runner copy', () => {
     expect(refreshRunnerCopy).toHaveBeenCalledTimes(2);
   });
 
-  // The SPEC tree is where a reader looks up which runner groups get. Naming
-  // only the build's staged copy sends them to compare a group's copy with one
-  // a build may have replaced since the host started.
-  it('pins the runner where the SPEC directory tree says, under data/', async () => {
+  // The runtime tree of the layout guide names the directory under data/ that
+  // holds the runner the host pinned at start.
+  it('pins the runner where the layout guide runtime tree says, under data/', async () => {
     const pin = runnerBundleCallsAtStart[0][2];
     const name = path.relative('/tmp/paperclaw-test-data', pin);
     const { readFileSync } = await vi.importActual<typeof import('fs')>('fs');
-    const spec = new URL('../docs/SPEC.md', import.meta.url);
-    const lines = readFileSync(spec, 'utf-8').split('\n');
+    const guide = new URL(
+      '../.claude/skills/structure/SKILL.md',
+      import.meta.url,
+    );
+    const lines = readFileSync(guide, 'utf-8').split('\n');
     const start = lines.findIndex((l) => l.startsWith('├── data/'));
     const end = lines.findIndex((l, i) => i > start && /^[├└]── /.test(l));
 

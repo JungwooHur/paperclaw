@@ -44,6 +44,7 @@ Read the doc for the area a change touches. A root cause found in an area goes t
 | `/customize` | Adding channels, integrations, changing behavior |
 | `/debug` | Container issues, logs, troubleshooting |
 | `/update` | Pull upstream PaperClaw changes, merge with customizations, run migrations |
+| `/structure` | Before placing, moving or removing code, tests or docs: the layout map and where new work goes |
 | `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
 | `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
 

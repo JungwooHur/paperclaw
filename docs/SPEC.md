@@ -7,16 +7,15 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 ## Table of Contents
 
 1. [Architecture](#architecture)
-2. [Folder Structure](#folder-structure)
-3. [Configuration](#configuration)
-4. [Memory System](#memory-system)
-5. [Session Management](#session-management)
-6. [Message Flow](#message-flow)
-7. [Commands](#commands)
-8. [Scheduled Tasks](#scheduled-tasks)
-9. [MCP Servers](#mcp-servers)
-10. [Deployment](#deployment)
-11. [Security Considerations](#security-considerations)
+2. [Configuration](#configuration)
+3. [Memory System](#memory-system)
+4. [Session Management](#session-management)
+5. [Message Flow](#message-flow)
+6. [Commands](#commands)
+7. [Scheduled Tasks](#scheduled-tasks)
+8. [MCP Servers](#mcp-servers)
+9. [Deployment](#deployment)
+10. [Security Considerations](#security-considerations)
 
 ---
 
@@ -82,94 +81,7 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 
 ---
 
-## Folder Structure
-
-```
-paperclaw/
-├── CLAUDE.md                      # Project context for Claude Code
-├── docs/
-│   ├── SPEC.md                    # This specification document
-│   ├── REQUIREMENTS.md            # Architecture decisions
-│   └── SECURITY.md                # Security model
-├── README.md                      # User documentation
-├── package.json                   # Node.js dependencies
-├── tsconfig.json                  # TypeScript configuration
-├── .mcp.json                      # MCP server configuration (reference)
-├── .gitignore
-│
-├── src/
-│   ├── index.ts                   # Orchestrator: state, message loop, agent invocation
-│   ├── channels/
-│   │   └── whatsapp.ts            # WhatsApp connection, auth, send/receive
-│   ├── ipc.ts                     # IPC watcher and task processing
-│   ├── router.ts                  # Message formatting and outbound routing
-│   ├── config.ts                  # Configuration constants
-│   ├── types.ts                   # TypeScript interfaces (includes Channel)
-│   ├── logger.ts                  # Pino logger setup
-│   ├── db.ts                      # SQLite database initialization and queries
-│   ├── group-queue.ts             # Per-group queue with global concurrency limit
-│   ├── mount-security.ts          # Mount allowlist validation for containers
-│   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
-│   ├── task-scheduler.ts          # Runs scheduled tasks when due
-│   └── container-runner.ts        # Spawns agents in containers
-│
-├── container/
-│   ├── Dockerfile                 # Container image (runs as 'node' user, includes Claude Code CLI)
-│   ├── build.sh                   # Build script for container image
-│   ├── agent-runner/              # Code that runs inside the container
-│   │   ├── package.json
-│   │   ├── tsconfig.json
-│   │   ├── src/
-│   │   │   ├── index.ts           # Entry point (query loop, IPC polling, session resume)
-│   │   │   ├── turn-attribution.ts # Which inputs each result answered
-│   │   │   └── ipc-mcp-stdio.ts   # Stdio-based MCP server for host communication
-│   │   └── test/                  # Its tests, kept out of src/ (compiled at every start)
-│   └── skills/
-│       └── agent-browser.md       # Browser automation skill
-│
-├── dist/                          # Compiled JavaScript (gitignored)
-│   └── agent-runner-src/          # The runner staged by the same build; a host pins it to data/runner-bundle/ when it starts
-│
-├── .claude/
-│   └── skills/
-│       ├── setup/SKILL.md              # /setup - First-time installation
-│       ├── customize/SKILL.md          # /customize - Add capabilities
-│       ├── debug/SKILL.md              # /debug - Container debugging
-│       ├── add-telegram/SKILL.md       # /add-telegram - Telegram channel
-│       ├── add-gmail/SKILL.md          # /add-gmail - Gmail integration
-│       ├── add-voice-transcription/    # /add-voice-transcription - Whisper
-│       ├── x-integration/SKILL.md      # /x-integration - X/Twitter
-│       ├── convert-to-apple-container/  # /convert-to-apple-container - Apple Container runtime
-│       └── add-parallel/SKILL.md       # /add-parallel - Parallel agents
-│
-├── groups/
-│   ├── CLAUDE.md                  # Global memory (all groups read this)
-│   ├── main/                      # Self-chat (main control channel)
-│   │   ├── CLAUDE.md              # Main channel memory
-│   │   └── logs/                  # Task execution logs
-│   └── {Group Name}/              # Per-group folders (created on registration)
-│       ├── CLAUDE.md              # Group-specific memory
-│       ├── logs/                  # Task logs for this group
-│       └── *.md                   # Files created by the agent
-│
-├── store/                         # Local data (gitignored)
-│   ├── auth/                      # WhatsApp authentication state
-│   └── messages.db                # SQLite database (messages, chats, scheduled_tasks, task_run_logs, registered_groups, sessions, router_state)
-│
-├── data/                          # Application state (gitignored)
-│   ├── sessions/                  # Per-group session data (.claude/ dirs with JSONL transcripts)
-│   ├── runner-bundle/             # The runner this host hands to groups, pinned when it started
-│   ├── env/env                    # Copy of .env for container mounting
-│   └── ipc/                       # Container IPC (messages/, tasks/)
-│
-├── logs/                          # Runtime logs (gitignored)
-│   ├── paperclaw.log               # Host stdout
-│   └── paperclaw.error.log         # Host stderr
-│   # Note: Per-container logs are in groups/{folder}/logs/container-*.log
-│
-└── launchd/
-    └── com.paperclaw.plist         # macOS service configuration
-```
+The repository layout and the runtime directories are in [.claude/skills/structure/SKILL.md](../.claude/skills/structure/SKILL.md).
 
 ---
 
