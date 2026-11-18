@@ -269,7 +269,9 @@ function buildVolumeMounts(
   );
   for (const warning of extra.warnings) logger.warn(warning);
   skillSources.push(...extra.dirs);
-  syncSkillDirs(skillSources, skillsDst);
+  for (const link of syncSkillDirs(skillSources, skillsDst)) {
+    logger.warn(`skill link points nowhere, skipping: ${link}`);
+  }
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
