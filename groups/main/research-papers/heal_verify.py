@@ -100,8 +100,8 @@ def choose_kept(occurrences):
         point.
     """
     first = occurrences[0]
-    richest = max(occurrences, key=lambda s: s["chars"])
-    if richest["chars"] > first["chars"] * RICHER_FACTOR:
+    richest = max(occurrences, key=vs.content_chars)
+    if vs.content_chars(richest) > vs.content_chars(first) * RICHER_FACTOR:
         return richest
     return first
 

@@ -32,6 +32,31 @@ surface on every healer run as `verify-heal error RuntimeError` and skip that
 page's dedup/flagging. **If you add an early return to a `--json` tool here,
 return JSON.**
 
+**A section's ratio compares translated prose with source prose.** The page holds
+figures and tables as images with their captions and drops back matter, so the
+audit leaves out of the ratio what the page does not translate as body text:
+
+- **Captions, on both sides.** The source turns them into `_TABLE_MARK`s, which
+  keep the span's extent: a LaTeXML `figcaption` holding `ltx_tag_figure`, and in a
+  PDF every line inside `extract_pdf_media.caption_regions` (the crops' caption
+  grammar). The page skips a body paragraph opening on a float label set off by a
+  separator (`extract_pdf_media.is_caption_text`; `Figure 1 shows …` stays), since
+  NotebookLM often translates a caption into one. Counting captions on one side
+  only would push every ratio one way.
+- **Table rows.** A run of 4+ short lines with no sentence end is a table, and a
+  line whose tokens are mostly numbers (`22.37 16.98 … 64.13%`) is a table fragment
+  at any length.
+- **Back matter**, `Acknowledgement`/`Acknowledgment` singular included.
+
+Captions still count as content where no ratio is taken: in the CONTENT_LOSS
+floor (`content_chars`), so a section of tables only is not empty, and when
+choosing which duplicate copy to keep.
+
+**Known limit:** a PDF caption set at body size with no sentence end also blanks a
+body paragraph in its column and font size that starts within 26 pt below it (the
+grammar `_stitched` uses for crops). A SUMMARIZED or CONTENT_LOSS on a section right
+after such a caption deserves a hand check.
+
 ## Batch queue sweeper
 
 `papers_queue.json` is driven by an agent INSIDE a container, and the dispatcher
