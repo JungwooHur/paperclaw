@@ -3353,3 +3353,219 @@ class TestWhatTheR5RulesRequire:
         box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
             ("table", 2)]["box"]
         assert box[1] <= note["bbox"][1]
+
+
+def test_a_fully_clipped_hairline_is_no_rule_between_caption_lines(tmp_path):
+    # Figure 6's caption is one block of two lines; a hairline whose clip path
+    # leaves none of it visible lies between them, over Figure 7's plot.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(100, 60, 500, 180), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+    assert page.insert_textbox(fitz.Rect(100, 190, 500, 230), "Figure 6: Scores of "
+                               "every run on the first task, drawn over every step "
+                               "of the training of each network, with the mean of "
+                               "the three seeds as a line.", fontsize=9) > 0
+    first, second = [ln["bbox"] for ln in blocks_with(page, "Figure 6")[0]["lines"]]
+    clipped_line(page, (0, 0, 5, 5), 100, 480, (first[3] + second[1]) / 2 - 0.2)
+    page.draw_rect(fitz.Rect(100, 222, 500, 380), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+    page.insert_text((100, 400), "Figure 7: Scores on the second task.", fontsize=9)
+    prose(page, 72, 540, 700)
+    rule = [d["rect"] for d in page.get_drawings() if d["rect"].height < 1][0]
+    assert rule.y0 >= first[3] - 0.5 and rule.y1 <= second[1] + 0.5
+    assert second[3] < 222
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("figure", 7)]["box"]
+    assert box[1] >= second[3] - 0.5 and box[3] >= 380
+
+
+def blocks_with(page, text):
+    """The text blocks one of whose lines starts with `text`."""
+    return [b for b in page.get_text("dict")["blocks"] if b.get("type") == 0
+            and any("".join(s["text"] for s in ln["spans"]).startswith(text)
+                    for ln in b["lines"])]
+
+
+def test_a_table_whose_caption_shares_its_block_is_no_part_of_the_next(tmp_path):
+    # Table 1, narrower than Table 2, has its caption line as the last line of
+    # its cells' block.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    first = ruled_table(page, 200, 400, 100, 4)
+    page.insert_text((200, first + 8), "Table 1: Symbols of the model.", fontsize=8)
+    top = first + 30
+    second = ruled_table(page, 150, 450, top, 4)
+    page.insert_text((200, second + 14), "Table 2: Terms of the reward.", fontsize=8)
+    prose(page, 72, 540, 700)
+    merged = blocks_with(page, "Table 1")[0]
+    assert len(merged["lines"]) > 1 and not blocks_starting(page, "Table 1")
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 2)]["box"]
+    assert merged["bbox"][3] - 0.5 <= box[1] <= top and box[3] >= second
+
+
+def test_a_table_stacked_over_labelled_images_ends_at_its_last_rule(tmp_path):
+    # A row of panel titles 12 pt under the table, each running 1 pt into the
+    # top of its image, and tick labels beside the images.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_text((150, 60), "Table 5: Time of every part.", fontsize=9)
+    bottom = ruled_table(page, 72, 540, 66, 4)
+    for x in (100, 330):
+        page.insert_text((x + 40, bottom + 20), "dim = 10", fontsize=6)
+        image_rect(page, fitz.Rect(x, bottom + 21, x + 180, bottom + 121))
+        for i in range(4):
+            page.insert_text((x - 10, bottom + 30 + 25 * i), f"0.{i}", fontsize=5)
+    page.insert_text((72, bottom + 135), "Figure 5: Time of every part, drawn.",
+                     fontsize=9)
+    prose(page, 72, 540, 700)
+    title = blocks_starting(page, "dim")[0]
+    image = [b["bbox"] for b in page.get_text("dict")["blocks"]
+             if b.get("type") == 1][0]
+    assert pm._NOTE_GAP < title[1] - bottom < 2 * pm._NOTE_GAP
+    assert image[1] < title[3]
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 5)]["box"]
+    assert bottom <= box[3] < title[1]
+
+
+def test_a_graphic_left_out_above_a_table_stops_its_padding(tmp_path):
+    # Table 3 is captioned above a drawing that ends 3 pt over Table 4.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_text((150, 60), "Table 3: Time of every part, drawn.", fontsize=9)
+    filled_rect(page, fitz.Rect(72, 66, 540, 197))
+    bottom = ruled_table(page, 72, 540, 200, 4)
+    page.insert_text((150, bottom + 14), "Table 4: Time of every part.", fontsize=9)
+    prose(page, 72, 540, 700)
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 4)]["box"]
+    assert 197 <= box[1] <= 200 and box[3] >= bottom
+
+
+def test_one_small_capitals_word_does_not_make_a_line_a_heading():
+    line = {"lines": [{"bbox": (72, 90, 250, 100), "spans": [
+        {"text": "Results of the ", "size": 10.0, "font": "CMR10", "flags": 4,
+         "origin": (72, 98)},
+        {"text": "Net", "size": 10.0, "font": "CMCSC10", "flags": 4,
+         "origin": (150, 98)},
+        {"text": " model on the second task", "size": 10.0, "font": "CMR10",
+         "flags": 4, "origin": (170, 98)}]}]}
+    assert not pm._is_heading(line, pm.Body(10.0, None))
+
+
+def test_a_fully_clipped_hairline_under_a_running_head_is_no_head_rule(tmp_path):
+    # Its clip path leaves none of it visible; a marker of the plot's lies
+    # between it and the head.
+    doc = fitz.open()
+    for i in range(4):
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((72, 40), "A STUDY OF THINGS", fontsize=9)
+        clipped_line(page, (0, 0, 5, 5), 72, 540, 54.5)
+        filled_rect(page, fitz.Rect(140, 49, 147, 53))
+        page.draw_rect(fitz.Rect(150, 58, 460, 250), color=(0, 0, 0),
+                       fill=(0.2, 0.4, 0.8))
+        page.insert_text((150, 266), f"Figure {i + 1}: A figure on page {i + 1}.",
+                         fontsize=9)
+        prose(page, 72, 540, 700)
+    media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))
+    assert all(media[("figure", n)]["box"][1] <= 49 for n in (1, 2, 3, 4))
+
+
+def test_a_prose_line_opening_on_a_label_is_no_caption(tmp_path):
+    # The paragraph under the table has a later line opening on `Table 7.`.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_text((150, 60), "Table 5: Time of every part.", fontsize=9)
+    rule = ruled_table(page, 72, 540, 66, 4)
+    page.insert_textbox(fitz.Rect(72, rule + 14, 540, 500),
+                        PROSE + "\nTable 7. " + PROSE, fontsize=10,
+                        align=fitz.TEXT_ALIGN_JUSTIFY)
+    paragraph = blocks_with(page, "Table 7")[0]
+    assert pm._is_prose(paragraph, pm.body_text(doc))
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 5)]["box"]
+    assert rule <= box[3] < paragraph["bbox"][1]
+
+
+def test_a_tables_note_sharing_a_block_with_the_next_caption_is_its_own(tmp_path):
+    # Table 5's note and Table 6's caption, under it, are one block.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_text((150, 60), "Table 5: Time of every part.", fontsize=8)
+    rule = ruled_table(page, 72, 540, 66, 4)
+    page.insert_text((76, rule + 9), "* averaged over three runs", fontsize=8)
+    page.insert_text((150, rule + 20.5), "Table 6: Time of every step.", fontsize=8)
+    ruled_table(page, 72, 540, rule + 30, 4)
+    prose(page, 72, 540, 700)
+    shared = blocks_with(page, "Table 6")[0]
+    note = shared["lines"][0]["bbox"]
+    assert pm._block_text(shared).startswith("* averaged")
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 5)]["box"]
+    assert note[3] <= box[3] <= shared["lines"][1]["bbox"][1] + 0.5
+
+
+def test_a_note_with_an_icon_beside_it_stays_with_an_unclaimed_table(tmp_path):
+    # An image starts beside the note's line; prose, no caption, follows.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_text((150, 60), "Table 5: Time of every part.", fontsize=9)
+    rule = ruled_table(page, 72, 540, 66, 4)
+    page.insert_text((90, rule + 9), "averaged over three runs", fontsize=7)
+    note = blocks_starting(page, "averaged")[0]
+    image_rect(page, fitz.Rect(76, note[3] - 4, 86, note[3] + 4))
+    prose(page, 72, 540, 400)
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 5)]["box"]
+    assert box[3] >= note[3]
+
+
+def test_a_table_under_labelled_images_starts_at_its_first_rule(tmp_path):
+    # Table 3 is captioned over two images, each with a title under it that
+    # its image runs 1 pt into; Table 4 is captioned below.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_text((150, 60), "Table 3: Samples of every part.", fontsize=9)
+    for x in (100, 330):
+        image_rect(page, fitz.Rect(x, 70, x + 180, 170))
+        page.insert_text((x + 60, 175), "dim = 10", fontsize=6)
+    title = blocks_starting(page, "dim")[0]
+    top = title[3] + 12
+    bottom = ruled_table(page, 72, 540, top, 4)
+    page.insert_text((150, bottom + 14), "Table 4: Time of every part.", fontsize=9)
+    prose(page, 72, 540, 700)
+    image = [b["bbox"] for b in page.get_text("dict")["blocks"]
+             if b.get("type") == 1][0]
+    assert image[3] > title[1]
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 4)]["box"]
+    assert title[3] < box[1] <= top and box[3] >= bottom
+
+
+def test_cells_citing_floats_are_no_captions(tmp_path):
+    # The middle cell of each row cites `Table A1`...; captioned below.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_line((72, 100), (540, 100))
+    for i in range(4):
+        y = 112 + 10 * i
+        page.insert_text((76, y), f"network {i}", fontsize=8)
+        page.insert_text((300, y), f"Table A{i + 1}", fontsize=8)
+        page.insert_text((500, y), f"{5 + i * 0.37:.2f}", fontsize=8)
+    page.draw_line((72, 145), (540, 145))
+    page.insert_text((150, 159), "Table 12: Rates of every change.", fontsize=9)
+    prose(page, 72, 540, 700)
+    cells = blocks_with(page, "Table A2")[0]
+    assert pm._block_text(cells).startswith("network 0")
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 12)]["box"]
+    assert box[1] <= 100 and box[3] >= 145
