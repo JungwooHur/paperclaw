@@ -3425,6 +3425,14 @@ def test_a_rule_at_the_edge_of_the_band_is_between(rule_y):
     assert pm._Rules(page).between(60, 100, 72, 540)
 
 
+@pytest.mark.parametrize("rule_y", [(59.6, 59.7), (100.3, 100.4)])
+def test_a_rule_just_outside_the_band_is_between(rule_y):
+    doc = fitz.open()
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(72, rule_y[0], 540, rule_y[1]), color=None, fill=(0, 0, 0))
+    assert pm._Rules(page).between(60, 100, 72, 540)
+
+
 def blocks_with(page, text):
     """The text blocks one of whose lines starts with `text`."""
     return [b for b in page.get_text("dict")["blocks"] if b.get("type") == 0

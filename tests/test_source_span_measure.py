@@ -307,6 +307,14 @@ class TestFigureCaptionsInPdf:
         doc.save(path)
         assert "Each curve" not in vs.source_text_from_pdf(str(path))
 
+    def test_a_sentence_ending_a_little_short_of_a_full_line_does_not_end_it(
+            self, tmp_path):
+        text = lines_at(tmp_path, [
+            ("Figure 1: Error of the estimator on the held-out part of each split,", 9, 255),
+            ("plotted against the number of samples for each model size.", 9, 253),
+            ("Each curve is one size of the training set over ten seeds.", 9, None)])
+        assert "held-out part" not in text and "Each curve" not in text
+
     def test_caption_fragments_on_one_baseline_are_one_line(self, tmp_path):
         import fitz
         doc = fitz.open()
@@ -384,6 +392,11 @@ class TestNumericRows:
     def test_a_sentence_with_numbers_is_prose(self):
         line = "In 2019 and 2020 the error fell from 12.5 to 3.4 on 8 of the 10 tasks."
         assert vs._prose_chars(line) == len(line)
+
+    def test_a_long_row_of_percentages_is_a_table_fragment(self):
+        row = " ".join(f"{n}.13% {n}.87%" for n in range(41, 47))
+        body = prose(900)
+        assert vs._prose_chars(body + "\n" + "\n".join([row] * 4)) == len(body)
 
     def test_a_line_of_exactly_half_numbers_is_prose(self):
         line = "Results 41.60 baseline 42.16 previous 39.85 ablation 47.02"
