@@ -39,6 +39,16 @@ export function extraSkillsDirsSetting(): string | undefined {
 /** What a configured skill directory turned out to be. */
 export type SkillDirState = 'ok' | 'missing' | 'empty';
 
+/** True when `entry` resolves to a directory; false for a file or a dangling link. */
+function isSkillDir(entry: string): boolean {
+  return fs.existsSync(entry) && fs.statSync(entry).isDirectory();
+}
+
+/** True when `entry` is a symlink whose target does not exist. */
+function isDanglingLink(entry: string): boolean {
+  return fs.lstatSync(entry).isSymbolicLink() && !fs.existsSync(entry);
+}
+
 /**
  * Reports whether a configured skill directory is usable.
  *
@@ -49,7 +59,7 @@ export function inspectSkillDir(dir: string): SkillDirState {
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return 'missing';
   const hasSkill = fs
     .readdirSync(dir)
-    .some((entry) => fs.statSync(path.join(dir, entry)).isDirectory());
+    .some((entry) => isSkillDir(path.join(dir, entry)));
   return hasSkill ? 'ok' : 'empty';
 }
 
@@ -126,14 +136,22 @@ function copyResolved(src: string, dst: string): void {
  * link installs a dangling one. It reads correctly on the host, which is what
  * makes it worth spelling out: the skill looks present everywhere you would
  * check, and only the agent finds nothing there.
+ *
+ * Returns the skill entries that are dangling links; those are not copied.
  */
-export function syncSkillDirs(sources: string[], dst: string): void {
+export function syncSkillDirs(sources: string[], dst: string): string[] {
+  const broken: string[] = [];
   for (const src of sources) {
     if (!fs.existsSync(src)) continue;
     for (const entry of fs.readdirSync(src)) {
       const srcDir = path.join(src, entry);
+      if (isDanglingLink(srcDir)) {
+        broken.push(srcDir);
+        continue;
+      }
       if (!fs.statSync(srcDir).isDirectory()) continue;
       copyResolved(srcDir, path.join(dst, entry));
     }
   }
+  return broken;
 }

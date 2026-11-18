@@ -6,6 +6,7 @@ import path from 'path';
 import {
   EXTRA_SKILLS_DIRS_ENV,
   SkillDirState,
+  inspectSkillDir,
   resolveExtraSkillDirs,
   syncSkillDirs,
 } from './skill-sync.js';
@@ -64,6 +65,31 @@ describe('resolveExtraSkillDirs', () => {
     );
     expect(dirs).toEqual(['/good']);
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe('inspectSkillDir', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-inspect-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reads a directory holding only a dangling link as empty', () => {
+    fs.symlinkSync(path.join(root, 'no-such-skill'), path.join(root, 'moved'));
+
+    expect(inspectSkillDir(root)).toBe('empty');
+  });
+
+  it('reads a directory with one live skill beside a dangling link as ok', () => {
+    fs.mkdirSync(path.join(root, 'live'));
+    fs.symlinkSync(path.join(root, 'no-such-skill'), path.join(root, 'moved'));
+
+    expect(inspectSkillDir(root)).toBe('ok');
   });
 });
 
@@ -152,6 +178,17 @@ describe('syncSkillDirs', () => {
     const at = path.join(root, 'dst', 'browser', 'REFERENCE.md');
     expect(fs.lstatSync(at).isSymbolicLink()).toBe(false);
     expect(fs.readFileSync(at, 'utf8')).toBe('shared reference');
+  });
+
+  it('skips a skill whose link points nowhere, names it, and installs the rest', () => {
+    const builtin = skill('builtin', 'browser', 'built-in');
+    const gone = path.join(builtin, 'moved');
+    fs.symlinkSync(path.join(root, 'no-such-skill'), gone);
+
+    const broken = syncSkillDirs([builtin], path.join(root, 'dst'));
+
+    expect(broken).toEqual([gone]);
+    expect(fs.readdirSync(path.join(root, 'dst'))).toEqual(['browser']);
   });
 
   it('leaves the destination untouched when nothing is configured', () => {
