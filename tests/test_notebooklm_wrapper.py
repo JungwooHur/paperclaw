@@ -467,7 +467,7 @@ _NO_NOTEBOOK_DOCS = [
     "container/bin/notebooklm",
     "container/skills/notebooklm/SKILL.md",
     "groups/main/CLAUDE.md",
-    "CLAUDE.md",
+    "container/README.md",
 ]
 _CLI_RESOLVER = "vendor/notebooklm-py/src/notebooklm/cli/resolve.py"
 

@@ -138,7 +138,7 @@ Build the host first and stop if it fails (fix it as step 8 says): a failed
 build stages no runner, so the restart would pin the old runner against the new
 image. The running host has pinned its runner, so this build reaches no group
 before the restart.
-Prune first (CLAUDE.md, "Container Build Cache"): `--no-cache` alone keeps stale
+Prune first (`container/README.md`, "Build cache"): `--no-cache` alone keeps stale
 COPY steps.
 
 ```bash

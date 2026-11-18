@@ -277,7 +277,7 @@ PaperClaw uses a hierarchical memory system based on CLAUDE.md files.
 
 | Level | Location | Read By | Written By | Purpose |
 |-------|----------|---------|------------|---------|
-| **Global** | `groups/CLAUDE.md` | All groups | Main only | Preferences, facts, context shared across all conversations |
+| **Global** | `groups/global/CLAUDE.md` | All groups | Main only | Preferences, facts, context shared across all conversations |
 | **Group** | `groups/{name}/CLAUDE.md` | That group | That group | Group-specific context, conversation memory |
 | **Files** | `groups/{name}/*.md` | That group | That group | Notes, research, documents created during conversation |
 
@@ -317,7 +317,7 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 
 Each group gets two copies under `data/sessions/{group}/` the first time its container starts, and they are kept differently.
 
-**`.claude/settings.json` is seeded once** and never refreshed. A change to the settings defaults in `src/container-runner.ts` therefore reaches new groups only. To apply one to an existing group, delete that group's `settings.json` and it is recreated on the next run. A setting that must reach every group is passed with `-e` on the container command instead, as the model pin is.
+**`.claude/settings.json` is seeded once** and never refreshed. A change to the settings defaults in `src/container-runner.ts` therefore reaches new groups only. To apply one to an existing group, delete that group's `settings.json` and it is recreated on the next run. A setting that must reach every group is passed with `-e` on the container command instead, as the model pin is. The runner is no home for one either: a group whose runner copy was edited keeps that copy (below), while `-e` reaches every group.
 
 **`agent-runner-src/` follows the bundled runner unless the group edited it.** The container compiles this copy, mounted writable at `/app/src`, not `container/agent-runner/src/`, so an agent can change its own runner without touching other groups. The bundle is the runner the host's own build staged: `npm run build` copies `container/agent-runner/src/` to `dist/agent-runner-src/` (`src/stage-runner.ts`), and a host running from `dist/` refreshes groups from that copy as it was when the host started (below). `npm run dev` runs the sources and refreshes from the checkout. Beside the copy, outside the mount, `agent-runner-src.seed.json` records a content hash of the copy as it was installed, taken from the copy and not the bundle, so a bundle that changes during the copy cannot make an unedited copy look edited. The hash covers the sorted relative paths and their contents, so mtimes and readdir order do not change it. At every container start, `src/runner-seed.ts` compares the copy with the bundle and the marker:
 
@@ -475,6 +475,7 @@ PaperClaw has a built-in scheduler that runs tasks as full agents in their group
 4. **Main Channel Privileges**: The main channel can schedule tasks for any group and view all tasks
 5. **One Run per Due Time**: A task's `next_run` advances only when its run finishes, so every 60-second scheduler poll during a long run finds it due again. The queue skips a task that is already running or queued. A queued task is re-read when its turn comes, and does not run if it was paused or cancelled while it waited.
 6. **Usage Limits**: A run refused by the usage limit sends nothing to the group. If no turn of it ended with an answer, its `next_run` moves to five minutes after the reset for that run only, and a `once` task stays `active` so that it runs then. A run that answered on one turn and was refused on another, in either order, is not run again, since that would send the answer twice: its run is logged as an error naming the limit, `next_run` follows the schedule, and a `once` task completes. What counts as an answer is defined under [Usage Limits](#usage-limits); an error message the CLI returns is not one. Output sent only through `send_message` is not seen, so a run that sent its work that way and was then refused still runs again in full. While a window is open, a due run starts no container: its `next_run` moves the same way, and its run log says the window was open. That time stands even if an answer closes the window sooner.
+7. **One Turn per Run**: A task container takes no piped messages (`src/group-queue.ts`), so a scheduled run gets exactly ONE turn. The runner writes a success marker only when a query turn ends. On every success marker, with or without text (the SDK result for `error_max_turns` carries none), `task-scheduler.ts` writes the close sentinel `TASK_CLOSE_DELAY_MS` later. The container then exits, and every in-flight background subagent is killed with it. The runner gives the run `maxTurns: 50`. A run that was not closed would wait on IPC until the group's no-output timeout (5 h for the main group), and until the run exits the group's queue is blocked.
 
 ### Schedule Types
 
