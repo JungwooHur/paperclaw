@@ -641,7 +641,7 @@ def caption_boxes(page, kind: str, num) -> list:
     starts.sort(key=lambda i: not _separated(_block_text(blocks[i])))
     if not starts:
         return []
-    rules = _page_rules(page)
+    rules = _Rules(page)
     return [(_stitched(blocks, i, rules), blocks[i]) for i in starts]
 
 
@@ -658,7 +658,7 @@ def caption_regions(page, blocks) -> list:
     set that heading or the next paragraph in the caption's block.
     """
     blocks = sorted((b for b in blocks if b.get("type") == 0), key=lambda b: b["bbox"][1])
-    rules = None
+    rules = _Rules(page)
     body = _body_size(blocks)
     out = []
     for i, b in enumerate(blocks):
@@ -666,8 +666,6 @@ def caption_regions(page, blocks) -> list:
             text = _block_text({"lines": [ln]})
             small = _body_size([{"type": 0, "lines": [ln]}]) < body - _BODY_SIZE_TOL
             if caption_kind(text) and (_separated(text) or small):
-                if rules is None:
-                    rules = _page_rules(page)
                 head = dict(b, lines=b["lines"][n:],
                             bbox=_union(x["bbox"] for x in b["lines"][n:]))
                 box = _stitched(blocks[:i] + [head] + blocks[i + 1:], i, rules)
@@ -726,7 +724,33 @@ def _page_rules(page) -> list:
             and v[3] - v[1] <= _RULE_MAX_THICK and v[2] - v[0] >= _RULE_MIN_LENGTH]
 
 
-def _caption_lines(block, rules=()) -> int:
+class _Rules:
+    """The page's horizontal rules (`_page_rules`), read on first use."""
+
+    def __init__(self, page):
+        self._page, self._rules, self._paths = page, None, None
+
+    def __iter__(self):
+        if self._rules is None:
+            self._rules = _page_rules(self._page)
+        return iter(self._rules)
+
+    def between(self, top: float, bottom: float, x0: float, x1: float) -> bool:
+        """Does a rule lie from `top` to `bottom` (each 0.5 looser) and across
+        part of x0..x1? None does when no path's box (`get_bboxlog`; it holds
+        the path's visible part) meets that band, and then the rules are not
+        read."""
+        if self._rules is None:
+            if self._paths is None:
+                self._paths = [r for t, r in self._page.get_bboxlog() if t.endswith("path")]
+            if not any(b[1] <= bottom + 0.5 and b[3] >= top - 0.5
+                       and b[0] < x1 + 0.5 and b[2] > x0 - 0.5 for b in self._paths):
+                return False
+        return any(r[1] >= top - 0.5 and r[3] <= bottom + 0.5 and r[0] < x1 and r[2] > x0
+                   for r in self)
+
+
+def _caption_lines(block, rules) -> int:
     """How many of the block's lines the caption opening it takes: all of them
     up to the first line, on a baseline of its own, in none of the fonts of
     the lines before it or past one of `rules` from them."""
@@ -736,10 +760,8 @@ def _caption_lines(block, rules=()) -> int:
         origin = ln["spans"][0]["origin"][1] if ln.get("spans") else base
         new_line = base is None or abs(origin - base) > _BASELINE_TOL
         x0, y0, x1, _ = ln["bbox"]
-        ruled = new_line and bottom is not None and any(
-            r[1] >= bottom - 0.5 and r[3] <= y0 + 0.5 and r[0] < x1 and r[2] > x0
-            for r in rules)
-        if i and new_line and (ruled or (names and not names & fonts)):
+        if i and new_line and ((names and not names & fonts)
+                               or rules.between(bottom, y0, x0, x1)):
             return i
         fonts |= names
         base = origin
@@ -774,8 +796,7 @@ def _stitched(blocks, start: int, rules) -> tuple:
             break
         if {round(s.get("size", 0), 1) for s in _spans(nxt)} - fonts:
             break
-        if any(r[1] >= y1 - 0.5 and r[3] <= ny0 + 0.5 and r[0] < nx1 and r[2] > nx0
-               for r in rules):
+        if rules.between(y1, ny0, nx0, nx1):
             break
         x0, x1, y1 = min(x0, nx0), max(x1, nx1), ny1
         text = _block_text(nxt)
@@ -1575,7 +1596,7 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
     # them, so the region kept growing: one crop swallowed the table AND the figure
     # above the one being rendered. Whatever sits beyond another caption belongs to
     # that float, never to this one.
-    rules = _page_rules(page)
+    rules = _Rules(page)
     for b in blocks:
         if b.get("type") != 0:
             continue
@@ -1953,7 +1974,7 @@ def _crop_problem(page, rect, kind: str, num, caption_box, body: Body,
         if not any(_overlaps(g, inner) and not _too_big(g, page.rect)
                    for g in images + drawings):
             return NO_GRAPHICS
-    rules = _page_rules(page)
+    rules = _Rules(page)
     texts, captions, figure_captions = [], [], []
     for b in blocks:
         if b.get("type") != 0:

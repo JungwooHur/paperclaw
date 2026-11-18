@@ -10,6 +10,7 @@ stopped it at something that was not this figure's body text:
   heading and the walk stopped before it took a single step.
 """
 import fitz
+import pytest
 
 import extract_pdf_media as pm
 
@@ -3377,6 +3378,51 @@ def test_a_fully_clipped_hairline_is_no_rule_between_caption_lines(tmp_path):
     box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
         ("figure", 7)]["box"]
     assert box[1] >= second[3] - 0.5 and box[3] >= 380
+
+
+def test_every_rule_lies_in_a_path_box_of_the_bbox_log():
+    # Rules stroked thin and wide, filled, and half clipped.
+    doc = fitz.open()
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_line((72, 100), (540, 100), width=0.4)
+    page.draw_line((72, 140), (540, 140), width=2)
+    page.draw_rect(fitz.Rect(72, 180, 540, 180.5), color=None, fill=(0, 0, 0))
+    clipped_line(page, (72, 200, 300, 240), 72, 540, 220)
+    page = fitz.open("pdf", doc.tobytes())[0]
+    rules = pm._page_rules(page)
+    paths = [r for t, r in page.get_bboxlog() if t.endswith("path")]
+    assert len(rules) == 4
+    assert all(any(b[0] <= r[0] and b[1] <= r[1] and b[2] >= r[2] and b[3] >= r[3]
+                   for b in paths) for r in rules)
+
+
+def test_rules_are_not_read_for_a_band_no_path_meets(monkeypatch):
+    doc = fitz.open()
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_line((72, 100), (540, 100), width=0.4)
+    rules = pm._Rules(page)
+    monkeypatch.setattr(pm, "_page_rules", lambda page: pytest.fail("rules read"))
+    assert not rules.between(300, 310, 72, 540)
+    monkeypatch.undo()
+    assert rules.between(99, 101, 72, 540)
+
+
+def test_a_rule_in_another_column_is_not_between_lines_of_this_one():
+    doc = fitz.open()
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(72, 80, 290, 130), color=(0, 0, 0))
+    page.draw_line((320, 105), (540, 105), width=0.4)
+    rules = pm._Rules(page)
+    assert not rules.between(100, 110, 72, 290)
+    assert rules.between(100, 110, 320, 540)
+
+
+@pytest.mark.parametrize("rule_y", [(59.6, 60.0), (100.0, 100.4)])
+def test_a_rule_at_the_edge_of_the_band_is_between(rule_y):
+    doc = fitz.open()
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.draw_rect(fitz.Rect(72, rule_y[0], 540, rule_y[1]), color=None, fill=(0, 0, 0))
+    assert pm._Rules(page).between(60, 100, 72, 540)
 
 
 def blocks_with(page, text):
