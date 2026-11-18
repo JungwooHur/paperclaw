@@ -130,10 +130,14 @@ _BACKGROUND_AREA_FRAC = 0.8  # a box this big is a page background, not content
 # A float's caption opener: the word, the label as printed, an optional
 # separator. The label is the citation grammar the HTML injectors share
 # (`extract_paper_figures._LABEL`): `7`, `S2`, `B.1`, `A1`, `3.1`, or a roman
-# numeral. Leading zeros are allowed because some PDFs pad the number.
+# numeral, and one letter glued onto a label ending in a digit (`10a`).
+# Leading zeros are allowed because some PDFs pad the number.
 _CAPTION = re.compile(
     r"\s*(?P<ed>Extended\s+Data\s+)?(?P<word>Fig\.?|Figure|Table)\s*0*"
-    + ef._LABEL + r"(?P<sep>\s*[:.|])?", re.I)
+    + ef._LABEL + r"(?P<suffix>(?<=\d)[a-z](?![A-Za-z]))?(?P<sep>\s*[:.|])?", re.I)
+
+# A label ending in one letter glued onto a digit (`10a`), and what precedes it.
+_SUFFIXED = re.compile(r"(?P<cited>.*\d)[a-z]", re.I)
 
 ED_PREFIX = "ed_"
 
@@ -174,16 +178,18 @@ def _read_label(text: str, sentence_ok: bool):
     """(kind, label) of the float label `text` opens with, or None.
 
     The label is an int for a number (a roman table number included) and the
-    printed string otherwise. With `sentence_ok` false, a label with no
-    separator that runs on into lower-case words or a comma opens a sentence,
-    not a caption. A label followed by `continued` heads a table's later part,
+    printed string otherwise, its letter suffix included (`10a`). With
+    `sentence_ok` false, a label with no separator that runs on into
+    lower-case words or a comma opens a sentence, and a suffixed one with no
+    separator a citation of a panel (`Fig. 1d` in a cell), not a caption. A
+    label followed by `continued` heads a table's later part,
     not its caption.
     """
     found = _CAPTION.match(text or "")
     if not found:
         return None
     base = "table" if found.group("word").lower().startswith("tab") else "figure"
-    token = found.group("label")
+    token = found.group("label") + (found.group("suffix") or "")
     if token.isdigit():
         label = int(token)
     elif re.fullmatch(r"[ivx]+", token, re.I):
@@ -193,7 +199,8 @@ def _read_label(text: str, sentence_ok: bool):
     else:
         label = token
     if (not sentence_ok and not found.group("sep")
-            and _SENTENCE_GOES_ON.match(text, found.end())):
+            and (found.group("suffix")
+                 or _SENTENCE_GOES_ON.match(text, found.end()))):
         return None
     if _CONTINUED.match(text, found.end()):
         return None
@@ -525,13 +532,12 @@ def _row_at(lines, index: int) -> tuple:
 
 
 def _rule_below(page, y: float, span: float = 12.0):
-    """Bottom of the wide hairline nearest under `y`, within `span` — the rule
-    under a running head — or None."""
-    found = [d["rect"] for d in page.get_drawings()
-             if d["rect"].y1 - d["rect"].y0 <= 2.5
-             and d["rect"].x1 - d["rect"].x0 >= page.rect.width * 0.5
-             and y - 2 <= d["rect"].y0 <= y + span]
-    return min(found, key=lambda r: r.y0).y1 if found else None
+    """Bottom of the visible part (`_visible`) of the wide hairline nearest
+    under `y`, within `span` — the rule under a running head — or None."""
+    found = [v for v in _visible(page).values() if v is not None
+             and v[3] - v[1] <= 2.5 and v[2] - v[0] >= page.rect.width * 0.5
+             and y - 2 <= v[1] <= y + span]
+    return min(found, key=lambda r: r[1])[3] if found else None
 
 
 def furniture_band(page, heads, feet) -> tuple:
@@ -626,10 +632,9 @@ def caption_boxes(page, kind: str, num) -> list:
 
 
 def _page_rules(page) -> list:
-    """Boxes of the page's horizontal rules."""
-    return [tuple(d["rect"]) for d in page.get_drawings()
-            if d["rect"].height <= _RULE_MAX_THICK
-            and d["rect"].width >= _RULE_MIN_LENGTH]
+    """Visible parts (`_visible`) of the page's horizontal rules."""
+    return [v for v in _visible(page).values() if v is not None
+            and v[3] - v[1] <= _RULE_MAX_THICK and v[2] - v[0] >= _RULE_MIN_LENGTH]
 
 
 def _caption_lines(block, rules=()) -> int:
@@ -1286,9 +1291,10 @@ def _table_end(caption_box, parts: _Parts, upward: bool, edge: float,
     (`_run_on`). It ends at the far edge of its last part, and of what is
     printed within `_NOTE_GAP` past it, when what follows before `edge`
     starts more than `_NOTE_GAP` away or, under a claiming caption, is a
-    graphic. It ends at `edge` when nothing follows, or a row of cells within
-    twice `_NOTE_GAP` and within the table's width, which a claiming caption
-    leaves to the table as printed past it.
+    graphic or text a graphic starts beside. It ends at `edge` when nothing
+    follows, or a row of cells within twice `_NOTE_GAP` and within the
+    table's width, which a claiming caption leaves to the table as printed
+    past it.
     """
     lo, hi = (edge, caption_box[1]) if upward else (caption_box[3], edge)
     column = column or _column(caption_box, parts.walls, lo, hi)
@@ -1315,6 +1321,11 @@ def _table_end(caption_box, parts: _Parts, upward: bool, edge: float,
             gap = None if nearest is None else nearest[1] - far
         if nearest is None:
             return edge
+        if claimed and nearest in texts and any(
+                e not in texts and (nearest[1] < e[3] <= far + 0.5 if upward
+                                    else far - 0.5 <= e[1] < nearest[3])
+                for e in past):
+            return far
         row = (nearest in in_cells and gap <= 2 * _NOTE_GAP
                and nearest[0] >= table[0] - _RULE_ALIGN
                and nearest[2] <= table[2] + _RULE_ALIGN)
@@ -1477,26 +1488,28 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
     for b in blocks:
         if b.get("type") != 0:
             continue
-        other = caption_kind(_block_text(b))
-        if other is None or other == (kind, num):
+        found = _other_caption(b, parts, kind, num)
+        if found is None:
             continue
         # _page_parts classifies a caption line as an ELEMENT (it looks like a
         # sub-caption), and the walk steps over elements — so it is dropped from
-        # the elements as it becomes a barrier. The block's lines past the
-        # caption (`_caption_lines`) stay content.
-        taken = _caption_lines(b, rules)
-        box = _union(ln["bbox"] for ln in b["lines"][:taken])
-        rest = b["lines"][taken:]
+        # the elements as it becomes a barrier. The block's lines before and
+        # past the caption (`_caption_lines`) stay content.
+        other, start = found
+        lines = b["lines"][start:]
+        taken = _caption_lines({"lines": lines}, rules)
+        box = _union(ln["bbox"] for ln in lines[:taken])
         whole = tuple(b["bbox"])
         parts.barriers = [e for e in parts.barriers if e != whole]
         parts.walls = [e for e in parts.walls if e != whole]
         parts.loose = [e for e in parts.loose if e != whole]
         parts.texts = [t for t in parts.texts if not _overlaps(t[0], box)]
-        if rest:
-            block = {"type": 0, "lines": rest,
-                     "bbox": _union(ln["bbox"] for ln in rest)}
-            parts.texts.append((tuple(block["bbox"]), block))
-            parts.elements.append(tuple(block["bbox"]))
+        for rest in (b["lines"][:start], lines[taken:]):
+            if rest:
+                block = {"type": 0, "lines": rest,
+                         "bbox": _union(ln["bbox"] for ln in rest)}
+                parts.texts.append((tuple(block["bbox"]), block))
+                parts.elements.append(tuple(block["bbox"]))
         parts.barriers.append(box)
         parts.walls.append(box)
         parts.captions.append(box)
@@ -1611,6 +1624,20 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
         return None, NOTHING_BESIDE
     problem = _crop_problem(page, rect, kind, num, caption_box, body, band)
     return (None, problem) if problem else (rect, None)
+
+
+def _other_caption(block, parts: _Parts, kind: str, num):
+    """((kind, label), index) of the caption, not `kind num`'s, that opens on
+    the block's line `index`: line 0 (`caption_kind` of the block's text) or,
+    in a block that is no barrier of `parts`, its first later line opening
+    one with a separator (`_separated`: a cell can cite `Table A9`); else
+    None."""
+    found = caption_kind(_block_text(block)), 0
+    if found[0] is None and tuple(block["bbox"]) not in parts.barriers:
+        texts = ["".join(s["text"] for s in ln["spans"]) for ln in block["lines"]]
+        found = next(((caption_kind(text), i) for i, text in enumerate(texts)
+                      if i and _separated(text) and caption_kind(text)), found)
+    return None if found[0] in (None, (kind, num)) else found
 
 
 def _on_page(box, page_rect) -> tuple:
@@ -2356,16 +2383,24 @@ def placements(keys: list, blocks: list, roman: dict) -> dict:
     return resolved
 
 
+def _cited_label(num):
+    """The label a body mention of the float `num` cites: what precedes the
+    letter of a suffixed label (`10a` -> "10", `S2c` -> "S2"), else `num`."""
+    found = _SUFFIXED.fullmatch(num) if isinstance(num, str) else None
+    return num if found is None else found.group("cited")
+
+
 def _anchor_for(kind: str, num, blocks: list, roman: str = ""):
     """Block to insert after: the first body mention of this figure/table (or of
-    `roman`, the numeral its caption prints), else, for a lettered label, the
-    heading of the appendix its letter names."""
+    `roman`, the numeral its caption prints), a mention of a suffixed label's
+    number included (`_cited_label`), else, for a lettered label, the heading
+    of the appendix its letter names."""
     if kind.startswith(ED_PREFIX):
         return _extended_data_anchor(base_kind(kind), num, blocks)
     # The same rule the HTML injectors read: a particle after the number, a
     # lowercase "fig. 5", an Extended Data mention that names another figure, and
     # another float's caption cross-referencing this one are all handled there.
-    found = ef.first_mention(kind, num, blocks, roman)
+    found = ef.first_mention(kind, _cited_label(num), blocks, roman)
     if found or isinstance(num, int):
         return found
     letter = re.match(r"([A-Za-z])\.?\d", num)

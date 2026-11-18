@@ -126,7 +126,7 @@ class TestUnrendered:
                        "table|2": {"page": 3, "problem": None}}}
         entry["rendered"] = {"base": ["table|2"], "branch": []}
         lines = ab.summary_table({"paper": entry}).splitlines()
-        assert lines[1].split()[-3:] == ["1", "2", "1"]
+        assert lines[1].split()[-4:] == ["1", "2", "1", "0"]
         assert "unrendered paper figure|7 p1: base None; branch nothing" in lines
         assert "unrendered paper table|2 p3: base rendered; branch None" in lines
 
@@ -137,6 +137,23 @@ class TestUnrendered:
         entry["rendered"] = {"base": [], "branch": []}
         assert ("unrendered paper figure|'S1' p2: base not read; branch x"
                 in ab.summary_table({"paper": entry}).splitlines())
+
+
+def test_a_float_the_base_rendered_is_lost_unless_the_branch_reports_it():
+    def row(key):
+        return {"key": key, "page": 4, "base": {"page": 4}, "branch": None,
+                "delta": None}
+    entry = {c: [] for c in ab.CATEGORIES}
+    entry["removed"] = [row("figure|10"), row("figure|11"), row("table|2")]
+    entry["relabeled"] = [row("figure|12 -> figure|'12a'")]
+    entry["unrendered"] = {"base": {},
+                           "branch": {"figure|11": {"page": 4, "problem": "x"},
+                                      "table|2": {"page": 4, "problem": None}}}
+    entry["rendered"] = {"base": [], "branch": []}
+    assert [r["key"] for r in ab.lost(entry)] == ["figure|10", "table|2"]
+    lines = ab.summary_table({"paper": entry}).splitlines()
+    assert lines[1].split()[-1] == "2"
+    assert "lost paper figure|10 p4" in lines and "lost paper table|2 p4" in lines
 
 
 def test_a_rendered_caption_is_not_listed_unrendered(tmp_path):

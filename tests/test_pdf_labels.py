@@ -6,6 +6,7 @@ rendered, and the injector keyed every float on an integer. The label is read by
 the same rule the HTML injectors use, and placed by the same mention rule.
 """
 import fitz
+import pytest
 
 import extract_paper_figures as ef
 import extract_pdf_media as pm
@@ -377,3 +378,55 @@ class TestWhatRenderMediaReports:
         monkeypatch.setattr(pm, "render_media", render_media)
         rep = pm.inject("p", "paper.pdf", apply=False, keep_text=True)
         assert rep["unrendered"] == [lost] and rep["found"] == 0
+
+
+class TestALetterSuffixedNumber:
+    """A float whose printed number carries a letter: `Figure 10a`, one float
+    per caption."""
+
+    @pytest.mark.parametrize("text, expected", [
+        ("Figure 10a: Reconstructions with no guidance.", ("figure", "10a")),
+        ("Fig. 3b. The second panel.", ("figure", "3b")),
+        ("Table 2b: Results on the second split.", ("table", "2b")),
+        ("Figure S2c: A supplementary panel.", ("figure", "S2c")),
+    ])
+    def test_it_is_read_with_its_letter(self, text, expected):
+        assert pm.caption_kind(text) == expected
+
+    def test_an_image_caption_needs_no_separator(self):
+        assert pm.image_label("Figure 10a DDIM latents") == ("figure", "10a")
+
+    @pytest.mark.parametrize("text, expected", [
+        ("Figure 10ab samples", ("figure", 10)),
+        ("Figure 3Dx renders", ("figure", 3)),
+    ])
+    def test_a_suffix_is_one_letter_only(self, text, expected):
+        assert pm.image_label(text) == expected
+
+    @pytest.mark.parametrize("text", [
+        "Figure 10a shows the reconstructions for every class.",
+        "Figure 10ab: no single letter.",
+        "Fig. 1d Fig. 4c",
+        "Table 2b Results on the second split.",
+    ])
+    def test_with_no_separator_it_opens_no_caption(self, text):
+        # A sentence, a word, or a cell citing panels (`Fig. 1d`).
+        assert pm.caption_kind(text) is None
+
+    def test_each_caption_is_its_own_float(self, tmp_path):
+        media = render(tmp_path, [
+            [("Figure 10a: The first panel.", (60, 60, 500, 200)),
+             ("Figure 10b: The second panel.", (60, 240, 500, 400))],
+            [("Figure 10c: The third panel.", (60, 60, 500, 300))]])
+        assert {k: v["page"] for k, v in media.items()} == {
+            ("figure", "10a"): 1, ("figure", "10b"): 1, ("figure", "10c"): 2}
+        assert media[("figure", "10b")]["box"][1] > 218
+
+    def test_a_mention_of_its_number_places_it(self):
+        # `Figures 10a through 10c` cites the number 10, as `Figure 10` does.
+        blocks = [para("intro", "그림 2에서 보듯 학습이 안정적이다."),
+                  para("ten", "Figures 10a through 10c show the interpolations."),
+                  para("later", "Figure 10b를 다시 보라.")]
+        keys = [("figure", "10a"), ("figure", "10b"), ("figure", "10c")]
+        placed = pm.placements(keys, blocks, dict.fromkeys(keys, ""))
+        assert placed == dict.fromkeys(keys, "ten")
