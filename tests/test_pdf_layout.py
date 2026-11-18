@@ -3569,3 +3569,43 @@ def test_cells_citing_floats_are_no_captions(tmp_path):
     box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
         ("table", 12)]["box"]
     assert box[1] <= 100 and box[3] >= 145
+
+
+def test_a_prose_line_opening_on_a_label_does_not_cut_the_table_under_it(tmp_path):
+    # The paragraph ends 4 pt over the table; a later line of it opens on
+    # `Table 7:`. Captioned below.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    page.insert_textbox(fitz.Rect(72, 60, 540, 296), PROSE + "\nTable 7: " + PROSE[:200],
+                        fontsize=10, align=fitz.TEXT_ALIGN_JUSTIFY)
+    paragraph = blocks_with(page, "Table 7")[0]
+    top = paragraph["bbox"][3] + 4
+    bottom = ruled_table(page, 72, 540, top, 4)
+    page.insert_text((150, bottom + 14), "Table 5: Time of every part.", fontsize=9)
+    prose(page, 72, 540, 700)
+    assert pm._is_prose(paragraph, pm.body_text(doc))
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 5)]["box"]
+    assert paragraph["bbox"][3] - 0.5 <= box[1] <= top and box[3] >= bottom
+
+
+def test_a_figure_over_a_tables_caption_does_not_cut_its_note(tmp_path):
+    # Figure 3 over Table 1's caption; a note under the table, then Figure 4,
+    # captioned below, claims what follows.
+    doc = fitz.open()
+    body_pages(doc)
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    filled_rect(page, fitz.Rect(150, 60, 460, 160))
+    page.insert_text((150, 175), "Figure 3: Samples of every part.", fontsize=9)
+    page.insert_text((150, 200), "Table 1: Comparison of accuracy.", fontsize=8)
+    bottom = ruled_table(page, 150, 460, 206, 4)
+    page.insert_text((150, bottom + 9), "* on the test split", fontsize=7)
+    filled_rect(page, fitz.Rect(150, bottom + 30, 460, bottom + 150))
+    page.insert_text((150, bottom + 165), "Figure 4: Trajectories of both runs.",
+                     fontsize=9)
+    prose(page, 72, 540, 700)
+    note = blocks_starting(page, "*")[0]
+    box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+        ("table", 1)]["box"]
+    assert note[3] <= box[3] < bottom + 30

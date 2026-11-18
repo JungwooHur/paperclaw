@@ -130,10 +130,14 @@ _BACKGROUND_AREA_FRAC = 0.8  # a box this big is a page background, not content
 # A float's caption opener: the word, the label as printed, an optional
 # separator. The label is the citation grammar the HTML injectors share
 # (`extract_paper_figures._LABEL`): `7`, `S2`, `B.1`, `A1`, `3.1`, or a roman
-# numeral. Leading zeros are allowed because some PDFs pad the number.
+# numeral, and one letter glued onto a label ending in a digit (`10a`).
+# Leading zeros are allowed because some PDFs pad the number.
 _CAPTION = re.compile(
     r"\s*(?P<ed>Extended\s+Data\s+)?(?P<word>Fig\.?|Figure|Table)\s*0*"
-    + ef._LABEL + r"(?P<sep>\s*[:.|])?", re.I)
+    + ef._LABEL + r"(?P<suffix>(?<=\d)[a-z](?![A-Za-z]))?(?P<sep>\s*[:.|])?", re.I)
+
+# A label ending in one letter glued onto a digit (`10a`), and what precedes it.
+_SUFFIXED = re.compile(r"(?P<cited>.*\d)[a-z]", re.I)
 
 ED_PREFIX = "ed_"
 
@@ -174,16 +178,18 @@ def _read_label(text: str, sentence_ok: bool):
     """(kind, label) of the float label `text` opens with, or None.
 
     The label is an int for a number (a roman table number included) and the
-    printed string otherwise. With `sentence_ok` false, a label with no
-    separator that runs on into lower-case words or a comma opens a sentence,
-    not a caption. A label followed by `continued` heads a table's later part,
+    printed string otherwise, its letter suffix included (`10a`). With
+    `sentence_ok` false, a label with no separator that runs on into
+    lower-case words or a comma opens a sentence, and a suffixed one with no
+    separator a citation of a panel (`Fig. 1d` in a cell), not a caption. A
+    label followed by `continued` heads a table's later part,
     not its caption.
     """
     found = _CAPTION.match(text or "")
     if not found:
         return None
     base = "table" if found.group("word").lower().startswith("tab") else "figure"
-    token = found.group("label")
+    token = found.group("label") + (found.group("suffix") or "")
     if token.isdigit():
         label = int(token)
     elif re.fullmatch(r"[ivx]+", token, re.I):
@@ -193,7 +199,8 @@ def _read_label(text: str, sentence_ok: bool):
     else:
         label = token
     if (not sentence_ok and not found.group("sep")
-            and _SENTENCE_GOES_ON.match(text, found.end())):
+            and (found.group("suffix")
+                 or _SENTENCE_GOES_ON.match(text, found.end()))):
         return None
     if _CONTINUED.match(text, found.end()):
         return None
@@ -2376,16 +2383,24 @@ def placements(keys: list, blocks: list, roman: dict) -> dict:
     return resolved
 
 
+def _cited_label(num):
+    """The label a body mention of the float `num` cites: what precedes the
+    letter of a suffixed label (`10a` -> "10", `S2c` -> "S2"), else `num`."""
+    found = _SUFFIXED.fullmatch(num) if isinstance(num, str) else None
+    return num if found is None else found.group("cited")
+
+
 def _anchor_for(kind: str, num, blocks: list, roman: str = ""):
     """Block to insert after: the first body mention of this figure/table (or of
-    `roman`, the numeral its caption prints), else, for a lettered label, the
-    heading of the appendix its letter names."""
+    `roman`, the numeral its caption prints), a mention of a suffixed label's
+    number included (`_cited_label`), else, for a lettered label, the heading
+    of the appendix its letter names."""
     if kind.startswith(ED_PREFIX):
         return _extended_data_anchor(base_kind(kind), num, blocks)
     # The same rule the HTML injectors read: a particle after the number, a
     # lowercase "fig. 5", an Extended Data mention that names another figure, and
     # another float's caption cross-referencing this one are all handled there.
-    found = ef.first_mention(kind, num, blocks, roman)
+    found = ef.first_mention(kind, _cited_label(num), blocks, roman)
     if found or isinstance(num, int):
         return found
     letter = re.match(r"([A-Za-z])\.?\d", num)

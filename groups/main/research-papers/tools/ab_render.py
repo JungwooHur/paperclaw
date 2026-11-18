@@ -17,7 +17,8 @@ in one of four categories:
 
 A caption a side reads (its own `caption_kind`) and renders nothing for is
 that side's `unrendered`, with the problem it reported (None when it reported
-none, or cannot report).
+none, or cannot report). A removed float the branch reports no problem for,
+whether or not it reads the caption, is `lost`.
 
 Written under `--out`:
 
@@ -282,21 +283,31 @@ def contact_sheets(report: dict, pdfs: dict, out_dir: str, per_sheet: int) -> li
     return written
 
 
-UNRENDERED_COLUMNS = ("unr base", "unr branch", "silent")
+UNRENDERED_COLUMNS = ("unr base", "unr branch", "silent", "lost")
+
+
+def lost(entry: dict) -> list:
+    """The removed rows of `entry` whose float the branch reports no problem
+    for: rendered on the base, and on the branch neither rendered, under its
+    label or another (`relabeled`), nor reported unrendered."""
+    branch = entry["unrendered"]["branch"]
+    return [row for row in entry["removed"]
+            if (branch.get(row["key"]) or {}).get("problem") is None]
 
 
 def _unrendered_counts(entry: dict) -> dict:
-    """{column: count}: each side's unrendered captions, and the branch's that
-    carry no problem."""
+    """{column: count}: each side's unrendered captions, the branch's that
+    carry no problem, and the floats it lost (`lost`)."""
     base, branch = entry["unrendered"]["base"], entry["unrendered"]["branch"]
     return {"unr base": len(base), "unr branch": len(branch),
-            "silent": sum(1 for u in branch.values() if u["problem"] is None)}
+            "silent": sum(1 for u in branch.values() if u["problem"] is None),
+            "lost": len(lost(entry))}
 
 
 def summary_table(report: dict) -> str:
-    """One line per PDF and a total: the count in each category and of
-    unrendered captions, then one line per caption either side leaves
-    unrendered."""
+    """One line per PDF and a total: the count in each category, of
+    unrendered captions and of lost floats, then one line per caption either
+    side leaves unrendered and one per lost float."""
     columns = CATEGORIES + UNRENDERED_COLUMNS
     lines = [f"{'pdf':<28}" + "".join(f"{c:>11}" for c in columns)]
     totals = dict.fromkeys(columns, 0)
@@ -320,6 +331,8 @@ def summary_table(report: dict) -> str:
             lines.append(f"unrendered {stem} {key} p{page}: "
                          f"base {_status('base', key)}; "
                          f"branch {_status('branch', key)}")
+        for row in lost(report[stem]):
+            lines.append(f"lost {stem} {row['key']} p{row['page']}")
     return "\n".join(lines)
 
 
