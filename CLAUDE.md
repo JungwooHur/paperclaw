@@ -30,7 +30,7 @@ Read the doc for the area a change touches. A root cause found in an area goes t
 | [systemd/README.md](systemd/README.md) | Service unit, rebuild on restart, WhatsApp watchdog, timers |
 | [container/README.md](container/README.md) | Image build cache, the NotebookLM wrapper |
 | [vendor/README.md](vendor/README.md) | Vendored notebooklm-py: upgrade, what a stale copy breaks |
-| [groups/main/research-papers/README.md](groups/main/research-papers/README.md) | Host-side paper scripts: page audit, batch queue sweeper |
+| [groups/main/research-papers/README.md](groups/main/research-papers/README.md) | Host-side paper scripts: page audit, batch queue sweeper, writing a script or repair, reading healer reports, re-processing a page |
 | [groups/main/research-papers/systemd/README.md](groups/main/research-papers/systemd/README.md) | Paper healer unit |
 | [scripts/README.md](scripts/README.md) | How the leak gates decide |
 | [docs/SPEC.md](docs/SPEC.md) | Host behaviour: per-group copies, usage limits, scheduled runs |
