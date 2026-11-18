@@ -121,7 +121,7 @@ _ARTIFACT_PATS = [
 # characters measured ~20,700). Its items cannot stop the span either, since each
 # item's number is a line of its own ("1." then "Claims"). A bare "Checklist" is
 # the heading only as a whole line, never a paragraph that opens with the word.
-_TAIL_RE = re.compile(r"\n\s*(references|bibliography|acknowledg(e)?ments"
+_TAIL_RE = re.compile(r"\n\s*(references|bibliography|acknowledg(e)?ments?"
                       r"|(?:neurips\s+(?:\d{4}\s+)?)?paper\s+checklist"
                       r"|checklist(?=[ \t]*\n))\b",
                       re.IGNORECASE)
@@ -258,6 +258,12 @@ def duplicate_groups(sections: list) -> dict:
     return groups
 
 
+def content_chars(section: dict) -> int:
+    """All of a `group_sections` section's text: its body and its translated
+    captions."""
+    return section["chars"] + section["caption_chars"]
+
+
 def dup_confirmed(a: dict, b: dict) -> bool:
     """Are these two same-titled sections really the SAME section, duplicated?
 
@@ -267,7 +273,7 @@ def dup_confirmed(a: dict, b: dict) -> bool:
     one copy to be an empty leftover heading. Without this the healer would archive
     a real section on any page that reuses a subheading.
     """
-    if min(a["chars"], b["chars"]) < 120:
+    if min(content_chars(a), content_chars(b)) < 120:
         return True                      # an empty twin is always the leftover
     ta, tb = _words(a["text"]), _words(b["text"])
     if not ta or not tb:
@@ -296,9 +302,13 @@ _EMPTY_SECTION_CHARS = 80
 def group_sections(blocks: list) -> list:
     """Ordered list of section dicts, body text aggregated under each heading.
 
-    Each entry: {key, title, heading, level, chars, heading_id, occurrence}.
+    Body text excludes a paragraph that is a translated float caption
+    (`extract_pdf_media.is_caption_text`); `caption_chars` counts those.
+    Each entry: {key, title, heading, level, chars, caption_chars, heading_id,
+    occurrence}.
     `occurrence` counts repeats of the same key in page order (1-based).
     """
+    import extract_pdf_media as epm
     sections, seen = [], {}
     cur = None
     for b in blocks:
@@ -327,11 +337,18 @@ def group_sections(blocks: list) -> list:
                 "heading": txt,
                 "level": int(t[-1]),
                 "chars": 0,
+                "caption_chars": 0,
                 "text": "",
                 "heading_id": b["id"],
                 "occurrence": seen.get(key, 0),
             }
             sections.append(cur)
+        elif cur is not None and t in BODY_TYPES and epm.is_caption_text(
+                aq._block_text(b)):
+            piece = aq._block_text(b)
+            cur["caption_chars"] += len(piece)
+            if len(cur["text"]) < 4000:
+                cur["text"] += " " + piece
         elif cur is not None and (t in BODY_TYPES or t == "equation"):
             # An equation BLOCK is body content too. Counting only rich_text made
             # every math-heavy section look summarized: one real section measured
@@ -360,7 +377,7 @@ def _rollup(sections: list) -> None:
     """
     for i, sec in enumerate(sections):
         own = sec["chars"]
-        total = own
+        total, captions = own, sec["caption_chars"]
         for nxt in sections[i + 1:]:
             if nxt["level"] < sec["level"]:
                 break
@@ -372,8 +389,10 @@ def _rollup(sections: list) -> None:
             # … all as heading_3). Level alone cannot see that nesting, so folding
             # only deeper headings still left the parent looking empty.
             total += nxt["chars"]
+            captions += nxt["caption_chars"]
         sec["own_chars"] = own
         sec["chars"] = total
+        sec["caption_chars"] = captions
 
 
 # ---- source loading -------------------------------------------------------
@@ -401,8 +420,8 @@ def _strip_html(html: str) -> str:
 
 _TABLE_FLOAT = re.compile(r'<figure\b[^>]*\bclass="[^"]*\bltx_table\b[^"]*"[^>]*>', re.I)
 _FIGURE_TAG = re.compile(r"<(/?)figure\b[^>]*>", re.I)
-# Stands in for a table's text, one character per character of it (a private-use
-# code point, which no paper's text contains).
+# Stands in for the text of a table or a caption, one character per character of
+# it (a private-use code point, which no paper's text contains).
 _TABLE_MARK = "\ue000"
 
 
@@ -442,9 +461,27 @@ def _drop_tables(html: str) -> str:
     return "".join(out)
 
 
+# A LaTeXML figure caption: its tag span is `ltx_tag_figure` (a table's is
+# `ltx_tag_table`, an algorithm's `ltx_tag_float`).
+_FIGURE_CAPTION = re.compile(
+    r"<figcaption\b[^>]*>(?:(?!</figcaption>).)*?\bltx_tag_figure\b.*?</figcaption>",
+    re.I | re.S)
+
+
+def _drop_figure_captions(html: str) -> str:
+    """LaTeXML HTML with each figure caption's text replaced by `_TABLE_MARK`s.
+
+    A figure is an image on the page, and its caption goes with it, so a
+    caption is no section's text.
+    """
+    return _FIGURE_CAPTION.sub(
+        lambda m: "\n" + _TABLE_MARK * len(_strip_html(m.group()).strip()) + "\n",
+        html)
+
+
 def source_text_from_html(html: str) -> str:
     """The text the audit measures a LaTeXML (arXiv) page against."""
-    return _strip_html(_drop_tables(html))
+    return _strip_html(_drop_figure_captions(_drop_tables(html)))
 
 
 def source_text_from_arxiv(arxiv_id: str):
@@ -459,6 +496,29 @@ def source_text_from_arxiv(arxiv_id: str):
         if len(html) > 50000 and "ltx_document" in html and "Fatal error" not in html:
             return source_text_from_html(html)
     return None
+
+
+def _pdf_page_text(page) -> str:
+    """`page.get_text()` with each float caption's lines replaced by `_TABLE_MARK`s.
+
+    A caption goes with its image or table on the page, so it is no section's
+    text; the marks keep the span's extent.
+    """
+    import fitz
+    import extract_pdf_media as epm
+    blocks = page.get_text(
+        "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)["blocks"]
+    boxes = epm.caption_regions(page, blocks)
+    out = []
+    for block in blocks:
+        for ln in block.get("lines", ()) if block.get("type") == 0 else ():
+            line = "".join(s["text"] for s in ln["spans"])
+            x0, y0, x1, y1 = ln["bbox"]
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            if any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes):
+                line = _TABLE_MARK * len(line)
+            out.append(line + "\n")
+    return "".join(out)
 
 
 def source_text_from_pdf(path_or_url: str):
@@ -490,11 +550,11 @@ def source_text_from_pdf(path_or_url: str):
             return None
         try:
             doc = fitz.open(local)
-            # Keep newlines — the References tail-cut anchors on a heading line.
-            text = "\n".join(doc[i].get_text() for i in range(doc.page_count))
         except Exception as e:
             sys.stderr.write(f"could not open pdf: {e}\n")
             return None
+        # Keep newlines — the References tail-cut anchors on a heading line.
+        text = "\n".join(_pdf_page_text(page) for page in doc)
     finally:
         if is_temp and os.path.exists(local):
             os.unlink(local)
@@ -692,6 +752,15 @@ def _next_source_heading(body: str, idx: int, limit: int) -> int:
     return limit
 
 
+_NUMBER = re.compile(r"[-+±−]?\d+(?:[.,]\d+)*%?")
+
+
+def _numeric_row(line: str) -> bool:
+    """Are most of the line's whitespace-separated tokens numbers?"""
+    tokens = line.split()
+    return sum(1 for t in tokens if _NUMBER.fullmatch(t)) * 2 > len(tokens)
+
+
 def _prose_chars(span: str) -> int:
     """Length of a source span counting PROSE only, not flattened table rows.
 
@@ -712,7 +781,8 @@ def _prose_chars(span: str) -> int:
 
     for line in lines:
         t = line.strip()
-        if t and len(t) < 40 and not re.search(r"[.!?][\"')\]]*$", t):
+        if t and (len(t) < 40 and not re.search(r"[.!?][\"')\]]*$", t)
+                  or _numeric_row(t)):
             run.append(t)
         else:
             flush()
@@ -1200,7 +1270,7 @@ def main() -> int:
             # hand they ran 0.60-0.79 of their source. Without a span, flag only a
             # section that is essentially EMPTY, which is the unambiguous case.
             floor = args.min_chars if sc is not None else _EMPTY_SECTION_CHARS
-            if tc < floor:
+            if content_chars(s) < floor:
                 findings.append({
                     "type": "CONTENT_LOSS", "section": key,
                     "heading": s["heading"][:70], "chars": tc,

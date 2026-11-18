@@ -695,7 +695,7 @@ python3 /workspace/group/research-papers/verify_sections.py \
 
 Fix and re-run until exit 0 — do NOT finish with findings outstanding. The thresholds (`--min-ratio 0.35`, `--min-chars 400`, `--min-source 800`) are calibrated on real pages: faithful full ko translations land at ~0.55-0.7 of source chars; batched-call summaries land at ≤0.2.
 
-**Step 2-D: Verify inline citation numbers against the real bibliography.** NotebookLM does not reliably keep a paper's citation markers even with Step 2-B rule 5 — it tends to renumber them sequentially per section, and for **author-year papers it fabricates numeric `[N]` markers that do not exist in the source at all**. Run the auditor after upload (arxiv papers only):
+**Step 2-D: Verify inline citation numbers against the real bibliography.** NotebookLM does not reliably keep a paper's citation markers even with Step 2-B rule 5 — it tends to renumber them sequentially per section, and for **author-year papers it fabricates numeric `[N]` markers that do not exist in the source at all**. The numbered `[N]` in an `ask --json` answer (ranges like `[4-8]` included) are NotebookLM's grounding markers, numbered by the chunks the answer drew on, not by the paper's bibliography: they stand at most of the source's citation positions and also at sentence ends where the source cites nothing, and a group of citations can come back as fewer numbers. Keep them in `answer`; they are the only trace of the citation positions this step reads. Run the auditor after upload (arxiv papers only):
 
 ```bash
 python3 research-papers/verify_citations.py --page PAGE_ID   # add --arxiv ID if Paper URL isn't set yet

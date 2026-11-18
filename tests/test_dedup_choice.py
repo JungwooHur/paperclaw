@@ -9,9 +9,9 @@ distinguishes them; richness only overrules it when the difference is real.
 import heal_verify as hv
 
 
-def occurrence(chars, heading="Smooth power laws:"):
+def occurrence(chars, heading="Smooth power laws:", captions=0):
     return {"heading": heading, "heading_id": "h%d" % chars, "chars": chars,
-            "key": None, "level": 3}
+            "caption_chars": captions, "key": None, "level": 3}
 
 
 class TestChoosingWhichCopyToKeep:
@@ -37,3 +37,9 @@ class TestChoosingWhichCopyToKeep:
     def test_one_copy_is_its_own_choice(self):
         only = occurrence(200)
         assert hv.choose_kept([only]) is only
+
+
+def test_translated_captions_count_toward_a_copy_s_richness():
+    first, captioned, later = (occurrence(10), occurrence(0, captions=900),
+                               occurrence(300))
+    assert hv.choose_kept([first, captioned, later]) is captioned

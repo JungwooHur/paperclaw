@@ -125,6 +125,7 @@ _STAMP_MIN_HEIGHT = 80.0
 _STAMP_MIN_PAGE_FRAC = 0.25  # ...and runs at least this much of the page height
 _STAMP_MARGIN_FRAC = 0.10    # ...entirely within this much of the outer margin
 _BACKGROUND_AREA_FRAC = 0.8  # a box this big is a page background, not content
+_LABEL_LINE_MAX = 40         # a figure's own label line is shorter than this (chars)
 
 
 # A float's caption opener: the word, the label as printed, an optional
@@ -148,6 +149,8 @@ _FIXED_PITCH_FONT = re.compile(
 
 # What a body sentence continues with after the label it opens on.
 _SENTENCE_GOES_ON = re.compile(r"\s*(?:[a-z]|[,;])")
+# A sentence's last characters: its stop and any closing quotes or brackets.
+_SENTENCE_END = re.compile(r"[.!?][\"')\]]*$")
 
 # The title opening an algorithm box: `Algorithm 2`, `ALGORITHM S1`.
 _ALGORITHM = re.compile(r"\s*algorithm\s+[A-Z]?\d+\b", re.I)
@@ -224,10 +227,21 @@ def caption_kind(text: str):
     return _read_label(text, sentence_ok=False)
 
 
+def _in_english(caption: str) -> str:
+    """`caption` with a Korean opening float word (`그림`, `표`) in English."""
+    return re.sub(r"^\s*그림", "Figure", re.sub(r"^\s*표", "Table", caption or ""))
+
+
 def image_label(caption: str):
     """(kind, label) an image block's caption opens with, in English or Korean."""
-    text = re.sub(r"^\s*그림", "Figure", re.sub(r"^\s*표", "Table", caption or ""))
-    return _read_label(text, sentence_ok=True)
+    return _read_label(_in_english(caption), sentence_ok=True)
+
+
+def is_caption_text(text: str) -> bool:
+    """Does `text`, in English or Korean, open on a float label set off by a
+    separator (`Figure 4:`, `그림 4:`, `표 1.`, `Fig. 8 |`)?"""
+    text = _in_english(text)
+    return bool(_read_label(text, sentence_ok=True)) and _separated(text)
 
 
 def opens_caption(text: str, kind: str, label) -> bool:
@@ -631,6 +645,81 @@ def caption_boxes(page, kind: str, num) -> list:
     return [(_stitched(blocks, i, rules), blocks[i]) for i in starts]
 
 
+def caption_regions(page, blocks) -> list:
+    """Box of every float caption among this page's text `blocks` (its
+    `get_text("dict")` blocks), figure or table (`_stitched`).
+
+    A caption opens a block, or follows short lines the PDF set in the same
+    block (the figure's own labels: axis titles, `log(N)`; a short caption),
+    and sets its label off with a separator or is set smaller than the page's
+    body text. It ends at a sentence end that a section heading follows or that
+    closes a short line (a paragraph's last), and a caption set smaller than
+    body text also ends at the first row set at body size, even where the PDF
+    set that heading or the next paragraph in the caption's block.
+    """
+    blocks = sorted((b for b in blocks if b.get("type") == 0), key=lambda b: b["bbox"][1])
+    rules = None
+    body = _body_size(blocks)
+    out = []
+    for i, b in enumerate(blocks):
+        for n, ln in enumerate(b["lines"]):
+            text = _block_text({"lines": [ln]})
+            small = _body_size([{"type": 0, "lines": [ln]}]) < body - _BODY_SIZE_TOL
+            if caption_kind(text) and (_separated(text) or small):
+                if rules is None:
+                    rules = _page_rules(page)
+                head = dict(b, lines=b["lines"][n:],
+                            bbox=_union(x["bbox"] for x in b["lines"][n:]))
+                box = _stitched(blocks[:i] + [head] + blocks[i + 1:], i, rules)
+                rows = _rows([head] + blocks[i + 1:], box)
+                right = max(x["bbox"][2] for row in rows for x in row)
+                kept = rows[:1]
+                for row in rows[1:]:
+                    now = _block_text({"lines": row})
+                    if (small and _at_body_size({"type": 0, "lines": row}, body)
+                            or _SENTENCE_END.search(_block_text({"lines": kept[-1]}).rstrip())
+                            and (_SECTION_NUMBER.match(now)
+                                 or _ends_short(kept[-1], right))):
+                        break
+                    kept.append(row)
+                out.append(_union(x["bbox"] for row in kept for x in row))
+            if len(text.strip()) >= _LABEL_LINE_MAX:
+                break
+    return out
+
+
+def _ends_caption(text: str, after: str) -> bool:
+    """Can caption text ending in `text` end before `after`: at a sentence end,
+    or at a closing bracket (`(best viewed in color)`) that `after` does not go
+    on from?"""
+    text = text.rstrip()
+    return bool(_SENTENCE_END.search(text)) or (
+        text.endswith(")") and not _SENTENCE_GOES_ON.match(after))
+
+
+def _ends_short(row, right: float) -> bool:
+    """Does `row` (a list of lines) stop more than half its font size short of
+    `right`, the way a paragraph's last line does?"""
+    size = max(s["size"] for ln in row for s in ln["spans"])
+    return right - max(ln["bbox"][2] for ln in row) > size / 2
+
+
+def _rows(blocks, box) -> list:
+    """The lines of `blocks` centred inside `box`, grouped by baseline, in order."""
+    rows = []
+    for b in blocks:
+        for ln in b["lines"]:
+            x0, y0, x1, y1 = ln["bbox"]
+            if not (box[0] <= (x0 + x1) / 2 <= box[2] and box[1] <= (y0 + y1) / 2 <= box[3]):
+                continue
+            base = ln["spans"][0]["origin"][1] if ln.get("spans") else y1
+            if rows and abs(rows[-1][0]["spans"][0]["origin"][1] - base) <= _BASELINE_TOL:
+                rows[-1].append(ln)
+            else:
+                rows.append([ln])
+    return rows
+
+
 def _page_rules(page) -> list:
     """Visible parts (`_visible`) of the page's horizontal rules."""
     return [v for v in _visible(page).values() if v is not None
@@ -667,7 +756,8 @@ def _union(boxes) -> tuple:
 def _stitched(blocks, start: int, rules) -> tuple:
     """Box of the caption opening at blocks[start] (sorted top to bottom): its
     lines of that block (`_caption_lines`) and, when it takes them all, the
-    blocks that continue it; no block past one of `rules` continues it."""
+    blocks that continue it; no block past one of `rules` or opening on a
+    section number (`_SECTION_NUMBER`) continues it."""
     head = blocks[start]
     taken = _caption_lines(head, rules)
     if taken < len(head["lines"]):
@@ -676,7 +766,8 @@ def _stitched(blocks, start: int, rules) -> tuple:
     fonts = {round(s.get("size", 0), 1) for s in _spans(head)}
     text = _block_text(head)
     for nxt in blocks[start + 1:]:
-        if text.rstrip().endswith("."):
+        after = _block_text(nxt)
+        if _ends_caption(text, after) or _SECTION_NUMBER.match(after):
             break
         nx0, ny0, nx1, ny1 = nxt["bbox"]
         if ny0 - y1 > _CAP_GAP or abs(nx0 - x0) > 40:
@@ -1666,7 +1757,7 @@ def _visible(page) -> dict:
     vector drawings: its box cut to the clip paths in force where it is
     drawn."""
     out, clips = {}, []
-    for d in page.get_drawings(extended=True):
+    for d in page.get_cdrawings(extended=True):
         clips = [c for c in clips if c[0] < d["level"]]
         if d["type"] == "clip":
             clips.append((d["level"], tuple(d["scissor"])))
