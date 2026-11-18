@@ -129,3 +129,77 @@ nothing reads the budget.
 - **If resumes come hours apart, read `papers_sweep_state.json` and the
   `backing off` lines before suspecting the sweeper.**
 - Whether a service restart orphaned it: [the bot's units README](../../../systemd/README.md#whatsapp-watchdog).
+
+## Writing a script or a repair
+
+- **Add the `!` line when you add a script.** `.gitignore` ignores
+  `groups/main/research-papers/*` and re-admits each script by an explicit `!`
+  line, so a NEW file is silently untracked — `git add` refuses it with a hint that
+  is easy to read past — while it still runs here, because the container mounts the
+  working tree. To audit:
+  ```bash
+  for f in groups/main/research-papers/*.py; do git ls-files --error-unmatch "$f" >/dev/null 2>&1 || echo "UNTRACKED $f"; done
+  ```
+- **A new healer that edits text must stop at the reference list**, as every other
+  healer does through `reference_section` (`clean_source_urls.plan_edits` works on
+  `reference_section.body_blocks`): the English list the healer injects carries its
+  arXiv and DOI links on purpose.
+- **A new kind of page in the DB needs its venue in `NON_PAPER_VENUES`, or the paper
+  repairs will run on it.** `page_kind.is_paper` is the one place that decides, from
+  the venue the owner sets, and `heal_paper_pages.heal` skips every repair on a
+  non-paper page.
+- **Any healer that deletes "everything after X" needs a fraction cap**, as
+  `strip_backmatter` refuses a cut over half the page.
+- **A loop that deletes and re-adds is invisible to a copy count; what prevents it
+  is the writer and the remover consulting the same predicate.** If one ever
+  recurs on the reference list, the tell is one page logging `REFERENCES injected`
+  on every cycle.
+- **`\b` does not hold between a Latin word or a number and a Korean particle**: in
+  `XYZ논문에서`, `Table 2에` or `3.2.2는` both sides are word characters, so a
+  `\b` or `(?![\w.])` boundary makes the mention invisible. Reject only what the
+  boundary must exclude: a longer token in the same script
+  (`(?<![A-Za-z0-9])kw(?![A-Za-z0-9])`), or a longer number (`(?![0-9])`).
+- **Fix a converter defect in the converter** (`save_qa_callout._MATH`), not only in
+  the healers — otherwise every new translation re-creates the damage.
+- **A 400 from Notion is always specific — never let it reach you as "Bad
+  Request".** Its body names the exact block and rule
+  (`body.children[84].paragraph.rich_text.length should be ≤ 100`), so a raised
+  error carries the response body.
+- **Validate a detector by dry-running it over the WHOLE DB, not over the page that
+  motivated it.**
+- **Before widening what counts as a heading, dry-run the duplicate healer over the
+  pages it will touch**: a rule that CREATES headings exposes every rule that reads
+  them.
+- **Before landing a crop-geometry change in `extract_pdf_media`, A/B it**:
+  `tools/ab_render.py` renders `render_media` against a base ref with contact
+  sheets, each side's unrendered captions and the base's floats the branch lost;
+  judge every added, changed and removed crop from them.
+- `heal_skip.txt`, beside the scripts, lists page ids the healer leaves completely
+  alone, compared dash-insensitively since Notion prints both forms: the owner's
+  switch for a page arranged BY HAND, whose own edits would otherwise keep it in the
+  healer's window. Not a heuristic.
+
+## Reading what the healer reports
+
+- **When a healer's log says it skipped something, check that the code path after
+  the message really ends there.**
+- **When a healer keeps "fixing" pages that are already correct, check what it uses
+  to recognise its own output.**
+- **A number in a caption is not always arabic** (`TABLE I`, `Table A:`) — check
+  before assuming a page "has no tables".
+- **Missing citations are mostly an input-side limit.** The translation source is
+  NotebookLM's own indexed text, which leaves `\cite{...}` keys unresolved and
+  carries only part of a paper's citations; the linker links the ones that survive,
+  and the rest is not a translation or linking bug — do not go looking for one.
+  `link_page` reports `warning: body has no citations (N in source)` when the
+  translation dropped every marker: **a page in that state needs re-translating; the
+  linker cannot help it.**
+
+## Re-processing a page
+
+`collect_papers.py --status … --clear-unprocessed` (the subagent's step 0 in
+`groups/main/CLAUDE.md`) does not cover two runs of the same paper at once: the
+second can clear what the first has uploaded so far, and the page ends up with both
+copies for `heal_verify` to dedup. And a genuinely short paper (3+ figures, at most
+4 sections, under 4,000 characters) reads as unfinished to both the audit and the
+status, so a request re-translates it and the list never comes.
