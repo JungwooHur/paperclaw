@@ -78,6 +78,18 @@ grep -E 'Scheduling retry|retry|Max retries' logs/paperclaw.log | tail -10
 
 ## Agent Not Responding
 
+- **No WhatsApp reply at all:** start with the connection and the service, as
+  `systemd/README.md` ("WhatsApp watchdog") says, then `store/auth-required` under
+  WhatsApp Auth Issues.
+- **The bot answers with an error sentence:** the agent runner forwards every SDK
+  result as `status: 'success'`, including ones with `is_error: true`, so to the
+  host an error looks like a reply. The usage-limit refusal is held and resumed
+  after the reset (docs/SPEC.md, "Usage Limits"); **any other `is_error` result is
+  still sent as the reply**, and an error sentence as the answer means it took this
+  path. `There's an issue with the selected model (...)` means the CLI bundled with
+  the SDK fell back to a default model the token cannot use; the model is pinned
+  through `AGENT_MODEL` (docs/SPEC.md, "Claude Authentication").
+
 ```bash
 # Check if messages are being received from WhatsApp
 grep 'New messages' logs/paperclaw.log | tail -10
@@ -159,15 +171,35 @@ container run -i --rm --entrypoint ls paperclaw-agent:latest /workspace/extra/
 
 ## WhatsApp Auth Issues
 
+**If WhatsApp is silent, check `store/auth-required` first** — if it is there, no
+amount of restarting will help. `Connection closed reason: 401` with
+`shouldReconnect: false` and a `<conflict type="device_removed"/>` stream error
+means WhatsApp **revoked this linked device**. It is not the 405 disconnect the
+watchdog restarts on: the stored session is dead server-side, and only a human
+re-scanning a QR brings it back. On a logout the process writes
+`store/auth-required` and exits **78**, the unit carries
+`RestartPreventExitStatus=78` so it stops instead of looping, the watchdog
+short-circuits while that marker exists, and a successful connection clears it.
+
+Re-authenticate with **`bash scripts/whatsapp-qr.sh`**. Two traps it handles: a
+revoked session still has `"registered": true` on disk, so `npm run auth` prints
+"Already authenticated" and exits without ever showing a QR until the old state is
+moved aside; and `qrcode-terminal` draws two characters per module, so a
+version-11 WhatsApp QR needs ~130 columns and is silently truncated — unreadable —
+in an 80-column terminal. The script moves the dead session aside (renames, never
+deletes), renders the same code in half-blocks at 65x33, and re-renders on each
+~20-30 s rotation.
+
 ```bash
 # Check if QR code was requested (means auth expired)
 grep 'QR\|authentication required\|qr' logs/paperclaw.log | tail -5
 
-# Check auth files exist
+# Check auth files exist, and whether a logout left its marker
 ls -la store/auth/
+ls -la store/auth-required
 
 # Re-authenticate if needed
-npm run auth
+bash scripts/whatsapp-qr.sh
 ```
 
 ## Service Management
@@ -188,3 +220,50 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.paperclaw.plist
 # Rebuild after code changes
 npm run build && launchctl kickstart -k gui/$(id -u)/com.paperclaw
 ```
+
+## Healer or Watchdog Not Running
+
+**When a healer "isn't applying", check `systemctl --user list-timers` FIRST** — a
+blank `NEXT` can mean it has not been running at all, and no amount of debugging
+the healer code will explain the symptom. A dead timer fails silently:
+`systemctl --user is-active` says `active`, `is-enabled` says `enabled`, the unit
+files are correctly symlinked, and nothing is logged. **Only `list-timers` shows
+it — `NEXT` is `-`.** The cause, and why both timers use wall-clock `OnCalendar=`
+(`*:0/5`, `*:0/30`), is in `systemd/README.md`, "Timers".
+
+Read `NEXT` together with `LAST`, because a busy timer looks identical in that one
+column. systemd will not start a second instance of a service that is already
+running, so **while the triggered unit is active the timer has no armed next
+elapse and `list-timers` prints `-` for NEXT**. `LAST` is what separates them: dead
+means LAST is old or never, saturated means LAST is seconds ago.
+
+```bash
+systemctl --user list-timers 'paperclaw-*'     # NEXT must be a real timestamp, or LAST seconds ago
+ls -la ~/.local/share/systemd/timers/          # stamp mtime = last real trigger
+systemctl --user show <timer> -p LastTriggerUSec    # the direct read of LAST
+systemctl --user show <service> -p ActiveState      # activating = mid-run
+```
+
+## CI Failures
+
+**When CI fails on code nobody touched, compare the `Runner Image` lines of the
+last green run and the red one** (`gh run view <id> --log | grep -A2 "Runner Image"`).
+`ubuntu-latest` moves under the repo: on Ubuntu 26.04, diffutils 3.12 reads
+`diff -ruN <dir> <file>` as the directory's same-named entry against the file —
+exit 1 and a patch, where 3.10 exited 2 — and a test that leaned on the error went
+red on every branch at once. Make the code decide for itself rather than read a
+system tool's exit code.
+
+**A git command run under a hook acts on the repository the hook runs in.** Git
+exports `GIT_DIR`, `GIT_INDEX_FILE` and friends to every hook it launches, and
+**they override `cwd`**, so a test's `execSync('git ...', { cwd: tempDir })` under
+`.husky/pre-push` acts on the real repository: it rewrites that repository's
+`user.name` and `user.email` to the fixture's placeholders, and a bare
+`git init --bare` with no directory argument flips it to `core.bare=true`.
+`vitest.setup.ts` deletes those variables before any test file loads, and
+`tests/leak_helpers.py` runs the leak-gate tests' git without them. **The symptoms
+do not look like a test problem.** A repository that has been flipped bare answers
+`git status` with `fatal: this operation must be run in a work tree` while
+`git branch --show-current` still works, the next commit is blocked by
+`check-sensitive.sh` for an author email nobody typed, and the index can hold
+hundreds of phantom staged deletions.

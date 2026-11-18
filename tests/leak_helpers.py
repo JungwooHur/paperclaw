@@ -2,7 +2,7 @@
 
 Every git call runs with the GIT_* variables removed: git exports GIT_DIR and
 GIT_INDEX_FILE to a hook, and they override cwd, so under a pre-push hook a
-"temporary" repository would be the real one (root CLAUDE.md). The private
+"temporary" repository would be the real one. The private
 value sources point at files in the test's own directory, so the real .env,
 messages.db and Notion are never read. Fake secrets are assembled at run time,
 so this file passes the commit hook that it tests.
