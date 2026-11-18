@@ -396,6 +396,13 @@ class TestALetterSuffixedNumber:
     def test_an_image_caption_needs_no_separator(self):
         assert pm.image_label("Figure 10a DDIM latents") == ("figure", "10a")
 
+    @pytest.mark.parametrize("text, expected", [
+        ("Figure 10ab samples", ("figure", 10)),
+        ("Figure 3Dx renders", ("figure", 3)),
+    ])
+    def test_a_suffix_is_one_letter_only(self, text, expected):
+        assert pm.image_label(text) == expected
+
     @pytest.mark.parametrize("text", [
         "Figure 10a shows the reconstructions for every class.",
         "Figure 10ab: no single letter.",
