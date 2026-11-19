@@ -46,10 +46,11 @@ single-column figure keeps its full width and a two-column figure keeps its own
 column, with no caption-shape guessing.
 
 A figure's own print that reads like body text stays its content: print set
-on a drawing that runs on past the caption (an EPS backdrop) is the figure's,
-small print opening on a panel's mark (`(a) …`) under a panel is a
-subcaption, and lines between the rows of an image grid or titling one of its
-panels are no prose to the crop check.
+on a drawing that runs on past the caption and holds no body prose or other
+caption (an EPS backdrop) is the figure's, small print opening on a panel's
+mark (`(a) …`) under a panel is a subcaption, and lines between the rows of an
+image grid or titling one of its panels are no prose to the crop check; a
+paragraph's last lines over a row are.
 
 Tables use the identical machinery, growing DOWNWARD (LaTeX puts a table's
 caption above its body) instead of upward. A rule set as a thin raster image is
@@ -1756,13 +1757,16 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
 
 
 def _on_backdrop(parts: _Parts, caption_box, page_rect) -> list:
-    """The loose barriers (`_Parts.loose`) over the caption set inside a
-    drawing of `parts` across its x-span that runs from over it to under it
-    and is not `_too_big`, under another image or drawing ending inside it
-    that shares some of their x-span: print on a figure's backdrop."""
+    """The loose barriers (`_Parts.loose`) ending over the caption that lie in
+    a backdrop, under an image or another drawing of `parts` that shares some
+    of the barrier's x-span and ends between the backdrop's top and the
+    barrier's: print on a figure's backdrop. A backdrop is a drawing of `parts`
+    across the caption's x-span that runs from over it to under it, is not
+    `_too_big` and holds no wall (`_Parts.walls`)."""
     backdrops = [d for d in parts.drawings if _across(caption_box, d)
                  and d[1] < caption_box[1] and d[3] > caption_box[3]
-                 and not _too_big(d, page_rect)]
+                 and not _too_big(d, page_rect)
+                 and not any(_contains(d, w) for w in parts.walls)]
     texts = {t for t, _ in parts.texts}
     graphics = [e for e in parts.elements if e not in texts and e not in backdrops]
     return [b for b in parts.loose if b[3] <= caption_box[1] + 0.5
@@ -1775,10 +1779,11 @@ def _on_backdrop(parts: _Parts, caption_box, page_rect) -> list:
 def _subcaptions(blocks, parts: _Parts, caption_box) -> list:
     """Boxes of the small print (`_Parts.small`) among the text `blocks` that
     opens on a panel's mark (`_PANEL_MARK`), ends over the caption and opens
-    within `_PANEL_GAP` under an image or drawing of `parts` sharing some of
-    its x-span: a figure's subcaptions."""
+    within `_PANEL_GAP` under an image or a drawing of `parts` that is no rule
+    (`_horizontals`) and shares some of its x-span: a figure's subcaptions."""
     texts = {t for t, _ in parts.texts}
-    graphics = [e for e in parts.elements if e not in texts]
+    graphics = [e for e in parts.elements
+                if e not in texts and not _horizontals([e])]
     out = []
     for b in blocks:
         box = tuple(b["bbox"])
@@ -2068,9 +2073,10 @@ def _crop_problem(page, rect, kind: str, num, caption_box, body: Body,
             for b in texts for box, _ in _lines(b)):
         return HOLDS_HEADING
     grid = [i for i in images if _overlaps(i, inner) and not _too_big(i, page.rect)]
-    if len([box for box in _prose_lines(texts, body, caption_box)
-            if held(box) and not content(box)
-            and not _in_image_grid(box, grid)]) >= _PROSE_LINES_HELD:
+    lines = [box for box in _prose_lines(texts, body, caption_box)
+             if held(box) and not content(box)]
+    if len([box for box in lines
+            if not _in_image_grid(box, grid, lines)]) >= _PROSE_LINES_HELD:
         return HOLDS_PROSE
     figures = figure_captions + ([caption_box] if base_kind(kind) == "figure" else [])
     owner = _owners(floats, [caption_box] + captions, figures,
@@ -2084,17 +2090,22 @@ def _crop_problem(page, rect, kind: str, num, caption_box, body: Body,
     return None
 
 
-def _in_image_grid(box, images) -> bool:
+def _in_image_grid(box, images, lines) -> bool:
     """Is the line `box` print of a grid of `images`: set between two of its
     rows, under one image and over another that each share some of its
-    x-span, within the x-extent of those that do; or within `_PANEL_GAP` over
-    or under one image of a row of two or more, within its x-span?"""
+    x-span, within the x-extent of those that do; or, with no other line of
+    `lines` sharing some of its x-span -3..4 pt over or under it (a
+    paragraph's), within `_PANEL_GAP` over or under one image of a row of two
+    or more, within its x-span?"""
     beside = [i for i in images if i[0] < box[2] and i[2] > box[0]]
     if (any(i[3] <= box[1] + 1 for i in beside)
             and any(i[1] >= box[3] - 1 for i in beside)
             and box[0] >= min(i[0] for i in beside) - _COLUMN_TOL
             and box[2] <= max(i[2] for i in beside) + _COLUMN_TOL):
         return True
+    if any(o != box and o[0] < box[2] and o[2] > box[0]
+           and (-3 <= box[1] - o[3] <= 4 or -3 <= o[1] - box[3] <= 4) for o in lines):
+        return False
     return any(i[0] - _COLUMN_TOL <= box[0] and box[2] <= i[2] + _COLUMN_TOL
                and (-1 <= i[1] - box[3] <= _PANEL_GAP
                     or -1 <= box[1] - i[3] <= _PANEL_GAP)

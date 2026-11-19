@@ -3764,6 +3764,60 @@ class TestABackdropPastTheCaption:
         assert heading[3] - 0.5 <= box[1] <= 300
 
 
+    @pytest.mark.parametrize("drawn", [False, True], ids=["image", "drawing"])
+    def test_a_heading_between_two_figures_on_it_ends_the_second(self, tmp_path,
+                                                                drawn):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_rect(fitz.Rect(40, 60, 572, 740), color=None, fill=(1, 1, 1))
+        (filled_rect if drawn else picture)(page, fitz.Rect(100, 80, 500, 250))
+        page.insert_text((100, 270), "Figure 1: The first result.", fontsize=10)
+        page.insert_text((72, 305), "4 Discussion", fontsize=16)
+        picture(page, fitz.Rect(100, 320, 500, 500))
+        page.insert_text((100, 515), "Figure 2: The second result.", fontsize=10)
+        prose(page, 72, 540, 700)
+        heading = blocks_starting(page, "4 Discussion")[0]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert heading[3] - 0.5 <= box[1] <= 320
+
+    def test_one_past_a_caption_over_a_heading_crops_no_heading(self, tmp_path):
+        # Figure 1's backdrop runs on past its caption over a heading and Figure 2.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_rect(fitz.Rect(54, 70, 560, 749), color=None, fill=(1, 1, 1))
+        filled_rect(page, fitz.Rect(100, 80, 500, 260))
+        page.insert_text((250, 290), "Radius (units)", fontsize=16)
+        page.insert_text((150, 312), "Figure 1: Values over the radius.", fontsize=10)
+        page.insert_text((72, 350), "3 Results", fontsize=16)
+        picture(page, fitz.Rect(100, 365, 500, 560))
+        page.insert_text((150, 575), "Figure 2: A picture under the heading.",
+                         fontsize=10)
+        prose(page, 72, 540, 720)
+        heading = blocks_starting(page, "3 Results")[0]
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))
+        assert ("figure", 2) in media
+        assert not any(pm._overlaps(m["box"], heading) for m in media.values())
+
+    def test_a_page_background_carries_no_crop_over_a_heading(self, tmp_path):
+        # A picture, a heading and Figure 3 on a white page, with no prose.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_rect(fitz.Rect(0, 0, 612, 792), color=None, fill=(1, 1, 1))
+        picture(page, fitz.Rect(111, 80, 550, 250))
+        page.insert_text((72, 282), "3 Results", fontsize=16)
+        filled_rect(page, fitz.Rect(111, 300, 550, 500))
+        page.insert_text((100, 520), "Figure 3: Values over the radius.",
+                         fontsize=10)
+        heading = blocks_starting(page, "3 Results")[0]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 3)]["box"]
+        assert heading[3] - 0.5 <= box[1] <= 300
+
+
 def picture(page, rect):
     """A raster image filling `rect`."""
     page.insert_image(rect, keep_proportion=False,
@@ -3828,17 +3882,53 @@ class TestTitlesInAnImageGrid:
                                 caption, pm.body_text(doc)) == pm.HOLDS_PROSE
 
 
+    def test_titles_between_the_rows_of_one_column_of_panels_are_no_prose(
+            self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        for y, title in zip((90, 240, 390), ("",) + self.ROWS[0]):
+            page.insert_text((64, y - 4), title, fontsize=10, fontname="tiro")
+            picture(page, fitz.Rect(60, y, 290, y + 118))
+        page.insert_text((60, 525), "Figure 8: A column of samples.", fontsize=10)
+        caption = blocks_starting(page, "Figure 8")[0]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 8)]["box"]
+        assert box[1] <= 90 and 508 <= box[3] <= caption[1]
+
+    def test_a_paragraphs_tail_over_a_row_is_prose(self, tmp_path):
+        # Two columns of prose, the left one's last two lines over a row of two
+        # images across both columns.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        for x in (54, 306):
+            for top, bottom in ((60, 280), (510, 740)):
+                page.insert_textbox(fitz.Rect(x, top, x + 236, bottom), PROSE,
+                                    fontsize=10, align=fitz.TEXT_ALIGN_JUSTIFY)
+            picture(page, fitz.Rect(x, 320, x + 236, 480))
+        page.insert_text((54, 300), PROSE[:44], fontsize=10)
+        page.insert_text((54, 312), PROSE[44:88], fontsize=10)
+        page.insert_text((200, 495), "Figure 3: Two panels across both columns.",
+                         fontsize=10)
+        unrendered = []
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert ("figure", 3) not in media
+        assert [u["problem"] for u in unrendered] == [pm.HOLDS_PROSE]
+
+
 class TestSubcaptionParagraphs:
 
-    def page(self, doc, size):
-        """Two images over 7-line `(a)`/`(b)` paragraphs at `size`, Figure 11's
-        caption under them and a paragraph of prose over them."""
+    def page(self, doc, size, marks=("(a) ", "(b) ")):
+        """Two images over 7-line paragraphs at `size` opening on `marks`,
+        Figure 11's caption under them and a paragraph of prose over them."""
         page = doc.new_page(width=LETTER[0], height=LETTER[1])
         prose(page, 108, 504, 439)
-        for x, mark in ((117, "(a)"), (317, "(b)")):
+        for x, mark in zip((117, 317), marks):
             picture(page, fitz.Rect(x, 455, x + 178, 633))
             assert page.insert_textbox(fitz.Rect(x, 638, x + 178, 738),
-                                       f"{mark} {PROSE[:220]}", fontsize=size,
+                                       mark + PROSE[:220], fontsize=size,
                                        align=fitz.TEXT_ALIGN_JUSTIFY) >= 0
         page.insert_text((220, 752), "Figure 11: Two panels and their subcaptions.",
                          fontsize=10)
@@ -3873,12 +3963,50 @@ class TestSubcaptionParagraphs:
         assert ("figure", 11) not in media
         assert [u["problem"] for u in unrendered] == [pm.NOTHING_BESIDE]
 
-    def test_at_body_size_they_are_prose(self, tmp_path):
+    @pytest.mark.parametrize("size,marks", [(10, ("(a) ", "(b) ")), (9, ("", ""))],
+                             ids=["at-body-size", "with-no-mark"])
+    def test_at_body_size_they_are_prose(self, tmp_path, size, marks):
         doc = fitz.open()
         body_pages(doc)
-        self.page(doc, 10)
+        self.page(doc, size, marks)
         unrendered = []
         media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
                                 unrendered=unrendered)
         assert ("figure", 11) not in media
         assert [u["problem"] for u in unrendered] == [pm.NOTHING_BESIDE]
+
+    def test_small_print_under_a_rule_over_a_figure_is_none(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((72, 90), "Results", fontsize=10)
+        page.draw_line((72, 93), (540, 93), color=(0, 0, 0), width=0.5)
+        assert page.insert_textbox(fitz.Rect(72, 98, 540, 160), f"(a) {PROSE[:300]}",
+                                   fontsize=8, align=fitz.TEXT_ALIGN_JUSTIFY) >= 0
+        picture(page, fitz.Rect(100, 175, 500, 360))
+        page.insert_text((100, 375), "Figure 2: A figure under small print.",
+                         fontsize=10)
+        prose(page, 72, 540, 700)
+        note = blocks_starting(page, "(a)")[0]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert note[3] - 0.5 <= box[1] <= 175
+
+    def test_a_tables_note_over_a_figure_is_none(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((60, 78), "Table 1: Measured values of the model.",
+                         fontsize=10)
+        bottom = ruled_table(page, 60, 540, 86, 5, size=10)
+        assert page.insert_textbox(fitz.Rect(60, bottom + 8, 540, bottom + 48),
+                                   f"(a) {PROSE[:260]}", fontsize=8,
+                                   align=fitz.TEXT_ALIGN_JUSTIFY) >= 0
+        picture(page, fitz.Rect(100, bottom + 56, 500, bottom + 236))
+        page.insert_text((100, bottom + 251), "Figure 1: A figure under the table.",
+                         fontsize=10)
+        prose(page, 60, 540, 720)
+        note = blocks_starting(page, "(a)")[0]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 1)]["box"]
+        assert note[3] - 0.5 <= box[1] <= bottom + 56
