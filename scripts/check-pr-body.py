@@ -138,9 +138,11 @@ def known_section_titles(page_limit=40):
         for b in blocks:
             if not HEADING_LEVEL.get(b["type"]):
                 continue
-            t = vs.english_title(block_text(b)).strip()
-            if len(t) >= MIN_TITLE:
-                titles.add(t)
+            text = block_text(b)
+            for t in (vs.english_title(text),
+                      re.split(r"\s*\(", text, 1)[0].strip()):
+                if len(t) >= MIN_TITLE:
+                    titles.add(t)
     return sorted(titles)
 
 

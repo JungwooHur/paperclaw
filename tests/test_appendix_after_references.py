@@ -172,6 +172,21 @@ class TestAppendicesAfterTheReferences:
         text = source().replace(SPANS["A.1"], "A New Setup Was Used\n" + SPANS["A.1"])
         assert vs.source_section_chars(text, SECTIONS)["A.1"] > len(SPANS["A.1"])
 
+    def test_an_appendix_title_with_short_words_is_found_past_the_references(self):
+        title = "Results of the Larger Model"
+        text = "\n".join([TOC, "A " + title, "1 Introduction", SPANS["1"], "2 Method",
+                          SPANS["2"], "References", BIBLIOGRAPHY, "A " + title,
+                          SPANS["A.1"], CHROME])
+        got = vs.source_section_chars(text, SECTIONS[:2] + [("A", title)])
+        assert close_to(got["A"], "A.1")
+
+    def test_a_last_section_found_only_in_the_table_of_contents_is_unmeasured(self):
+        text = "\n".join([TOC + "\nE Late Results", prose(900), "1 Introduction",
+                          SPANS["1"], "2 Method", SPANS["2"], "References",
+                          BIBLIOGRAPHY, CHROME])
+        got = vs.source_section_chars(text, SECTIONS[:2] + [("E", "Late Results")])
+        assert got["E"] is None and close_to(got["1"], "1"), got
+
     def test_a_paper_without_appendices_is_still_cut_at_its_references(self):
         text = "\n".join([TOC, "1 Introduction", SPANS["1"], "2 Method",
                           SPANS["2"], "References", BIBLIOGRAPHY, CHROME])
