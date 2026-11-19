@@ -39,6 +39,8 @@ from translate_fulltext import notion
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HEAD = ("heading_1", "heading_2", "heading_3")
+# Block types whose text `verify_sections.group_sections` counts.
+_TEXT_TYPES = _HEAD + vs.BODY_TYPES + ("equation",)
 
 
 def audit(page_id: str, arxiv: str = None) -> dict:
@@ -86,6 +88,18 @@ def _section_ranges(blocks):
 # characters and the correctly placed one was archived.
 RICHER_FACTOR = 1.5
 
+# The least fraction of an archived section's own distinct words, of three
+# letters or more, that a copy holding its text has.
+SHARED_WORDS = 0.6
+
+# The fewest such words an archived section's own text has for `SHARED_WORDS` of
+# them to hold it; a text with fewer is held only verbatim.
+MIN_WORDS = 20
+
+
+class DedupRefused(RuntimeError):
+    """`dedupe_duplicates` refusing a page: nothing on it was archived."""
+
 
 def choose_kept(occurrences):
     """The copy of a duplicated section to keep, given them in document order.
@@ -106,17 +120,118 @@ def choose_kept(occurrences):
     return first
 
 
+def _holds(copy, section):
+    """Does `copy` hold `section`'s whole own text, subsections left out: at least
+    `SHARED_WORDS` of its words, all of it verbatim when it has fewer than
+    `MIN_WORDS` words or `vs.EMPTY_TWIN_CHARS` characters, and at least as many
+    characters."""
+    own = vs.own_content_chars(section)
+    words = vs._words(section["own_text"])
+    if len(words) >= MIN_WORDS and own >= vs.EMPTY_TWIN_CHARS:
+        shares = len(words & vs._words(copy["own_text"])) >= SHARED_WORDS * len(words)
+    else:
+        shares = " ".join(section["own_text"].split()) in " ".join(copy["own_text"].split())
+    return shares and own <= vs.own_content_chars(copy)
+
+
+def _own_blocks(ordered, sections):
+    """Heading id -> the blocks of `ordered` after that section's heading, up to
+    the next section's: its own span, subsections left out."""
+    own, cur = {}, None
+    starts = {s["heading_id"] for s in sections}
+    for b in ordered:
+        if b["id"] in starts:
+            cur = own.setdefault(b["id"], [])
+        elif cur is not None:
+            cur.append(b)
+    return own
+
+
+def _unread(block):
+    """Does `block` hold what the text check does not read: children, or content
+    of a type `group_sections` counts no text of? A `column_list` left in
+    reading order holds no block."""
+    return block["type"] != "column_list" and bool(
+        block.get("has_children") or block["type"] not in _TEXT_TYPES)
+
+
+def _key(block):
+    """`block` as compared across copies: its type, its caption with whitespace
+    normalised, the rest of its payload and its children's keys; a captioned hosted
+    file's payload leaves out `file`, the url its upload signed."""
+    payload = dict(block.get(block["type"]) or {})
+    caption = " ".join("".join(t["plain_text"] for t in payload.pop("caption", None) or [])
+                       .split())
+    if caption and payload.get("type") == "file":
+        del payload["file"]
+    kids = [_key(c) for c in vs.fetch_blocks(block["id"])] if block.get("has_children") else []
+    return json.dumps([block["type"], caption, payload, kids], ensure_ascii=False,
+                      sort_keys=True)
+
+
+def _top_level_range(page_id, section, span, held, top):
+    """The top-level block ids that hold exactly `span`.
+
+    Args:
+        page_id: The page, named in the error.
+        section: The `group_sections` section `span` belongs to.
+        span: Its block ids in reading order, heading first.
+        held: Top-level block id -> its blocks in reading order.
+        top: Block id in reading order -> the top-level block id holding it.
+
+    Raises:
+        DedupRefused: The section's heading sits in a column, or a column_list
+          holds both blocks of `span` and blocks outside it.
+    """
+    if top[section["heading_id"]] != section["heading_id"]:
+        raise DedupRefused(f"page {page_id}: duplicate {section['heading']!r} has its "
+                           f"heading inside a column; no top-level range archives it")
+    ids = list(dict.fromkeys(top[bid] for bid in span))
+    inside = set(span)
+    for bid in ids:
+        if any(b["id"] not in inside for b in held[bid]):
+            raise DedupRefused(f"page {page_id}: duplicate {section['heading']!r} ends "
+                               f"inside column_list {bid}, which holds the next section")
+    return ids
+
+
 def dedupe_duplicates(page_id, blocks, apply):
     """Archive redundant duplicate sections keeping the richest copy. Scopes keys
     hierarchically (parent chain) exactly like verify_sections, so a subsection
-    letter reused under different parents (II>A vs III>A) is NOT a duplicate."""
-    scoped = vs.duplicate_groups(vs.group_sections(blocks))
-    ranges = _section_ranges(blocks)
+    letter reused under different parents (II>A vs III>A) is NOT a duplicate.
+
+    Copies are measured and compared in reading order (`vs.reading_order`), as
+    the audit reads them; what is archived is whole top-level blocks of `blocks`,
+    the page's top-level children. A group keeps one of the copies that the
+    groups before it, its parent's among them, left standing.
+
+    Raises:
+        DedupRefused: Before archiving anything, when a copy to archive has no
+          top-level range (`_top_level_range`), when the plan archives more than
+          half the page's top-level blocks, or when a section the plan archives
+          has a heading with children, text of its own that no copy outside the
+          plan `_holds`, or `_unread` own blocks that such copies do not match
+          one for one by `_key`.
+        RuntimeError: A PATCH failed; the other blocks were archived.
+    """
+    # A top-level block with nothing in reading order, an empty column_list,
+    # stands for itself.
+    held = {b["id"]: vs.reading_order([b]) or [b] for b in blocks}
+    ordered = [x for b in blocks for x in held[b["id"]]]
+    top = {x["id"]: b["id"] for b in blocks for x in held[b["id"]]}
+    sections = vs.group_sections(ordered)
+    scoped = vs.duplicate_groups(sections)
+    ranges = _section_ranges(ordered)
     seen, to_archive = set(), []
+
+    def archived(section):
+        return top[section["heading_id"]] in seen
+
     for occ in scoped.values():
-        if len(occ) < 2:
+        standing = [o for o in occ if not archived(o)]
+        if len(occ) < 2 or not standing:
             continue
-        keep = choose_kept(occ)                # position first, richness to break it
+        keep = choose_kept(standing)           # position first, richness to break it
         occ = [keep] + [o for o in occ if o is not keep]
         # Same rule the audit uses: only archive a copy whose BODY matches the
         # one being kept. Unlabelled titles repeat legitimately, and a label can
@@ -124,13 +239,40 @@ def dedupe_duplicates(page_id, blocks, apply):
         # key archived six real subsections.
         occ = [occ[0]] + [o for o in occ[1:] if vs.dup_confirmed(occ[0], o)]
         for d in occ[1:]:
-            for bid in ranges.get(d["heading_id"], []):
+            if all(top[x] in seen for x in ranges[d["heading_id"]]):
+                continue
+            for bid in _top_level_range(page_id, d, ranges[d["heading_id"]], held, top):
                 if bid not in seen:            # overlapping parent/child dup ranges
                     seen.add(bid)              # must not double-PATCH a block
                     to_archive.append(bid)
     # safety cap: never archive most of the page (a mis-scope shouldn't nuke it)
     if len(to_archive) > len(blocks) // 2:
-        return 0
+        raise DedupRefused(f"page {page_id}: the dedup would archive {len(to_archive)} of "
+                           f"{len(blocks)} top-level blocks, more than half; nothing archived")
+    own = _own_blocks(ordered, sections)
+    by_id = {b["id"]: b for b in ordered}
+
+    def unread(section):
+        """`section`'s `_unread` own blocks, counted by `_key`."""
+        return Counter(_key(b) for b in own[section["heading_id"]] if _unread(b))
+
+    for occ in scoped.values():
+        for s in occ:
+            if not archived(s):
+                continue
+            if by_id[s["heading_id"]].get("has_children"):
+                raise DedupRefused(f"page {page_id}: the dedup would archive {s['heading']!r}, "
+                                   f"a heading with children; nothing archived")
+            standing = [o for o in occ if not archived(o)]
+            if vs.own_content_chars(s) and not any(_holds(o, s) for o in standing):
+                raise DedupRefused(f"page {page_id}: the dedup would archive {s['heading']!r} "
+                                   f"and every copy holding its text; nothing archived")
+            missing = unread(s) - sum((unread(o) for o in standing), Counter())
+            if missing:
+                kinds = ", ".join(sorted({json.loads(k)[0] for k in missing}))
+                raise DedupRefused(f"page {page_id}: the dedup would archive {s['heading']!r} "
+                                   f"with {sum(missing.values())} {kinds} block(s) no copy "
+                                   f"left standing holds; nothing archived")
     if apply:
         failures = []
         for bid in to_archive:
@@ -244,7 +386,8 @@ def heal_verify(page_id: str, apply: bool = False) -> dict:
     findings = result.get("findings", [])
     kinds = Counter(f.get("type") for f in findings)
     rep = {"page": page_id, "findings": dict(kinds), "deduped_blocks": 0,
-           "promoted_headings": 0, "split_headings": 0, "stripped_markers": 0, "emphasis_fixed": 0, "flags": []}
+           "promoted_headings": 0, "split_headings": 0, "stripped_markers": 0,
+           "emphasis_fixed": 0, "dedup_refused": None, "flags": []}
     # Split first, then look again: a bloated heading hides its own section's
     # duplicate from the dedup below, so the audit that ran before the split
     # cannot be trusted to have reported one.
@@ -260,7 +403,10 @@ def heal_verify(page_id: str, apply: bool = False) -> dict:
     # auto-repair DUPLICATE only, and only if the audit agrees one exists
     if kinds.get("DUPLICATE"):
         blocks = vs.fetch_blocks(page_id)
-        rep["deduped_blocks"] = dedupe_duplicates(page_id, blocks, apply)
+        try:
+            rep["deduped_blocks"] = dedupe_duplicates(page_id, blocks, apply)
+        except DedupRefused as e:
+            rep["dedup_refused"] = str(e)
     # surface the content-integrity findings (dropped/short/summarized/duplicated
     # sections) — these are the silent breakage the agent's assembly produces
     for f in findings:

@@ -67,6 +67,38 @@ choosing which duplicate copy to keep.
 at any depth, stands for its columns' blocks, left column first, so that text
 counts in the section the list sits in.
 
+**The dedup leaves every section's content a copy, or refuses the page.**
+`heal_verify` measures and compares copies in reading order too, and archives a copy
+as whole top-level blocks. Groups run parent first, so a subsection keeps one of the
+copies its parent's group left standing. Before any PATCH, every section the plan
+archives (its subsections left out, each checked in its own group) needs a copy
+outside the plan holding its whole own text, body and translated captions, not
+just the first 4000 characters `dup_confirmed` reads: at least `SHARED_WORDS` of
+its distinct words of three letters or more, or all of it verbatim when it has
+fewer than `MIN_WORDS` such words (an equation, symbols, digits) or fewer
+characters than `EMPTY_TWIN_CHARS`, below which `dup_confirmed` takes a copy for an
+empty twin whatever its words; and at least as many characters (`_holds`). A
+heading with no text of its own needs none. Every block in its own span whose
+content no text count reads (a type other than a heading, a body type or an
+equation, or a block with children) needs an equal block in the section's copies
+left standing, one for one (`_key`): the same type, caption, payload and children.
+A re-upload gives a hosted file a new url, so a captioned hosted file matches by
+its caption alone and an uncaptioned one matches none; an external image, a
+bookmark or an embed matches only at its url. The dedup refuses the page,
+archiving nothing on it, when a section has no such copy, when an archived
+section's heading has children (a toggleable heading's, which no section's span
+reads), when the plan would archive more than half the page's top-level blocks,
+or when a copy to archive has no top-level blocks: its heading sits in a column,
+or it ends inside a `column_list` holding the next section. The healer logs
+`DEDUP refused` with the page and the heading or the counts beside the page's
+`AUDIT` lines; the page's repairs run before the dedup in that cycle have already
+applied. The copy is left to a hand fix. Known limit: a holder needs only
+`SHARED_WORDS` of an archived section's distinct words of three letters or more,
+so a holder as long but worded otherwise may lack up to 40% of them, and the
+sentences they make. The share compares no digits, symbols or equation structure,
+so where it decides, a holder with the same words but other numbers or formulas
+holds the section.
+
 **Known limits.** A SUMMARIZED or CONTENT_LOSS deserves a hand check on a section:
 
 - right after a PDF caption set at body size with no sentence end, which also blanks

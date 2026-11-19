@@ -309,6 +309,8 @@ def heal(pages, apply):
             n_dedup = hv.get("deduped_blocks") or 0
             for flag in hv.get("flags", []):
                 print(f"  {pid}: AUDIT {flag}", file=sys.stderr)
+            if hv["dedup_refused"]:
+                print(f"  {pid}: DEDUP refused: {hv['dedup_refused']}", file=sys.stderr)
         except Exception as e:
             print(f"  {pid}: verify-heal error {type(e).__name__}: {e}", file=sys.stderr)
         # n_mm / n_mf belong here too: a page whose ONLY repair was mangled-math or

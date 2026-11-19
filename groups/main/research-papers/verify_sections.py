@@ -296,6 +296,17 @@ def content_chars(section: dict) -> int:
     return section["chars"] + section["caption_chars"]
 
 
+def own_content_chars(section: dict) -> int:
+    """A `group_sections` section's own text, its subsections left out: its body
+    and its translated captions."""
+    return section["own_chars"] + section["own_caption_chars"]
+
+
+# A section copy with fewer characters than this, its subsections included, is an
+# empty twin: `dup_confirmed` takes it for a copy of any same-titled section.
+EMPTY_TWIN_CHARS = 120
+
+
 def dup_confirmed(a: dict, b: dict) -> bool:
     """Are these two same-titled sections really the SAME section, duplicated?
 
@@ -305,7 +316,7 @@ def dup_confirmed(a: dict, b: dict) -> bool:
     one copy to be an empty leftover heading. Without this the healer would archive
     a real section on any page that reuses a subheading.
     """
-    if min(content_chars(a), content_chars(b)) < 120:
+    if min(content_chars(a), content_chars(b)) < EMPTY_TWIN_CHARS:
         return True                      # an empty twin is always the leftover
     ta, tb = _words(a["text"]), _words(b["text"])
     if not ta or not tb:
@@ -336,8 +347,11 @@ def group_sections(blocks: list) -> list:
 
     Body text excludes a paragraph that is a translated float caption
     (`extract_pdf_media.is_caption_text`); `caption_chars` counts those.
-    Each entry: {key, title, heading, level, chars, caption_chars, heading_id,
-    occurrence}.
+    Each entry: {key, title, heading, level, chars, caption_chars, text, own_text,
+    heading_id, occurrence}.
+    `own_text` is the section's body and captions, its subsections left out, in
+    page order; `text` is `own_text` cut after the piece that brings it to 4000
+    characters.
     `occurrence` counts repeats of the same key in page order (1-based).
     """
     import extract_pdf_media as epm
@@ -371,6 +385,7 @@ def group_sections(blocks: list) -> list:
                 "chars": 0,
                 "caption_chars": 0,
                 "text": "",
+                "own_text": "",
                 "heading_id": b["id"],
                 "occurrence": seen.get(key, 0),
             }
@@ -379,6 +394,7 @@ def group_sections(blocks: list) -> list:
                 aq._block_text(b)):
             piece = aq._block_text(b)
             cur["caption_chars"] += len(piece)
+            cur["own_text"] += " " + piece
             if len(cur["text"]) < 4000:
                 cur["text"] += " " + piece
         elif cur is not None and (t in BODY_TYPES or t == "equation"):
@@ -390,6 +406,7 @@ def group_sections(blocks: list) -> list:
             piece = ((b.get("equation") or {}).get("expression", "")
                      if t == "equation" else aq._block_text(b))
             cur["chars"] += len(piece)
+            cur["own_text"] += " " + piece
             if len(cur["text"]) < 4000:
                 cur["text"] += " " + piece
     _rollup(sections)
@@ -397,7 +414,8 @@ def group_sections(blocks: list) -> list:
 
 
 def _rollup(sections: list) -> None:
-    """Fold every subsection's text into its parent's `chars`.
+    """Fold every subsection's text into its parent's `chars` and `caption_chars`;
+    `own_chars` and `own_caption_chars` keep the section's own.
 
     The source span for a section is cut at the next heading of EQUAL OR SHALLOWER
     level, so it already contains that section's subsections. The page side counted
@@ -423,6 +441,7 @@ def _rollup(sections: list) -> None:
             total += nxt["chars"]
             captions += nxt["caption_chars"]
         sec["own_chars"] = own
+        sec["own_caption_chars"] = sec["caption_chars"]
         sec["chars"] = total
         sec["caption_chars"] = captions
 
