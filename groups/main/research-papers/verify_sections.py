@@ -133,8 +133,8 @@ _LETTERED_KEY = re.compile(r"[A-Z](?:[.-]\d+)*")
 
 
 def _heading_needle(key: str, title: str, n_words: int):
-    """Regex of a source heading that opens a line: an optional `Appendix`/`부록`
-    word or dash, the label (group `key`) in its own case, then the first
+    """Regex of a source heading that opens a line: an optional `Appendix` word
+    or dash, the label (group `key`) in its own case, then the first
     `n_words` title words of over two letters, up to 8 other words between two.
     None without a key or such words.
     """
@@ -142,7 +142,7 @@ def _heading_needle(key: str, title: str, n_words: int):
     if not key or not words:
         return None
     gap = r"(?:\W+\w+){0,8}?\W+"
-    return (r"(?im)^[^\S\n]*(?:(?:appendix|부록)\s+)?-?(?P<key>(?-i:"
+    return (r"(?im)^[^\S\n]*(?:appendix\s+)?-?(?P<key>(?-i:"
             + re.escape(key) + r"))[.:)]?\s+" + gap.join(re.escape(w) for w in words))
 
 

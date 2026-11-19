@@ -155,19 +155,31 @@ def test_short_text_needs_no_oracle(tmp_path, monkeypatch):
     assert cpb.could_hold_a_title(TITLE)
 
 
-def test_an_appendix_heading_blocks_a_body_that_quotes_it_with_its_label(
-        tmp_path, monkeypatch):
+def _title_problems(tmp_path, monkeypatch, heading, body):
+    """`scan`'s findings on `body` with `heading` the one page heading."""
     cpb = _scanner(tmp_path, monkeypatch, NOTION_TOKEN="fake-token-123456",
                    NOTION_RESEARCH_DB="fake-db-1")
     import verify_sections
-    heading = "Appendix I Widget Calibration (부록 I 위젯 보정)"
     query = json.dumps({"results": [{"id": "page-1"}]}).encode()
     monkeypatch.setattr(cpb.urllib.request, "urlopen",
                         lambda req, timeout: io.BytesIO(query))
     monkeypatch.setattr(verify_sections, "fetch_blocks", lambda page_id: [
         {"type": "heading_2",
          "heading_2": {"rich_text": [{"plain_text": heading}]}}])
-    titles = cpb.known_section_titles()
-    problems = dict(cpb.scan("fixes Appendix I Widget Calibration\n", titles,
-                             [], patterns=False))
+    return dict(cpb.scan(body, cpb.known_section_titles(), [], patterns=False))
+
+
+def test_an_appendix_heading_blocks_a_body_that_quotes_it_with_its_label(
+        tmp_path, monkeypatch):
+    problems = _title_problems(tmp_path, monkeypatch,
+                               "Appendix I Widget Calibration (부록 I 위젯 보정)",
+                               "fixes Appendix I Widget Calibration\n")
+    assert "paper content" in problems
+
+
+def test_a_numbered_heading_blocks_a_body_that_quotes_it_without_its_label(
+        tmp_path, monkeypatch):
+    problems = _title_problems(tmp_path, monkeypatch,
+                               "3.2 Adaptive Widget Calibration (3.2 적응형 위젯 보정)",
+                               "fixes Adaptive Widget Calibration\n")
     assert "paper content" in problems

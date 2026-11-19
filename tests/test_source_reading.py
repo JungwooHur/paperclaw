@@ -86,6 +86,12 @@ class TestASourceIsReadByWhatItIs:
         path.write_bytes(pdf_bytes(PDF_TEXT))
         assert "prints in its body" in vs.load_source_text(str(path), None)
 
+    def test_a_local_file_that_is_no_pdf_raises(self, tmp_path):
+        path = tmp_path / "paper.html"
+        path.write_bytes(b"<html><body><p>Body text here.</p></body></html>")
+        with pytest.raises(ValueError, match="paper.html"):
+            vs.load_source_text(str(path), None)
+
     def test_a_local_path_that_does_not_exist_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="missing.pdf"):
             vs.load_source_text(str(tmp_path / "missing.pdf"), None)
@@ -190,9 +196,17 @@ class TestAHeadingOpensItsLine:
         for key, text in (("A", a), ("B", b)):
             assert got[key] is not None and abs(got[key] - len(text)) <= 40, (key, got)
 
-    def test_a_title_formula_the_source_spells_in_tex_is_skipped(self):
+    @pytest.mark.parametrize("formula, located", [
+        (r"\mathbf{x}_{t-1}^{(i,j,k)}", True),     # mathbf x _ t 1 i j k
+        (r"\mathbf{x}_{t-1}^{(i,j,k,l)}", False),  # the same and l
+    ], ids=["8-words", "9-words"])
+    def test_a_title_formula_the_source_spells_in_tex_is_skipped_up_to_8_words(
+            self, formula, located):
         first, second = prose(600), prose(700)
         got = spans(["1 Sampling 𝐱ₜ₋₁⁽ⁱ⁾ Exactly (정확한 샘플링)", "2 Results (결과)"],
-                    "1 Sampling \\mathbf{x}_{t-1}^{(i)} Exactly\n" + first
+                    "1 Sampling " + formula + " Exactly\n" + first
                     + "\n2 Results\n" + second + "\n")
-        assert got["1"] is not None and abs(got["1"] - len(first)) <= 60, got
+        if located:
+            assert got["1"] is not None and abs(got["1"] - len(first)) <= 60, got
+        else:
+            assert got["1"] is None, got

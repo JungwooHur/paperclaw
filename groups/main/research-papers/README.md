@@ -52,10 +52,14 @@ Captions still count as content where no ratio is taken: in the CONTENT_LOSS
 floor (`content_chars`), so a section of tables only is not empty, and when
 choosing which duplicate copy to keep.
 
-**Known limit:** a PDF caption set at body size with no sentence end also blanks a
-body paragraph in its column and font size that starts within 26 pt below it (the
-grammar `_stitched` uses for crops). A SUMMARIZED or CONTENT_LOSS on a section right
-after such a caption deserves a hand check.
+**Known limits.** A SUMMARIZED or CONTENT_LOSS deserves a hand check on a section:
+
+- right after a PDF caption set at body size with no sentence end, which also blanks
+  a body paragraph in its column and font size that starts within 26 pt below it
+  (the grammar `_stitched` uses for crops);
+- made of prompt or example tables, in PDF mode: their text counts as source prose;
+- with text inside a `column_list`: the page side reads top-level blocks only
+  (`fetch_blocks`), so that text is not counted.
 
 **A source is read by what it is, not by its name.** `--source` is a PDF (a URL
 or a local path) or an HTML page (a URL). It is fetched or read once and read as a
