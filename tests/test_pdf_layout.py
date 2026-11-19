@@ -3909,6 +3909,24 @@ class TestTitlesInAnImageGrid:
             ("figure", 8)]["box"]
         assert box[1] <= 90 and 508 <= box[3] <= caption[1]
 
+    def test_prose_between_the_rows_of_two_figures_is_refused(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        for x in (60, 310):
+            picture(page, fitz.Rect(x, 80, x + 230, 200))
+            picture(page, fitz.Rect(x, 262, x + 230, 380))
+        page.insert_text((100, 215), "Figure 1: Two panels.", fontsize=10)
+        for y in (240, 252):
+            page.insert_text((60, y), PROSE[:95], fontsize=10)
+        page.insert_text((100, 395), "Figure 2: Two more panels.", fontsize=10)
+        prose(page, 60, 540, 600)
+        unrendered = []
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert ("figure", 2) not in media
+        assert [u["problem"] for u in unrendered] == [pm.HOLDS_PROSE]
+
     def test_a_paragraphs_tail_over_a_row_is_prose(self, tmp_path):
         # Two columns of prose, the left one's last two lines over a row of two
         # images across both columns.
