@@ -9,6 +9,8 @@ stopped it at something that was not this figure's body text:
   are most of the text, so a one-line axis title above the caption read as a
   heading and the walk stopped before it took a single step.
 """
+import os
+
 import fitz
 import pytest
 
@@ -4619,3 +4621,244 @@ class TestReadOnce:
 
         monkeypatch.setattr(fitz.Page, "get_text", get_text)
         assert pm.ReadOnce(page).get_text("dict") == read(page, "dict")
+
+
+class TestATableContinuedOverPages:
+    """A table whose rows run on over the following pages: one crop per page,
+    in page order, under one key."""
+
+    def doc(self, first_rows=60, then=()):
+        """A page of prose, then Table 3 under its caption over `first_rows`
+        rows, then one page per `then` entry (header line or None, rows,
+        caption under the rows or None, prose under them)."""
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((72, 60), "Table 3: Error of every network.", fontsize=8)
+        bottom = ruled_table(page, 72, 540, 66, first_rows)
+        if bottom < 600:
+            prose(page, 72, 540, bottom + 200)
+        for header, rows, caption, more in then:
+            page = doc.new_page(width=LETTER[0], height=LETTER[1])
+            if header:
+                page.insert_text((72, 54), header, fontsize=8)
+            bottom = ruled_table(page, 72, 540, 60, rows)
+            if caption:
+                page.insert_text((72, bottom + 14), caption, fontsize=8)
+            if more:
+                prose(page, 72, 540, bottom + 200)
+        return doc
+
+    def render(self, tmp_path, doc, unrendered=None):
+        return pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                               unrendered=unrendered)
+
+    def test_rows_under_a_continued_line_are_cropped_on_each_page(self, tmp_path):
+        doc = self.doc(then=[("Table 3 (continued)", 60, None, False),
+                             ("Table 3 - continued from previous page", 8, None, True)])
+        table = self.render(tmp_path, doc)[("table", 3)]
+        assert table["page"] == 2
+        parts = table["continued"]
+        assert [p["page"] for p in parts] == [3, 4]
+        assert all(p["box"][1] > 54 and p["box"][0] <= 72 and p["box"][2] >= 540
+                   for p in parts)
+        assert parts[0]["box"][3] >= 60 + 13 + 600 + 4 and parts[1]["box"][3] < 200
+        assert [os.path.basename(p["path"]) for p in parts] == [
+            "table3-2.png", "table3-3.png"]
+        assert all(os.path.exists(p["path"]) for p in parts)
+
+    def test_rows_of_its_columns_atop_the_next_page_are_cropped(self, tmp_path):
+        table = self.render(tmp_path, self.doc(then=[(None, 8, None, True)]))[
+            ("table", 3)]
+        (part,) = table["continued"]
+        assert part["page"] == 3 and part["box"][1] < 60 < 66 + 13 + 80 < part["box"][3]
+
+    def test_a_table_that_ends_on_its_page_is_not_extended(self, tmp_path):
+        table = self.render(tmp_path, self.doc(first_rows=20,
+                                               then=[(None, 8, None, True)]))[
+            ("table", 3)]
+        assert table["continued"] == []
+
+    def test_the_next_page_s_own_table_is_not_taken(self, tmp_path):
+        media = self.render(tmp_path, self.doc(
+            then=[(None, 8, "Table 4: Error of the small networks.", True)]))
+        assert media[("table", 3)]["continued"] == []
+        assert media[("table", 4)]["page"] == 3
+
+    def test_rows_of_other_columns_are_not_taken(self, tmp_path):
+        doc = self.doc()
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        bottom = ruled_table(page, 72, 300, 60, 8, rule_x=(72, 540))
+        prose(page, 72, 540, bottom + 200)
+        assert self.render(tmp_path, doc)[("table", 3)]["continued"] == []
+
+    def test_rows_under_rules_of_another_extent_are_not_taken(self, tmp_path):
+        doc = self.doc()
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        bottom = ruled_table(page, 72, 540, 60, 8, rule_x=(60, 552))
+        prose(page, 72, 540, bottom + 200)
+        assert self.render(tmp_path, doc)[("table", 3)]["continued"] == []
+
+    def test_rows_under_body_text_are_not_taken(self, tmp_path):
+        doc = self.doc()
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        top = prose(page, 72, 540, 200)[3] + 30
+        ruled_table(page, 72, 540, top, 8)
+        assert self.render(tmp_path, doc)[("table", 3)]["continued"] == []
+
+    def test_rows_a_caption_under_them_claims_are_not_taken_uncropped(
+            self, tmp_path, monkeypatch):
+        doc = self.doc(then=[(None, 8, "Table 4: Error of the small networks.", True)])
+        crop = pm.float_crop
+        monkeypatch.setattr(pm, "float_crop", lambda page, kind, num, *a: (
+            (None, pm.HOLDS_PROSE, None) if num == 4 else crop(page, kind, num, *a)))
+        unrendered = []
+        assert self.render(tmp_path, doc, unrendered)[("table", 3)]["continued"] == []
+        assert [u for u in unrendered if "part" in u] == []
+
+    def test_rows_the_next_page_s_own_crop_takes_are_not_taken(self, tmp_path):
+        # Table 4's caption stands under a note, further than a caption's gap.
+        doc = self.doc()
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        bottom = ruled_table(page, 72, 540, 60, 8)
+        for i in range(3):
+            page.insert_text((76, bottom + 9 + 9 * i), f"Note {i}: a footnote on "
+                             "the rows above.", fontsize=7)
+        page.insert_text((72, bottom + 50), "Table 4: Error of the small networks.",
+                         fontsize=8)
+        prose(page, 72, 540, bottom + 260)
+        unrendered = []
+        media = self.render(tmp_path, doc, unrendered)
+        assert media[("table", 3)]["continued"] == [] and unrendered == []
+        assert media[("table", 4)]["box"][1] <= 60
+
+    def test_rows_under_another_tables_continued_line_are_not_taken(self, tmp_path):
+        doc = self.doc(then=[("Table 4 (continued)", 8, None, True)])
+        assert self.render(tmp_path, doc)[("table", 3)]["continued"] == []
+
+    def test_rows_of_one_column_more_are_not_taken(self, tmp_path):
+        doc = self.doc()
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        bottom = ruled_table(page, 72, 540, 60, 8)
+        for y in [70] + [83 + 10 * i for i in range(8)]:
+            page.insert_text((528, y), "x", fontsize=8)
+        prose(page, 72, 540, bottom + 200)
+        assert self.render(tmp_path, doc)[("table", 3)]["continued"] == []
+
+    def stacked(self):
+        """Table 3's rows under its `continued` line atop page 3, then Table 4's
+        rows straight under them, captioned under its own rows."""
+        doc = self.doc()
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((72, 54), "Table 3 (continued)", fontsize=8)
+        bottom = ruled_table(page, 72, 540, ruled_table(page, 72, 540, 60, 8) + 8, 8)
+        page.insert_text((72, bottom + 14), "Table 4: Error of the small networks.",
+                         fontsize=8)
+        prose(page, 72, 540, bottom + 200)
+        return doc
+
+    def test_a_table_captioned_under_its_rows_right_under_the_rows_is_not_taken(
+            self, tmp_path):
+        unrendered = []
+        media = self.render(tmp_path, self.stacked(), unrendered)
+        assert media[("table", 3)]["continued"] == []
+        assert unrendered == [{"kind": "table", "label": 3, "page": 3,
+                               "problem": pm.MEETS_FLOAT, "part": 1}]
+
+    def test_rows_another_caption_sits_under_are_not_taken(self, tmp_path, monkeypatch):
+        crop = pm.float_crop
+        monkeypatch.setattr(pm, "float_crop", lambda page, kind, num, *a: (
+            (None, pm.HOLDS_PROSE, None) if num == 4 else crop(page, kind, num, *a)))
+        unrendered = []
+        media = self.render(tmp_path, self.stacked(), unrendered)
+        assert media[("table", 3)]["continued"] == []
+        assert unrendered == [
+            {"kind": "table", "label": 4, "page": 3, "problem": pm.HOLDS_PROSE},
+            {"kind": "table", "label": 3, "page": 3, "problem": pm.MEETS_FLOAT,
+             "part": 1}]
+
+    def test_its_own_caption_under_its_last_page_does_not_stop_it(self, tmp_path):
+        doc = self.doc()
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((72, 54), "Table 3 (continued)", fontsize=8)
+        bottom = ruled_table(page, 72, 540, 60, 8)
+        page.insert_text((72, bottom + 24), "Table 3: Error of every network.",
+                         fontsize=8)
+        prose(page, 72, 540, bottom + 200)
+        (part,) = self.render(tmp_path, doc)[("table", 3)]["continued"]
+        assert part["page"] == 3 and part["box"][3] < bottom + 14
+
+    def test_rows_whose_crop_runs_into_the_pages_own_float_are_not_taken(
+            self, tmp_path, monkeypatch):
+        doc = self.doc(then=[(None, 8, None, False)])
+        page = doc[-1]
+        page.insert_text((100, 300), "Table 4: Error of the small networks.", fontsize=8)
+        prose(page, 72, 540, ruled_table(page, 100, 500, 306, 8) + 200)
+        crop = pm._crop_at
+
+        def runs_on(page, start, kind, num, *a):
+            rect, problem = crop(page, start, kind, num, *a)
+            return ((rect[0], rect[1], rect[2], 360) if page.number == 2 and num == 3
+                    else rect), problem
+
+        monkeypatch.setattr(pm, "_crop_at", runs_on)
+        unrendered = []
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert media[("table", 3)]["continued"] == [] and media[("table", 4)]
+        assert unrendered == [{"kind": "table", "label": 3, "page": 3,
+                               "problem": pm.MEETS_FLOAT, "part": 1}]
+
+    def test_a_later_page_with_no_crop_is_reported_with_its_part(
+            self, tmp_path, monkeypatch, capsys):
+        doc = self.doc(then=[("Table 3 (continued)", 60, None, False),
+                             ("Table 3 (continued)", 8, None, True)])
+        crop = pm._crop_at
+        monkeypatch.setattr(pm, "_crop_at", lambda page, *a: (
+            (None, pm.HOLDS_PROSE) if page.number == 3 else crop(page, *a)))
+        unrendered = []
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert [p["page"] for p in media[("table", 3)]["continued"]] == [3]
+        assert unrendered == [{"kind": "table", "label": 3, "page": 4,
+                               "problem": pm.HOLDS_PROSE, "part": 2}]
+        assert "table 3 part 2 on page 4" in capsys.readouterr().err
+
+    def test_a_figure_never_runs_on(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 400)
+        page.draw_rect(fitz.Rect(120, 430, 490, 680), color=(0, 0, 0),
+                       fill=(0.8, 0.3, 0.3))
+        page.insert_text((72, 700), "Figure 5: Error of each run.", fontsize=8)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_rect(fitz.Rect(120, 54, 490, 300), color=(0, 0, 0),
+                       fill=(0.3, 0.3, 0.8))
+        page.insert_text((72, 320), "Figure 5 (continued)", fontsize=8)
+        prose(page, 72, 540, 500)
+        unrendered = []
+        media = self.render(tmp_path, doc, unrendered)
+        assert media[("figure", 5)]["continued"] == [] and unrendered == []
+
+    def test_its_later_pages_text_is_the_floats_text(self, tmp_path):
+        doc = self.doc(then=[("Table 3 (continued)", 8, None, True)])
+        pdf = save(doc, tmp_path)
+        media = pm.render_media(pdf, str(tmp_path / "out"))
+        assert pm._media_text(pdf, media).count("model error") == 2
+
+    def test_each_part_is_a_crop_of_its_page(self, tmp_path):
+        doc = self.doc(then=[("Table 3 (continued)", 8, None, True)])
+        crops = [(page.number, c) for page, cs in pm.float_crops(doc) for c in cs]
+        assert [(n, c[:2], c[3:]) for n, c in crops] == [
+            (1, ("table", 3), (None, "Table 3: Error of every network.", 0)),
+            (2, ("table", 3), (None, None, 1))]
+
+    def test_its_rows_and_continued_lines_leave_the_audit_s_source(self, tmp_path):
+        import verify_sections as vs
+
+        doc = self.doc(then=[("Table 3 (continued)", 60, None, False),
+                             (None, 8, None, True)])
+        text = vs.load_source_text(save(doc, tmp_path), None)
+        assert "network" not in text and "continued" not in text
+        assert "Body prose" in text

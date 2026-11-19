@@ -39,10 +39,12 @@ audit leaves out of the ratio what the page does not translate as body text:
 - **Floats, body and caption, on the source side.** The source turns them into
   `_TABLE_MARK`s, which keep the span's extent. In LaTeXML a float is each outermost
   `<figure>` element: a figure (a prompt box set as text included), a table, an
-  algorithm or a listing. In a PDF it is every line whose centre lies in the crop
+  algorithm or a listing. In a PDF it is every line whose centre lies in a crop
   the renderer takes (`extract_pdf_media.float_crops`, the loop `render_media`
-  renders) or in `extract_pdf_media.caption_regions` (the crops' caption grammar),
-  so a float the renderer does not crop loses its caption only. A block the renderer
+  renders; a table's later pages included) or in
+  `extract_pdf_media.caption_regions` (the crops' caption grammar, and a line
+  heading a table's later part), so a float the renderer does not crop loses its
+  caption only. A block the renderer
   reads as a heading (`extract_pdf_media._is_heading`) is kept inside a crop, so a
   crop that runs past its float does not unlocate the next section. A run of blanked
   lines counts as one line break, so a float of many lines adds nothing to the span.
@@ -106,8 +108,9 @@ holds the section.
   (the grammar `_stitched` uses for crops);
 - holding a float the renderer does not crop, in PDF mode (`render_media` reports
   it unrendered, such as a table with no ruled structure or a figure of text with
-  no drawing), or the later pages of a table it crops on its first page only: that
-  body counts as source prose;
+  no drawing), or a later page of a table that no `Table N (continued)` line heads
+  and that does not open on the table's ruled columns (below): that body counts as
+  source prose;
 - whose PDF text a float's crop still runs over: a line of body text between the
   float's graphics that the crop check lets through, text inside a drawing the
   crop takes (an abstract boxed over a teaser), or a title block of small print
@@ -287,6 +290,17 @@ nothing reads the budget.
   `tools/ab_render.py` renders `render_media` against a base ref with contact
   sheets, each side's unrendered captions and the base's floats the branch lost;
   judge every added, changed and removed crop from them.
+- **A table the PDF runs over several pages is one image per page**
+  (`render_media`'s `continued`), placed in page order where the table goes: the
+  first image carries the table's caption, each later one `Table N (continued)`
+  (`continued_caption`). An uncaptioned image would count as a figure
+  (`extract_paper_figures` counts every image not captioned `Table`) and could not
+  be told from one placed by hand. The repeated `(continued)` caption is no copy:
+  `extract_paper_tables.is_table_key` leaves it out of the runaway guard and
+  `dedup_tables`. A later page is one a `Table N (continued)` line heads, or, after
+  a part that ends its page's text, one whose first print is ruled rows with the
+  part's rule extent and columns that no caption of that page claims; a later crop
+  that meets another float of its page (`MEETS_FLOAT`) is reported, not placed.
 - **A script that opens a PDF sends MuPDF's messages to stderr**
   (`fitz.set_messages(fd=2)` before `fitz.open`). PyMuPDF prints them on stdout by
   default (`MuPDF error: ...`), into any JSON the script prints there;
