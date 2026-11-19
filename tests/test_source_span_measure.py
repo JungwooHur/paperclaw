@@ -170,7 +170,7 @@ def lines_at(tmp_path, lines):
         page.insert_text((60, 400 + 11 * n), text, fontsize=size)
     path = tmp_path / "paper.pdf"
     doc.save(path)
-    return " ".join(vs.source_text_from_pdf(str(path)).split())
+    return " ".join(vs.load_source_text(str(path), None).split())
 
 
 class TestFigureCaptionsInPdf:
@@ -179,14 +179,14 @@ class TestFigureCaptionsInPdf:
         for end, size in ((" (best viewed in color)", 10), (" (Best viewed in color.)", 9),
                           (' ("ours")?', 9)):
             path = stacked(tmp_path, [(CAPTION[:-1] + end, 9), (PARAGRAPH, size)])
-            text = " ".join(vs.source_text_from_pdf(path).split())
+            text = " ".join(vs.load_source_text(path, None).split())
             assert "noise grows" not in text and PARAGRAPH in text, (end, size)
 
     def test_a_caption_block_ending_in_a_bracket_that_goes_on_takes_the_next(
             self, tmp_path):
         path = blocks_below(tmp_path, CAPTION[:-1] + " for the encoder (left)",
                             "and for the decoder (right) of the model.")
-        assert "decoder (right)" not in vs.source_text_from_pdf(path)
+        assert "decoder (right)" not in vs.load_source_text(path, None)
 
     def test_a_short_caption_line_ending_in_a_bracket_does_not_end_it(
             self, tmp_path):
@@ -208,7 +208,7 @@ class TestFigureCaptionsInPdf:
     def test_a_body_block_under_a_body_size_bracketed_caption_is_kept(self, tmp_path):
         path = blocks_below(tmp_path, CAPTION[:-1] + " (best viewed in color)",
                             PARAGRAPH)
-        text = " ".join(vs.source_text_from_pdf(path).split())
+        text = " ".join(vs.load_source_text(path, None).split())
         assert "noise grows" not in text and PARAGRAPH in text
 
     def test_a_body_block_under_a_caption_ending_a_full_line_is_kept(self, tmp_path):
@@ -225,7 +225,7 @@ class TestFigureCaptionsInPdf:
                                    fontsize=10) >= 0
         path = tmp_path / "paper.pdf"
         doc.save(path)
-        text = " ".join(vs.source_text_from_pdf(str(path)).split())
+        text = " ".join(vs.load_source_text(str(path), None).split())
         assert "noise grows" not in text and PARAGRAPH in text
 
     def test_a_heading_after_a_full_last_caption_line_is_kept(self, tmp_path):
@@ -253,7 +253,7 @@ class TestFigureCaptionsInPdf:
         page.insert_textbox(fitz.Rect(320, 380, 560, 620), PARAGRAPH, fontsize=10)
         path = tmp_path / "paper.pdf"
         doc.save(path)
-        text = " ".join(vs.source_text_from_pdf(str(path)).split())
+        text = " ".join(vs.load_source_text(str(path), None).split())
         assert "noise grows" not in text and PARAGRAPH in text
 
     def test_a_caption_block_is_not_source_text(self, tmp_path):
@@ -261,7 +261,7 @@ class TestFigureCaptionsInPdf:
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11), (body, 10),
                         (CAPTION, 9), (prose(800), 10), ("3 Results", 11),
                         (prose(900), 10))
-        text = vs.source_text_from_pdf(path)
+        text = vs.load_source_text(path, None)
         assert "noise grows" not in text
         got = vs.source_section_chars(text, SECTIONS[1:])
         assert close_to(got["2.1"], body + prose(800), slack=80)
@@ -271,12 +271,12 @@ class TestFigureCaptionsInPdf:
         # The PDF set an axis title and the caption under it as one block.
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11),
                         (prose(900), 10), ("log(N)\n" + CAPTION, 9))
-        assert "noise grows" not in vs.source_text_from_pdf(path)
+        assert "noise grows" not in vs.load_source_text(path, None)
 
     def test_a_heading_the_pdf_set_in_the_caption_block_is_kept(self, tmp_path):
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11), (prose(900), 10),
                         (CAPTION + "\n3 Results", 9), (prose(900), 10))
-        text = vs.source_text_from_pdf(path)
+        text = vs.load_source_text(path, None)
         assert "noise grows" not in text and "3 Results" in text
         assert vs.source_section_chars(text, SECTIONS[1:])["2.1"] is not None
 
@@ -286,7 +286,7 @@ class TestFigureCaptionsInPdf:
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11), (prose(900), 10),
                         (CAPTION + "\n" + para, 10), ("3 Results", 11),
                         (prose(900), 10))
-        text = vs.source_text_from_pdf(path)
+        text = vs.load_source_text(path, None)
         assert "noise grows" not in text
         assert "Using the model on the larger sets" in text
         got = vs.source_section_chars(text, SECTIONS[1:])
@@ -305,7 +305,7 @@ class TestFigureCaptionsInPdf:
             page.insert_text((60, 400 + 11 * n), line, fontsize=size)
         path = tmp_path / "paper.pdf"
         doc.save(path)
-        assert "Each curve" not in vs.source_text_from_pdf(str(path))
+        assert "Each curve" not in vs.load_source_text(str(path), None)
 
     def test_a_sentence_ending_a_little_short_of_a_full_line_does_not_end_it(
             self, tmp_path):
@@ -328,18 +328,18 @@ class TestFigureCaptionsInPdf:
                          fontsize=9)
         path = tmp_path / "paper.pdf"
         doc.save(path)
-        text = vs.source_text_from_pdf(str(path))
+        text = vs.load_source_text(str(path), None)
         assert "Each curve" not in text and "noise grows" not in text
 
     def test_a_line_that_opens_on_a_label_inside_a_paragraph_is_kept(self, tmp_path):
         body = prose(300) + "\nFigure 1. The error falls quickly with scale."
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11), (body, 10))
-        assert "falls quickly" in vs.source_text_from_pdf(path)
+        assert "falls quickly" in vs.load_source_text(path, None)
 
     def test_a_sentence_that_opens_on_a_label_is_kept(self, tmp_path):
         sentence = "Figure 1 shows that the error falls quickly with scale."
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11), (sentence, 10))
-        assert sentence in " ".join(vs.source_text_from_pdf(path).split())
+        assert sentence in " ".join(vs.load_source_text(path, None).split())
 
     def test_a_heading_block_under_a_caption_with_no_stop_is_kept(self, tmp_path):
         import fitz
@@ -355,7 +355,7 @@ class TestFigureCaptionsInPdf:
             y = 1000 - left + gap
         path = tmp_path / "paper.pdf"
         doc.save(path)
-        text = vs.source_text_from_pdf(str(path))
+        text = vs.load_source_text(str(path), None)
         got = vs.source_section_chars(text, [
             ("E.1", "Setup"), ("E.2", "Generalization across labelers"),
             ("E.3", "Metadata results")])
@@ -367,7 +367,7 @@ class TestFigureCaptionsInPdf:
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11), (prose(900), 10),
                         ("Figure 1: Overview.\nTable 1: Sizes of the splits.", 9),
                         (prose(900), 10))
-        text = vs.source_text_from_pdf(path)
+        text = vs.load_source_text(path, None)
         assert "Overview" not in text and "Sizes of the splits" not in text
 
 
@@ -514,7 +514,7 @@ class TestCaptionGrammarEdges:
                         ("The two figures below show the effect of scale.", 10),
                         (CAPTION + " " + CAPTION[10:] * 3, 9), ("3 Results", 11),
                         (prose(900), 10))
-        got = vs.source_section_chars(vs.source_text_from_pdf(path), SECTIONS[1:])
+        got = vs.source_section_chars(vs.load_source_text(path, None), SECTIONS[1:])
         assert got["2.1"] is not None and got["2.1"] < 100
 
     def test_a_body_paragraph_opening_on_a_label_is_kept(self, tmp_path):
@@ -523,10 +523,10 @@ class TestCaptionGrammarEdges:
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11),
                         (prose(600), 10), (para, 10), (prose(600), 10))
         assert "Figure 3 (left) shows" in " ".join(
-            vs.source_text_from_pdf(path).split())
+            vs.load_source_text(path, None).split())
 
     def test_a_caption_with_no_separator_in_caption_type_is_blanked(self, tmp_path):
         caption = "Fig. 1 " + CAPTION.split(": ", 1)[1]
         path = pdf_with(tmp_path, ("2.1 Effect of Scale", 11),
                         (prose(900), 10), (caption, 9), (prose(900), 10))
-        assert "noise grows" not in vs.source_text_from_pdf(path)
+        assert "noise grows" not in vs.load_source_text(path, None)

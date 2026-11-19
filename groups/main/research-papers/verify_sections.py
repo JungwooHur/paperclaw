@@ -50,7 +50,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 from html import unescape
 import urllib.request
 
@@ -133,20 +132,31 @@ _CHROME_RE = re.compile(r"Experimental\s+support,\s+please\s+view\s+the\s+build\
 _LETTERED_KEY = re.compile(r"[A-Z](?:[.-]\d+)*")
 
 
+def _heading_needle(key: str, title: str, n_words: int):
+    """Regex, matched with re.I, of a source heading: the label in its own case
+    and not inside a word, then the first `n_words` title words of over two
+    letters, up to 8 other words between two. None without a key or such words.
+    """
+    words = [w for w in re.split(r"\W+", title) if len(w) > 2][:n_words]
+    if not key or not words:
+        return None
+    gap = r"(?:\W+\w+){0,8}?\W+"
+    return (r"(?<!\w)(?-i:" + re.escape(key) + r")[.:)]?\s+"
+            + gap.join(re.escape(w) for w in words))
+
+
 def _appendix_past(tail: str, ordered_sections: list) -> bool:
     """Does one of the page's lettered (appendix) headings open a line of `tail`?
 
     Args:
-        tail: The source text past the back-matter cut, lowercased.
+        tail: The source text past the back-matter cut.
         ordered_sections: The page's (key, title) pairs.
     """
     for key, title in ordered_sections:
         if not _LETTERED_KEY.fullmatch(key or "") or key == "I":
             continue
-        words = [w for w in re.split(r"\W+", title) if len(w) > 2][:4]
-        if words and re.search(r"\n\s*(?:appendix\s+)?" + re.escape(key.lower())
-                               + r"[.\s]+" + r"\W+".join(re.escape(w.lower()) for w in words),
-                               tail):
+        needle = _heading_needle(key, title, 4)
+        if needle and re.search(r"\n\s*(?:appendix\s+)?" + needle, tail, re.I):
             return True
     return False
 
@@ -164,16 +174,23 @@ def _echo_norm(s: str) -> str:
     return re.sub(r"[^0-9a-z가-힣]", "", s.lower())
 
 
+def _split_label(heading_text: str):
+    """(label, rest) of a heading: 'Appendix E. Title' -> ('E', '. Title').
+
+    After an `Appendix`/`부록` prefix a bare letter is a label too ('Appendix B
+    Pre-training Data' -> 'B'). The label is None, and the rest the whole text,
+    when the heading has none.
+    """
+    text = heading_text or ""
+    prefix = _APPENDIX_PREFIX.match(text)
+    body = text[prefix.end():] if prefix else text
+    m = _KEY_RE.match(body) or (prefix and re.match(r"\s*([A-Z])\b", body))
+    return (m.group(1), body[m.end():]) if m else (None, text)
+
+
 def section_key(heading_text: str):
     """'2.1 The Robot-Native Regime (2.1 ...)' -> '2.1'. None if no label."""
-    text = _APPENDIX_PREFIX.sub("", heading_text or "")
-    m = _KEY_RE.match(text)
-    if m:
-        return m.group(1)
-    # "Appendix B Pre-training Data" -> "B": the prefix made the label explicit, so
-    # the bare letter no longer needs punctuation after it to be unambiguous.
-    m = re.match(r"^\s*([A-Z])\b", text) if text is not heading_text else None
-    return m.group(1) if m else None
+    return _split_label(heading_text)[0]
 
 
 def english_title(heading_text: str) -> str:
@@ -181,12 +198,9 @@ def english_title(heading_text: str) -> str:
 
     '2.1 The Robot-Native Regime (2.1 한국어)' -> 'The Robot-Native Regime'
     """
-    text = heading_text or ""
     # Drop the trailing "(translation)" half if present.
-    text = re.split(r"\s*\(", text, 1)[0]
-    # Drop the leading section label.
-    text = _KEY_RE.sub("", text, count=1)
-    return re.sub(r"\s+", " ", text).strip(" .:-")
+    text = re.split(r"\s*\(", heading_text or "", 1)[0]
+    return re.sub(r"\s+", " ", _split_label(text)[1]).strip(" .:)-")
 
 
 import reference_section  # noqa: E402
@@ -521,62 +535,48 @@ def _pdf_page_text(page) -> str:
     return "".join(out)
 
 
-def source_text_from_pdf(path_or_url: str):
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        sys.stderr.write("PyMuPDF not installed; cannot read PDF source.\n")
-        return None
-    local, is_temp = path_or_url, False
-    if re.match(r"^https?://", path_or_url):
-        # Unique temp path: parallel subagents share /tmp, so a fixed name
-        # would let concurrent gates overwrite each other's source PDF.
-        fd, local = tempfile.mkstemp(suffix=".pdf", prefix="verify_sections_")
-        os.close(fd)
-        is_temp = True
-        try:
-            req = urllib.request.Request(
-                path_or_url,
-                headers={"User-Agent": "Mozilla/5.0", "Referer": path_or_url})
-            with urllib.request.urlopen(req, timeout=60) as r, open(local, "wb") as f:
-                f.write(r.read())
-        except Exception as e:
-            sys.stderr.write(f"could not download source pdf: {e}\n")
-            os.unlink(local)
-            return None
-    try:
-        if not os.path.exists(local):
-            sys.stderr.write(f"source not found: {local}\n")
-            return None
-        try:
-            doc = fitz.open(local)
-        except Exception as e:
-            sys.stderr.write(f"could not open pdf: {e}\n")
-            return None
+def source_text_from_pdf(pdf: bytes) -> str:
+    """The text of a PDF given as its bytes, one line of text per line."""
+    import fitz  # PyMuPDF
+    with fitz.open(stream=pdf, filetype="pdf") as doc:
         # Keep newlines — the References tail-cut anchors on a heading line.
         text = "\n".join(_pdf_page_text(page) for page in doc)
-    finally:
-        if is_temp and os.path.exists(local):
-            os.unlink(local)
     return re.sub(r"[ \t]+", " ", text)
 
 
+def _fetch(url: str):
+    """(body, content type) of a GET of `url`."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0",
+                                               "Referer": url})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read(), r.headers.get_content_type()
+    except OSError as e:
+        raise OSError(f"could not fetch source {url}: {e}") from e
+
+
 def load_source_text(source: str | None, arxiv: str | None):
+    """The source's text: arXiv's HTML of `arxiv`, else the PDF or HTML page at
+    `source`, a URL or a local file.
+
+    None when neither is given, or when arXiv has no HTML of the paper. Raises
+    when `source` cannot be read or is neither a PDF nor HTML.
+    """
     if arxiv:
         return source_text_from_arxiv(arxiv)
     if not source:
         return None
-    if re.search(r"\.pdf($|\?)", source, re.IGNORECASE) or os.path.exists(source):
-        return source_text_from_pdf(source)
-    if re.match(r"^https?://", source):  # landing page -> try as html
-        try:
-            req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                html = resp.read().decode("utf-8", "ignore")
-            return _strip_html(html)
-        except Exception:
-            return None
-    return None
+    if re.match(r"^https?://", source, re.I):
+        body, content_type = _fetch(source)
+    else:
+        with open(source, "rb") as f:
+            body, content_type = f.read(), None
+    if b"%PDF-" in body[:1024] or content_type == "application/pdf":
+        return source_text_from_pdf(body)
+    if content_type in ("text/html", "application/xhtml+xml"):
+        return _strip_html(body.decode("utf-8", "ignore"))
+    raise ValueError(f"source {source} is neither a PDF nor HTML "
+                     f"(Content-Type {content_type}, starting {body[:40]!r})")
 
 
 # A Methods heading on a line of its own. Journals set it after the reference
@@ -643,14 +643,13 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
     # When a lettered heading of the page really sits past the cut, measure to
     # the end of the document; each span below stops at the first References
     # heading after its start, so the bibliography is still never counted.
-    if len(body) >= doc_end or _appendix_past(full_text[len(body):doc_end].lower(),
+    if len(body) >= doc_end or _appendix_past(full_text[len(body):doc_end],
                                               ordered_sections):
         body = full_text[:doc_end]
-    low = body.lower()
     found = []
     for key, title in ordered_sections:
-        words = [w for w in re.split(r"\W+", title) if len(w) > 2][:6]
-        if not key or not words:
+        needle = _heading_needle(key, title, 6)
+        if not needle:
             continue
         # Join the kept words allowing a few SKIPPED short words between them.
         # The old needle dropped words of <=2 chars and then glued the rest with
@@ -672,11 +671,8 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
         # section, which reported a SUMMARIZED that was not real (on that text 3
         # and 5 found nothing, 8 found both). Longer formulas skip more, so the
         # allowance stays at 8.
-        gap = r"(?:\W+\w+){0,8}?\W+"
-        needle = (re.escape(key.lower()) + r"\.?\s+"
-                  + gap.join(re.escape(w.lower()) for w in words))
         last = None
-        for mm in re.finditer(needle, low):
+        for mm in re.finditer(needle, body, re.I):
             last = mm
         if last:
             found.append((key, last.start()))
@@ -692,7 +688,7 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
         if key not in pos:
             continue
         nxt_key = keys_in_order[i + 1] if i + 1 < len(keys_in_order) else None
-        if nxt_key is None:
+        if nxt_key is None and pos[key] == max(pos.values()):
             end = len(body)                      # the last section runs to the end
         elif nxt_key in pos and pos[nxt_key] > pos[key]:
             end = pos[nxt_key]
