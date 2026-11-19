@@ -5,6 +5,10 @@ paragraph of its own opening on a separated label (`Figure 4:`, `그림 4:`), in
 the source a figure or table caption. Measured on one side only, a complete
 translation reads as SUMMARIZED or CONTENT_LOSS, or a short one passes.
 """
+import contextlib
+import io
+import json
+
 import verify_sections as vs
 
 SENTENCE = ("The method is evaluated on a range of tasks and compared with the "
@@ -495,6 +499,70 @@ class TestTranslatedCaptionsOnThePage:
         for text in ("그림 1은 오차가 빠르게 줄어든다는 것을 보여준다.",
                      "Figure 1 shows that the error falls quickly."):
             assert self.chars(text) == len(self.BODY) + len(text), text
+
+
+class TestTextBesideAFigure:
+    """A `column_list` holds `column`s, and each column the blocks set in it."""
+
+    INTRO = "아래 그림은 각 설정에서 얻은 정성적 결과를 보여준다. "
+    BODY = TestTranslatedCaptionsOnThePage.BODY
+    CAPTION = "Figure 5: 각 설정에서 얻은 정성적 결과."
+
+    def test_a_section_whose_text_sits_in_a_column_list_measures_it(self, monkeypatch):
+        children = {
+            "page": [block("heading_3", "6.1 Qualitative Results"),
+                     block("paragraph", self.INTRO),
+                     {"type": "column_list", "id": "columns", "has_children": True},
+                     block("heading_3", "6.2 Limitations"), block("paragraph", self.BODY)],
+            "columns": [{"type": "column", "id": "left", "has_children": True},
+                        {"type": "column", "id": "right", "has_children": True}],
+            "left": [{"type": "image", "id": "img"}, block("paragraph", self.CAPTION)],
+            "right": [block("paragraph", self.BODY), block("paragraph", self.BODY)],
+        }
+        monkeypatch.setattr(vs, "fetch_blocks", children.__getitem__)
+        monkeypatch.setattr(vs, "page_title", lambda page: "a paper")
+        monkeypatch.setattr(vs, "load_source_text", lambda *a: (
+            "6.1 Qualitative Results\n" + prose(1500) + "\n6.2 Limitations\n"
+            + prose(700)))
+        monkeypatch.setattr("sys.argv", ["verify_sections.py", "--page", "page",
+                                         "--source", "x.pdf", "--json"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            vs.main()
+        report = json.loads(out.getvalue())
+        chars = {s["key"]: s["chars"] for s in report["sections"]}
+        assert chars["6.1"] == len(self.INTRO) + 2 * len(self.BODY), chars
+        assert not [f for f in report["findings"] if f.get("section") == "6.1"], report
+
+    def test_the_columns_are_read_left_to_right_in_place(self, monkeypatch):
+        children = {
+            "columns": [{"type": "column", "id": "left"}, {"type": "column", "id": "right"}],
+            "left": [block("paragraph", "left one"), block("paragraph", "left two")],
+            "right": [block("paragraph", "right one")],
+        }
+        monkeypatch.setattr(vs, "fetch_blocks", children.__getitem__)
+        got = vs.reading_order([block("paragraph", "before"),
+                                {"type": "column_list", "id": "columns"},
+                                block("paragraph", "after")])
+        assert [b["id"] for b in got] == ["before", "left one", "left two", "right on",
+                                          "after"]
+
+    def test_a_column_list_inside_a_column_is_read_in_place(self, monkeypatch):
+        children = {
+            "columns": [{"type": "column", "id": "left"}, {"type": "column", "id": "right"}],
+            "left": [block("paragraph", "left one"), {"type": "column_list", "id": "inner"},
+                     block("paragraph", "left two")],
+            "inner": [{"type": "column", "id": "inner a"}, {"type": "column", "id": "inner b"}],
+            "inner a": [block("paragraph", "nested a")],
+            "inner b": [block("paragraph", "nested b")],
+            "right": [block("paragraph", "right one")],
+        }
+        monkeypatch.setattr(vs, "fetch_blocks", children.__getitem__)
+        got = vs.reading_order([block("paragraph", "before"),
+                                {"type": "column_list", "id": "columns"},
+                                block("paragraph", "after")])
+        assert [b["id"] for b in got] == ["before", "left one", "nested a", "nested b",
+                                          "left two", "right on", "after"]
 
 
 class TestCaptionGrammarEdges:

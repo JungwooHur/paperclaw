@@ -82,6 +82,7 @@ def source_sections(pdf_path: str) -> dict:
     """
     import fitz
 
+    fitz.set_messages(fd=2)
     doc = fitz.open(pdf_path)
     try:
         full = "\n".join(doc[p].get_text() for p in range(doc.page_count))
