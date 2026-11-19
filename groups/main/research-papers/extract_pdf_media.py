@@ -45,6 +45,12 @@ then the UNION of what was actually collected (plus the caption), so a
 single-column figure keeps its full width and a two-column figure keeps its own
 column, with no caption-shape guessing.
 
+A figure's own print that reads like body text stays its content: print set
+on a drawing that runs on past the caption (an EPS backdrop) is the figure's,
+small print opening on a panel's mark (`(a) …`) under a panel is a
+subcaption, and lines between the rows of an image grid or titling one of its
+panels are no prose to the crop check.
+
 Tables use the identical machinery, growing DOWNWARD (LaTeX puts a table's
 caption above its body) instead of upward.
 
@@ -126,6 +132,7 @@ _STAMP_MIN_PAGE_FRAC = 0.25  # ...and runs at least this much of the page height
 _STAMP_MARGIN_FRAC = 0.10    # ...entirely within this much of the outer margin
 _BACKGROUND_AREA_FRAC = 0.8  # a box this big is a page background, not content
 _LABEL_LINE_MAX = 40         # a figure's own label line is shorter than this (chars)
+_PANEL_GAP = 12.0            # a panel's title or subcaption stands this close to it
 
 
 # A float's caption opener: the word, the label as printed, an optional
@@ -161,6 +168,9 @@ _SECTION = r"\s*(?:[1-9]\d?|[A-Z](?=\.\d))(?:\.\d{1,2})*\.?"
 # A section number and the first letter of the heading it opens: `3 M`,
 # `3.1. M`, `A.2 M`.
 _SECTION_NUMBER = re.compile(_SECTION + r"\s+[A-Z]")
+
+# A panel's mark opening its subcaption: `(a) `, `(iv) `.
+_PANEL_MARK = re.compile(r"\s*\((?:[a-z]|[ivx]{1,4})\)\s")
 
 # A small-capitals typeface, by name.
 _SMALL_CAPS_FONT = re.compile(r"cmcsc|smallcap|caps\b", re.I)
@@ -1628,6 +1638,10 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
         if base_kind(other[0]) == "figure":
             parts.figure_captions.append(box)
         parts.elements = [e for e in parts.elements if not _overlaps(e, box)]
+    if base_kind(kind) == "figure":
+        for box in (_on_backdrop(parts, caption_box, page.rect)
+                    + _subcaptions(blocks, parts, caption_box)):
+            parts.make_element(box)
     for box in _ruled_floats(parts.drawings, parts.barriers + [caption_box]):
         column = _column(caption_box, parts.walls, min(box[1], caption_box[1]),
                          max(box[3], caption_box[3]))
@@ -1736,6 +1750,43 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
         return None, NOTHING_BESIDE
     problem = _crop_problem(page, rect, kind, num, caption_box, body, band)
     return (None, problem) if problem else (rect, None)
+
+
+def _on_backdrop(parts: _Parts, caption_box, page_rect) -> list:
+    """The loose barriers (`_Parts.loose`) over the caption set inside a
+    drawing of `parts` across its x-span that runs from over it to under it
+    and is not `_too_big`, under another image or drawing ending inside it
+    that shares some of their x-span: print on a figure's backdrop."""
+    backdrops = [d for d in parts.drawings if _across(caption_box, d)
+                 and d[1] < caption_box[1] and d[3] > caption_box[3]
+                 and not _too_big(d, page_rect)]
+    texts = {t for t, _ in parts.texts}
+    graphics = [e for e in parts.elements if e not in texts and e not in backdrops]
+    return [b for b in parts.loose if b[3] <= caption_box[1] + 0.5
+            and any(_contains(d, b) and any(
+                d[1] <= g[3] <= b[1] + 0.5 and g[0] < b[2] and g[2] > b[0]
+                for g in graphics)
+                for d in backdrops)]
+
+
+def _subcaptions(blocks, parts: _Parts, caption_box) -> list:
+    """Boxes of the small print (`_Parts.small`) among the text `blocks` that
+    opens on a panel's mark (`_PANEL_MARK`), ends over the caption and opens
+    within `_PANEL_GAP` under an image or drawing of `parts` sharing some of
+    its x-span: a figure's subcaptions."""
+    texts = {t for t, _ in parts.texts}
+    graphics = [e for e in parts.elements if e not in texts]
+    out = []
+    for b in blocks:
+        box = tuple(b["bbox"])
+        if (b.get("type") == 0 and box in parts.small
+                and _PANEL_MARK.match(_block_text(b))
+                and box[3] <= caption_box[1] + 0.5
+                and any(g[0] < box[2] and g[2] > box[0]
+                        and box[1] - _PANEL_GAP <= g[3] <= box[1] + 0.5
+                        for g in graphics)):
+            out.append(box)
+    return out
 
 
 def _other_caption(block, parts: _Parts, kind: str, num):
@@ -1958,12 +2009,12 @@ def _crop_problem(page, rect, kind: str, num, caption_box, body: Body,
     A figure crop holds a drawing or an image more than half its padding
     inside its edges. No crop holds a line (`_holds`) of another float's
     caption, a block of body prose (`_is_prose`) or `_PROSE_LINES_HELD` lines
-    of prose (`_prose_lines`) that are not a float's content (`_content_line`),
-    or a ruled float another caption owns (`_owners`) or an algorithm box
-    (`_algorithms`) more than half its padding inside its edges; a table crop
-    holds no line at heading size. Our
-    caption's own lines are left out, and so are drawings outside `band`
-    (head..foot); an image as thin as a rule is a rule.
+    of prose (`_prose_lines`) that are not a float's content (`_content_line`)
+    nor print of a grid of its images (`_in_image_grid`), or a ruled float
+    another caption owns (`_owners`) or an algorithm box (`_algorithms`) more
+    than half its padding inside its edges; a table crop holds no line at
+    heading size. Our caption's own lines are left out, and so are drawings
+    outside `band` (head..foot); an image as thin as a rule is a rule.
     """
     blocks = page.get_text("dict")["blocks"]
     inset = _PAD / 2
@@ -2013,8 +2064,10 @@ def _crop_problem(page, rect, kind: str, num, caption_box, body: Body,
             held(box) and _line_size(b, box) >= body.size + _HEADING_SIZE_DELTA
             for b in texts for box, _ in _lines(b)):
         return HOLDS_HEADING
+    grid = [i for i in images if _overlaps(i, inner) and not _too_big(i, page.rect)]
     if len([box for box in _prose_lines(texts, body, caption_box)
-            if held(box) and not content(box)]) >= _PROSE_LINES_HELD:
+            if held(box) and not content(box)
+            and not _in_image_grid(box, grid)]) >= _PROSE_LINES_HELD:
         return HOLDS_PROSE
     figures = figure_captions + ([caption_box] if base_kind(kind) == "figure" else [])
     owner = _owners(floats, [caption_box] + captions, figures,
@@ -2026,6 +2079,25 @@ def _crop_problem(page, rect, kind: str, num, caption_box, body: Body,
            for a in _algorithms(blocks, _horizontals(drawn), body, caption_box)):
         return HOLDS_FLOAT
     return None
+
+
+def _in_image_grid(box, images) -> bool:
+    """Is the line `box` print of a grid of `images`: set between two of its
+    rows, under one image and over another that each share some of its
+    x-span, within the x-extent of those that do; or within `_PANEL_GAP` over
+    or under one image of a row of two or more, within its x-span?"""
+    beside = [i for i in images if i[0] < box[2] and i[2] > box[0]]
+    if (any(i[3] <= box[1] + 1 for i in beside)
+            and any(i[1] >= box[3] - 1 for i in beside)
+            and box[0] >= min(i[0] for i in beside) - _COLUMN_TOL
+            and box[2] <= max(i[2] for i in beside) + _COLUMN_TOL):
+        return True
+    return any(i[0] - _COLUMN_TOL <= box[0] and box[2] <= i[2] + _COLUMN_TOL
+               and (-1 <= i[1] - box[3] <= _PANEL_GAP
+                    or -1 <= box[1] - i[3] <= _PANEL_GAP)
+               and any(j[1] < i[3] and j[3] > i[1]
+                       and (j[2] <= i[0] or j[0] >= i[2]) for j in images)
+               for i in images)
 
 
 def _content_line(box, rules, floats, verticals, frames) -> bool:
