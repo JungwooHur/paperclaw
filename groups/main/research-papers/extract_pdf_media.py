@@ -2147,6 +2147,7 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
     """
     import fitz
 
+    fitz.set_messages(fd=2)
     os.makedirs(out_dir, exist_ok=True)
     wanted = None if only is None else {ef._label_key(n) for n in only}
     doc = fitz.open(pdf_path)
@@ -2413,6 +2414,7 @@ def _media_text(pdf_path: str, media: dict) -> str:
     """
     import fitz
 
+    fitz.set_messages(fd=2)
     doc = fitz.open(pdf_path)
     try:
         parts = []
@@ -2654,6 +2656,7 @@ def attachment_for(title: str, directory: str = ATTACHMENTS):
         return None
     import fitz
 
+    fitz.set_messages(fd=2)
     names = sorted(n for n in os.listdir(directory) if n.lower().endswith(".pdf"))
     for name in names:
         path = os.path.join(directory, name)

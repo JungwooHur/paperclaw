@@ -142,6 +142,59 @@ class TestALabelIsNotATitleWord:
         assert got["D.1"] is not None and abs(got["D.1"] - len(first)) <= 40, got
         assert got["E"] is not None and abs(got["E"] - len(second)) <= 40, got
 
+    def test_a_short_word_between_the_label_and_the_title_is_skipped(self):
+        method, tracking, data, planning = prose(500), prose(700), prose(600), prose(800)
+        got = spans(["3 Method (방법)", "3.1 3D Widget Tracking (3D 위젯 추적)",
+                     "3.1.1 Widget Data (위젯 데이터)", "3.2 Planning (계획)"],
+                    "3 Method\n" + method + "\n3.1 3D Widget Tracking\n" + tracking
+                    + "\n3.1.1 Widget Data\n" + data + "\n3.2 Planning\n" + planning
+                    + "\n")
+        for key, text in (("3", method), ("3.1", tracking), ("3.1.1", data)):
+            assert got[key] is not None and abs(got[key] - len(text)) <= 40, (key, got)
+
+    @pytest.mark.parametrize("title, printed", [
+        ("A 3D Widget Tracking", "A 3D Widget Tracking"),
+        ("x₀.₅ Widget Tracking", "x0 5 Widget Tracking")], ids=["two-words", "subscripts"])
+    def test_a_title_opening_with_short_words_is_located(self, title, printed):
+        method, tracking = prose(500), prose(700)
+        got = spans(["3 Method (방법)", f"3.1 {title} (위젯 추적)", "3.2 Planning (계획)"],
+                    "3 Method\n" + method + f"\n3.1 {printed}\n" + tracking
+                    + "\n3.2 Planning\n" + prose(800) + "\n")
+        for key, text in (("3", method), ("3.1", tracking)):
+            assert got[key] is not None and abs(got[key] - len(text)) <= 40, (key, got)
+
+    def test_a_list_item_of_a_short_word_and_the_title_does_not_move_it(self):
+        method = prose(500) + "\n3) A method of the baseline runs each task twice.\n" + prose(300)
+        got = spans(["3 Method (방법)", "4 Results (결과)"],
+                    "3 Method\n" + method + "\n4 Results\n" + prose(800) + "\n")
+        assert got["3"] is not None and abs(got["3"] - len(method)) <= 40, got
+
+    @pytest.mark.parametrize("printed", ["3 the method", "3 a method", "3 A 3D method"])
+    def test_a_word_the_title_lacks_makes_no_heading(self, printed):
+        got = spans(["3 Method (방법)"], printed + " of the baseline runs twice.\n"
+                    + prose(600) + "\n")
+        assert got["3"] is None, got
+
+    @pytest.mark.parametrize("later", [
+        "2) A baseline (Author et al., 2025b) requires each method to run twice.",
+        "2\nPreprint\n2.4 A method of the baseline"], ids=["list-item", "page-number"])
+    def test_a_long_word_before_the_title_makes_no_heading(self, later):
+        intro, method, results = prose(600), prose(700), prose(800)
+        got = spans(["1 Introduction (서론)", "2 Method (방법)", "3 Results (결과)"],
+                    "1 Introduction\n" + intro + "\n2 Method\n" + method + "\n3 Results\n"
+                    + results + "\n" + later + "\n" + prose(300) + "\n")
+        for key, text in (("1", intro), ("2", method)):
+            assert got[key] is not None and abs(got[key] - len(text)) <= 40, (key, got)
+
+    def test_the_short_words_before_the_title_share_its_line(self):
+        method, experiments = prose(600), prose(700)
+        got = spans(["4 Method (방법)", "5 Experiments (실험)", "6 Results (결과)"],
+                    "4 Method\n" + method + "\n5\n50\n" + vs._TABLE_MARK * 60
+                    + "\n5. Experiments\n" + experiments + "\n6 Results\n" + prose(800)
+                    + "\n")
+        for key, text in (("4", method), ("5", experiments)):
+            assert got[key] is not None and abs(got[key] - len(text)) <= 40, (key, got)
+
     def test_a_parenthesised_number_is_located(self):
         first, second = prose(700), prose(500)
         got = spans(self.NUMBERED, "1) Intuition: " + first

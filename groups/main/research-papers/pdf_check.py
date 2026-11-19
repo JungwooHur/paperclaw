@@ -31,6 +31,7 @@ def looks_like_slides(pages: int, avg_chars: float, last_text: str) -> bool:
 
 
 def measure(path: str) -> tuple:
+    fitz.set_messages(fd=2)
     doc = fitz.open(path)
     pages = doc.page_count
     avg_chars = sum(len(page.get_text()) for page in doc) / max(pages, 1)
