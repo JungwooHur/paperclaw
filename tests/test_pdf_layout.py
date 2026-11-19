@@ -3882,6 +3882,19 @@ class TestTitlesInAnImageGrid:
                                 caption, pm.body_text(doc)) == pm.HOLDS_PROSE
 
 
+    ROW = ((60, 311, 290, 429), (310, 311, 540, 429))
+
+    @pytest.mark.parametrize("box,images,others,printed", [
+        ((60, 298, 290, 308), ROW[:1], [], False),
+        ((40, 298, 560, 308), ROW, [], False),
+        ((60, 431, 290, 441), ROW, [], True),
+        ((60, 431, 290, 441), ROW, [(60, 444, 290, 454)], False),
+        ((60, 298, 290, 308), ROW, [(310, 310, 540, 320)], True),
+    ], ids=["over-a-lone-image", "wider-than-its-image", "under-an-image-of-a-row",
+            "over-another-line", "beside-a-line-in-the-next-column"])
+    def test_a_line_by_a_panel_is_its_print(self, box, images, others, printed):
+        assert pm._in_image_grid(box, images, [box] + others) is printed
+
     def test_titles_between_the_rows_of_one_column_of_panels_are_no_prose(
             self, tmp_path):
         doc = fitz.open()
