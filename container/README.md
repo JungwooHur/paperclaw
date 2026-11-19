@@ -6,6 +6,51 @@
 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
 
+## Bash hook
+
+The CLI bundled with the pinned agent SDK (0.2.34, CLI 2.1.34) rewrites a piped
+Bash command before bash sees it, and both rewrites break it:
+
+- A piped command with no backtick, no `$(` and no `for`/`while`/`until`/`if`/
+  `case`/`select` word is split with shell-quote's `parse`, which gets no
+  environment, and joined again around an inserted `< /dev/null`: every `$VAR`
+  and `${...}` comes out empty.
+- Any other piped command is quoted whole with `<` and `/dev/null` as quoted
+  words, so the redirect lands on the pipe's last stage, which reads `/dev/null`.
+
+Both showed as "NOTION_TOKEN is empty": `curl ... -H "Authorization: Bearer
+$NOTION_TOKEN" | head` sent an empty token (Notion answers 401), and `curl ... |
+python3 -c "...for..."` failed with `JSONDecodeError`, while `env` in the same
+shell showed the token set. The agent skipped its Notion writes and reported a
+token problem.
+
+The runner's PreToolUse hook (`container/agent-runner/src/bash-hook.ts`) runs
+every command as
+
+```
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null; { eval "$(cat <<'PAPERCLAW_BASH_CMD'
+<command>
+PAPERCLAW_BASH_CMD
+)"; } < /dev/null
+```
+
+The CLI passes a command holding a heredoc through quoted whole with no
+redirect, so neither rewrite runs; the quoted delimiter hands bash the text
+verbatim, and the outer redirect keeps stdin on `/dev/null`. A command with a
+line that starts with the delimiter is refused: inside `$(...)` bash also ends
+the heredoc at a line such as `PAPERCLAW_BASH_CMD)`.
+
+One shape still breaks. A command holding a shift by a digit (`1 << 2`) or a
+`<<` inside `$((...))` no longer looks like a heredoc to the CLI, and when a line
+continuation also comes before its first double quote, the CLI can turn each `!`
+into `\!`.
+
+CLI 2.1.112 (SDK 0.2.112) quotes every command whole and puts `< /dev/null` on
+`eval` itself; #164 tracks that bump. `container/agent-runner/test/bash-hook.test.ts`
+runs Bash calls through the bundled CLI against a fake Messages API, with and
+without the hook, and fails once the CLI stops erasing a `$VAR` in a piped
+command.
+
 ## NotebookLM wrapper
 
 Multiple paper requests are meant to run as **parallel background subagents** (the
