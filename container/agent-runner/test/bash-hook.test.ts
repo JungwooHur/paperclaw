@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
 import { query, type HookCallback } from '@anthropic-ai/claude-agent-sdk';
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { COMMAND_DELIMITER, sanitizeBashHook } from '../src/bash-hook.js';
+import { sanitizeBashHook } from '../src/bash-hook.js';
 
 const CLI = fileURLToPath(
   new URL(
@@ -52,16 +52,36 @@ const AS_WRITTEN: Record<string, string> = {
   'echo trailing | cat\n': 'trailing',
   'echo $((1 << 2)) | cat; [ 1 != 2 ] && echo ne': '4\nne',
   "echo 1 \\\n  '!' | cat": '1 !',
+  'echo $((1 << 2)) "x!y"; ! false && echo neg': '4 x!y\nneg',
+  'x=PROBE_VAR; [[ 1 != 2 ]] && echo "${!x}" $((1<<2))': `${PROBE} 4`,
+  'read -r x; echo "rc=$?"': 'rc=1',
 };
 
 /** Prints `out` and leaves exit status 3. */
 const EXIT_3 = 'echo out | cat; (exit 3)';
 
-/** Commands holding a line that starts with the delimiter. */
-const HOLD_DELIMITER = [
-  `echo refused-command-ran\n${COMMAND_DELIMITER}\necho after`,
-  `echo refused-command-ran\n${COMMAND_DELIMITER})\necho after`,
+/** Commands whose last command exits 1, which the CLI reads as no error. */
+const NOT_ERRORS = [
+  'grep zzz /dev/null',
+  'test -e /nonexistent',
+  'echo a | grep zzz',
 ];
+
+/** Commands that stop at a bash error on their last line. */
+const LINE_ERRORS = ['cd /nonexistent', 'true\n\ncd /nonexistent'];
+
+/**
+ * Lines past the unhooked call's line number that a bash error in a hooked
+ * call reports.
+ */
+const LINE_OFFSET = 4;
+
+/** The line number in a bash error message `text`. */
+function errorLine(text: string): number {
+  const match = /line (\d+): cd:/.exec(text);
+  if (!match) throw new Error(`no bash error line in ${JSON.stringify(text)}`);
+  return Number(match[1]);
+}
 
 interface ContentBlock {
   type: string;
@@ -248,10 +268,19 @@ beforeAll(async () => {
   }
   [hooked, raw] = await Promise.all([
     runBash(
-      [...Object.keys(AS_WRITTEN), AUTH_KEY, EXIT_3, ...HOLD_DELIMITER],
+      [
+        ...Object.keys(AS_WRITTEN),
+        AUTH_KEY,
+        EXIT_3,
+        ...NOT_ERRORS,
+        ...LINE_ERRORS,
+      ],
       [sanitizeBashHook],
     ),
-    runBash([PIPED_VAR, PIPED_FOR, AUTH_KEY], []),
+    runBash(
+      [PIPED_VAR, PIPED_FOR, AUTH_KEY, ...NOT_ERRORS, ...LINE_ERRORS],
+      [],
+    ),
   ]);
 }, 90_000);
 
@@ -273,12 +302,18 @@ describe('a Bash call through the runner hook', () => {
     });
   });
 
-  for (const command of HOLD_DELIMITER) {
-    it(`refuses ${JSON.stringify(command)} unrun`, () => {
-      const result = hooked.get(command)!;
-      expect(result.isError).toBe(true);
-      expect(result.text).toContain(`starts with ${COMMAND_DELIMITER}`);
-      expect(result.text).not.toContain('refused-command-ran');
+  for (const command of NOT_ERRORS) {
+    it(`reads exit 1 of ${JSON.stringify(command)} as no error`, () => {
+      expect(hooked.get(command)).toEqual({ text: '', isError: false });
+      expect(hooked.get(command)).toEqual(raw.get(command));
+    });
+  }
+
+  for (const command of LINE_ERRORS) {
+    it(`reports the error line of ${JSON.stringify(command)} ${LINE_OFFSET} lines on`, () => {
+      expect(errorLine(hooked.get(command)!.text)).toBe(
+        errorLine(raw.get(command)!.text) + LINE_OFFSET,
+      );
     });
   }
 });

@@ -1,6 +1,6 @@
 {
   "sdkVersion": "0.2.34",
-  "sourceHash": "b1d5a43f2ca0b704a834727dc9b6687d086fe2b5f531c426a7ba8f22f98dee53",
+  "sourceHash": "175491dc83a499dc0b39472b12f3dfffedb7542b7134de51cd3fd99edbc6ca07",
   "outputs": [
     {
       "case": "start-up drain",
@@ -383,7 +383,7 @@
     {
       "case": "usage-limit refusal",
       "status": "success",
-      "result": "You've hit your limit · resets 11:56am (UTC)",
+      "result": "You've hit your limit · resets 12:51pm (UTC)",
       "turn": {
         "inputs": [
           "r-refused"

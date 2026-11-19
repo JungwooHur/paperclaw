@@ -8,42 +8,58 @@ The container buildkit caches the build context aggressively. `--no-cache` alone
 
 ## Bash hook
 
-The CLI bundled with the pinned agent SDK (0.2.34, CLI 2.1.34) rewrites a piped
-Bash command before bash sees it, and both rewrites break it:
+The CLI bundled with the pinned agent SDK (0.2.34, CLI 2.1.34) runs a Bash
+command as `eval <quoted command>`. Unless the command holds a heredoc or a `<`
+input redirect, the CLI also means to give it `/dev/null` for stdin, and that is
+where it breaks:
 
 - A piped command with no backtick, no `$(` and no `for`/`while`/`until`/`if`/
   `case`/`select` word is split with shell-quote's `parse`, which gets no
   environment, and joined again around an inserted `< /dev/null`: every `$VAR`
   and `${...}` comes out empty.
-- Any other piped command is quoted whole with `<` and `/dev/null` as quoted
-  words, so the redirect lands on the pipe's last stage, which reads `/dev/null`.
+- Any other command, piped or not, is quoted by shell-quote with `<` and
+  `/dev/null` as quoted words, and `eval` appends the redirect to the command
+  text, so only its last simple command reads `/dev/null`. A pipe's last stage
+  stops reading the pipe, and an earlier command reads the CLI's own stdin: a
+  `read` there waits until the CLI moves the call to the background. Only an
+  unpiped command holding a quoted string that spans lines escapes this: it is
+  single-quoted whole with the redirect on `eval`.
 
-Both showed as "NOTION_TOKEN is empty": `curl ... -H "Authorization: Bearer
-$NOTION_TOKEN" | head` sent an empty token (Notion answers 401), and `curl ... |
-python3 -c "...for..."` failed with `JSONDecodeError`, while `env` in the same
-shell showed the token set. The agent skipped its Notion writes and reported a
-token problem.
+The CLI does not count a heredoc in a command that also holds a shift such as
+`1 << 2` or `$((x << y))`.
 
-The runner's PreToolUse hook (`container/agent-runner/src/bash-hook.ts`) runs
-every command as
+A command holding a heredoc or a `<` input redirect gets no redirect. It is
+single-quoted whole when it holds a heredoc or a quoted string that spans lines,
+and quoted by shell-quote otherwise, which keeps the text except that each `!`
+gains a backslash when the text holds a `'`.
+
+Both failures showed as "NOTION_TOKEN is empty": `curl ... -H
+"Authorization: Bearer $NOTION_TOKEN" | head` sent an empty token (Notion
+answers 401), and `curl ... | python3 -c "...for..."` failed with
+`JSONDecodeError`, while `env` in the same shell showed the token set. The
+agent skipped its Notion writes and reported a token problem.
+
+The runner's PreToolUse hook (`container/agent-runner/src/bash-hook.ts`) puts
+two lines before every command:
 
 ```
-unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null; { eval "$(cat <<'PAPERCLAW_BASH_CMD'
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null; exec </dev/null; : '
+'
 <command>
-PAPERCLAW_BASH_CMD
-)"; } < /dev/null
 ```
 
-The CLI passes a command holding a heredoc through quoted whole with no
-redirect, so neither rewrite runs; the quoted delimiter hands bash the text
-verbatim, and the outer redirect keeps stdin on `/dev/null`. A command with a
-line that starts with the delimiter is refused: inside `$(...)` bash also ends
-the heredoc at a line such as `PAPERCLAW_BASH_CMD)`.
+- `exec </dev/null` is a `<` input redirect and `: '<newline>'` a quoted
+  string that spans lines, so the CLI single-quotes the whole text with no
+  redirect: bash gets the command verbatim, and `exec` gives every command
+  `/dev/null` for stdin.
+- The command stays last. The CLI takes the first word of the last command to
+  read the exit status, and `grep`, `rg`, `find`, `diff`, `test` and `[`
+  exiting 1 is no error; a wrapper around the command would hide that word and
+  turn a `grep` with no match into an error.
 
-One shape still breaks. A command holding a shift by a digit (`1 << 2`) or a
-`<<` inside `$((...))` no longer looks like a heredoc to the CLI, and when a line
-continuation also comes before its first double quote, the CLI can turn each `!`
-into `\!`.
+What remains: bash reports line numbers in errors and `$LINENO` 4 lines later
+than for the same call without the hook. Without it, the CLI already reports
+line k of an n-line command as line k + n - 1.
 
 CLI 2.1.112 (SDK 0.2.112) quotes every command whole and puts `< /dev/null` on
 `eval` itself; #164 tracks that bump. `container/agent-runner/test/bash-hook.test.ts`
