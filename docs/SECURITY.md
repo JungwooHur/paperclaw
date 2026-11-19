@@ -80,7 +80,7 @@ The main group's project-root bind mount hides three paths by overlaying an empt
 - Any path matching the blocked-pattern list (`.ssh`, `.aws`, `.netrc`, etc.).
 
 **Bash Subprocess Hardening:**
-A `PreToolUse` hook in the agent runner prepends `unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN` to every Bash invocation, so subprocesses the agent spawns cannot read Claude auth tokens from `printenv` even though the SDK itself needs them. Non-auth secrets (e.g. `NOTION_TOKEN`) stay visible — the agent calls Notion's API on the user's behalf.
+A `PreToolUse` hook in the agent runner (`container/agent-runner/src/bash-hook.ts`) prepends `unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN` to every Bash invocation, so subprocesses the agent spawns cannot read Claude auth tokens from `printenv` even though the SDK itself needs them. Non-auth secrets (e.g. `NOTION_TOKEN`) stay visible — the agent calls Notion's API on the user's behalf. The same prefix also holds `exec </dev/null; : '<newline>'`, which makes the bundled CLI pass the command to bash verbatim; without it, the CLI's rewrite of piped commands erases every `$VAR` in them (`container/README.md`, "Bash hook").
 
 > **Residual risk:** the Claude Agent SDK still needs `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` in its own process environment to authenticate, so an in-process exfil (e.g. an SDK extension that read `process.env` and posted it somewhere) would defeat the Bash hook. The mount masking + Bash hook combo only blocks the easy `cat .env` and `echo $ANTHROPIC_API_KEY` paths. **PRs welcome** for tighter in-process credential isolation.
 
