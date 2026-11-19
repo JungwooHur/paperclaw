@@ -9,6 +9,8 @@ import contextlib
 import io
 import json
 
+import pytest
+
 import verify_sections as vs
 
 SENTENCE = ("The method is evaluated on a range of tasks and compared with the "
@@ -96,6 +98,83 @@ class TestFigureCaptionsInHtml:
     def test_a_body_reference_to_a_figure_is_kept(self):
         html = latexml("As Figure 1 shows, the error falls quickly.", "")
         assert "As Figure 1 shows" in vs.source_text_from_html(html)
+
+
+PROMPT = ("You are a careful assistant. Read the question below and answer it in "
+          "full sentences, giving the reason for each step you take.")
+EQUATION = ('<table id="S2.E1" class="ltx_equation ltx_eqn_table"><tbody>'
+            '<tr class="ltx_equation ltx_eqn_row ltx_align_baseline">'
+            '<td class="ltx_eqn_cell ltx_align_center">'
+            '<math id="S2.E1.m1" class="ltx_Math" alttext="L=\\sum_{i}\\ell_{i}" '
+            'display="block"><mi>L</mi></math></td></tr></tbody></table>')
+INLINE = ('The loss <math id="S2.p1.m1" class="ltx_Math" alttext="L" '
+          'display="inline"><mi>L</mi></math> sums the error over every sample '
+          'of the training run.')
+# LaTeXML's floats, `{body}` their text: a prompt box set as a figure, a figure
+# of two such panels, an algorithm, a code listing and a table of sentences.
+FLOATS = {
+    "figure": ('<figure id="S2.F3" class="ltx_figure"><div class="ltx_block">{body}'
+               '</div><figcaption class="ltx_caption"><span class="ltx_tag '
+               'ltx_tag_figure">Figure 3: </span>The prompt.</figcaption></figure>'),
+    "panels": ('<figure id="S2.F4" class="ltx_figure"><div class="ltx_flex_figure">'
+               + "".join(f'<div class="ltx_flex_cell ltx_flex_size_2"><figure '
+                         f'id="S2.F4.sf{n}" class="ltx_figure ltx_figure_panel">{{body}}'
+                         '<figcaption class="ltx_caption"><span class="ltx_tag '
+                         f'ltx_tag_figure">({mark}) </span>A prompt.</figcaption>'
+                         '</figure></div>' for n, mark in ((1, "a"), (2, "b")))
+               + '</div><figcaption class="ltx_caption"><span class="ltx_tag '
+               'ltx_tag_figure">Figure 4: </span>Two prompts.</figcaption></figure>'),
+    "algorithm": ('<figure id="alg1" class="ltx_float ltx_float_algorithm '
+                  'ltx_framed ltx_framed_top"><figcaption class="ltx_caption">'
+                  '<span class="ltx_tag ltx_tag_float">Algorithm 1</span> The '
+                  'loop</figcaption><div class="ltx_listing">{body}</div></figure>'),
+    "listing": ('<figure id="lst1" class="ltx_float ltx_lstlisting"><div '
+                'class="ltx_listing">{body}</div><figcaption class="ltx_caption">'
+                '<span class="ltx_tag ltx_tag_float">Listing 1: </span>The '
+                'prompt.</figcaption></figure>'),
+    "table": ('<figure id="S2.T1" class="ltx_table"><figcaption class="ltx_caption">'
+              '<span class="ltx_tag ltx_tag_table">Table 1: </span>Prompts.'
+              '</figcaption><table class="ltx_tabular"><tr><td>{body}</td></tr>'
+              '</table></figure>'),
+}
+
+
+def latexml_float(kind, before=BEFORE, after=AFTER, middle=""):
+    """A LaTeXML page: section 2.1 holds `before`, a `kind` float whose body is
+    sentences, `middle` (markup), then `after`."""
+    para = lambda text: "".join(f'<p class="ltx_p">{ln}</p>' for ln in text.splitlines())
+    return "".join([
+        '<h2 class="ltx_title ltx_title_section">2 Method</h2>', para(prose(1200)),
+        '<h3 class="ltx_title ltx_title_subsection">2.1 Effect of Scale</h3>',
+        para(before), FLOATS[kind].format(body=para("\n".join([PROMPT] * 12))),
+        middle, para(after),
+        '<h2 class="ltx_title ltx_title_section">3 Results</h2>', para(prose(1500)),
+    ])
+
+
+class TestFloatBodiesInHtml:
+    """A float is an image on the page, whatever LaTeXML sets in it, so its
+    body is no section's text."""
+
+    @pytest.mark.parametrize("kind", sorted(FLOATS))
+    def test_a_float_body_is_not_source_text(self, kind):
+        assert "careful assistant" not in vs.source_text_from_html(latexml_float(kind))
+
+    @pytest.mark.parametrize("kind", sorted(FLOATS))
+    def test_the_section_measures_its_prose_only(self, kind):
+        got = vs.source_section_chars(
+            vs.source_text_from_html(latexml_float(kind)), SECTIONS)
+        assert close_to(got["2.1"], BEFORE + AFTER, slack=80)
+
+    def test_a_sentence_and_a_float_is_still_a_located_section(self):
+        html = latexml_float("figure", "The prompt below asks for reasons.", "")
+        got = vs.source_section_chars(vs.source_text_from_html(html), SECTIONS)
+        assert got["2.1"] is not None and got["2.1"] < 100
+
+    def test_an_equation_and_inline_math_outside_a_float_are_kept(self):
+        text = vs.source_text_from_html(latexml_float("figure", INLINE, AFTER, EQUATION))
+        assert "The loss L sums the error" in text
+        assert "L=\\sum_{i}\\ell_{i}" in text
 
 
 def pdf_with(tmp_path, *items):
@@ -375,6 +454,142 @@ class TestFigureCaptionsInPdf:
         assert "Overview" not in text and "Sizes of the splits" not in text
 
 
+def sentences_table(page, top, ruled=True, over=False):
+    """Three rows of cells of sentences, between rules when `ruled`, captioned
+    below, or above when `over`; returns the caption's baseline, or when `over`
+    the table's last rule."""
+    if over:
+        page.insert_text((72, top + 10), "Table 3: Examples of answers.", fontsize=10)
+        top += 16
+    y = top
+    for _ in range(3):
+        if ruled:
+            page.draw_line((72, y), (540, y))
+        for j in range(3):
+            page.insert_text((78, y + 14 + 12 * j), PROMPT[:70], fontsize=10)
+        y += 50
+    if ruled:
+        page.draw_line((72, y), (540, y))
+    if over:
+        return y
+    page.insert_text((72, y + 14), "Table 3: Examples of answers.", fontsize=10)
+    return y + 14
+
+
+def prompt_box(page, top):
+    """A framed box of six lines of sentences, captioned below; returns the
+    caption's baseline."""
+    import fitz
+
+    page.draw_rect(fitz.Rect(90, top, 520, top + 130), color=(0, 0, 0))
+    for j in range(6):
+        page.insert_text((100, top + 20 + 16 * j), PROMPT[:60], fontsize=9)
+    page.insert_text((72, top + 150), "Figure 2: The prompt given to the model.",
+                     fontsize=10)
+    return top + 150
+
+
+def pdf_float(tmp_path, float_at=None, gap=26):
+    """A PDF whose section 2.1 is a paragraph, the float `float_at(page, top)`
+    draws (none when None), and a paragraph `gap` under the bottom it returns;
+    pages of 10 pt prose before it."""
+    import fitz
+
+    doc = fitz.open()
+    para = lambda page, top: page.insert_textbox(
+        fitz.Rect(72, top, 540, top + 130), prose(600), fontsize=10)
+    for heading in ("1 Introduction", "2 Method"):
+        page = doc.new_page()
+        page.insert_text((72, 70), heading, fontsize=12)
+        for top in (80, 260, 440, 620):
+            para(page, top)
+    page = doc.new_page()
+    page.insert_text((72, 70), "2.1 Effect of Scale", fontsize=12)
+    para(page, 80)
+    bottom = float_at(page, 220) if float_at else 220
+    para(page, bottom + gap)
+    page.insert_text((72, bottom + 180), "3 Results", fontsize=12)
+    para(page, bottom + 190)
+    path = tmp_path / ("float.pdf" if float_at else "plain.pdf")
+    doc.save(path)
+    return str(path)
+
+
+def measure(path):
+    """The source text of the PDF at `path` and its section 2.1's span."""
+    text = vs.load_source_text(path, None)
+    return text, vs.source_section_chars(text, SECTIONS)["2.1"]
+
+
+class TestFloatBodiesInPdf:
+    """A float the crop renderer takes (`extract_pdf_media.float_crops`) is an
+    image on the page, so the text in its crop is no section's text."""
+
+    @pytest.mark.parametrize("float_at", [sentences_table, prompt_box])
+    def test_the_section_measures_its_prose_only(self, tmp_path, float_at):
+        text, got = measure(pdf_float(tmp_path, float_at))
+        assert "careful assistant" not in text
+        assert close_to(got, "x" * measure(pdf_float(tmp_path))[1], slack=2)
+
+    @pytest.mark.parametrize("float_at,gap", [
+        (lambda page, top: prompt_box(page, top - 4), 26),
+        (lambda page, top: sentences_table(page, top, over=True), 2),
+    ], ids=["prose-over-a-box", "prose-under-a-table"])
+    def test_prose_whose_line_the_crop_meets_is_counted(self, tmp_path, float_at, gap):
+        import fitz
+
+        import extract_pdf_media as epm
+
+        path = pdf_float(tmp_path, float_at, gap)
+        with fitz.open(path) as doc:
+            (rect,) = [c[2] for _, cs in epm.float_crops(doc) for c in cs]
+            edges = {ln["bbox"][k] for b in doc[2].get_text("dict")["blocks"]
+                     if epm._block_text(b).startswith("The method")
+                     for ln in b["lines"] for k in (1, 3)}
+        assert {rect.y0, rect.y1} & edges
+        assert close_to(measure(path)[1], "x" * measure(pdf_float(tmp_path))[1], slack=2)
+
+    def test_a_float_the_renderer_cannot_crop_keeps_its_body(self, tmp_path):
+        import fitz
+
+        import extract_pdf_media as epm
+
+        path = pdf_float(tmp_path, lambda page, top: sentences_table(page, top, False))
+        with fitz.open(path) as doc:
+            crops = [c for _, cs in epm.float_crops(doc) for c in cs]
+        assert [(c[0], c[1], c[2]) for c in crops] == [("table", 3, None)]
+        text = vs.load_source_text(path, None)
+        assert "careful assistant" in text and "Examples of answers" not in text
+
+    def test_a_heading_in_a_crop_is_kept(self, tmp_path):
+        # A crop the renderer took past its float, over the next heading.
+        import fitz
+
+        import extract_pdf_media as epm
+
+        with fitz.open(pdf_float(tmp_path, prompt_box)) as doc:
+            pages = [epm.ReadOnce(page) for page in doc]
+            text = vs._pdf_page_text(pages[2], [fitz.Rect(60, 200, 550, 560)],
+                                     epm.body_text(pages))
+        assert "careful assistant" not in text and "3 Results" in text
+
+    def test_each_page_s_get_text_is_one_dict_without_images(self, tmp_path,
+                                                             monkeypatch):
+        import fitz
+
+        path, reads, read = pdf_float(tmp_path, prompt_box), [], fitz.Page.get_text
+
+        def get_text(page, option="text", **kwargs):
+            reads.append((page.number, option, kwargs.get("flags")))
+            return read(page, option, **kwargs)
+
+        monkeypatch.setattr(fitz.Page, "get_text", get_text)
+        vs.load_source_text(path, None)
+        assert sorted(n for n, _, _ in reads) == [0, 1, 2]
+        assert all(o == "dict" and f is not None and not f & fitz.TEXT_PRESERVE_IMAGES
+                   for _, o, f in reads)
+
+
 class TestNumericRows:
 
     def test_a_long_row_of_numbers_is_a_table_fragment(self):
@@ -574,7 +789,6 @@ class TestCaptionGrammarEdges:
         html = latexml().replace("<h3", algorithm + "<h3", 1)
         got = vs.source_section_chars(vs.source_text_from_html(html), SECTIONS)
         assert close_to(got["2.1"], BEFORE + AFTER, slack=80)
-        assert "Algorithm 1 Search" in vs.source_text_from_html(html)
 
     def test_a_sentence_and_a_long_caption_is_still_a_located_pdf_section(
             self, tmp_path):

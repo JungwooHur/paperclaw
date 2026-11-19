@@ -135,6 +135,7 @@ _STAMP_MARGIN_FRAC = 0.10    # ...entirely within this much of the outer margin
 _BACKGROUND_AREA_FRAC = 0.8  # a box this big is a page background, not content
 _LABEL_LINE_MAX = 40         # a figure's own label line is shorter than this (chars)
 _PANEL_GAP = 12.0            # a panel's title or subcaption stands this close to it
+_READ_TOL = 1e-3             # two reads' boxes of one text block this close are one box
 
 
 # A float's caption opener: the word, the label as printed, an optional
@@ -521,7 +522,7 @@ def learn_furniture(doc) -> tuple:
     heads, feet = set(), set()
     per_side = _FURNITURE_SAMPLE // 2
     for side in (0, 1):
-        pages = range(side, doc.page_count, 2)
+        pages = range(side, len(doc), 2)
         step = max(1, len(pages) // per_side)
         sampled = list(pages[::step])[:per_side]
         tops, bots = {}, {}
@@ -891,11 +892,10 @@ def _page_parts(page, caption_box, body: Body, band) -> _Parts:
         else:
             parts.elements.append(box)
             parts.texts.append((box, b))
-    for d in page.get_drawings():
-        r = d["rect"]
-        if r.y1 - r.y0 <= 0.2 and r.x1 - r.x0 <= 0.2:
+    for d in page.get_cdrawings():
+        box = tuple(d["rect"])
+        if box[3] - box[1] <= 0.2 and box[2] - box[0] <= 0.2:
             continue                      # degenerate stroke
-        box = (r.x0, r.y0, r.x1, r.y1)
         if _furniture(box):
             continue
         parts.elements.append(box)
@@ -1643,8 +1643,8 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
             parts.figure_captions.append(box)
         parts.elements = [e for e in parts.elements if not _overlaps(e, box)]
     if base_kind(kind) == "figure":
-        for box in (_on_backdrop(parts, caption_box, page.rect)
-                    + _subcaptions(blocks, parts, caption_box)):
+        for box in dict.fromkeys(_on_backdrop(parts, caption_box, page.rect)
+                                 + _subcaptions(blocks, parts, caption_box)):
             parts.make_element(box)
     for box in _ruled_floats(parts.drawings, parts.barriers + [caption_box]):
         column = _column(caption_box, parts.walls, min(box[1], caption_box[1]),
@@ -1716,13 +1716,15 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
     seen = [v for v in (visible.get(b, b) for b in boxes) if v is not None]
     x0, x1 = min(b[0] for b in boxes), max(b[2] for b in boxes)
     if upward:
-        drawn = [v for v in (visible.get(b, b) for b in boxes if b in parts.drawings)
+        drawings = set(parts.drawings)
+        drawn = [v for v in (visible.get(b, b) for b in boxes if b in drawings)
                  if v is not None]
         head = _head_print(page, band, drawn, x0, x1)
         boxes, seen = boxes + head, seen + head
         top = min([top] + [h[1] for h in head])
+    stepped = set(taken)
     left_out = [e for e in elements
-                if e not in taken and e[0] < x1 and e[2] > x0
+                if e not in stepped and e[0] < x1 and e[2] > x0
                 and not _horizontals([e]) and not _verticals([e])
                 and (e[1] < top - 0.5 and e[3] <= top + 0.5 if upward
                      else e[3] > bottom + 0.5 and e[1] >= bottom - 0.5)]
@@ -2028,7 +2030,7 @@ def _crop_problem(page, rect, kind: str, num, caption_box, body: Body,
     inset = _PAD / 2
     inner = (rect.x0 + inset, rect.y0 + inset, rect.x1 - inset, rect.y1 - inset)
     images = [tuple(b["bbox"]) for b in blocks if b.get("type") != 0]
-    drawings = [tuple(d["rect"]) for d in page.get_drawings()]
+    drawings = [tuple(d["rect"]) for d in page.get_cdrawings()]
     if base_kind(kind) == "figure":
         if not any(_overlaps(g, inner) and not _too_big(g, page.rect)
                    for g in images + drawings):
@@ -2127,9 +2129,107 @@ def _content_line(box, rules, floats, verticals, frames) -> bool:
             or any(_contains(f, box) for f in frames))
 
 
+class ReadOnce:
+    """A PDF page that reads each `get_text`, its drawings and painted boxes once.
+
+    `get_text("dict")` is the page's own without the image data: an image is a
+    block of `type` 1 holding only its `number` and `bbox`. Any other
+    `get_text` and `rect` are the page's, read once too; everything else is the
+    page's own.
+    """
+
+    def __init__(self, page):
+        self._page, self._read, self.rect = page, {}, page.rect
+
+    def __getattr__(self, name):
+        return getattr(self._page, name)
+
+    def _once(self, key, read):
+        if key not in self._read:
+            self._read[key] = read()
+        return self._read[key]
+
+    def _dict(self):
+        """The text read without images, its lines split into the blocks a
+        textpage read with them holds (`extractBLOCKS`); the page's own
+        `get_text("dict")` where the two do not hold the same lines."""
+        import fitz
+
+        page = self.get_text(
+            "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)
+        lines = [(b.get("flags"), ln) for b in page["blocks"] for ln in b["lines"]]
+        tp = self._page.get_textpage(flags=fitz.TEXTFLAGS_DICT)
+        images = {i["number"]: i["bbox"] for i in tp.extractIMGINFO()}
+        blocks, at = [], 0
+        for x0, y0, x1, y1, text, number, kind in tp.extractBLOCKS():
+            if kind == 1:
+                blocks.append({"number": number, "type": 1, "bbox": images[number]})
+                continue
+            taken, at = lines[at:at + text.count("\n")], at + text.count("\n")
+            box = _union(ln["bbox"] for _, ln in taken) if taken else None
+            if box is None or max(
+                    abs(a - b) for a, b in zip(box, (x0, y0, x1, y1))) > _READ_TOL:
+                return self._page.get_text("dict")
+            blocks.append({"number": number, "type": 0, "flags": taken[0][0],
+                           "bbox": box, "lines": [ln for _, ln in taken]})
+        if at != len(lines):
+            return self._page.get_text("dict")
+        return dict(page, blocks=blocks)
+
+    def get_text(self, option="text", **kwargs):
+        if option == "dict" and not kwargs:
+            return self._once("dict", self._dict)
+        return self._once((option, tuple(sorted(kwargs.items()))),
+                          lambda: self._page.get_text(option, **kwargs))
+
+    def get_cdrawings(self, extended=False):
+        return self._once(("cdrawings", extended),
+                          lambda: self._page.get_cdrawings(extended=extended))
+
+    def get_bboxlog(self):
+        return self._once("bboxlog", self._page.get_bboxlog)
+
+
+def float_crops(doc, kinds=("figure", "table"), wanted=None, body: Body = None):
+    """Yield (page, crops) for each page of `doc` (a document or its pages, in
+    order).
+
+    crops lists (kind, label, rect, problem, caption), as `float_crop` gives
+    them, for each label a caption line on the page introduces
+    (`caption_kind`) that no earlier page cropped, of a kind in `kinds` and,
+    when `wanted` (`ef._label_key`s) is given, a figure in it. `body` is the
+    document's (`body_text`), computed here when not given.
+    """
+    heads, feet = learn_furniture(doc)
+    if body is None:
+        body = body_text(doc)
+    found = set()
+    for page in doc:
+        labels = []
+        for b in page.get_text("dict")["blocks"]:
+            seen = caption_kind(_block_text(b)) if b.get("type") == 0 else None
+            if seen is not None and seen not in labels:
+                labels.append(seen)
+        crops, band = [], furniture_band(page, heads, feet) if labels else None
+        for kind, num in labels:
+            if wanted is not None and (kind != "figure"
+                                       or ef._label_key(num) not in wanted):
+                continue
+            if base_kind(kind) not in kinds or (kind, num) in found:
+                continue
+            rect, problem, caption = float_crop(page, kind, num, band, body)
+            if rect is None and problem is None:
+                raise RuntimeError(f"{kind} {num} on page {page.number + 1}: "
+                                   "caption read but not found")
+            if rect is not None:
+                found.add((kind, num))
+            crops.append((kind, num, rect, problem, caption))
+        yield page, crops
+
+
 def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
                  only: set = None, unrendered: list = None) -> dict:
-    """Render every figure/table found in the PDF.
+    """Render every figure/table found in the PDF (`float_crops`).
 
     Returns {(kind, label): {"path", "page", "caption", "box", "roman"}}, the
     label as `caption_kind` reads it and "roman" its numeral as printed
@@ -2152,30 +2252,12 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
     wanted = None if only is None else {ef._label_key(n) for n in only}
     doc = fitz.open(pdf_path)
     try:
-        heads, feet = learn_furniture(doc)
-        body = body_text(doc)
         found, missed = {}, {}
-        for pno in range(doc.page_count):
-            page = doc[pno]
-            band = furniture_band(page, heads, feet)
-            labels = []
-            for b in page.get_text("dict")["blocks"]:
-                seen = caption_kind(_block_text(b)) if b.get("type") == 0 else None
-                if seen is not None and seen not in labels:
-                    labels.append(seen)
-            for kind, num in labels:
-                if wanted is not None and (kind != "figure"
-                                           or ef._label_key(num) not in wanted):
-                    continue
-                if base_kind(kind) not in kinds or (kind, num) in found:
-                    continue
-                rect, problem, caption = float_crop(page, kind, num, band, body)
+        for page, crops in float_crops(doc, kinds, wanted):
+            for kind, num, rect, problem, caption in crops:
                 if rect is None:
-                    if problem is None:
-                        raise RuntimeError(f"{kind} {num} on page {pno + 1}: "
-                                           "caption read but not found")
                     missed.setdefault((kind, num), {
-                        "kind": kind, "label": num, "page": pno + 1,
+                        "kind": kind, "label": num, "page": page.number + 1,
                         "problem": problem})
                     continue
                 out = os.path.join(out_dir, f"{kind}{num}.png")
@@ -2184,7 +2266,7 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
                                       clip=rect, alpha=False)
                 pix.save(out)
                 cap = re.sub(r"\s+", " ", caption).strip()
-                found[(kind, num)] = {"path": out, "page": pno + 1,
+                found[(kind, num)] = {"path": out, "page": page.number + 1,
                                       "caption": cap[:1900],
                                       "box": [round(v, 1) for v in rect],
                                       "roman": caption_numeral(caption)}

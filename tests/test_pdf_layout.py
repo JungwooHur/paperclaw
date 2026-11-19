@@ -3984,11 +3984,15 @@ class TestTitlesInAnImageGrid:
 
 class TestSubcaptionParagraphs:
 
-    def page(self, doc, size, marks=("(a) ", "(b) ")):
+    def page(self, doc, size, marks=("(a) ", "(b) "), backdrop=False):
         """Two images over 7-line paragraphs at `size` opening on `marks`,
-        Figure 11's caption under them and a paragraph of prose over them."""
+        Figure 11's caption under them and a paragraph of prose over them; all
+        but the prose on a grey backdrop when `backdrop`."""
         page = doc.new_page(width=LETTER[0], height=LETTER[1])
         prose(page, 108, 504, 439)
+        if backdrop:
+            page.draw_rect(fitz.Rect(100, 445, 512, 770), color=None,
+                           fill=(0.93, 0.93, 0.93))
         for x, mark in zip((117, 317), marks):
             picture(page, fitz.Rect(x, 455, x + 178, 633))
             assert page.insert_textbox(fitz.Rect(x, 638, x + 178, 738),
@@ -4006,6 +4010,16 @@ class TestSubcaptionParagraphs:
         assert any(pm._is_barrier(b, pm.body_text(doc))
                    for b in page.get_text("dict")["blocks"]
                    if b.get("type") == 0 and pm._block_text(b).startswith("(a)"))
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 11)]["box"]
+        assert 439 <= box[1] <= 455 and 715 <= box[3] <= caption[1]
+
+    def test_ones_on_the_figure_s_backdrop_belong_to_it(self, tmp_path):
+        # Each is print on the backdrop and a subcaption both.
+        doc = fitz.open()
+        body_pages(doc)
+        page = self.page(doc, 9, backdrop=True)
+        caption = blocks_starting(page, "Figure 11")[0]
         box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
             ("figure", 11)]["box"]
         assert 439 <= box[1] <= 455 and 715 <= box[3] <= caption[1]
@@ -4101,3 +4115,45 @@ class TestSubcaptionParagraphs:
         prose(page, 72, 540, 700)
         media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))
         assert ("table", 2) not in media or media[("table", 2)]["box"][1] <= 140
+
+
+class TestReadOnce:
+    """`ReadOnce` holds the blocks the page's own read does, image data aside."""
+
+    def doc(self, tmp_path):
+        """Body pages, a grid of titled images, and two images over subcaptions on
+        a backdrop."""
+        doc = fitz.open()
+        body_pages(doc)
+        image_grid(doc.new_page(width=LETTER[0], height=LETTER[1]),
+                   TestTitlesInAnImageGrid.ROWS)
+        TestSubcaptionParagraphs().page(doc, 9, backdrop=True)
+        return fitz.open(save(doc, tmp_path))
+
+    def test_its_pages_crop_what_the_document_does(self, tmp_path):
+        doc = self.doc(tmp_path)
+        crops = [(page.number, crops) for page, crops in pm.float_crops(doc)]
+        assert [(n, c[:2]) for n, cs in crops for c in cs if c[2] is not None] == [
+            (1, ("figure", 8)), (2, ("figure", 11))]
+        assert [(page.number, crops) for page, crops
+                in pm.float_crops([pm.ReadOnce(p) for p in doc])] == crops
+
+    def test_its_dict_is_the_page_s_with_each_image_its_number_and_box(self, tmp_path):
+        for page in self.doc(tmp_path):
+            own = page.get_text("dict")
+            blocks = [b if b["type"] == 0 else {k: b[k] for k in ("number", "type", "bbox")}
+                      for b in own["blocks"]]
+            assert pm.ReadOnce(page).get_text("dict") == dict(own, blocks=blocks)
+
+    def test_a_read_whose_lines_differ_gives_the_page_s_own_dict(self, tmp_path,
+                                                                 monkeypatch):
+        page, read = self.doc(tmp_path)[1], fitz.Page.get_text
+
+        def get_text(page, option="text", **kwargs):
+            got = read(page, option, **kwargs)
+            if option == "dict" and "flags" in kwargs:
+                got["blocks"][0]["lines"].pop(0)
+            return got
+
+        monkeypatch.setattr(fitz.Page, "get_text", get_text)
+        assert pm.ReadOnce(page).get_text("dict") == read(page, "dict")

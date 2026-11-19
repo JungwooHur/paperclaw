@@ -36,13 +36,24 @@ return JSON.**
 figures and tables as images with their captions and drops back matter, so the
 audit leaves out of the ratio what the page does not translate as body text:
 
-- **Captions, on both sides.** The source turns them into `_TABLE_MARK`s, which
-  keep the span's extent: a LaTeXML `figcaption` holding `ltx_tag_figure`, and in a
-  PDF every line inside `extract_pdf_media.caption_regions` (the crops' caption
-  grammar). The page skips a body paragraph opening on a float label set off by a
-  separator (`extract_pdf_media.is_caption_text`; `Figure 1 shows …` stays), since
-  NotebookLM often translates a caption into one. Counting captions on one side
-  only would push every ratio one way.
+- **Floats, body and caption, on the source side.** The source turns them into
+  `_TABLE_MARK`s, which keep the span's extent. In LaTeXML a float is each outermost
+  `<figure>` element: a figure (a prompt box set as text included), a table, an
+  algorithm or a listing. In a PDF it is every line whose centre lies in the crop
+  the renderer takes (`extract_pdf_media.float_crops`, the loop `render_media`
+  renders) or in `extract_pdf_media.caption_regions` (the crops' caption grammar),
+  so a float the renderer does not crop loses its caption only. A block the renderer
+  reads as a heading (`extract_pdf_media._is_heading`) is kept inside a crop, so a
+  crop that runs past its float does not unlocate the next section. A run of blanked
+  lines counts as one line break, so a float of many lines adds nothing to the span.
+  The audit reads each PDF page's text once without image bytes, plus a with-images
+  textpage for block bounds (`extract_pdf_media.ReadOnce`, which holds the same
+  blocks): the renderer's own reads carry every image's bytes, too slow to run on
+  every `--source` audit of an image-heavy PDF.
+- **Captions on the page.** The page skips a body paragraph opening on a float
+  label set off by a separator (`extract_pdf_media.is_caption_text`; `Figure 1
+  shows …` stays), since NotebookLM often translates a caption into one. Counting
+  captions on one side only would push every ratio one way.
 - **Table rows.** A run of 4+ short lines with no sentence end is a table, and a
   line whose tokens are mostly numbers (`22.37 16.98 … 64.13%`) is a table fragment
   at any length.
@@ -61,7 +72,12 @@ counts in the section the list sits in.
 - right after a PDF caption set at body size with no sentence end, which also blanks
   a body paragraph in its column and font size that starts within 26 pt below it
   (the grammar `_stitched` uses for crops);
-- made of prompt or example tables, in PDF mode: their text counts as source prose.
+- holding a float the renderer does not crop, in PDF mode (`render_media` reports
+  it unrendered, such as a table with no ruled structure or a figure of text with
+  no drawing), or the later pages of a table it crops on its first page only: that
+  body counts as source prose;
+- whose PDF text a float's crop runs over (body prose beside a figure or under a
+  title block): that text, a heading aside, does not count.
 
 **A source is read by what it is, not by its name.** `--source` is a PDF (a URL
 or a local path) or an HTML page (a URL). It is fetched or read once and read as a

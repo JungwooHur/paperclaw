@@ -450,70 +450,40 @@ def _strip_html(html: str) -> str:
     return re.sub(r"\n\s*\n+", "\n", html)
 
 
-_TABLE_FLOAT = re.compile(r'<figure\b[^>]*\bclass="[^"]*\bltx_table\b[^"]*"[^>]*>', re.I)
 _FIGURE_TAG = re.compile(r"<(/?)figure\b[^>]*>", re.I)
-# Stands in for the text of a table or a caption, one character per character of
+# Stands in for the text of a float or a caption, one character per character of
 # it (a private-use code point, which no paper's text contains).
 _TABLE_MARK = "\ue000"
+# A run of lines that are marks only: a float, or a caption, blanked line by line.
+_FLOAT_LINES = re.compile(f"(?:^{_TABLE_MARK}+\n)+", re.M)
 
 
-def _drop_tables(html: str) -> str:
-    """LaTeXML HTML with the text of every table float blanked out.
+def _drop_floats(html: str) -> str:
+    """LaTeXML HTML with the text of every float blanked out.
 
-    A table is never translated: it is placed on the page as a rendered image,
-    so its cells are no section's text. `_prose_chars` drops a run of short
-    cells, but a table whose cells are sentences (worked examples, prompts)
-    passes for prose, and an appendix made of such tables measured thousands of
-    characters against a translation that was complete. Cells could also be
-    read as a numbered heading, or hold a section's title, and cut or place a
-    span there.
-
-    The table becomes a line of `_TABLE_MARK` as long as its text, so a span
-    keeps its extent: a section that is one sentence and a table is still a
-    located section, measured small, and not a heading lost in a contents list
-    (see `source_section_chars`). A float whose closing tag cannot be found is
-    kept, so a malformed page loses nothing.
+    A float is each outermost `<figure>` element: a figure, a table, an
+    algorithm or a listing, caption included. Its text becomes a line of
+    `_TABLE_MARK` as long as it, so a span keeps its extent. A `<figure>` with
+    no closing tag is kept.
     """
-    out, pos = [], 0
-    for m in _TABLE_FLOAT.finditer(html):
-        if m.start() < pos:                  # inside a table already blanked
-            continue
-        depth, end = 0, None
-        for tag in _FIGURE_TAG.finditer(html, m.start()):
-            depth += -1 if tag.group(1) else 1
+    out, pos, depth, start = [], 0, 0, 0
+    for tag in _FIGURE_TAG.finditer(html):
+        if not tag.group(1):
+            start = tag.start() if depth == 0 else start
+            depth += 1
+        elif depth:
+            depth -= 1
             if depth == 0:
-                end = tag.end()
-                break
-        if end is None:
-            continue
-        size = len(_strip_html(html[m.start():end]).strip())
-        out += [html[pos:m.start()], "\n", _TABLE_MARK * size, "\n"]
-        pos = end
+                size = len(_strip_html(html[start:tag.end()]).strip())
+                out += [html[pos:start], "\n", _TABLE_MARK * size, "\n"]
+                pos = tag.end()
     out.append(html[pos:])
     return "".join(out)
 
 
-# A LaTeXML figure caption: its tag span is `ltx_tag_figure` (a table's is
-# `ltx_tag_table`, an algorithm's `ltx_tag_float`).
-_FIGURE_CAPTION = re.compile(
-    r"<figcaption\b[^>]*>(?:(?!</figcaption>).)*?\bltx_tag_figure\b.*?</figcaption>",
-    re.I | re.S)
-
-
-def _drop_figure_captions(html: str) -> str:
-    """LaTeXML HTML with each figure caption's text replaced by `_TABLE_MARK`s.
-
-    A figure is an image on the page, and its caption goes with it, so a
-    caption is no section's text.
-    """
-    return _FIGURE_CAPTION.sub(
-        lambda m: "\n" + _TABLE_MARK * len(_strip_html(m.group()).strip()) + "\n",
-        html)
-
-
 def source_text_from_html(html: str) -> str:
     """The text the audit measures a LaTeXML (arXiv) page against."""
-    return _strip_html(_drop_figure_captions(_drop_tables(html)))
+    return _strip_html(_drop_floats(html))
 
 
 def source_text_from_arxiv(arxiv_id: str):
@@ -530,24 +500,31 @@ def source_text_from_arxiv(arxiv_id: str):
     return None
 
 
-def _pdf_page_text(page) -> str:
-    """`page.get_text()` with each float caption's lines replaced by `_TABLE_MARK`s.
+def _pdf_page_text(page, crops, body) -> str:
+    """`page.get_text()` with the lines in each float caption, and in each of
+    `crops` (the page's float crops, rects) outside a block the renderer reads
+    as a heading at the document's `body` (`extract_pdf_media._is_heading`),
+    replaced by `_TABLE_MARK`s.
 
-    A caption goes with its image or table on the page, so it is no section's
-    text; the marks keep the span's extent.
+    A float is an image on the page and its caption goes with it, so neither is
+    a section's text; the marks keep the span's extent.
     """
     import fitz
     import extract_pdf_media as epm
     blocks = page.get_text(
         "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)["blocks"]
-    boxes = epm.caption_regions(page, blocks)
+    captions = epm.caption_regions(page, blocks)
+    inside = lambda boxes, x, y: any(b[0] <= x <= b[2] and b[1] <= y <= b[3] for b in boxes)
     out = []
     for block in blocks:
-        for ln in block.get("lines", ()) if block.get("type") == 0 else ():
+        if block.get("type") != 0:
+            continue
+        floats = [] if epm._is_heading(block, body) else crops
+        for ln in block.get("lines", ()):
             line = "".join(s["text"] for s in ln["spans"])
             x0, y0, x1, y1 = ln["bbox"]
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            if any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes):
+            if inside(captions, cx, cy) or inside(floats, cx, cy):
                 line = _TABLE_MARK * len(line)
             out.append(line + "\n")
     return "".join(out)
@@ -556,10 +533,15 @@ def _pdf_page_text(page) -> str:
 def source_text_from_pdf(pdf: bytes) -> str:
     """The text of a PDF given as its bytes, one line of text per line."""
     import fitz  # PyMuPDF
+    import extract_pdf_media as epm
     fitz.set_messages(fd=2)
     with fitz.open(stream=pdf, filetype="pdf") as doc:
+        pages = [epm.ReadOnce(page) for page in doc]
+        body = epm.body_text(pages)
         # Keep newlines — the References tail-cut anchors on a heading line.
-        text = "\n".join(_pdf_page_text(page) for page in doc)
+        text = "\n".join(
+            _pdf_page_text(page, [c[2] for c in crops if c[2] is not None], body)
+            for page, crops in epm.float_crops(pages, body=body))
     return re.sub(r"[ \t]+", " ", text)
 
 
@@ -699,7 +681,7 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
         if ref:
             end = ref.start()                    # back matter is no section's text
         segment = body[pos[key]:min(end, _next_source_heading(body, pos[key], end))]
-        span = _prose_chars(segment.replace(_TABLE_MARK, ""))
+        span = _prose_chars(_FLOAT_LINES.sub("\n", segment).replace(_TABLE_MARK, ""))
         # A "section" of a couple of hundred characters means the headings located
         # inside a nested list, not in the body — report nothing rather than a
         # ratio computed against a table of contents entry. Its tables count toward
