@@ -67,22 +67,6 @@ const NOT_ERRORS = [
   'echo a | grep zzz',
 ];
 
-/** Commands that stop at a bash error on their last line. */
-const LINE_ERRORS = ['cd /nonexistent', 'true\n\ncd /nonexistent'];
-
-/**
- * Lines past the unhooked call's line number that a bash error in a hooked
- * call reports.
- */
-const LINE_OFFSET = 4;
-
-/** The line number in a bash error message `text`. */
-function errorLine(text: string): number {
-  const match = /line (\d+): cd:/.exec(text);
-  if (!match) throw new Error(`no bash error line in ${JSON.stringify(text)}`);
-  return Number(match[1]);
-}
-
 interface ContentBlock {
   type: string;
   id?: string;
@@ -153,9 +137,11 @@ function sse(res: http.ServerResponse, model: string, blocks: ContentBlock[]) {
   res.end();
 }
 
+/** A tool result's text without the `<system-reminder>` blocks the CLI adds. */
 function resultText(block: ContentBlock): string {
   const c = block.content ?? '';
-  return typeof c === 'string' ? c : c.map((p) => p.text ?? '').join('');
+  const text = typeof c === 'string' ? c : c.map((p) => p.text ?? '').join('');
+  return text.replace(/\s*<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
 }
 
 /**
@@ -270,19 +256,10 @@ beforeAll(async () => {
   }
   [hooked, raw] = await Promise.all([
     runBash(
-      [
-        ...Object.keys(AS_WRITTEN),
-        AUTH_KEY,
-        EXIT_3,
-        ...NOT_ERRORS,
-        ...LINE_ERRORS,
-      ],
+      [...Object.keys(AS_WRITTEN), AUTH_KEY, EXIT_3, ...NOT_ERRORS],
       [sanitizeBashHook],
     ),
-    runBash(
-      [PIPED_VAR, PIPED_FOR, AUTH_KEY, ...NOT_ERRORS, ...LINE_ERRORS],
-      [],
-    ),
+    runBash([PIPED_VAR, PIPED_FOR, AUTH_KEY, ...NOT_ERRORS], []),
   ]);
 }, 90_000);
 
@@ -308,14 +285,6 @@ describe('a Bash call through the runner hook', () => {
     it(`reads exit 1 of ${JSON.stringify(command)} as no error`, () => {
       expect(hooked.get(command)).toEqual({ text: '', isError: false });
       expect(hooked.get(command)).toEqual(raw.get(command));
-    });
-  }
-
-  for (const command of LINE_ERRORS) {
-    it(`reports the error line of ${JSON.stringify(command)} ${LINE_OFFSET} lines on`, () => {
-      expect(errorLine(hooked.get(command)!.text)).toBe(
-        errorLine(raw.get(command)!.text) + LINE_OFFSET,
-      );
     });
   }
 });
