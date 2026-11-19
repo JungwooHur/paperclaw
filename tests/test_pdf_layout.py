@@ -3942,7 +3942,7 @@ class TestTitlesInAnImageGrid:
             ("figure", 8)]["box"]
         assert box[1] <= 90 and 358 <= box[3] <= caption[1]
 
-    def test_prose_between_the_rows_of_two_figures_is_refused(self, tmp_path):
+    def test_prose_between_the_rows_of_two_figures_is_left_out(self, tmp_path):
         doc = fitz.open()
         body_pages(doc)
         page = doc.new_page(width=LETTER[0], height=LETTER[1])
@@ -3954,13 +3954,12 @@ class TestTitlesInAnImageGrid:
             page.insert_text((60, y), PROSE[:95], fontsize=10)
         page.insert_text((100, 395), "Figure 2: Two more panels.", fontsize=10)
         prose(page, 60, 540, 600)
-        unrendered = []
-        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
-                                unrendered=unrendered)
-        assert ("figure", 2) not in media
-        assert [u["problem"] for u in unrendered] == [pm.HOLDS_PROSE]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert held_lines(doc[1], box) == []
+        assert box[1] <= 262 and box[3] >= 380
 
-    def test_a_paragraphs_tail_over_a_row_is_prose(self, tmp_path):
+    def test_a_paragraphs_tail_over_a_row_is_left_out(self, tmp_path):
         # Two columns of prose, the left one's last two lines over a row of two
         # images across both columns.
         doc = fitz.open()
@@ -3975,11 +3974,10 @@ class TestTitlesInAnImageGrid:
         page.insert_text((54, 312), PROSE[44:88], fontsize=10)
         page.insert_text((200, 495), "Figure 3: Two panels across both columns.",
                          fontsize=10)
-        unrendered = []
-        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
-                                unrendered=unrendered)
-        assert ("figure", 3) not in media
-        assert [u["problem"] for u in unrendered] == [pm.HOLDS_PROSE]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 3)]["box"]
+        assert held_lines(doc[1], box) == []
+        assert box[1] <= 320 and box[3] >= 480
 
 
 class TestSubcaptionParagraphs:
@@ -4115,6 +4113,470 @@ class TestSubcaptionParagraphs:
         prose(page, 72, 540, 700)
         media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))
         assert ("table", 2) not in media or media[("table", 2)]["box"][1] <= 140
+
+
+def prose_line(page, x0, x1, y, size=10, start=0):
+    """One line of PROSE's words, from its `start`th on, as many as fit x0..x1,
+    at baseline `y`."""
+    words = PROSE.split()
+    text = ""
+    for word in words[start:] + words:
+        if fitz.get_text_length(f"{text} {word}", fontsize=size) > x1 - x0:
+            break
+        text = f"{text} {word}".strip()
+    page.insert_text((x0, y), text, fontsize=size)
+
+
+def held_lines(page, box):
+    """Text of each printed line (`pm._lines`) of the page whose middle lies in
+    `box`."""
+    out = []
+    for b in page.get_text("dict")["blocks"]:
+        for line, _ in pm._lines(b) if b.get("type") == 0 else ():
+            if (box[0] < (line[0] + line[2]) / 2 < box[2]
+                    and box[1] < (line[1] + line[3]) / 2 < box[3]):
+                out.append(" ".join(s["text"] for ln in b["lines"]
+                                    if pm._contains(line, tuple(ln["bbox"]))
+                                    for s in ln["spans"]))
+    return out
+
+
+def plot(page, rect):
+    page.draw_rect(fitz.Rect(rect), color=(0, 0, 0), fill=(0.2, 0.4, 0.8))
+
+
+class TestTheCropTakesNoBodyText:
+    """A line of body text outside a float's graphics ends its crop."""
+
+    def test_a_figure_beside_the_text_leaves_the_paragraph_out(self, tmp_path):
+        # One block: a full-width line, then lines wrapped beside the figure.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose_line(page, 72, 540, 100)
+        for i in range(7):
+            prose_line(page, 72, 230, 112 + 12 * i, start=3 * i)
+        plot(page, (250, 106, 540, 180))
+        page.insert_text((250, 194), "Figure 2: A plot set beside the text.", fontsize=9)
+        prose(page, 72, 540, 400)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert held_lines(doc[1], box) == []
+        assert box[0] <= 250 and box[1] <= 106 and box[2] >= 540 and box[3] >= 180
+
+    @pytest.mark.parametrize("into", [2, 4])
+    def test_a_small_print_legend_reaching_into_the_plot_stays(self, tmp_path, into):
+        # A 9 pt legend line across the column, its box `into` pt into the plot.
+        legend = ("Proposed method   Baseline with replay   Baseline without replay   "
+                  "Oracle policy   Random policy   Expert data")
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 100)
+        width = fitz.get_text_length(legend, fontsize=9)
+        page.insert_text((306 - width / 2, 150 + into - 2.7), legend, fontsize=9)
+        plot(page, (76, 150, 536, 320))
+        page.insert_text((76, 336), "Figure 2: A plot under its legend.", fontsize=9)
+        prose(page, 72, 540, 600)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert any(line.startswith("Proposed method") for line in held_lines(doc[1], box))
+
+    def test_a_crop_its_body_text_cannot_all_be_cut_from_is_refused(self, tmp_path):
+        # One block: a full-width line between a rule and the figure, then lines
+        # wrapped beside the figure.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 90)
+        page.draw_rect(fitz.Rect(300, 104, 330, 105), color=(0, 0, 0), fill=(0, 0, 0))
+        prose_line(page, 72, 540, 120)
+        for i in range(8):
+            prose_line(page, 72, 262, 132 + 12 * i, start=3 * i)
+        plot(page, (280, 126, 540, 220))
+        page.insert_text((280, 234), "Figure 2: A plot set beside the text.", fontsize=9)
+        prose(page, 72, 540, 400)
+        unrendered = []
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert ("figure", 2) not in media
+        assert [u["problem"] for u in unrendered] == [pm.HOLDS_PROSE]
+
+    def test_a_refused_crop_with_lines_beside_its_figure_stays_refused(self, tmp_path):
+        # A display equation over the plot; one block of lines wrapped beside it
+        # running on full width under its caption.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 90)
+        for x, piece in ((150, "x = a + b"), (330, "J(A) - J(B)"), (500, "(5)")):
+            page.insert_text((x, 116), piece, fontsize=10)
+        for i in range(10):
+            prose_line(page, 72, 262, 136 + 12 * i, start=3 * i)
+        for i in range(2):
+            prose_line(page, 72, 540, 256 + 12 * i, start=5 * i)
+        plot(page, (280, 128, 540, 200))
+        page.insert_text((280, 214), "Figure 4: A plot set beside the text, with",
+                         fontsize=9)
+        page.insert_text((280, 224), "a caption of two lines.", fontsize=9)
+        prose(page, 72, 540, 500)
+        unrendered = []
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"),
+                                unrendered=unrendered)
+        assert ("figure", 4) not in media
+        assert [u["problem"] for u in unrendered] == [pm.HOLDS_PROSE]
+
+    def test_a_title_line_on_a_lone_image_stays(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 150)
+        page.insert_text((180, 186), "Outputs of the model for one fixed input seed",
+                         fontsize=10)
+        picture(page, fitz.Rect(120, 189, 492, 400))
+        page.insert_text((120, 416), "Figure 7: Samples of the model.", fontsize=9)
+        prose(page, 72, 540, 600)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 7)]["box"]
+        assert box[1] <= 176
+
+    def test_a_long_rotated_axis_title_stays(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 150)
+        page.insert_text((100, 380), "Share of the episodes that end at the goal",
+                         fontsize=10, rotate=90)
+        plot(page, (110, 170, 500, 390))
+        page.insert_text((110, 406), "Figure 3: A plot with a long axis title.",
+                         fontsize=9)
+        prose(page, 72, 540, 600)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 3)]["box"]
+        assert box[0] <= 90
+
+    def test_a_teaser_leaves_the_title_block_out(self, tmp_path):
+        doc = fitz.open()
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((150, 80), "A Title Set Large Over the Teaser", fontsize=17)
+        page.insert_text((160, 108), "Ann Author, Ben Builder, Cy Coder and Di Debugger",
+                         fontsize=10)
+        page.insert_text((200, 122), "One University, Two Institute", fontsize=9)
+        plot(page, (72, 140, 540, 300))
+        page.insert_text((72, 316), "Figure 1: A teaser under the title block.",
+                         fontsize=9)
+        prose(page, 72, 540, 500)
+        body_pages(doc)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 1)]["box"]
+        assert held_lines(doc[0], box) == []
+        assert box[1] <= 140 and box[3] >= 300
+
+    def test_small_print_spanning_the_column_over_a_figure_is_left_out(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((72, 80), "A.2 Further results", fontsize=12)
+        prose_line(page, 72, 540, 100, size=9)
+        prose_line(page, 72, 300, 110, size=9, start=5)
+        plot(page, (120, 126, 500, 300))
+        page.insert_text((120, 316), "Figure 4: A plot under a short paragraph.",
+                         fontsize=9)
+        prose(page, 72, 540, 500)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 4)]["box"]
+        assert held_lines(doc[1], box) == []
+        assert box[1] <= 126
+
+    def test_a_label_opening_a_line_under_prose_is_no_caption_of_what_is_above(
+            self, tmp_path):
+        # "Figure 3. The ..." opens a block under a line of prose and an equation;
+        # Figure 3 itself is on the next page.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 300)
+        page.insert_text((200, 400), "x = a + b", fontsize=10)
+        page.draw_rect(fitz.Rect(180, 409, 330, 410), color=(0, 0, 0), fill=(0, 0, 0))
+        page.insert_text((200, 424), "c - d", fontsize=10)
+        prose_line(page, 72, 540, 440)
+        page.insert_text((72, 456), "Figure 3. The curve splits the range in two.",
+                         fontsize=10)
+        prose(page, 72, 540, 600)
+        assert len(blocks_starting(page, "Figure 3.")) == 1
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        plot(page, (150, 100, 460, 250))
+        page.insert_text((150, 266), "Figure 3: A plot.", fontsize=9)
+        prose(page, 72, 540, 500)
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))
+        assert media[("figure", 3)]["page"] == 3
+
+    def test_subcaptions_at_body_size_under_the_panels_stay(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 150)
+        for x0, subcaption in ((72, "(a) Without the first part of the method"),
+                               (310, "(b) With it")):
+            plot(page, (x0, 170, x0 + 220, 300))
+            page.insert_text((x0, 314), subcaption, fontsize=10)
+        page.insert_text((72, 334), "Figure 4: Two panels with their subcaptions.",
+                         fontsize=9)
+        prose(page, 72, 540, 500)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 4)]["box"]
+        assert box[1] <= 170 and box[3] >= 316
+
+    def test_a_figure_s_own_title_wider_than_the_column_stays(self, tmp_path):
+        doc = fitz.open()
+        for _ in range(2):
+            body = doc.new_page(width=LETTER[0], height=LETTER[1])
+            for x0, x1 in (LEFT, RIGHT):
+                for y in (250, 500, 750):
+                    prose(body, x0, x1, y)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((110, 100), "What the method guarantees, and what it leaves "
+                         "to the solver it calls", fontsize=9)
+        for x0 in (60, 310):
+            plot(page, (x0, 110, x0 + 230, 300))
+        page.insert_text((60, 316), "Figure 5: A figure across both columns.", fontsize=9)
+        for x0, x1 in (LEFT, RIGHT):
+            prose(page, x0, x1, 600)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 5)]["box"]
+        assert box[1] <= 92
+
+    @pytest.mark.parametrize("tail, title_x, frame_x0, frame_y0", [
+        ("it.", 100, 160, 142), ("of the column", 92, 160, 142),
+        ("of the column and then it ends", 92, 175, 142),
+        ("of the column", 92, 160, 135.7), ("of the column", 92, 160, 133.2),
+    ], ids=["short-of-the-axis-title", "over-the-axis-title", "over-the-frame",
+            "into-the-frame-s-top", "further-into-the-frame-s-top"])
+    def test_a_paragraph_s_last_line_over_a_plot_cuts_off_none_of_its_side(
+            self, tmp_path, tail, title_x, frame_x0, frame_y0):
+        # The paragraph's short last line, its box 123.3..137.0, stands over the
+        # plot's frame or reaches less than half its height into the frame's
+        # top; the plot's tick labels and rotated axis title stand left of the
+        # frame.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 100)
+        prose_line(page, 72, 540, 122)
+        page.insert_text((72, 134), tail, fontsize=10)
+        plot(page, (frame_x0, frame_y0, 520, frame_y0 + 160))
+        for i, tick in enumerate(("1.0", "0.5", "0.0")):
+            page.insert_text((140, frame_y0 + 8 + 76 * i), tick, fontsize=8)
+        page.insert_text((title_x, frame_y0 + 130), "Success rate", fontsize=9,
+                         rotate=90)
+        page.insert_text((frame_x0, frame_y0 + 178),
+                         "Figure 2: A plot under a paragraph.", fontsize=9)
+        prose(page, 72, 540, 620)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert sorted(held_lines(doc[1], box)) == ["0.0", "0.5", "1.0", "Success rate"]
+        assert box[0] <= 72 and box[1] <= frame_y0
+
+    @pytest.mark.parametrize("caption_y", [276, 266],
+                             ids=["over-the-caption", "within-a-line-gap-over-it"])
+    def test_a_line_across_the_column_under_an_image_row_stays(self, tmp_path,
+                                                                caption_y):
+        prompt = ("Prompt: a red kettle on a wooden table by the open window in "
+                  "the soft morning light, film grain, close up")
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 110)
+        for i in range(4):
+            picture(page, fitz.Rect(74 + 117 * i, 130, 184 + 117 * i, 240))
+        page.insert_text((72, 256), prompt, fontsize=10)
+        page.insert_text((74, caption_y), "Figure 7: Samples for one prompt.",
+                         fontsize=9)
+        prose(page, 72, 540, 560)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 7)]["box"]
+        assert held_lines(doc[1], box) == [prompt]
+
+    @pytest.mark.parametrize("x, line, plot_x", [
+        (80, "Proposed method   Baseline with replay   Baseline without replay   "
+             "Oracle policy", (100, 520)),
+        (96, "Return of every method over the whole training budget", (100, 520)),
+        (185.4, "Return of every method over the whole training budget", (236, 376)),
+    ], ids=["legend-past-the-plot-s-edge", "title-past-the-plot-s-edge",
+            "title-centred-over-a-narrow-plot"])
+    def test_a_lone_line_over_the_plot_stays(self, tmp_path, x, line, plot_x):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 120)
+        page.insert_text((x, 150), line, fontsize=10)
+        plot(page, (plot_x[0], 156, plot_x[1], 330))
+        page.insert_text((plot_x[0], 346), "Figure 2: A plot under one line.", fontsize=9)
+        prose(page, 72, 540, 560)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert held_lines(doc[1], box) == [line]
+
+    def test_a_lone_line_over_the_legend_of_a_plot_is_left_out(self, tmp_path):
+        # The line's box ends 17 pt over the plot, the legend's 2.6 pt over it.
+        legend = "ours   baseline   oracle"
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 120)
+        page.insert_text((185.4, 150), "Return of every method over the whole "
+                         "training budget", fontsize=10)
+        page.insert_text((260, 165), legend, fontsize=8)
+        plot(page, (236, 170, 376, 330))
+        page.insert_text((236, 346), "Figure 2: A plot under one line.", fontsize=9)
+        prose(page, 72, 540, 560)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert held_lines(doc[1], box) == [legend]
+
+    def test_a_title_of_two_lines_over_the_plot_is_left_out(self, tmp_path):
+        # The lines' boxes end 11.5 pt and 0.5 pt over the plot.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 110)
+        for y, line in ((141.5, "Return of every method over the whole training"),
+                        (152.5, "budget, each one averaged over five seeds")):
+            width = fitz.get_text_length(line, fontsize=10)
+            page.insert_text((310 - width / 2, y), line, fontsize=10)
+        plot(page, (100, 156, 520, 330))
+        page.insert_text((100, 346), "Figure 2: A plot under two lines.", fontsize=9)
+        prose(page, 72, 540, 560)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert held_lines(doc[1], box) == []
+        assert box[1] <= 156
+
+    @pytest.mark.parametrize("centred", [True, False],
+                             ids=["title-centred-on-the-row", "one-line-paragraph"])
+    def test_a_lone_line_over_a_row_of_plots_stays_centred_on_the_row(
+            self, tmp_path, centred):
+        title = "Return of every method over the whole training budget"
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 110)
+        if centred:
+            width = fitz.get_text_length(title, fontsize=10)
+            page.insert_text((306 - width / 2, 140), title, fontsize=10)
+        else:
+            prose_line(page, 72, 470, 140)
+        for x0 in (72, 312):
+            plot(page, (x0, 148, x0 + 228, 300))
+        page.insert_text((72, 316), "Figure 2: Every method over training.", fontsize=9)
+        prose(page, 72, 540, 560)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert held_lines(doc[1], box) == ([title] if centred else [])
+        assert box[1] <= 148
+
+    @pytest.mark.parametrize("across, caption_y", [(False, 330), (True, 334)],
+                             ids=["narrower-than-the-column", "past-a-line-gap"])
+    def test_a_line_over_a_body_size_caption_it_does_not_go_on_stays(
+            self, tmp_path, across, caption_y):
+        # The line's box ends 2.3 pt over the caption's, or 6.3 pt.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 120)
+        plot(page, (150, 140, 460, 300))
+        if across:
+            prose_line(page, 72, 540, 314)
+        else:
+            page.insert_text((150, 314), "The note under the plot runs on for most "
+                             "of the column", fontsize=10)
+        page.insert_text((150, caption_y), "Figure 2: A plot over a note.", fontsize=10)
+        prose(page, 72, 540, 560)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert len(held_lines(doc[1], box)) == 1
+
+    def test_a_one_line_paragraph_over_a_plot_is_left_out(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 100)
+        prose_line(page, 72, 470, 122)
+        plot(page, (160, 130, 520, 290))
+        page.insert_text((160, 306), "Figure 2: A plot under a short paragraph.",
+                         fontsize=9)
+        prose(page, 72, 540, 600)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 2)]["box"]
+        assert held_lines(doc[1], box) == []
+        assert box[1] <= 130
+
+    def test_a_table_under_a_line_across_the_column_over_its_caption_is_rendered(
+            self, tmp_path):
+        note = ("Scores are averaged over five seeds, and the steps count all the "
+                "frames of the training environment.")
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 120)
+        bottom = ruled_table(page, 110, 500, 140, 3)
+        page.insert_text((72, bottom + 12), note, fontsize=10)
+        page.insert_text((150, bottom + 24), "Table 2: Results on the benchmark suite.",
+                         fontsize=9)
+        prose(page, 72, 540, 400)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 2)]["box"]
+        assert note in held_lines(doc[1], box)
+
+    def test_a_cut_that_leaves_a_body_line_inside_gives_the_crop_back(self, tmp_path):
+        # Small print over two stacked plots, a line of body text across the
+        # column between them.
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.insert_text((72, 80), "A.2 Further results", fontsize=12)
+        prose_line(page, 72, 540, 100, size=9)
+        prose_line(page, 72, 300, 110, size=9, start=5)
+        plot(page, (120, 126, 500, 200))
+        prose_line(page, 72, 540, 214)
+        plot(page, (120, 222, 500, 300))
+        page.insert_text((120, 316), "Figure 4: Two plots and a line between them.",
+                         fontsize=9)
+        prose(page, 72, 540, 500)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 4)]["box"]
+        assert len(held_lines(doc[1], box)) == 3
+
+
+def test_a_float_s_content_holds_no_body_line():
+    doc = fitz.open()
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    prose(page, 72, 540, 200)
+    body = pm.Body(10, 468)
+    printed = pm._printed(page.get_text("dict")["blocks"], body)
+    rest = (lambda box: False, [(72, 300, 540, 400)], [])
+    assert len(pm._body_lines(printed, body, lambda box: False, *rest)) == len(printed)
+    assert pm._body_lines(printed, body, lambda box: True, *rest) == []
+
+
+def test_prose_three_tenths_off_the_body_size_is_body_prose_line_by_line():
+    doc = fitz.open()
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    prose(page, 72, 540, 200)
+    lines = pm._prose_lines(page.get_text("dict")["blocks"], pm.Body(10.3, 468))
+    assert len(lines) == len(page.get_text("dict")["blocks"][0]["lines"])
+
+
+def test_prose_three_tenths_off_the_body_size_is_body_prose():
+    # The size whose window holds the most print is 10.3 pt, 0.3 pt over the
+    # prose at 10 pt.
+    doc = fitz.open()
+    page = doc.new_page(width=LETTER[0], height=LETTER[1])
+    for size, bottom in ((10.0, 200), (10.0, 380), (10.3, 520), (10.5, 660)):
+        prose(page, 72, 540, bottom, size=size)
+    body = pm.body_text(doc)
+    assert abs(body.size - 10.3) < 1e-9
+    assert [pm._is_prose(b, body) for b in page.get_text("dict")["blocks"]] == [True] * 4
 
 
 class TestReadOnce:
