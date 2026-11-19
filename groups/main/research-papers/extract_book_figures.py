@@ -31,6 +31,7 @@ def extract_figures(zip_path, workdir=None):
     Local paths are durable (unlike Notion file_upload ids, which expire until
     attached) — upload them to Notion at assembly time."""
     import fitz  # PyMuPDF
+    fitz.set_messages(fd=2)
     work = workdir or tempfile.mkdtemp(prefix="bookfig_")
     os.makedirs(work, exist_ok=True)
     cache = os.path.join(work, "figmap.json")

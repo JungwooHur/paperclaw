@@ -22,8 +22,9 @@ section-by-section workflow silently degraded into something thinner):
      length of the SAME section in the source.
 
 What this does:
-  * Pull the page's top-level blocks, group body text under each heading, and key
-    each heading by its leading section number ("1", "2.1", "III").
+  * Pull the page's blocks in reading order (a column_list column by column),
+    group body text under each heading, and key each heading by its leading
+    section number ("1", "2.1", "III").
   * DUPLICATE check (no source needed): any section key present more than once.
     The extra copies' heading block-ids are printed so they can be deleted.
   * COMPLETENESS / SUMMARIZATION check (needs --source or --arxiv): locate each
@@ -135,15 +136,18 @@ _LETTERED_KEY = re.compile(r"[A-Z](?:[.-]\d+)*")
 def _heading_needle(key: str, title: str, n_words: int):
     """Regex of a source heading that opens a line: an optional `Appendix` word
     or dash, the label (group `key`) in its own case, then the first
-    `n_words` title words of over two letters, up to 8 other words between two.
-    None without a key or such words.
+    `n_words` title words of over two letters, after exactly as many words of
+    one or two characters as the title opens with, on the first word's line, and
+    with up to 8 other words between two. None without a key or such words.
     """
-    words = [w for w in re.split(r"\W+", title) if len(w) > 2][:n_words]
+    tokens = [w for w in re.split(r"\W+", title) if w]
+    words = [w for w in tokens if len(w) > 2][:n_words]
     if not key or not words:
         return None
+    lead = r"\w{1,2}[^\w\n]+" * tokens.index(words[0])
     gap = r"(?:\W+\w+){0,8}?\W+"
-    return (r"(?im)^[^\S\n]*(?:appendix\s+)?-?(?P<key>(?-i:"
-            + re.escape(key) + r"))[.:)]?\s+" + gap.join(re.escape(w) for w in words))
+    return (r"(?im)^[^\S\n]*(?:appendix\s+)?-?(?P<key>(?-i:" + re.escape(key)
+            + r"))[.:)]?\s+" + lead + gap.join(re.escape(w) for w in words))
 
 
 def _appendix_past(tail: str, ordered_sections: list) -> bool:
@@ -224,6 +228,19 @@ def fetch_blocks(page_id: str) -> list:
         if not d.get("has_more"):
             return blocks
         cursor = d["next_cursor"]
+
+
+def reading_order(blocks: list) -> list:
+    """`blocks` with each `column_list`, at any depth, replaced in place by the
+    children of its columns, left column first."""
+    out = []
+    for b in blocks:
+        if b["type"] == "column_list":
+            for column in fetch_blocks(b["id"]):
+                out += reading_order(fetch_blocks(column["id"]))
+        else:
+            out.append(b)
+    return out
 
 
 def page_title(page_id: str) -> str:
@@ -517,6 +534,7 @@ def source_text_from_pdf(pdf: bytes) -> str:
     """The text of a PDF given as its bytes, one line of text per line."""
     import fitz  # PyMuPDF
     import extract_pdf_media as epm
+    fitz.set_messages(fd=2)
     with fitz.open(stream=pdf, filetype="pdf") as doc:
         pages = [epm.ReadOnce(page) for page in doc]
         body = epm.body_text(pages)
@@ -816,7 +834,7 @@ def main() -> int:
     # reports the paper's own bibliography as BACKMATTER to delete and its LaTeX
     # as BARE_MATH to rewrite. See reference_section.
     blocks = reference_section.body_blocks(fetch_blocks(args.page))
-    sections = group_sections(blocks)
+    sections = group_sections(reading_order(blocks))
     if not sections:
         # `--json` is a CONTRACT: callers parse stdout as JSON no matter the exit
         # code (heal_verify treats unparseable output as a crash and aborts the whole

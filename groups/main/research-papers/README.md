@@ -63,6 +63,10 @@ Captions still count as content where no ratio is taken: in the CONTENT_LOSS
 floor (`content_chars`), so a section of tables only is not empty, and when
 choosing which duplicate copy to keep.
 
+**The page is read in reading order.** A `column_list` (text set beside a figure),
+at any depth, stands for its columns' blocks, left column first, so that text
+counts in the section the list sits in.
+
 **Known limits.** A SUMMARIZED or CONTENT_LOSS deserves a hand check on a section:
 
 - right after a PDF caption set at body size with no sentence end, which also blanks
@@ -73,9 +77,7 @@ choosing which duplicate copy to keep.
   no drawing), or the later pages of a table it crops on its first page only: that
   body counts as source prose;
 - whose PDF text a float's crop runs over (body prose beside a figure or under a
-  title block): that text, a heading aside, does not count;
-- with text inside a `column_list`: the page side reads top-level blocks only
-  (`fetch_blocks`), so that text is not counted.
+  title block): that text, a heading aside, does not count.
 
 **A source is read by what it is, not by its name.** `--source` is a PDF (a URL
 or a local path) or an HTML page (a URL). It is fetched or read once and read as a
@@ -89,9 +91,15 @@ reports a WARN.
 **A heading is found in the source by its label and title words**, the label read
 as `section_key` reads it: `Appendix E. Title` is `E` + `Title` and `1) Title` is
 `1` + `Title`, so a source printing `E Title`, `Appendix E Title`, `-E Title`
-(LaTeXML's IEEE appendices) or `1) Title` locates it. The label must open a line,
-so a cross-reference (`Results of Section 4.2 Title`, `(Table B.3)`) or a
-number ending in the label (`12 Title`) is no heading. A section is measured only
+(LaTeXML's IEEE appendices) or `1) Title` locates it. Only title words of over two
+letters are sought, after exactly as many words of one or two characters as the
+title opens with, on the first word's line (`3.1 3D Title`, or `x0 5` for a title
+`x₀.₅`), and with up to 8 other words between two (a title formula the source
+spells in TeX). Any other word before the first title word makes no heading: for a
+title `Method`, neither a list item `3) A method ...` nor `2) A baseline ...
+requires each method` is one.
+The label must open a line, so a cross-reference (`Results of Section 4.2 Title`,
+`(Table B.3)`) or a number ending in the label (`12 Title`) is no heading. A section is measured only
 when it and the section after it are located, and the page's last section only
 when no located heading follows it: a heading found only in the table of contents
 would otherwise run to the end.
@@ -238,6 +246,11 @@ nothing reads the budget.
   `tools/ab_render.py` renders `render_media` against a base ref with contact
   sheets, each side's unrendered captions and the base's floats the branch lost;
   judge every added, changed and removed crop from them.
+- **A script that opens a PDF sends MuPDF's messages to stderr**
+  (`fitz.set_messages(fd=2)` before `fitz.open`). PyMuPDF prints them on stdout by
+  default (`MuPDF error: ...`), into any JSON the script prints there;
+  `tests/test_mupdf_messages.py` runs each such script on a PDF that makes MuPDF
+  print one.
 - `heal_skip.txt`, beside the scripts, lists page ids the healer leaves completely
   alone, compared dash-insensitively since Notion prints both forms: the owner's
   switch for a page arranged BY HAND, whose own edits would otherwise keep it in the
