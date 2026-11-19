@@ -52,6 +52,17 @@ mark (`(a) …`) under a panel is a subcaption, and lines between the rows of an
 image grid or titling one of its panels are no prose to the crop check; a
 paragraph's last lines over a row are.
 
+A crop takes no body text: a block holding a line of body-size prose outside
+the float's graphics that is none of their content or titles (`_body_lines`).
+Such a block's lines level with the graphics and beside them move that side of
+the crop clear of them; past the graphics the crop ends at the widest gap before
+the first such line, a figure's small print across the column counting there
+too (a paragraph over a figure set beside the text, a teaser's title block). A
+cut that cannot clear every such line leaves the crop as it was. A figure whose
+caption, set at body size, continues a line of body-size prose across the
+column within `_LINE_GAP` over it is refused: that caption is a paragraph's line
+opening on a label.
+
 Tables use the identical machinery, growing DOWNWARD (LaTeX puts a table's
 caption above its body) instead of upward. A rule set as a thin raster image is
 a rule like a drawn one.
@@ -135,6 +146,7 @@ _STAMP_MARGIN_FRAC = 0.10    # ...entirely within this much of the outer margin
 _BACKGROUND_AREA_FRAC = 0.8  # a box this big is a page background, not content
 _LABEL_LINE_MAX = 40         # a figure's own label line is shorter than this (chars)
 _PANEL_GAP = 12.0            # a panel's title or subcaption stands this close to it
+_LINE_GAP = 4.0              # the lines of one paragraph stand at most this far apart
 _READ_TOL = 1e-3             # two reads' boxes of one text block this close are one box
 
 
@@ -283,11 +295,16 @@ def _size_histogram(blocks, hist: dict) -> dict:
     return hist
 
 
+def _within(a: float, b: float, tol: float) -> bool:
+    """Are `a` and `b`, values rounded to 0.1 or coarser, at most `tol` apart?"""
+    return abs(a - b) <= tol + 1e-6
+
+
 def _mode(hist: dict, tol: float) -> float:
     """The key of `hist` whose window of keys within `tol` holds the most weight;
     ties go to the heavier key."""
     def window(key):
-        return sum(n for k, n in hist.items() if abs(k - key) <= tol + 1e-6)
+        return sum(n for k, n in hist.items() if _within(k, key, tol))
     return max(hist, key=lambda k: (window(k), hist[k]))
 
 
@@ -343,7 +360,7 @@ def body_text(doc) -> Body:
 
 def _at_body_size(block, body_size: float) -> bool:
     """Is the block's dominant print the document's body size?"""
-    return abs(_body_size([block]) - body_size) <= _BODY_SIZE_TOL
+    return _within(_body_size([block]), body_size, _BODY_SIZE_TOL)
 
 
 def _lines(block) -> list:
@@ -1752,6 +1769,23 @@ def _crop_at(page, caption_box, kind: str, num, band, body: Body) -> tuple:
         max(top - _PAD, top_limit),
         min(x1 + _PAD, max(x1, right_limit)),
         min(bottom + _PAD, bottom_limit))
+    rasters = {tuple(b["bbox"]) for b in blocks if b.get("type") != 0}
+    shapes = set(parts.drawings) | rasters
+    frames = [g for g in shapes if g[2] - g[0] > _RULE_MAX_THICK
+              and g[3] - g[1] > _RULE_MAX_THICK and not _too_big(g, page.rect)]
+
+    def content(box):
+        return _content_line(box, _horizontals(parts.drawings), ruled,
+                             _verticals(parts.drawings), frames)
+
+    graphics = [b for b in boxes if b in shapes and not _too_big(b, page.rect)]
+    rect, problem = _clear_of_body(
+        blocks, rect, kind, caption_box, upward, graphics,
+        [g for g in graphics if g in rasters],
+        content, body,
+        lambda r: _crop_problem(page, r, kind, num, caption_box, body, band) is None)
+    if problem:
+        return None, problem
     if rect.width <= 40 or rect.height <= 20:
         return None, NOTHING_BESIDE
     problem = _crop_problem(page, rect, kind, num, caption_box, body, band)
@@ -1928,8 +1962,134 @@ def _prose_lines(blocks, body: Body, caption_box=None) -> list:
         small = (caption_box is not None and not _across(caption_box, b["bbox"])
                  and _is_barrier(b, body) and not _is_heading(b, body))
         out += [box for box, chars in _lines(b) if chars >= _PROSE_LINE_CHARS
-                and (small or abs(_line_size(b, box) - body.size) <= _BODY_SIZE_TOL)]
+                and (small or _within(_line_size(b, box), body.size, _BODY_SIZE_TOL))]
     return out
+
+
+def _spans_column(box, body: Body) -> bool:
+    """Is `box` as wide as the column (`Body.measure`), to within `_WIDE_FRAC`
+    either way?"""
+    width = box[2] - box[0]
+    return (body.measure is not None
+            and _WIDE_FRAC * body.measure <= width <= body.measure / _WIDE_FRAC)
+
+
+def _printed(blocks, body: Body) -> list:
+    """(block, box, characters) of each printed line (`_lines`) of the text
+    `blocks` that open no caption (`caption_kind`) and are no heading
+    (`_is_heading`)."""
+    return [(b, box, n) for b in blocks
+            if b.get("type") == 0 and caption_kind(_block_text(b)) is None
+            and not _is_heading(b, body)
+            for box, n in _lines(b)]
+
+
+def _body_lines(lines, body: Body, content, small, graphics, images) -> list:
+    """Boxes of the printed `lines` (`_printed`) of each block holding a line of
+    body text: one wider than tall of `_PROSE_LINE_CHARS` characters or more,
+    set at body size or, where `small(box)` holds, across the column
+    (`_spans_column`) in print of `_BARRIER_MIN_SIZE_FRAC` of it or more, that
+    is no float's `content`, no print of a grid of `images` (`_in_image_grid`)
+    and no title of `graphics`: a line narrower than the column, in no paragraph
+    (`_in_paragraph`), centred to within `_COLUMN_TOL` on the x-span of the
+    graphics near it (`_near`) or of one of them, or with `_SAME_EXTENT` of its
+    width or more within one of them."""
+    found = [(b, box) for b, box, n in lines
+             if n >= _PROSE_LINE_CHARS and box[2] - box[0] > box[3] - box[1]
+             and not content(box)
+             and (_within(_line_size(b, box), body.size, _BODY_SIZE_TOL)
+                  or small(box) and _spans_column(box, body)
+                  and _line_size(b, box) >= _BARRIER_MIN_SIZE_FRAC * body.size)]
+    boxes = [box for _, box in found]
+
+    def title(box):
+        width = box[2] - box[0]
+        row = [g for g in graphics if _near(box, g)]
+
+        def centred(g):
+            return abs(box[0] + box[2] - g[0] - g[2]) / 2 <= _COLUMN_TOL
+
+        return ((body.measure is None or width < _WIDE_FRAC * body.measure)
+                and not _in_paragraph(box, boxes) and bool(row)
+                and (centred(_union(row))
+                     or any(centred(g) or min(box[2], g[2]) - max(box[0], g[0])
+                            >= _SAME_EXTENT * width for g in row)))
+
+    held = {id(b) for b, box in found
+            if not _in_image_grid(box, images, boxes) and not title(box)}
+    return [box for b, box, _ in lines if id(b) in held]
+
+
+def _clear_of_body(blocks, rect, kind: str, caption_box, upward: bool, graphics,
+                   images, content, body: Body, accepted) -> tuple:
+    """(rect, None): `rect`, on the page of `blocks`, cut clear of the body text
+    (`_body_lines`) outside its float's `graphics`, `images` the raster ones; or
+    (None, HOLDS_PROSE) for a figure over its caption at `caption_box`, set at
+    body size, with a line of body-size print across the column (`_spans_column`)
+    between them, within `_LINE_GAP` over the caption: a paragraph the caption
+    goes on.
+
+    A body line beside the graphics, its middle level with them, moves that side
+    of `rect` to it, unless `accepted(rect)` is False: then `rect` is given back
+    as it is. A line with its middle past the graphics, on the far side from the
+    caption, lies beyond them, and a figure's small print wholly past them counts
+    as body text too; the far edge moves to the widest gap in the run of text
+    lines from the graphics out to the first body line, never into the graphics. A cut
+    that leaves a body line inside gives `rect` back as it is.
+    """
+    import fitz
+
+    if not graphics:
+        return rect, None
+    gx0, gy0, gx1, gy1 = _union(graphics)
+    printed = _printed(blocks, body)
+    figure = base_kind(kind) == "figure"
+
+    def beyond(box):
+        middle = (box[1] + box[3]) / 2
+        return middle < gy0 if upward else middle > gy1
+
+    def inside(box, r):
+        return (r.x0 < (box[0] + box[2]) / 2 < r.x1
+                and r.y0 < (box[1] + box[3]) / 2 < r.y1)
+
+    caption_size = _line_size(
+        {"lines": [ln for b in blocks for ln in b.get("lines") or ()]}, caption_box)
+    if figure and upward and _within(caption_size, body.size, _BODY_SIZE_TOL) and any(
+            inside(box, rect) and box[1] >= gy1 - 1 and caption_box[1] - box[3] <= _LINE_GAP
+            and n >= _PROSE_LINE_CHARS and _spans_column(box, body)
+            and _within(_line_size(b, box), body.size, _BODY_SIZE_TOL)
+            and not content(box)
+            for b, box, n in printed):
+        return None, HOLDS_PROSE
+    lines = [box for box in _body_lines(printed, body, content,
+                                        lambda box: figure and (
+                                            box[3] <= gy0 + 1 if upward
+                                            else box[1] >= gy1 - 1),
+                                        graphics, images)
+             if inside(box, rect)]
+    level = [b for b in lines if gy0 < (b[1] + b[3]) / 2 < gy1]
+    left = [b[2] for b in level if b[2] <= gx0 + _COLUMN_TOL]
+    right = [b[0] for b in level if b[0] >= gx1 - _COLUMN_TOL]
+    if (left or right) and not accepted(rect):
+        return rect, None
+    cut = fitz.Rect(max([rect.x0] + left), rect.y0, min([rect.x1] + right), rect.y1)
+    past = {b for b in lines if inside(b, cut) and beyond(b)}
+    if past:
+        run = sorted((box for b in blocks if b.get("type") == 0
+                      for box, _ in _lines(b) if inside(box, cut) and beyond(box)),
+                     key=lambda box: -box[3] if upward else box[1])
+        edge, widest = (gy0 if upward else gy1), float("-inf")
+        for box in run:
+            gap = edge - box[3] if upward else box[1] - edge
+            if gap >= widest:
+                widest, far = gap, min(box[3], gy0) if upward else max(box[1], gy1)
+            if box in past:
+                break
+            edge = min(edge, box[1]) if upward else max(edge, box[3])
+        cut = (fitz.Rect(cut.x0, max(cut.y0, far), cut.x1, cut.y1) if upward
+               else fitz.Rect(cut.x0, cut.y0, cut.x1, min(cut.y1, far)))
+    return (rect if any(inside(b, cut) for b in lines) else cut), None
 
 
 def _held_to_structure(page, parts: _Parts, boxes, column, top: float,
@@ -2092,27 +2252,42 @@ def _crop_problem(page, rect, kind: str, num, caption_box, body: Body,
     return None
 
 
+def _in_paragraph(box, lines) -> bool:
+    """Does another line of `lines` share some of the line `box`'s x-span -3 pt
+    to `_LINE_GAP` over or under it, as a paragraph's lines do?"""
+    return any(o != box and o[0] < box[2] and o[2] > box[0]
+               and (-3 <= box[1] - o[3] <= _LINE_GAP or -3 <= o[1] - box[3] <= _LINE_GAP)
+               for o in lines)
+
+
+def _by_graphic(box, graphic) -> bool:
+    """Is the line `box` `_near` `graphic`, within its x-span?"""
+    return (graphic[0] - _COLUMN_TOL <= box[0] and box[2] <= graphic[2] + _COLUMN_TOL
+            and _near(box, graphic))
+
+
+def _near(box, graphic) -> bool:
+    """Is the line `box` within `_PANEL_GAP` over or under `graphic`?"""
+    return -1 <= graphic[1] - box[3] <= _PANEL_GAP or -1 <= box[1] - graphic[3] <= _PANEL_GAP
+
+
 def _in_image_grid(box, images, lines) -> bool:
     """Is the line `box` print of a grid of `images`: set between two of its
     rows, under one image and over another that each share some of its
-    x-span, within the x-extent of those that do; or, with no other line of
-    `lines` sharing some of its x-span -3..4 pt over or under it (a
-    paragraph's), within `_PANEL_GAP` over or under one image of a row of two
-    or more, within its x-span?"""
+    x-span, within the x-extent of those that do; or, in no paragraph of
+    `lines` (`_in_paragraph`), by one image of a row of two or more
+    (`_by_graphic`)?"""
     beside = [i for i in images if i[0] < box[2] and i[2] > box[0]]
     if (any(i[3] <= box[1] + 1 for i in beside)
             and any(i[1] >= box[3] - 1 for i in beside)
             and box[0] >= min(i[0] for i in beside) - _COLUMN_TOL
             and box[2] <= max(i[2] for i in beside) + _COLUMN_TOL):
         return True
-    if any(o != box and o[0] < box[2] and o[2] > box[0]
-           and (-3 <= box[1] - o[3] <= 4 or -3 <= o[1] - box[3] <= 4) for o in lines):
+    if _in_paragraph(box, lines):
         return False
-    return any(i[0] - _COLUMN_TOL <= box[0] and box[2] <= i[2] + _COLUMN_TOL
-               and (-1 <= i[1] - box[3] <= _PANEL_GAP
-                    or -1 <= box[1] - i[3] <= _PANEL_GAP)
-               and any(j[1] < i[3] and j[3] > i[1]
-                       and (j[2] <= i[0] or j[0] >= i[2]) for j in images)
+    return any(_by_graphic(box, i) and any(j[1] < i[3] and j[3] > i[1]
+                                           and (j[2] <= i[0] or j[0] >= i[2])
+                                           for j in images)
                for i in images)
 
 

@@ -76,8 +76,17 @@ counts in the section the list sits in.
   it unrendered, such as a table with no ruled structure or a figure of text with
   no drawing), or the later pages of a table it crops on its first page only: that
   body counts as source prose;
-- whose PDF text a float's crop runs over (body prose beside a figure or under a
-  title block): that text, a heading aside, does not count.
+- whose PDF text a float's crop still runs over: a line of body text between the
+  float's graphics that the crop check lets through, text inside a drawing the
+  crop takes (an abstract boxed over a teaser), or a title block of small print
+  with no body line past it; that text, a heading aside, does not count. Body
+  prose beside a figure or past its graphics is cut off (`_clear_of_body`);
+- holding a figure whose own print that cut takes for body text: an unframed
+  legend or title line of the figure's own (a body-size legend of 40 or more
+  characters level with a plot, a small-print legend across the column wholly over
+  it, a row title off-centre from its plot frames) is left out of the image and
+  counts as source prose; a figure whose body-size caption sits within 4 pt under
+  a column-wide body line of its own is refused and reported unrendered.
 
 **A source is read by what it is, not by its name.** `--source` is a PDF (a URL
 or a local path) or an HTML page (a URL). It is fetched or read once and read as a

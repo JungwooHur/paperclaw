@@ -393,8 +393,8 @@ class TestFigureCaptionsInPdf:
     def test_a_sentence_ending_a_little_short_of_a_full_line_does_not_end_it(
             self, tmp_path):
         text = lines_at(tmp_path, [
-            ("Figure 1: Error of the estimator on the held-out part of each split,", 9, 255),
-            ("plotted against the number of samples for each model size.", 9, 253),
+            ("Figure 1: Error of the estimator on the held-out part of each split,", 9, 250),
+            ("plotted against the number of samples for each model size.", 9, 248),
             ("Each curve is one size of the training set over ten seeds.", 9, None)])
         assert "held-out part" not in text and "Each curve" not in text
 
