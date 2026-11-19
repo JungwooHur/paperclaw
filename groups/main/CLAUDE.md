@@ -339,8 +339,7 @@ use the tool above.
   **ar5iv** HTML instead of the mandated arxiv-native HTML, ar5iv's inline `[N]`
   citation *hyperlinks* flatten to text: the body fills with citation groups like
   `[ 1 https://ar5iv…#bib.bib1 , 2 https://…#bib.bib2 ]` and figure/table references
-  like `Figure 5 https://…#S5.F5`. Step 2-B's "strip `[12]` citations" rule never
-  matched this URL form. `clean_source_urls.py` now also strips it — bibliography
+  like `Figure 5 https://…#S5.F5`. `clean_source_urls.py` strips this form — bibliography
   citation groups removed entirely, and figure/table reference URLs dropped while
   the `Figure 5`/`Table 2` text is kept: `python3 research-papers/clean_source_urls.py
   --page <id> --apply`. **Prevent it upstream by sourcing arxiv-native HTML**
