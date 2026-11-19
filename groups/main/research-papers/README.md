@@ -57,18 +57,24 @@ body paragraph in its column and font size that starts within 26 pt below it (th
 grammar `_stitched` uses for crops). A SUMMARIZED or CONTENT_LOSS on a section right
 after such a caption deserves a hand check.
 
-**A source is read by what it is, not by its name.** `--source` is fetched once
-and read as a PDF when its first kilobyte holds `%PDF-` or it is served as
-`application/pdf` (`https://arxiv.org/pdf/<id>` has no `.pdf`), and as HTML when
-served as `text/html`. Anything else, a failed fetch or a missing file raises,
-naming the source. `--arxiv` for a paper arXiv has no HTML of still reports a WARN.
+**A source is read by what it is, not by its name.** `--source` is a PDF (a URL
+or a local path) or an HTML page (a URL). It is fetched or read once and read as a
+PDF when its first kilobyte holds `%PDF-` (`https://arxiv.org/pdf/<id>` has no
+`.pdf`), and a URL's body as HTML when served as `text/html` or
+`application/xhtml+xml`. Anything else (a local file that is no PDF, a body
+served as `application/pdf` that is none), a failed fetch or a missing file
+raises, naming the source. `--arxiv` for a paper arXiv has no HTML of still
+reports a WARN.
 
 **A heading is found in the source by its label and title words**, the label read
 as `section_key` reads it: `Appendix E. Title` is `E` + `Title` and `1) Title` is
-`1` + `Title`, so a source printing `E Title`, `Appendix E Title` or `1) Title`
-locates it. A section is measured only when it and the section after it are
-located, and the page's last section only when no located heading follows it: a
-heading found only in the table of contents would otherwise run to the end.
+`1` + `Title`, so a source printing `E Title`, `Appendix E Title`, `-E Title`
+(LaTeXML's IEEE appendices) or `1) Title` locates it. The label must open a line,
+so a cross-reference (`Results of Section 4.2 Title`, `(Table B.3)`) or a
+number ending in the label (`12 Title`) is no heading. A section is measured only
+when it and the section after it are located, and the page's last section only
+when no located heading follows it: a heading found only in the table of contents
+would otherwise run to the end.
 
 ## Batch queue sweeper
 

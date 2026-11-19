@@ -57,9 +57,11 @@ class TestASourceIsReadByWhatItIs:
         serve(monkeypatch, pdf_bytes(PDF_TEXT), "application/octet-stream")
         assert "prints in its body" in vs.load_source_text(URL, None)
 
-    def test_an_html_page_is_read_as_html(self, monkeypatch):
+    @pytest.mark.parametrize("content_type", ["text/html; charset=utf-8",
+                                              "application/xhtml+xml"])
+    def test_an_html_page_is_read_as_html(self, monkeypatch, content_type):
         serve(monkeypatch, b"<html><body><p>Body <b>text</b> here.</p></body></html>",
-              "text/html; charset=utf-8")
+              content_type)
         text = " ".join(vs.load_source_text("https://example.org/paper", None).split())
         assert "Body text here." in text
         assert "<p>" not in text
@@ -67,6 +69,11 @@ class TestASourceIsReadByWhatItIs:
     def test_a_body_neither_pdf_nor_html_raises(self, monkeypatch):
         serve(monkeypatch, b"%!PS-Adobe-3.0\n", "application/postscript")
         with pytest.raises(ValueError, match="example.org/pdf/paper.*postscript"):
+            vs.load_source_text(URL, None)
+
+    def test_a_body_served_as_a_pdf_that_is_not_one_raises(self, monkeypatch):
+        serve(monkeypatch, b"<html><body>Not Found</body></html>", "application/pdf")
+        with pytest.raises(ValueError, match="example.org/pdf/paper.*application/pdf"):
             vs.load_source_text(URL, None)
 
     def test_a_failed_fetch_raises_naming_the_url(self, monkeypatch):
@@ -115,6 +122,10 @@ class TestALabelIsNotATitleWord:
         assert [vs.section_key(h) for h in self.APPENDIX + self.NUMBERED] == [
             "D.1", "E", "1", "2"]
 
+    def test_a_capital_word_opening_an_unlabelled_heading_is_no_label(self):
+        assert vs.section_key("A New Approach (새 접근)") is None
+        assert vs.english_title("A New Approach (새 접근)") == "A New Approach"
+
     @pytest.mark.parametrize("printed", ["E Few-shot Exemplars",
                                          "Appendix E Few-shot Exemplars",
                                          "E. Few-shot Exemplars"])
@@ -140,9 +151,48 @@ class TestALabelIsFoundOnlyAsALabel:
 
     def test_neither_a_word_ending_in_the_letter_nor_an_article_is_a_label(self):
         d, e, a = prose(600), prose(700), prose(800)
-        f = ("This part describes the detailed results of a run in which we used a "
-             "network architecture of the same size. " + prose(500))
+        f = ("This part describes the detailed results of a run in which we used\n"
+             "a network architecture of the same size. " + prose(500))
         got = spans(self.HEADINGS, "D Setup\n" + d + "\nE Detailed Results\n" + e
                     + "\nA Network Architecture\n" + a + "\nF Compute\n" + f + "\n")
         for key, text in (("D", d), ("E", e), ("A", a)):
             assert got[key] is not None and abs(got[key] - len(text)) <= 40, (key, got)
+
+
+class TestAHeadingOpensItsLine:
+
+    def test_a_later_heading_citing_a_section_does_not_move_it(self):
+        headings = ["1 Introduction (서론)", "2 Widget Drift Model (위젯 드리프트 모델)",
+                    "Appendix A. Proofs of the Bounds (부록 A. 경계의 증명)",
+                    "Appendix B. Results of Section 2 (부록 B. 2절의 결과)"]
+        data, proofs, later = prose(600), prose(700), prose(800)
+        got = spans(headings, "1 Introduction\n" + prose(500) + "\n2 Widget Drift Model\n"
+                    + data + "\nA Proofs of the Bounds\n" + proofs
+                    + "\nB Results of Section 2 Widget Drift Model\n" + later + "\n")
+        for key, text in (("2", data), ("A", proofs), ("B", later)):
+            assert got[key] is not None and abs(got[key] - len(text)) <= 60, (key, got)
+
+    def test_a_label_inside_a_number_or_a_word_is_no_heading(self):
+        headings = ["1 Introduction (서론)", "2 Method Overview (방법 개요)",
+                    "Appendix E. Detailed Results (부록 E. 상세 결과)",
+                    "Appendix F. Compute (부록 F. 계산)"]
+        method, e = prose(600), prose(700)
+        f = prose(500) + "\n12 Method Overview\nBASELINE Detailed Results\n" + prose(200)
+        got = spans(headings, "1 Introduction\n" + prose(500) + "\n2 Method Overview\n"
+                    + method + "\nE Detailed Results\n" + e + "\nF Compute\n" + f + "\n")
+        for key, text in (("2", method), ("E", e)):
+            assert got[key] is not None and abs(got[key] - len(text)) <= 40, (key, got)
+
+    def test_a_dash_before_an_appendix_letter_is_part_of_its_label(self):
+        a, b = prose(600), prose(700)
+        got = spans(["A. Training Details (학습 세부사항)", "B. Extra Results (추가 결과)"],
+                    "-A Training Details\n" + a + "\n-B Extra Results\n" + b + "\n")
+        for key, text in (("A", a), ("B", b)):
+            assert got[key] is not None and abs(got[key] - len(text)) <= 40, (key, got)
+
+    def test_a_title_formula_the_source_spells_in_tex_is_skipped(self):
+        first, second = prose(600), prose(700)
+        got = spans(["1 Sampling 𝐱ₜ₋₁⁽ⁱ⁾ Exactly (정확한 샘플링)", "2 Results (결과)"],
+                    "1 Sampling \\mathbf{x}_{t-1}^{(i)} Exactly\n" + first
+                    + "\n2 Results\n" + second + "\n")
+        assert got["1"] is not None and abs(got["1"] - len(first)) <= 60, got

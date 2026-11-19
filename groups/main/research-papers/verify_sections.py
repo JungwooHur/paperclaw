@@ -133,16 +133,17 @@ _LETTERED_KEY = re.compile(r"[A-Z](?:[.-]\d+)*")
 
 
 def _heading_needle(key: str, title: str, n_words: int):
-    """Regex, matched with re.I, of a source heading: the label in its own case
-    and not inside a word, then the first `n_words` title words of over two
-    letters, up to 8 other words between two. None without a key or such words.
+    """Regex of a source heading that opens a line: an optional `Appendix`/`부록`
+    word or dash, the label (group `key`) in its own case, then the first
+    `n_words` title words of over two letters, up to 8 other words between two.
+    None without a key or such words.
     """
     words = [w for w in re.split(r"\W+", title) if len(w) > 2][:n_words]
     if not key or not words:
         return None
     gap = r"(?:\W+\w+){0,8}?\W+"
-    return (r"(?<!\w)(?-i:" + re.escape(key) + r")[.:)]?\s+"
-            + gap.join(re.escape(w) for w in words))
+    return (r"(?im)^[^\S\n]*(?:(?:appendix|부록)\s+)?-?(?P<key>(?-i:"
+            + re.escape(key) + r"))[.:)]?\s+" + gap.join(re.escape(w) for w in words))
 
 
 def _appendix_past(tail: str, ordered_sections: list) -> bool:
@@ -156,7 +157,7 @@ def _appendix_past(tail: str, ordered_sections: list) -> bool:
         if not _LETTERED_KEY.fullmatch(key or "") or key == "I":
             continue
         needle = _heading_needle(key, title, 4)
-        if needle and re.search(r"\n\s*(?:appendix\s+)?" + needle, tail, re.I):
+        if needle and re.search(needle, tail):
             return True
     return False
 
@@ -556,11 +557,13 @@ def _fetch(url: str):
 
 
 def load_source_text(source: str | None, arxiv: str | None):
-    """The source's text: arXiv's HTML of `arxiv`, else the PDF or HTML page at
-    `source`, a URL or a local file.
+    """The source's text: arXiv's HTML of `arxiv`, else `source`, a PDF at a URL
+    or a local path, or an HTML page (text/html or application/xhtml+xml) at a
+    URL.
 
-    None when neither is given, or when arXiv has no HTML of the paper. Raises
-    when `source` cannot be read or is neither a PDF nor HTML.
+    A PDF is known by `%PDF-` in its first kilobyte. None when neither is given,
+    or when arXiv has no HTML of the paper. Raises when `source` cannot be read
+    or is none of these.
     """
     if arxiv:
         return source_text_from_arxiv(arxiv)
@@ -571,7 +574,7 @@ def load_source_text(source: str | None, arxiv: str | None):
     else:
         with open(source, "rb") as f:
             body, content_type = f.read(), None
-    if b"%PDF-" in body[:1024] or content_type == "application/pdf":
+    if b"%PDF-" in body[:1024]:
         return source_text_from_pdf(body)
     if content_type in ("text/html", "application/xhtml+xml"):
         return _strip_html(body.decode("utf-8", "ignore"))
@@ -651,31 +654,11 @@ def source_section_chars(full_text: str, ordered_sections: list) -> dict:
         needle = _heading_needle(key, title, 6)
         if not needle:
             continue
-        # Join the kept words allowing a few SKIPPED short words between them.
-        # The old needle dropped words of <=2 chars and then glued the rest with
-        # `\W+`, which cannot span the word it just dropped: a title such as
-        # "Properties of the Method" became `properties\W+method` and never
-        # matched, so that heading was NOT
-        # FOUND and its span silently merged into the previous section — doubling
-        # the previous section's measured source length and firing SUMMARIZED at a
-        # translation that was actually complete (one real section measured 5622
-        # source chars against a true span of 2629).
-        # Allow more skipped words between the label and the title words. A title
-        # carrying maths spans several tokens in the source, which reads each
-        # formula as its TeX (`_strip_html`): "VI The ψ₀.₇ Model…" is "VI The
-        # \psi_{0.7} Model…" there: three tokens to skip for a heading written in
-        # Unicode, whose formula gives the needle no word, while a heading that
-        # keeps the TeX (`\psi_{0.7}`) finds its own words in it. When the source
-        # still carried the rendered form beside the TeX, a 3-word allowance
-        # located neither VI nor VII, and their spans merged into the previous
-        # section, which reported a SUMMARIZED that was not real (on that text 3
-        # and 5 found nothing, 8 found both). Longer formulas skip more, so the
-        # allowance stays at 8.
         last = None
-        for mm in re.finditer(needle, body, re.I):
+        for mm in re.finditer(needle, body):
             last = mm
         if last:
-            found.append((key, last.start()))
+            found.append((key, last.start("key")))
     # A span is trustworthy only when BOTH ends are known. Using "the next located
     # heading" let an unlocated section hand its text to the one before it: on one
     # paper 4.1 measured 15,449 chars because 4.2-4.5 could not be found, and the

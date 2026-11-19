@@ -5,6 +5,7 @@ It used to pipe the body to `check-sensitive.sh --msg /dev/stdin`, which exits
 These tests pin that each of its three checks fires, and that a report carries
 labels, never the text it found.
 """
+import io
 import json
 import os
 import stat
@@ -152,3 +153,21 @@ def test_short_text_needs_no_oracle(tmp_path, monkeypatch):
     cpb = _scanner(tmp_path, monkeypatch)
     assert not cpb.could_hold_a_title("feat: add a guard")
     assert cpb.could_hold_a_title(TITLE)
+
+
+def test_an_appendix_heading_blocks_a_body_that_quotes_it_with_its_label(
+        tmp_path, monkeypatch):
+    cpb = _scanner(tmp_path, monkeypatch, NOTION_TOKEN="fake-token-123456",
+                   NOTION_RESEARCH_DB="fake-db-1")
+    import verify_sections
+    heading = "Appendix I Widget Calibration (부록 I 위젯 보정)"
+    query = json.dumps({"results": [{"id": "page-1"}]}).encode()
+    monkeypatch.setattr(cpb.urllib.request, "urlopen",
+                        lambda req, timeout: io.BytesIO(query))
+    monkeypatch.setattr(verify_sections, "fetch_blocks", lambda page_id: [
+        {"type": "heading_2",
+         "heading_2": {"rich_text": [{"plain_text": heading}]}}])
+    titles = cpb.known_section_titles()
+    problems = dict(cpb.scan("fixes Appendix I Widget Calibration\n", titles,
+                             [], patterns=False))
+    assert "paper content" in problems
