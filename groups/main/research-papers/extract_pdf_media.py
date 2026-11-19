@@ -202,7 +202,7 @@ def base_kind(kind: str) -> str:
     return kind[len(ED_PREFIX):] if kind.startswith(ED_PREFIX) else kind
 
 
-def _read_label(text: str, sentence_ok: bool):
+def _read_label(text: str, sentence_ok: bool, continued: bool = False):
     """(kind, label) of the float label `text` opens with, or None.
 
     The label is an int for a number (a roman table number included) and the
@@ -210,8 +210,8 @@ def _read_label(text: str, sentence_ok: bool):
     `sentence_ok` false, a label with no separator that runs on into
     lower-case words or a comma opens a sentence, and a suffixed one with no
     separator a citation of a panel (`Fig. 1d` in a cell), not a caption. A
-    label followed by `continued` heads a table's later part,
-    not its caption.
+    label followed by `continued` (`_CONTINUED`) heads a table's later part:
+    read only with `continued` true, which reads no other label.
     """
     found = _CAPTION.match(text or "")
     if not found:
@@ -230,9 +230,24 @@ def _read_label(text: str, sentence_ok: bool):
             and (found.group("suffix")
                  or _SENTENCE_GOES_ON.match(text, found.end()))):
         return None
-    if _CONTINUED.match(text, found.end()):
+    if bool(_CONTINUED.match(text, found.end())) != continued:
         return None
     return (ED_PREFIX + base if found.group("ed") else base), label
+
+
+def continued_kind(text: str):
+    """(kind, label) of the float whose later part the PDF text `text` heads
+    (`Table 3 (continued)`, `Table 12 – Continued from previous page`), or
+    None."""
+    return _read_label(text, sentence_ok=True, continued=True)
+
+
+def continued_caption(kind: str, num, roman: str) -> str:
+    """The caption `inject` gives each later page's image of table `kind num`,
+    `roman` its printed numeral (`caption_numeral`): `Table 12 (continued)`,
+    `Extended Data Table IV (continued)`; `continued_kind` reads it back."""
+    ed = "Extended Data " if kind.startswith(ED_PREFIX) else ""
+    return f"{ed}Table {roman.upper() or num} (continued)"
 
 
 def caption_numeral(text: str) -> str:
@@ -677,7 +692,8 @@ def caption_boxes(page, kind: str, num) -> list:
 
 def caption_regions(page, blocks) -> list:
     """Box of every float caption among this page's text `blocks` (its
-    `get_text("dict")` blocks), figure or table (`_stitched`).
+    `get_text("dict")` blocks), figure or table (`_stitched`), and of every
+    line heading a table's later part (`continued_kind`).
 
     A caption opens a block, or follows short lines the PDF set in the same
     block (the figure's own labels: axis titles, `log(N)`; a short caption),
@@ -694,6 +710,8 @@ def caption_regions(page, blocks) -> list:
     for i, b in enumerate(blocks):
         for n, ln in enumerate(b["lines"]):
             text = _block_text({"lines": [ln]})
+            if continued_kind(text):
+                out.append(tuple(ln["bbox"]))
             small = _body_size([{"type": 0, "lines": [ln]}]) < body - _BODY_SIZE_TOL
             if caption_kind(text) and (_separated(text) or small):
                 head = dict(b, lines=b["lines"][n:],
@@ -1589,6 +1607,7 @@ HOLDS_CAPTION = "the crop holds another float's caption"
 HOLDS_HEADING = "the crop holds a heading"
 HOLDS_FLOAT = "the crop holds another caption's ruled float"
 RUNS_ON = "a ruled block no caption claims follows the table"
+MEETS_FLOAT = "the crop meets another float on its page"
 
 
 def float_crop(page, kind: str, num, band=(float("-inf"), float("inf")),
@@ -2365,27 +2384,154 @@ class ReadOnce:
         return self._once("bboxlog", self._page.get_bboxlog)
 
 
+def _text_lines(page) -> list:
+    """Boxes of the page's text lines."""
+    return [tuple(ln["bbox"]) for b in page.get_text("dict")["blocks"]
+            if b.get("type") == 0 for ln in b["lines"]]
+
+
+def _continued_header(page, kind: str, num):
+    """Box of the line on `page` heading a later part of `kind num`
+    (`continued_kind`), or None."""
+    for b in page.get_text("dict")["blocks"]:
+        for ln in b.get("lines", ()) if b.get("type") == 0 else ():
+            if continued_kind(_block_text({"lines": [ln]})) == (kind, num):
+                return tuple(ln["bbox"])
+    return None
+
+
+def _ends_page(page, rect, band) -> bool:
+    """Does the crop `rect` end its page's text: no text line centred under it,
+    across its x-span, over the foot of `band` (`furniture_band`)?"""
+    return not any(rect[3] < (ln[1] + ln[3]) / 2 < band[1]
+                   and ln[0] < rect[2] and ln[2] > rect[0]
+                   for ln in _text_lines(page))
+
+
+def _columns(page, box) -> list:
+    """[x0, x1] of each column of the table in `box`: the merged x-spans of
+    the cells of its rows holding the most cells. A row is the lines in `box`
+    whose centres lie within `_ROW_TOL`, and a cell its lines standing under
+    `_CELL_GAP` apart."""
+    lines = sorted(((ln[1] + ln[3]) / 2, ln[0], ln[2]) for ln in _text_lines(page)
+                   if _contains(box, ln))
+    rows, i = [], 0
+    while i < len(lines):
+        j = i
+        while j + 1 < len(lines) and lines[j + 1][0] - lines[i][0] <= _ROW_TOL:
+            j += 1
+        cells = []
+        for _, x0, x1 in sorted(lines[i:j + 1], key=lambda ln: ln[1]):
+            if cells and x0 - cells[-1][1] < _CELL_GAP:
+                cells[-1][1] = max(cells[-1][1], x1)
+            else:
+                cells.append([x0, x1])
+        rows.append(cells)
+        i = j + 1
+    most = max(map(len, rows), default=0)
+    merged = []
+    for x0, x1 in sorted(c for r in rows if len(r) == most for c in r):
+        if merged and x0 <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], x1)
+        else:
+            merged.append([x0, x1])
+    return merged
+
+
+def _rows_atop(page, band, last, own) -> tuple:
+    """A box just over the rules of the table rows that open `page` and go on
+    from `last` ((page, rect, band, part) of the part before, on the page
+    before), else None.
+
+    They do when that part ends its page's text (`_ends_page`) and the first
+    print across their x-span under the head of `band` is a ruled float
+    (`_ruled_floats`) whose rules start and end within `_RULE_ALIGN` of the
+    part's, its columns (`_columns`) as many as the part's, two or more, each
+    over its own, that no caption on `page` sits within `_CAP_GAP` under and no
+    crop of `own` (this page's crops) meets.
+    """
+    before, rect, before_band, _ = last
+    if not _ends_page(before, rect, before_band):
+        return None
+    ruled = [r for r in _ruled_floats([tuple(d["rect"]) for d in before.get_cdrawings()])
+             if _contains(rect, r)]
+    if not ruled:
+        return None
+    x0, x1 = min(r[0] for r in ruled), max(r[2] for r in ruled)
+    floats = sorted(_ruled_floats([tuple(d["rect"]) for d in page.get_cdrawings()]),
+                    key=lambda r: r[1])
+    lines = _text_lines(page)
+    first = next((r for r in floats if r[0] < x1 and r[2] > x0), None)
+    if (first is None or abs(first[0] - x0) > _RULE_ALIGN
+            or abs(first[2] - x1) > _RULE_ALIGN
+            or any(band[0] < (ln[1] + ln[3]) / 2 < first[1]
+                   and ln[0] < first[2] and ln[2] > first[0] for ln in lines)):
+        return None
+    if _captions_under(page, first) or _meets_crop(first, own):
+        return None
+    was, now = _columns(before, rect), _columns(page, first)
+    if len(now) < 2 or len(now) != len(was) or any(
+            min(a[1], b[1]) <= max(a[0], b[0]) for a, b in zip(was, now)):
+        return None
+    return first[0], first[1] - _RULE_TOUCH - 1, first[2], first[1] - _RULE_TOUCH
+
+
+def _captions_under(page, box) -> set:
+    """(kind, label) of each caption (`caption_kind`) whose block opens within
+    `_CAP_GAP` under `box`, across its x-span."""
+    return {seen for b in page.get_text("dict")["blocks"] if b.get("type") == 0
+            for seen in [caption_kind(_block_text(b))]
+            if seen and box[3] - 0.5 <= b["bbox"][1] <= box[3] + _CAP_GAP
+            and _across(box, b["bbox"])}
+
+
+def _meets_crop(box, crops) -> bool:
+    """Does `box` overlap the rect of any of `crops` (`float_crops`' tuples)?"""
+    return any(c[2] is not None and _overlaps(c[2], box) for c in crops)
+
+
+def _continuation(page, kind: str, num, band, body: Body, last, own) -> tuple:
+    """(rect, problem) of the part of `kind num` on `page` that goes on from
+    `last` ((page, rect, band, part) of its part on the page before), as
+    `_crop_at` gives it from the line heading it (`_continued_header`), else
+    from just over its rows (`_rows_atop`); (None, None) when the page holds
+    none. `own` is this page's crops; a crop that overlaps one of them or that
+    another float's caption sits under (`_captions_under`) is `MEETS_FLOAT`.
+    """
+    start = _continued_header(page, kind, num) or _rows_atop(page, band, last, own)
+    if start is None:
+        return None, None
+    rect, problem = _crop_at(page, start, kind, num, band, body)
+    if rect is not None and (_meets_crop(rect, own)
+                             or _captions_under(page, rect) - {(kind, num)}):
+        return None, MEETS_FLOAT
+    return rect, problem
+
+
 def float_crops(doc, kinds=("figure", "table"), wanted=None, body: Body = None):
     """Yield (page, crops) for each page of `doc` (a document or its pages, in
     order).
 
-    crops lists (kind, label, rect, problem, caption), as `float_crop` gives
-    them, for each label a caption line on the page introduces
-    (`caption_kind`) that no earlier page cropped, of a kind in `kinds` and,
-    when `wanted` (`ef._label_key`s) is given, a figure in it. `body` is the
-    document's (`body_text`), computed here when not given.
+    crops lists (kind, label, rect, problem, caption, part). Part 0 is each
+    label a caption line on the page introduces (`caption_kind`) that no
+    earlier page cropped, of a kind in `kinds` and, when `wanted`
+    (`ef._label_key`s) is given, a figure in it, as `float_crop` gives it.
+    Part n > 0 is a table's part on the page after its part n - 1
+    (`_continuation`), caption None. `body` is the document's (`body_text`),
+    computed here when not given.
     """
     heads, feet = learn_furniture(doc)
     if body is None:
         body = body_text(doc)
-    found = set()
+    found, running = set(), {}
     for page in doc:
         labels = []
         for b in page.get_text("dict")["blocks"]:
             seen = caption_kind(_block_text(b)) if b.get("type") == 0 else None
             if seen is not None and seen not in labels:
                 labels.append(seen)
-        crops, band = [], furniture_band(page, heads, feet) if labels else None
+        band = furniture_band(page, heads, feet) if labels or running else None
+        crops, ran = [], {}
         for kind, num in labels:
             if wanted is not None and (kind != "figure"
                                        or ef._label_key(num) not in wanted):
@@ -2398,7 +2544,16 @@ def float_crops(doc, kinds=("figure", "table"), wanted=None, body: Body = None):
                                    "caption read but not found")
             if rect is not None:
                 found.add((kind, num))
-            crops.append((kind, num, rect, problem, caption))
+                ran[(kind, num)] = (page, rect, band, 0)
+            crops.append((kind, num, rect, problem, caption, 0))
+        for (kind, num), last in running.items():
+            rect, problem = _continuation(page, kind, num, band, body, last, crops)
+            if rect is None and problem is None:
+                continue
+            if rect is not None:
+                ran[(kind, num)] = (page, rect, band, last[3] + 1)
+            crops.append((kind, num, rect, problem, None, last[3] + 1))
+        running = {k: v for k, v in ran.items() if base_kind(k[0]) == "table"}
         yield page, crops
 
 
@@ -2406,11 +2561,12 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
                  only: set = None, unrendered: list = None) -> dict:
     """Render every figure/table found in the PDF (`float_crops`).
 
-    Returns {(kind, label): {"path", "page", "caption", "box", "roman"}}, the
-    label as `caption_kind` reads it and "roman" its numeral as printed
-    (`caption_numeral`). A label is rendered from the FIRST page whose
-    caption line introduces it, so a body reference ("as Figure 3 shows") never
-    wins over the real caption.
+    Returns {(kind, label): {"path", "page", "caption", "box", "roman",
+    "continued"}}, the label as `caption_kind` reads it, "roman" its numeral
+    as printed (`caption_numeral`) and "continued" [{"path", "page", "box"}]
+    of each later page of a table (`float_crops`' parts), in page order. A
+    label is rendered from the FIRST page whose caption line introduces it, so
+    a body reference ("as Figure 3 shows") never wins over the real caption.
 
     `only` restricts rendering to those figure labels — used to fill the specific
     figures the HTML could not supply, without re-rendering the ones it already
@@ -2418,7 +2574,8 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
 
     Every caption found with no crop (`float_crop`'s problem) is printed to
     stderr and appended to `unrendered` as {"kind", "label", "page",
-    "problem"}, unless the label is rendered from another page.
+    "problem"}, unless the label is rendered from another page; a later part
+    with no crop, with its "part" too.
     """
     import fitz
 
@@ -2427,29 +2584,41 @@ def render_media(pdf_path: str, out_dir: str, kinds=("figure", "table"),
     wanted = None if only is None else {ef._label_key(n) for n in only}
     doc = fitz.open(pdf_path)
     try:
-        found, missed = {}, {}
+        found, missed, parts_missed = {}, {}, []
         for page, crops in float_crops(doc, kinds, wanted):
-            for kind, num, rect, problem, caption in crops:
+            for kind, num, rect, problem, caption, part in crops:
+                where = {"kind": kind, "label": num, "page": page.number + 1}
                 if rect is None:
-                    missed.setdefault((kind, num), {
-                        "kind": kind, "label": num, "page": page.number + 1,
-                        "problem": problem})
+                    if part:
+                        parts_missed.append(dict(where, problem=problem, part=part))
+                    else:
+                        missed.setdefault((kind, num), dict(where, problem=problem))
                     continue
-                out = os.path.join(out_dir, f"{kind}{num}.png")
+                out = os.path.join(out_dir, f"{kind}{num}"
+                                   + (f"-{part + 1}" if part else "") + ".png")
                 zoom = _DPI / 72.0
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
                                       clip=rect, alpha=False)
                 pix.save(out)
+                image = {"path": out, "page": page.number + 1,
+                         "box": [round(v, 1) for v in rect]}
+                if part:
+                    found[(kind, num)]["continued"].append(image)
+                    continue
                 cap = re.sub(r"\s+", " ", caption).strip()
-                found[(kind, num)] = {"path": out, "page": page.number + 1,
-                                      "caption": cap[:1900],
-                                      "box": [round(v, 1) for v in rect],
-                                      "roman": caption_numeral(caption)}
+                found[(kind, num)] = dict(image, caption=cap[:1900],
+                                          roman=caption_numeral(caption),
+                                          continued=[])
         for key, item in missed.items():
             if key in found:
                 continue
             print(f"WARN {item['kind']} {item['label']} on page {item['page']}: "
                   f"{item['problem']}; not rendered", file=sys.stderr)
+            if unrendered is not None:
+                unrendered.append(item)
+        for item in parts_missed:
+            print(f"WARN {item['kind']} {item['label']} part {item['part']} on page "
+                  f"{item['page']}: {item['problem']}; not rendered", file=sys.stderr)
             if unrendered is not None:
                 unrendered.append(item)
         return found
@@ -2493,7 +2662,7 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     def _img_kind(b):
         # Extended Data is counted apart: a page holding the main figures says
         # nothing about whether its Extended Data figures are there.
-        seen = image_label(_img_caption(b))
+        seen = image_label(_img_caption(b)) or continued_kind(_img_caption(b))
         return seen[0] if seen else "figure"
 
     # Count/replace images ANYWHERE on the page, not just at top level — see
@@ -2578,15 +2747,25 @@ def inject(page_id: str, source: str, apply: bool = False, force: bool = False,
     for key in order:
         children = []
         for kind, num, item in groups[key]:
+            images = [item] + item["continued"]
+            captions = [item["caption"]] + [
+                continued_caption(kind, num, item["roman"])] * len(item["continued"])
             if not apply:
-                children.append({"_kind": kind, "_num": num, "_after": key})
-                rep["planned"].append({"kind": kind, "label": num, "after": key})
+                for part, caption in enumerate(captions):
+                    children.append({"_kind": kind, "_num": num, "_after": key})
+                    rep["planned"].append({"kind": kind, "label": num, "after": key}
+                                          | ({"part": part, "caption": caption}
+                                             if part else {}))
                 continue
-            fid = upload_image(item["path"])
-            if not fid:
+            fids = []
+            for image in images:
+                fids.append(upload_image(image["path"]))
+                time.sleep(0.2)
+            if not all(fids):
+                rep.setdefault("not_uploaded", []).append({"kind": kind, "label": num})
                 continue
-            children.append(ef._image_block(fid, item["caption"]))
-            time.sleep(0.2)
+            children += [ef._image_block(fid, caption)
+                         for fid, caption in zip(fids, captions)]
         if not children:
             continue
         rep["placed"] += len(children)
@@ -2675,9 +2854,9 @@ def _media_text(pdf_path: str, media: dict) -> str:
     doc = fitz.open(pdf_path)
     try:
         parts = []
-        for item in media.values():
-            pno = item.get("page", 0) - 1
-            box = item.get("box")
+        for image in (i for item in media.values() for i in [item] + item["continued"]):
+            pno = image.get("page", 0) - 1
+            box = image.get("box")
             if not box or not (0 <= pno < doc.page_count):
                 continue
             parts.append(doc[pno].get_text(clip=fitz.Rect(*box)))

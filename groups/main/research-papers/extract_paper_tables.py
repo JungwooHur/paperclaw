@@ -85,8 +85,11 @@ def caption_number(cap: str):
 
 
 def is_table_key(key: str) -> bool:
-    """A caption key this injector could have written: every one opens "table"."""
-    return key.startswith("table")
+    """A caption key this injector could have written: every one opens "table",
+    and none is a later page's (`extract_pdf_media.continued_caption`)."""
+    import extract_pdf_media
+
+    return key.startswith("table") and not extract_pdf_media.continued_kind(key)
 
 
 def table_repeats(blocks: list) -> int:

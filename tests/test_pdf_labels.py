@@ -240,7 +240,7 @@ class TestOrderingMixedLabels:
         monkeypatch.setattr(vs, "fetch_blocks", lambda _: blocks)
         monkeypatch.setattr(pm, "fetch_pdf", lambda *_: "paper.pdf")
         media = {key: {"path": "x.png", "page": 1, "caption": "c", "box": [0, 0, 1, 1],
-                       "roman": ""}
+                       "roman": "", "continued": []}
                  for key in (("figure", "S2"), ("table", "A.1"), ("figure", 2))}
         monkeypatch.setattr(pm, "render_media", lambda *a, **k: dict(media))
         rep = pm.inject("p", "paper.pdf", apply=False, keep_text=True)
@@ -315,7 +315,7 @@ class TestRomanTables:
         monkeypatch.setattr(vs, "fetch_blocks", lambda _: self.BLOCKS)
         monkeypatch.setattr(pm, "fetch_pdf", lambda *_: "paper.pdf")
         media = {("table", 4): {"path": "x.png", "page": 1, "caption": "c",
-                                "box": [0, 0, 1, 1], "roman": "iv"}}
+                                "box": [0, 0, 1, 1], "roman": "iv", "continued": []}}
         monkeypatch.setattr(pm, "render_media", lambda *a, **k: dict(media))
         rep = pm.inject("p", "paper.pdf", apply=False, keep_text=True,
                         kinds=("table",))
@@ -347,6 +347,102 @@ class TestContinuedTables:
         doc.save(path)
         media = pm.render_media(str(path), str(tmp_path / "out"))
         assert media[("table", 7)]["page"] == 2
+
+
+class TestAContinuedTableOnThePage:
+    """A table cropped on several pages is one image per page, in page order:
+    the first carries the table's caption, each later one `Table N
+    (continued)`."""
+
+    BLOCKS = [para("p", "본문 " * 600), para("m", "Table 3 shows the errors.")]
+    MEDIA = {("table", 3): {
+        "path": "t.png", "page": 2, "caption": "Table 3: Errors.", "box": [0, 0, 1, 1],
+        "roman": "", "continued": [{"page": 3, "box": [0, 0, 1, 1], "path": "t-2.png"},
+                                   {"page": 4, "box": [0, 0, 1, 1], "path": "t-3.png"}]}}
+
+    def inject(self, monkeypatch, blocks, apply, upload=lambda path: "id-" + path,
+               force=False):
+        import notion_upload
+        import translate_fulltext
+
+        sent = []
+        monkeypatch.setattr(vs, "fetch_blocks", lambda _: blocks)
+        monkeypatch.setattr(pm, "fetch_pdf", lambda *_: "paper.pdf")
+        monkeypatch.setattr(pm, "render_media", lambda *a, **k: dict(self.MEDIA))
+        monkeypatch.setattr(notion_upload, "upload_image", upload)
+        monkeypatch.setattr(translate_fulltext, "notion",
+                            lambda method, path, body=None: sent.append(
+                                (method, path, body)) or {})
+        monkeypatch.setattr("time.sleep", lambda _: None)
+        rep = pm.inject("p", "paper.pdf", apply=apply, force=force, keep_text=True,
+                        kinds=("table",))
+        return rep, sent
+
+    def placed(self, monkeypatch):
+        """The image blocks an applied run writes, as a page read returns them."""
+        _, sent = self.inject(monkeypatch, self.BLOCKS, apply=True)
+        ((_, _, body),) = sent
+        return [image(f"i{n}", "".join(c["text"]["content"]
+                                       for c in child["image"].get("caption", [])))
+                for n, child in enumerate(body["children"])]
+
+    def test_a_dry_run_plans_each_page_after_its_mention(self, monkeypatch):
+        rep, _ = self.inject(monkeypatch, self.BLOCKS, apply=False)
+        assert rep["planned"] == [
+            {"kind": "table", "label": 3, "after": "m"},
+            {"kind": "table", "label": 3, "after": "m", "part": 1,
+             "caption": "Table 3 (continued)"},
+            {"kind": "table", "label": 3, "after": "m", "part": 2,
+             "caption": "Table 3 (continued)"}]
+        assert rep["found"] == 1 and rep["placed"] == 3
+
+    def test_the_first_image_carries_the_caption_and_each_later_one_its_label(
+            self, monkeypatch):
+        rep, sent = self.inject(monkeypatch, self.BLOCKS, apply=True)
+        ((_, _, body),) = sent
+        images = [c["image"] for c in body["children"]]
+        assert [i["file_upload"]["id"] for i in images] == [
+            "id-t.png", "id-t-2.png", "id-t-3.png"]
+        assert [i["caption"][0]["text"]["content"] for i in images] == [
+            "Table 3: Errors.", "Table 3 (continued)", "Table 3 (continued)"]
+        assert body["after"] == "m" and rep["placed"] == 3
+
+    @pytest.mark.parametrize("kind, num, roman, caption", [
+        ("table", 4, "iv", "Table IV (continued)"),
+        ("ed_table", 2, "", "Extended Data Table 2 (continued)"),
+        ("table", "A.1", "", "Table A.1 (continued)")])
+    def test_a_later_image_carries_the_tables_own_label(self, kind, num, roman,
+                                                         caption):
+        assert pm.continued_caption(kind, num, roman) == caption
+        assert pm.continued_kind(caption) == (kind, num)
+
+    def test_a_float_with_an_image_that_fails_to_upload_is_reported(self, monkeypatch):
+        rep, sent = self.inject(monkeypatch, self.BLOCKS, apply=True,
+                                upload=lambda path: None if path == "t-2.png" else "id")
+        assert sent == [] and rep["placed"] == 0
+        assert rep["not_uploaded"] == [{"kind": "table", "label": 3}]
+
+    def test_its_images_are_no_figures_to_the_figure_injector(self, monkeypatch):
+        blocks = self.BLOCKS + self.placed(monkeypatch)
+        monkeypatch.setattr(vs, "fetch_blocks", lambda _: blocks)
+        monkeypatch.setattr(ef, "fetch_html", lambda _: (None, None))
+        rep = ef.inject_figures("p", "<arxiv-id>")
+        assert rep["existing_images"] == 0 and not rep["skipped_existing"]
+
+    def test_its_images_count_as_that_table(self, monkeypatch):
+        blocks = self.BLOCKS + self.placed(monkeypatch)
+        rep, _ = self.inject(monkeypatch, blocks, apply=False)
+        assert rep["existing"] == {"table": 3, "ed_table": 0}
+        assert rep["kinds"] == ["ed_table"]
+
+    def test_force_tables_only_replaces_its_images_and_keeps_one_placed_by_hand(
+            self, monkeypatch):
+        blocks = (self.BLOCKS[:1] + [image("hand", "")] + self.placed(monkeypatch)
+                  + [image("hand2", ""), self.BLOCKS[1]])
+        rep, sent = self.inject(monkeypatch, blocks, apply=True, force=True)
+        archived = [path for method, path, body in sent if body == {"archived": True}]
+        assert archived == ["/blocks/i0", "/blocks/i1", "/blocks/i2"]
+        assert rep["replaced"] == 3 and rep["existing"]["figure"] == 2
 
 
 class TestWhatRenderMediaReports:

@@ -12,8 +12,9 @@ in one of four categories:
   removed    rendered on the base only
   relabeled  a removed float and an added one of the same kind on the same
              page whose boxes mostly overlap: one float read under a new label
-  changed    rendered on both, on another page or with a box that moved
-  same       rendered on both with the same box
+  changed    rendered on both, on another page, with a box that moved or with
+             other later pages (`render_media`'s "continued")
+  same       rendered on both with the same box and later pages
 
 A caption a side reads (its own `caption_kind`) and renders nothing for is
 that side's `unrendered`, with the problem it reported (None when it reported
@@ -26,7 +27,7 @@ Written under `--out`:
                                  "unrendered": {side: {key: {page, problem}}}}}
   sheets/<category>-NN.png  one row per float: its page with the base box in red
                           and the branch box in green, then the base crop and
-                          the branch crop
+                          the branch crop; then one row per later page of it
 
 The base side is cached by commit under `<out>/base-<sha>/`, so rerunning after
 a change to the work tree renders only the branch side again.
@@ -80,6 +81,11 @@ def _kind(key: str) -> str:
     return key.split("|", 1)[0]
 
 
+def _moved(a: dict, b: dict, tol: float) -> bool:
+    """Are the images `a` and `b` on other pages or boxes more than `tol` apart?"""
+    return a["page"] != b["page"] or any(abs(d) > tol for d in delta(a["box"], b["box"]))
+
+
 def compare(base: dict, branch: dict, tol: float = BOX_TOL) -> dict:
     """{category: [row]} for two `render_one` results of one PDF.
 
@@ -99,7 +105,8 @@ def compare(base: dict, branch: dict, tol: float = BOX_TOL) -> dict:
             out["removed"].append(row)
             continue
         row["delta"] = delta(a["box"], b["box"])
-        moved = a["page"] != b["page"] or any(abs(d) > tol for d in row["delta"])
+        moved = (_moved(a, b, tol) or len(a["continued"]) != len(b["continued"])
+                 or any(_moved(x, y, tol) for x, y in zip(a["continued"], b["continued"])))
         out["changed" if moved else "same"].append(row)
     for gone in list(out["removed"]):
         twins = [new for new in out["added"]
@@ -123,8 +130,11 @@ def compare(base: dict, branch: dict, tol: float = BOX_TOL) -> dict:
 def render_one(scripts_dir: str, pdf: str, out_dir: str) -> dict:
     """Runs `render_media` from `scripts_dir` on `pdf` in this process.
 
-    Returns {"media": {key: {page, box, path}}, "unrendered": {key: {page,
-    problem}}}.
+    Returns {"media": {key: {page, box, path, continued}}, "unrendered":
+    {key: {page, problem}}}; "continued" is [{page, box, path}] of each later
+    page of the float, none from a side whose `render_media` crops no later
+    page. A later page reported with no crop is unrendered under
+    `<key> part <n>`.
     """
     import inspect
 
@@ -142,10 +152,14 @@ def render_one(scripts_dir: str, pdf: str, out_dir: str) -> dict:
     else:
         media = pm.render_media(pdf, out_dir)
     media = {key_of(kind, label): {"page": item["page"], "box": item["box"],
-                                   "path": item["path"]}
+                                   "path": item["path"],
+                                   "continued": item.get("continued", [])}
              for (kind, label), item in media.items()}
-    problems = {key_of(u["kind"], u["label"]): u["problem"] for u in reported}
-    unrendered = {}
+    problems = {key_of(u["kind"], u["label"]): u["problem"] for u in reported
+                if "part" not in u}
+    unrendered = {f"{key_of(u['kind'], u['label'])} part {u['part']}":
+                  {"page": u["page"], "problem": u["problem"]}
+                  for u in reported if "part" in u}
     with fitz.open(pdf) as doc:
         for pno in range(doc.page_count):
             for b in doc[pno].get_text("dict")["blocks"]:
@@ -253,6 +267,19 @@ def _row(sheet, y: float, pdf: str, row: dict, doc_cache: dict) -> None:
         x += _CROP_WIDTH + 12
 
 
+def part_rows(row: dict) -> list:
+    """A sheet row (`compare`'s) for each later page of `row`'s float, the
+    sides' later pages matched in order; key `<key> part <n>`."""
+    sides = [row[s]["continued"] if row[s] else [] for s in ("base", "branch")]
+    out = []
+    for n in range(max(map(len, sides))):
+        a, b = (side[n] if n < len(side) else None for side in sides)
+        out.append({"key": f"{row['key']} part {n + 1}", "page": (b or a)["page"],
+                    "base": a, "branch": b,
+                    "delta": delta(a["box"], b["box"]) if a and b else None})
+    return out
+
+
 def contact_sheets(report: dict, pdfs: dict, out_dir: str, per_sheet: int) -> list:
     """Writes `<out_dir>/<category>-NN.png` for every added/removed/changed row."""
     import fitz
@@ -264,8 +291,8 @@ def contact_sheets(report: dict, pdfs: dict, out_dir: str, per_sheet: int) -> li
     written, doc_cache = [], {}
     page_w = 8 + _THUMB_WIDTH + 2 * (_CROP_WIDTH + 12) + 16
     for category in SHEET_CATEGORIES:
-        rows = [(stem, row) for stem in sorted(report)
-                for row in report[stem][category]]
+        rows = [(stem, r) for stem in sorted(report)
+                for row in report[stem][category] for r in [row] + part_rows(row)]
         for start in range(0, len(rows), per_sheet):
             chunk = rows[start:start + per_sheet]
             sheet_doc = fitz.open()

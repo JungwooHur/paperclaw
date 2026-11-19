@@ -48,7 +48,7 @@ MEDIA_TEXT = """
 import json, sys
 import extract_pdf_media
 print(json.dumps(extract_pdf_media._media_text(
-    sys.argv[1], {"Figure 1": {"page": 1, "box": [0, 0, 612, 792]}})))
+    sys.argv[1], {"Figure 1": {"page": 1, "box": [0, 0, 612, 792], "continued": []}})))
 """
 ATTACHMENT = """
 import json, os, sys

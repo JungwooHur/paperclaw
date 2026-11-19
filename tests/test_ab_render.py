@@ -10,8 +10,9 @@ ab = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(ab)
 
 
-def item(page, box):
-    return {"page": page, "box": box, "path": "x.png"}
+def item(page, box, continued=()):
+    return {"page": page, "box": box, "path": "x.png",
+            "continued": [{"page": p, "box": b, "path": "y.png"} for p, b in continued]}
 
 
 def keys(report, category):
@@ -19,6 +20,37 @@ def keys(report, category):
 
 
 class TestCompare:
+
+    def test_a_table_whose_continued_parts_moved_has_changed(self):
+        box = [10, 10, 100, 100]
+        base = {"table|3": item(2, box, [(3, box)])}
+        for parts in ([], [(3, box), (4, box)], [(3, [10, 10, 100, 120])], [(4, box)]):
+            report = ab.compare(base, {"table|3": item(2, box, parts)})
+            assert keys(report, "changed") == ["table|3"], parts
+        report = ab.compare(base, {"table|3": item(2, box, [(3, box)])})
+        assert keys(report, "same") == ["table|3"]
+
+    def test_each_continued_part_gets_its_own_sheet_row(self):
+        box = [10, 10, 100, 100]
+        (row,) = ab.compare({"table|3": item(2, box, [(3, box)])},
+                            {"table|3": item(2, box, [(3, [10, 12, 100, 100]),
+                                                      (4, box)])})["changed"]
+        parts = ab.part_rows(row)
+        assert [(r["key"], r["page"], r["delta"]) for r in parts] == [
+            ("table|3 part 1", 3, [0, 2, 0, 0]), ("table|3 part 2", 4, None)]
+        assert parts[1]["base"] is None and parts[1]["branch"]["page"] == 4
+
+    def test_the_sheets_draw_a_row_per_later_page(self, tmp_path, monkeypatch):
+        box = [10, 10, 100, 100]
+        report = {"paper": ab.compare(
+            {"table|3": item(2, box, [(3, box)])},
+            {"table|3": item(2, box, [(3, box), (4, box)])})}
+        drawn = []
+        monkeypatch.setattr(ab, "_row", lambda sheet, y, pdf, row, cache: drawn.append(
+            (pdf, row["key"])))
+        ab.contact_sheets(report, {"paper": "paper.pdf"}, str(tmp_path), 10)
+        assert drawn == [("paper.pdf", "table|3"), ("paper.pdf", "table|3 part 1"),
+                         ("paper.pdf", "table|3 part 2")]
 
     def test_each_float_lands_in_one_category(self):
         base = {"figure|1": item(1, [0, 0, 100, 100]),

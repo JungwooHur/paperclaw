@@ -100,6 +100,14 @@ class TestWhatIsNeverTouched:
         blocks = [image("a", "", "image.png"), image("b", "", "image.png")]
         assert dt.duplicate_tables(blocks) == []
 
+    def test_the_later_pages_of_a_table_share_their_caption_and_all_stay(self):
+        import extract_pdf_media as pm
+
+        later = pm.continued_caption("table", 3, "")
+        blocks = [image("t", "Table 3: Errors"), image("c1", later, "t-2.png"),
+                  image("c2", later, "t-3.png")]
+        assert dt.duplicate_tables(blocks) == [] and ept.table_repeats(blocks) == 1
+
     def test_one_file_name_under_two_captions_is_two_tables(self):
         # Every run starts its counter at table_0, so distinct tables share names.
         blocks = [image("a", "TABLE I: A", "table_0.png"),
