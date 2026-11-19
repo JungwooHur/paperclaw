@@ -5,7 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { cleanup, createTempDir } from './test-helpers.js';
 
-describe('run-migrations', () => {
+/** Milliseconds one run-migrations subprocess may take, and so one test. */
+const RUN_TIMEOUT_MS = 30_000;
+
+describe('run-migrations', { timeout: RUN_TIMEOUT_MS }, () => {
   let tmpDir: string;
   let newCoreDir: string;
   const scriptPath = path.resolve('scripts/run-migrations.ts');
@@ -36,7 +39,7 @@ describe('run-migrations', () => {
         cwd: tmpDir,
         encoding: 'utf-8',
         stdio: 'pipe',
-        timeout: 30_000,
+        timeout: RUN_TIMEOUT_MS,
       });
       return { stdout, exitCode: 0 };
     } catch (err: any) {
