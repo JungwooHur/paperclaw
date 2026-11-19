@@ -52,7 +52,8 @@ subcaption, and lines between the rows of an image grid or titling one of its
 panels are no prose to the crop check.
 
 Tables use the identical machinery, growing DOWNWARD (LaTeX puts a table's
-caption above its body) instead of upward.
+caption above its body) instead of upward. A rule set as a thin raster image is
+a rule like a drawn one.
 
   # eyeball the crops first — renders to disk, touches nothing:
   extract_pdf_media.py --pdf <path-or-url> --out <dir>
@@ -825,7 +826,8 @@ class _Parts:
     small: the loose barriers that are no heading (`_is_heading`): small print
         set as prose.
     elements: boxes of everything else — text, raster images, drawings.
-    drawings: the elements that are vector drawings.
+    drawings: the elements that are vector drawings or raster rules
+        (`_horizontals`).
     texts: (box, block) of the elements that are text.
     """
 
@@ -867,6 +869,7 @@ def _page_parts(page, caption_box, body: Body, band) -> _Parts:
             continue
         if b.get("type") != 0:
             parts.elements.append(box)    # raster image
+            parts.drawings += _horizontals([box])
             continue
         if _overlaps(box, caption_box):   # the caption is the anchor, not content
             rest = [ln for ln in b.get("lines") or ()

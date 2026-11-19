@@ -2140,6 +2140,29 @@ class TestATableRuledWithImages:
             ("table", 6)]["box"]
         assert box[1] <= 60 and box[3] >= y
 
+    def test_a_header_line_between_its_rules_is_its_own(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 150)
+        page.insert_text((94, 178), "Table 10. Parameters of the fitted model, each given "
+                         "with its mean and its error band", fontsize=10)
+        image_rule(page, 90, 514, 194)
+        image_rule(page, 90, 514, 196)
+        page.insert_text((348, 215), "Mean and error band", fontsize=10)
+        image_rule(page, 90, 514, 222)
+        y = 240
+        for i in range(12):
+            page.insert_text((96, y), f"Parameter number {i} of the model", fontsize=10)
+            page.insert_text((360, y), f"p{i} = 0.{i}3 +- 0.04", fontsize=10)
+            y += 15
+        image_rule(page, 90, 514, y - 8)
+        page.insert_text((105, y + 10), "a Fit to every data set at once", fontsize=7)
+        prose(page, 72, 540, y + 200)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("table", 10)]["box"]
+        assert box[1] <= 194 and box[3] >= y - 8
+
 
 class TestWhatContinuesATable:
     """A table captioned above, then a ruled block as wide, then prose."""
