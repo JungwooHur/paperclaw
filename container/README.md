@@ -57,9 +57,8 @@ unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN 2>/dev/null; exec </dev/null; : 
   exiting 1 is no error; a wrapper around the command would hide that word and
   turn a `grep` with no match into an error.
 
-What remains: bash reports line numbers in errors and `$LINENO` 4 lines later
-than for the same call without the hook. Without it, the CLI already reports
-line k of an n-line command as line k + n - 1.
+What remains: bash reports an error or `$LINENO` on line k of an n-line command
+as line k + n + 3, where plain bash reports k.
 
 CLI 2.1.112 (SDK 0.2.112) quotes every command whole and puts `< /dev/null` on
 `eval` itself; #164 tracks that bump. `container/agent-runner/test/bash-hook.test.ts`

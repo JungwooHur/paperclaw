@@ -29,7 +29,7 @@ const PROBE = 'probe-value';
 const PIPED_VAR = 'echo "v=${PROBE_VAR:+set} $PROBE_VAR" | cat';
 const PIPED_FOR = [
   "printf '{}' | python3 -c \"import sys",
-  'for line in sys.stdin: print(line, end=\'\')"',
+  "for line in sys.stdin: print(line, end='')\"",
 ].join('\n');
 
 /** Prints whether the CLI's auth key is set. */
@@ -42,12 +42,12 @@ const AS_WRITTEN: Record<string, string> = {
   'cat | wc -c | tr -d " "': '0',
   'echo "$(printf ab)" | cat': 'ab',
   'echo `printf cd` | cat': 'cd',
-  "printf 'ab\\n' | while read -r l; do echo \"got $l\"; done": 'got ab',
+  'printf \'ab\\n\' | while read -r l; do echo "got $l"; done': 'got ab',
   "cat <<'EOF' | tr a-z A-Z\nquoted $PROBE_VAR\nEOF": 'QUOTED $PROBE_VAR',
   'cat <<EOF | cat\nplain $PROBE_VAR\nEOF': `plain ${PROBE}`,
-  "echo ')' | cat; echo \"a)b\" | cat": ')\na)b',
+  'echo \')\' | cat; echo "a)b" | cat': ')\na)b',
   'case x in x) echo case-x;; esac | cat': 'case-x',
-  "echo 'it'\"'\"'s' \"a \\\"q\\\"\" | cat": 'it\'s a "q"',
+  'echo \'it\'"\'"\'s\' "a \\"q\\"" | cat': 'it\'s a "q"',
   "printf '%s\\n' 'a\\b' \"c\\\\d\" | cat": 'a\\b\nc\\d',
   'echo trailing | cat\n': 'trailing',
   'echo $((1 << 2)) | cat; [ 1 != 2 ] && echo ne': '4\nne',
@@ -254,7 +254,9 @@ async function runBash(
   }
   const missing = commands.filter((c) => !results.has(c));
   if (missing.length > 0) {
-    throw new Error(`no tool result for ${JSON.stringify(missing)}:\n${stderr}`);
+    throw new Error(
+      `no tool result for ${JSON.stringify(missing)}:\n${stderr}`,
+    );
   }
   return results;
 }
