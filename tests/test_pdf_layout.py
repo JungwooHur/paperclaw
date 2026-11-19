@@ -3927,6 +3927,21 @@ class TestTitlesInAnImageGrid:
             ("figure", 8)]["box"]
         assert box[1] <= 90 and 508 <= box[3] <= caption[1]
 
+    def test_two_line_titles_between_its_rows_are_no_prose(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        for x, first, second in zip((60, 310), *self.ROWS):
+            picture(page, fitz.Rect(x, 90, x + 230, 208))
+            page.insert_text((x + 4, 224), first, fontsize=10, fontname="tiro")
+            page.insert_text((x + 4, 236), second, fontsize=10, fontname="tiro")
+            picture(page, fitz.Rect(x, 240, x + 230, 358))
+        page.insert_text((108, 375), "Figure 8: A grid of samples.", fontsize=10)
+        caption = blocks_starting(page, "Figure 8")[0]
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 8)]["box"]
+        assert box[1] <= 90 and 358 <= box[3] <= caption[1]
+
     def test_prose_between_the_rows_of_two_figures_is_refused(self, tmp_path):
         doc = fitz.open()
         body_pages(doc)
@@ -3995,12 +4010,14 @@ class TestSubcaptionParagraphs:
             ("figure", 11)]["box"]
         assert 439 <= box[1] <= 455 and 715 <= box[3] <= caption[1]
 
-    def test_away_from_the_panels_they_are_no_subcaptions(self, tmp_path):
+    @pytest.mark.parametrize("panel", [(117, 320, 495, 420), (317, 330, 495, 445)],
+                             ids=["far-over-them", "beside-them"])
+    def test_away_from_the_panels_they_are_no_subcaptions(self, tmp_path, panel):
         doc = fitz.open()
         body_pages(doc)
         page = doc.new_page(width=LETTER[0], height=LETTER[1])
         prose(page, 108, 504, 300)
-        picture(page, fitz.Rect(117, 320, 495, 420))
+        picture(page, fitz.Rect(panel))
         assert page.insert_textbox(fitz.Rect(117, 450, 295, 550),
                                    f"(a) {PROSE[:220]}", fontsize=9,
                                    align=fitz.TEXT_ALIGN_JUSTIFY) >= 0
@@ -4014,7 +4031,8 @@ class TestSubcaptionParagraphs:
 
     @pytest.mark.parametrize("size,marks", [(10, ("(a) ", "(b) ")), (9, ("", ""))],
                              ids=["at-body-size", "with-no-mark"])
-    def test_at_body_size_they_are_prose(self, tmp_path, size, marks):
+    def test_unmarked_or_body_size_paragraphs_are_no_subcaptions(
+            self, tmp_path, size, marks):
         doc = fitz.open()
         body_pages(doc)
         self.page(doc, size, marks)
