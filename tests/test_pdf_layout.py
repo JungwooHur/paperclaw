@@ -2163,6 +2163,24 @@ class TestATableRuledWithImages:
             ("table", 10)]["box"]
         assert box[1] <= 194 and box[3] >= y - 8
 
+    def test_a_picture_is_no_rule_around_the_print_over_it(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        page.draw_line((108, 132), (504, 132))
+        for i, line in enumerate(("First Author, Second Author and Third Author",
+                                  "Fourth Author, Fifth Author, Sixth Author",
+                                  "Seventh Author and Eighth Author, Ninth One",
+                                  "Tenth Author and the Eleventh Author of it")):
+            page.insert_text((160 + 9 * (i % 2), 164 + 12 * i), line, fontsize=10)
+        picture(page, fitz.Rect(108, 213, 504, 361))
+        page.insert_text((108, 418), "Figure 1: An overview of the whole system.",
+                         fontsize=10)
+        prose(page, 108, 504, 700)
+        box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
+            ("figure", 1)]["box"]
+        assert 200 <= box[1] <= 213
+
 
 class TestWhatContinuesATable:
     """A table captioned above, then a ruled block as wide, then prose."""
@@ -4041,3 +4059,27 @@ class TestSubcaptionParagraphs:
         box = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))[
             ("figure", 1)]["box"]
         assert note[3] - 0.5 <= box[1] <= bottom + 56
+
+    def test_a_table_is_never_cut_to_its_last_row_of_subtables(self, tmp_path):
+        doc = fitz.open()
+        body_pages(doc)
+        page = doc.new_page(width=LETTER[0], height=LETTER[1])
+        prose(page, 72, 540, 120)
+        y = 140
+        for spans, marks, column_rule in (
+                (((72, 292), (320, 540)), ("(a) ", "(b) "), False),
+                (((72, 250), (280, 540)), ("(c) ", "(d) "), True)):
+            for (x0, x1), mark in zip(spans, marks):
+                bottom = ruled_table(page, x0, x1, y, 3)
+                if column_rule:
+                    page.draw_line((x0 + 110, bottom - 10), (x0 + 110, bottom))
+                assert page.insert_textbox(fitz.Rect(x0, bottom + 4, x1, bottom + 70),
+                                           mark + PROSE[:220], fontsize=8,
+                                           align=fitz.TEXT_ALIGN_JUSTIFY) >= 0
+            y = bottom + 75
+        under = max(b[3] for b in blocks_starting(page, "(c)") + blocks_starting(page, "(d)"))
+        page.insert_text((95, under + 18), "Table 2: Ablations of every part, trained "
+                         "on one set and tested on another one.", fontsize=10)
+        prose(page, 72, 540, 700)
+        media = pm.render_media(save(doc, tmp_path), str(tmp_path / "out"))
+        assert ("table", 2) not in media or media[("table", 2)]["box"][1] <= 140
